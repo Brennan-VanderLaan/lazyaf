@@ -1,0 +1,23 @@
+I want to create a visual orchestrator for working with many AI agents to achieve various tasks, because I am lazy, af.
+
+So the thought is right now it's fairly easy to make quick progress with claude code as-is. I want to make it easier to extend how plugins and agents are used, as well as MCP endpoints via a web-ui.
+
+Right now we are establishing the backend queue system and how the application establishes communication with worker nodes.
+
+I want to use 0mq
+
+We need the following rough structures
+
+./worker
+- Connects to configured backend
+./backend
+- Persistence layer, access control, rest backend
+./ui
+- Graphical node based workflow configuration layer
+- worker configuration layer
+- mcp configuration layer
+- claude configuration layer
+./integrations
+- runtimes for running containers and getting gpu resources in the mix
+-- runpod.io
+-- k8s pytorch job

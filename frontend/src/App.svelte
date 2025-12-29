@@ -1,14 +1,7 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import RepoSelector from './lib/components/RepoSelector.svelte';
+  import RunnerPanel from './lib/components/RunnerPanel.svelte';
   import Board from './lib/components/Board.svelte';
-  import { websocketStore } from './lib/stores/websocket';
-
-  onMount(() => {
-    // WebSocket disabled until Phase 4 (agent integration)
-    // websocketStore.connect();
-    // return () => websocketStore.disconnect();
-  });
 </script>
 
 <div class="app">
@@ -18,6 +11,7 @@
       <span class="logo-text">LazyAF</span>
     </div>
     <RepoSelector />
+    <RunnerPanel />
   </aside>
 
   <main class="main">

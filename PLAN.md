@@ -293,14 +293,26 @@ src/
 ### Phase 3: Runner Pool
 **Goal**: Docker-based runner pool that can execute commands
 
-- [ ] Create runner Docker image
-- [ ] Implement Runner model and pool manager
-- [ ] Runner registration/heartbeat system
-- [ ] Job queue (in-memory for now)
-- [ ] Job assignment logic
-- [ ] Runner status API
+- [x] Create runner Docker image
+- [x] Implement Runner model and pool manager
+- [x] Runner registration/heartbeat system
+- [x] Job queue (in-memory for now)
+- [x] Job assignment logic
+- [x] Runner status API
 
 **Deliverable**: Can spawn runners and assign dummy jobs
+
+### Phase 3.5: Runner UI/UX
+**Goal**: Visibility into runner pool and easy agent management
+
+- [x] Add runner types and API client to frontend
+- [x] Create runner store with 2s polling
+- [x] Build RunnerPanel component (pool stats, +/- scaling)
+- [x] Add individual runner list with status badges
+- [x] Backend endpoint for docker run command generation
+- [x] Docker command modal (placeholders + copy with secrets button)
+
+**Deliverable**: Can see runner status, scale pool, and copy docker commands to spin up runners
 
 ### Phase 4: Agent Integration
 **Goal**: Cards trigger Claude Code, results in PRs

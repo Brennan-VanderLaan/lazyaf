@@ -1,10 +1,13 @@
+from uuid import uuid4
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Card, Repo
+from app.models import Card, Repo, Job
 from app.schemas import CardCreate, CardRead, CardUpdate
+from app.services.job_queue import job_queue, QueuedJob
 
 router = APIRouter(tags=["cards"])
 
@@ -78,10 +81,41 @@ async def start_card(card_id: str, db: AsyncSession = Depends(get_db)):
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
 
-    # TODO: Create job and assign to runner
+    if card.status != "todo":
+        raise HTTPException(status_code=400, detail="Card must be in 'todo' status to start")
+
+    # Get the repo
+    result = await db.execute(select(Repo).where(Repo.id == card.repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    # Create a job in the database
+    job_id = str(uuid4())
+    job = Job(id=job_id, card_id=card.id, status="queued")
+    db.add(job)
+
+    # Update card status and link to job
     card.status = "in_progress"
+    card.job_id = job_id
+    card.branch_name = f"lazyaf/{job_id[:8]}"
+
     await db.commit()
     await db.refresh(card)
+
+    # Queue the job for a runner
+    queued_job = QueuedJob(
+        id=job_id,
+        card_id=card.id,
+        repo_id=repo.id,
+        repo_url=repo.remote_url or "",
+        repo_path=repo.path,
+        base_branch=repo.default_branch,
+        card_title=card.title,
+        card_description=card.description,
+    )
+    await job_queue.enqueue(queued_job)
+
     return card
 
 

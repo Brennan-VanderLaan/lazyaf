@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, Card, CardCreate, CardUpdate, Job, Runner } from './types';
+import type { Repo, RepoCreate, Card, CardCreate, CardUpdate, Job, Runner, PoolStatus, DockerCommand, RunnerLogs } from './types';
 
 const BASE_URL = '/api';
 
@@ -61,10 +61,11 @@ export const jobs = {
 // Runners
 export const runners = {
   list: () => request<Runner[]>('/runners'),
-  scale: (count: number) => request<{ message: string }>('/runners/scale', {
-    method: 'POST',
-    body: JSON.stringify({ count }),
-  }),
+  status: () => request<PoolStatus>('/runners/status'),
+  logs: (runnerId: string, offset: number = 0) =>
+    request<RunnerLogs>(`/runners/${runnerId}/logs?offset=${offset}`),
+  dockerCommand: (withSecrets: boolean = false) =>
+    request<DockerCommand>(`/runners/docker-command?with_secrets=${withSecrets}`),
 };
 
 // Health

@@ -50,7 +50,6 @@ class TestListRepos:
         """Returns repos with all expected fields."""
         payload = repo_create_payload(
             name="TestRepo",
-            path="/repos/test",
             remote_url="https://github.com/org/test.git",
         )
         await client.post("/api/repos", json=payload)
@@ -61,8 +60,9 @@ class TestListRepos:
         repo = repos[0]
         assert "id" in repo
         assert repo["name"] == "TestRepo"
-        assert repo["path"] == "/repos/test"
         assert repo["remote_url"] == "https://github.com/org/test.git"
+        assert "is_ingested" in repo
+        assert "internal_git_url" in repo
         assert "created_at" in repo
 
 
@@ -71,18 +71,18 @@ class TestCreateRepo:
 
     async def test_create_repo_minimal(self, client):
         """Creates repo with minimal required fields."""
-        payload = repo_create_payload(name="MinimalRepo", path="/repos/minimal")
+        payload = repo_create_payload(name="MinimalRepo")
 
         response = await client.post("/api/repos", json=payload)
         result = assert_created_response(response, {"name": "MinimalRepo"})
-        assert result["path"] == "/repos/minimal"
         assert result["default_branch"] == "main"
+        assert result["is_ingested"] is False
+        assert "internal_git_url" in result
 
     async def test_create_repo_full(self, client):
         """Creates repo with all fields specified."""
         payload = {
             "name": "FullRepo",
-            "path": "/repos/full",
             "remote_url": "https://github.com/org/full.git",
             "default_branch": "dev",
         }
@@ -91,6 +91,7 @@ class TestCreateRepo:
         result = assert_created_response(response, {"name": "FullRepo"})
         assert result["remote_url"] == "https://github.com/org/full.git"
         assert result["default_branch"] == "dev"
+        assert "internal_git_url" in result
 
     async def test_create_repo_generates_uuid(self, client):
         """Creates repo with auto-generated UUID."""
@@ -103,17 +104,20 @@ class TestCreateRepo:
 
     async def test_create_repo_missing_name_fails(self, client):
         """Fails to create repo without name."""
-        payload = {"path": "/repos/test"}
+        payload = {"remote_url": "https://github.com/org/test.git"}
 
         response = await client.post("/api/repos", json=payload)
         assert_status_code(response, 422)  # Validation error
 
-    async def test_create_repo_missing_path_fails(self, client):
-        """Fails to create repo without path."""
-        payload = {"name": "TestRepo"}
+    async def test_create_repo_name_only_succeeds(self, client):
+        """Creates repo with only name (all other fields have defaults)."""
+        payload = {"name": "NameOnlyRepo"}
 
         response = await client.post("/api/repos", json=payload)
-        assert_status_code(response, 422)  # Validation error
+        assert_status_code(response, 201)
+        result = response.json()
+        assert result["name"] == "NameOnlyRepo"
+        assert result["default_branch"] == "main"
 
 
 class TestGetRepo:
@@ -138,7 +142,6 @@ class TestGetRepo:
         """Returns repo with complete field set."""
         create_payload = {
             "name": "CompleteRepo",
-            "path": "/repos/complete",
             "remote_url": "https://github.com/org/complete.git",
             "default_branch": "develop",
         }
@@ -148,9 +151,10 @@ class TestGetRepo:
         response = await client.get(f"/api/repos/{repo_id}")
         result = response.json()
         assert result["name"] == "CompleteRepo"
-        assert result["path"] == "/repos/complete"
         assert result["remote_url"] == "https://github.com/org/complete.git"
         assert result["default_branch"] == "develop"
+        assert "is_ingested" in result
+        assert "internal_git_url" in result
         assert "created_at" in result
 
 
@@ -182,13 +186,14 @@ class TestUpdateRepo:
 
         update_data = {
             "name": "NewName",
-            "path": "/new/path",
-            "default_branch": "main",
+            "remote_url": "https://github.com/org/updated.git",
+            "default_branch": "develop",
         }
         response = await client.patch(f"/api/repos/{repo_id}", json=update_data)
         result = response.json()
         assert result["name"] == "NewName"
-        assert result["path"] == "/new/path"
+        assert result["remote_url"] == "https://github.com/org/updated.git"
+        assert result["default_branch"] == "develop"
 
     async def test_update_repo_not_found(self, client):
         """Returns 404 when updating non-existent repo."""

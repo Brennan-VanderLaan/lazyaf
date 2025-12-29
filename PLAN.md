@@ -70,10 +70,14 @@
 class Repo:
     id: UUID
     name: str
-    path: str                    # Local path to repo
-    remote_url: str | None       # GitHub remote
+    remote_url: str | None       # Real remote (GitHub/GitLab) for landing changes
     default_branch: str          # e.g., "dev" or "main"
+    is_ingested: bool            # True if repo content is in internal git server
     created_at: datetime
+
+    @property
+    def internal_git_url(self) -> str:
+        """URL to clone from internal git server: /git/{id}.git"""
 ```
 
 ### Card
@@ -138,9 +142,20 @@ class Runner:
 ### Repos
 ```
 GET    /api/repos              # List all repos
-POST   /api/repos              # Attach a repo
+POST   /api/repos              # Create a repo record
+POST   /api/repos/ingest       # Create repo + init internal git storage
 GET    /api/repos/{id}         # Get repo details
-DELETE /api/repos/{id}         # Detach repo
+GET    /api/repos/{id}/clone-url  # Get internal git clone URL
+DELETE /api/repos/{id}         # Delete repo (and git storage)
+```
+
+### Git (Internal Git Server)
+```
+GET    /git/{id}.git/info/refs?service=git-upload-pack   # Clone/fetch refs
+GET    /git/{id}.git/info/refs?service=git-receive-pack  # Push refs
+POST   /git/{id}.git/git-upload-pack                     # Clone/fetch data
+POST   /git/{id}.git/git-receive-pack                    # Push data
+GET    /git/{id}.git/HEAD                                # HEAD reference
 ```
 
 ### Cards
@@ -314,17 +329,68 @@ src/
 
 **Deliverable**: Can see runner status, scale pool, and copy docker commands to spin up runners
 
-### Phase 4: Agent Integration
-**Goal**: Cards trigger Claude Code, results in PRs
+### Phase 3.75: Internal Git Server
+**Goal**: Host repos internally for iteration isolation - don't pollute real remotes until ready
 
-- [ ] Runner entrypoint script (clone, branch, invoke Claude)
+**Motivation**: During active development/iteration, we don't want to push experimental branches and PRs to GitHub/GitLab. The internal git server lets agents work in isolation. When satisfied with results, users can "land" changes to the real remote.
+
+#### Architecture
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        INTERNAL GIT SERVER                          │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    HTTP Smart Protocol                       │   │
+│  │  GET  /git/{repo_id}.git/info/refs   (clone discovery)      │   │
+│  │  POST /git/{repo_id}.git/git-upload-pack   (fetch)          │   │
+│  │  POST /git/{repo_id}.git/git-receive-pack  (push)           │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                       │
+│                              ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    Bare Git Repos                            │   │
+│  │  backend/git_repos/{repo_id}.git/                           │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Flows
+1. **Ingest**: User runs CLI → pushes local repo → stored in internal git server
+2. **Agent Work**: Runner clones from internal server → makes changes → pushes back
+3. **Land**: User pushes approved branch to real remote (GitHub/GitLab)
+
+#### Implementation
+
+**Phase 3.75a: Git Server Foundation** ✅
+- [x] Add dulwich dependency (pure Python git library)
+- [x] Create `git_server.py` service for bare repo management
+- [x] Create `git.py` router with HTTP smart protocol endpoints
+- [x] Update Repo model (add `is_ingested`, remove `path` requirement)
+- [x] Add `/api/repos/ingest` endpoint
+
+**Phase 3.75b: Agent Integration**
+- [ ] Update runner entrypoint to clone from internal git URL
+- [ ] Runner pushes feature branches back to internal server (not origin)
+- [ ] Skip PR creation when working against internal server
+- [ ] Track branches per repo in database
+
+**Tech Stack**:
+- `dulwich` - Pure Python git implementation, embeds in FastAPI
+- HTTP smart protocol - Works through firewalls, supports auth headers
+- Bare repos stored in `backend/git_repos/`
+
+**Deliverable**: Can ingest local repos, agents work in isolation, land changes when ready
+
+### Phase 4: Agent Integration
+**Goal**: Cards trigger Claude Code, results in PRs (or internal branches)
+
+- [ ] Runner entrypoint script (clone from internal server, branch, invoke Claude)
 - [ ] Claude Code invocation with card context
-- [ ] PR creation via gh CLI
+- [ ] Push results back to internal git server
 - [ ] Job status callbacks
-- [ ] Link PRs back to cards
+- [ ] Link branches/PRs back to cards
 - [ ] WebSocket status updates
 
-**Deliverable**: Creating a card and clicking "Start" produces a real PR
+**Deliverable**: Creating a card and clicking "Start" produces changes in the internal repo
 
 ### Phase 5: Review Flow
 **Goal**: Complete the human review loop
@@ -370,20 +436,28 @@ lazyaf/
 │   │   │   ├── repos.py
 │   │   │   ├── cards.py
 │   │   │   ├── jobs.py
-│   │   │   └── runners.py
+│   │   │   ├── runners.py
+│   │   │   └── git.py           # Git HTTP smart protocol
 │   │   ├── services/
 │   │   │   ├── __init__.py
 │   │   │   ├── runner_pool.py
 │   │   │   ├── job_queue.py
-│   │   │   └── websocket.py
+│   │   │   ├── websocket.py
+│   │   │   └── git_server.py    # Bare repo management
 │   │   └── schemas/
 │   │       ├── __init__.py
 │   │       └── ...              # Pydantic models
+│   ├── git_repos/               # Internal bare git repos
+│   │   └── {repo_id}.git/
 │   ├── runner/
 │   │   ├── Dockerfile
 │   │   └── entrypoint.py
 │   ├── pyproject.toml
 │   └── alembic/                 # DB migrations
+├── cli/                         # LazyAF CLI tool
+│   ├── pyproject.toml
+│   └── lazyaf/
+│       └── cli.py               # ingest, land commands
 ├── frontend/
 │   ├── src/
 │   │   └── ...                  # Svelte app

@@ -23,16 +23,14 @@ class TestRepoCreateSchema:
 
     def test_valid_repo_create_minimal(self):
         """RepoCreate accepts minimal required fields."""
-        data = {"name": "TestRepo", "path": "/repos/test"}
+        data = {"name": "TestRepo"}
         schema = assert_schema_valid(RepoCreate, data)
         assert schema.name == "TestRepo"
-        assert schema.path == "/repos/test"
 
     def test_valid_repo_create_full(self):
         """RepoCreate accepts all fields."""
         data = {
             "name": "FullRepo",
-            "path": "/repos/full",
             "remote_url": "https://github.com/org/repo.git",
             "default_branch": "dev",
         }
@@ -42,24 +40,19 @@ class TestRepoCreateSchema:
 
     def test_repo_create_default_branch(self):
         """RepoCreate defaults branch to 'main'."""
-        data = {"name": "TestRepo", "path": "/repos/test"}
+        data = {"name": "TestRepo"}
         schema = RepoCreate(**data)
         assert schema.default_branch == "main"
 
     def test_repo_create_remote_url_optional(self):
         """RepoCreate allows None for remote_url."""
-        data = {"name": "LocalRepo", "path": "/repos/local", "remote_url": None}
+        data = {"name": "LocalRepo", "remote_url": None}
         schema = assert_schema_valid(RepoCreate, data)
         assert schema.remote_url is None
 
     def test_repo_create_missing_name_fails(self):
         """RepoCreate requires name field."""
-        data = {"path": "/repos/test"}
-        assert_schema_invalid(RepoCreate, data)
-
-    def test_repo_create_missing_path_fails(self):
-        """RepoCreate requires path field."""
-        data = {"name": "TestRepo"}
+        data = {}
         assert_schema_invalid(RepoCreate, data)
 
 
@@ -71,20 +64,17 @@ class TestRepoUpdateSchema:
         data = {}
         schema = assert_schema_valid(RepoUpdate, data)
         assert schema.name is None
-        assert schema.path is None
 
     def test_repo_update_partial(self):
         """RepoUpdate accepts partial updates."""
         data = {"name": "NewName"}
         schema = assert_schema_valid(RepoUpdate, data)
         assert schema.name == "NewName"
-        assert schema.path is None
 
     def test_repo_update_all_fields(self):
         """RepoUpdate accepts all fields."""
         data = {
             "name": "UpdatedRepo",
-            "path": "/new/path",
             "remote_url": "https://github.com/new/repo.git",
             "default_branch": "develop",
         }
@@ -101,20 +91,24 @@ class TestRepoReadSchema:
         data = {
             "id": "123e4567-e89b-12d3-a456-426614174000",
             "name": "TestRepo",
-            "path": "/repos/test",
             "remote_url": None,
             "default_branch": "main",
+            "is_ingested": False,
+            "internal_git_url": "/git/123e4567-e89b-12d3-a456-426614174000.git",
             "created_at": datetime.utcnow(),
         }
         schema = assert_schema_valid(RepoRead, data)
         assert schema.id == data["id"]
+        assert schema.is_ingested == False
+        assert schema.internal_git_url == data["internal_git_url"]
 
     def test_repo_read_requires_id(self):
         """RepoRead requires id field."""
         data = {
             "name": "TestRepo",
-            "path": "/repos/test",
             "default_branch": "main",
+            "is_ingested": False,
+            "internal_git_url": "/git/test.git",
             "created_at": datetime.utcnow(),
         }
         assert_schema_invalid(RepoRead, data)
@@ -124,7 +118,30 @@ class TestRepoReadSchema:
         data = {
             "id": "123e4567-e89b-12d3-a456-426614174000",
             "name": "TestRepo",
-            "path": "/repos/test",
             "default_branch": "main",
+            "is_ingested": False,
+            "internal_git_url": "/git/test.git",
+        }
+        assert_schema_invalid(RepoRead, data)
+
+    def test_repo_read_requires_is_ingested(self):
+        """RepoRead requires is_ingested field."""
+        data = {
+            "id": "123e4567-e89b-12d3-a456-426614174000",
+            "name": "TestRepo",
+            "default_branch": "main",
+            "internal_git_url": "/git/test.git",
+            "created_at": datetime.utcnow(),
+        }
+        assert_schema_invalid(RepoRead, data)
+
+    def test_repo_read_requires_internal_git_url(self):
+        """RepoRead requires internal_git_url field."""
+        data = {
+            "id": "123e4567-e89b-12d3-a456-426614174000",
+            "name": "TestRepo",
+            "default_branch": "main",
+            "is_ingested": False,
+            "created_at": datetime.utcnow(),
         }
         assert_schema_invalid(RepoRead, data)

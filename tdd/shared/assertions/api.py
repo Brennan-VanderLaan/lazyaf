@@ -117,3 +117,109 @@ def assert_validation_error(response: Response) -> dict[str, Any]:
     """
     assert_status_code(response, 422)
     return response.json()
+
+
+# -----------------------------------------------------------------------------
+# Git Protocol Assertions
+# -----------------------------------------------------------------------------
+
+def assert_git_info_refs_response(
+    response: Response,
+    service: str,
+) -> bytes:
+    """Assert response is a valid git info/refs response.
+
+    Args:
+        response: HTTP response
+        service: Expected service (git-upload-pack or git-receive-pack)
+
+    Returns:
+        The response content for further inspection
+    """
+    assert_status_code(response, 200)
+
+    expected_content_type = f"application/x-{service}-advertisement"
+    assert response.headers["content-type"] == expected_content_type, (
+        f"Expected content-type '{expected_content_type}', "
+        f"got '{response.headers['content-type']}'"
+    )
+
+    content = response.content
+    service_line = f"# service={service}\n".encode()
+    assert service_line in content, f"Missing service announcement: {service_line}"
+    assert content.endswith(b"0000"), "Response should end with flush packet"
+
+    return content
+
+
+def assert_git_head_response(response: Response) -> str:
+    """Assert response is a valid git HEAD response.
+
+    Returns:
+        The HEAD reference (e.g., 'ref: refs/heads/main')
+    """
+    assert_status_code(response, 200)
+    assert "text/plain" in response.headers["content-type"]
+
+    content = response.text
+    assert content.startswith("ref: refs/heads/"), (
+        f"HEAD should be symbolic ref, got: {content}"
+    )
+    assert content.endswith("\n"), "HEAD response should end with newline"
+
+    return content.strip()
+
+
+def assert_git_pack_response(
+    response: Response,
+    service: str,
+) -> bytes:
+    """Assert response is a valid git pack response.
+
+    Args:
+        response: HTTP response
+        service: git-upload-pack or git-receive-pack
+
+    Returns:
+        The response content
+    """
+    assert_status_code(response, 200)
+
+    expected_content_type = f"application/x-{service}-result"
+    assert response.headers["content-type"] == expected_content_type, (
+        f"Expected content-type '{expected_content_type}', "
+        f"got '{response.headers['content-type']}'"
+    )
+
+    return response.content
+
+
+def assert_ingest_response(response: Response, expected_name: str) -> dict[str, Any]:
+    """Assert response is a valid ingest response.
+
+    Args:
+        response: HTTP response
+        expected_name: Expected repo name
+
+    Returns:
+        The full response JSON
+    """
+    assert_status_code(response, 201)
+
+    result = response.json()
+    assert "id" in result, "Ingest response should include 'id'"
+    assert result["name"] == expected_name, (
+        f"Expected name '{expected_name}', got '{result['name']}'"
+    )
+    assert "internal_git_url" in result, "Ingest response should include 'internal_git_url'"
+    assert "clone_url" in result, "Ingest response should include 'clone_url'"
+
+    # Validate URL formats
+    assert result["internal_git_url"].startswith("/git/"), (
+        f"internal_git_url should start with /git/, got: {result['internal_git_url']}"
+    )
+    assert result["internal_git_url"].endswith(".git"), (
+        f"internal_git_url should end with .git, got: {result['internal_git_url']}"
+    )
+
+    return result

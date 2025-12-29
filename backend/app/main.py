@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.database import init_db
 from app.routers import repos, cards, jobs, runners
+from app.routers import git
 from app.services.websocket import manager
 
 settings = get_settings()
@@ -42,6 +43,7 @@ app.include_router(repos.router)
 app.include_router(cards.router)
 app.include_router(jobs.router)
 app.include_router(runners.router)
+app.include_router(git.router)
 
 
 @app.get("/health")

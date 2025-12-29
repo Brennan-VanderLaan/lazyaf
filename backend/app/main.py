@@ -1,11 +1,12 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import init_db
 from app.routers import repos, cards, jobs, runners
+from app.services.websocket import manager
 
 settings = get_settings()
 
@@ -45,3 +46,15 @@ async def health():
 @app.get("/")
 async def root():
     return {"message": f"Welcome to {settings.app_name}", "docs": "/docs"}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive, handle any incoming messages
+            data = await websocket.receive_text()
+            # For now, just echo back or ignore client messages
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)

@@ -13,8 +13,10 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.database import engine
     await init_db()
     yield
+    await engine.dispose()
 
 
 app = FastAPI(
@@ -50,11 +52,26 @@ async def root():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    import asyncio
     await manager.connect(websocket)
     try:
         while True:
-            # Keep connection alive, handle any incoming messages
-            data = await websocket.receive_text()
-            # For now, just echo back or ignore client messages
+            try:
+                # Use wait_for with timeout to allow shutdown to interrupt
+                message = await asyncio.wait_for(websocket.receive(), timeout=30.0)
+                if message["type"] == "websocket.disconnect":
+                    break
+            except asyncio.TimeoutError:
+                # Send ping to keep alive, continue loop
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception:
+                    break
+            except asyncio.CancelledError:
+                break
     except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
         manager.disconnect(websocket)

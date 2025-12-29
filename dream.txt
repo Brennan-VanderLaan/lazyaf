@@ -1,23 +1,18 @@
 I want to create a visual orchestrator for working with many AI agents to achieve various tasks, because I am lazy, af.
 
-So the thought is right now it's fairly easy to make quick progress with claude code as-is. I want to make it easier to extend how plugins and agents are used, as well as MCP endpoints via a web-ui.
+I am a devops engineer and I want to embrace a sane SDLC.
 
-Right now we are establishing the backend queue system and how the application establishes communication with worker nodes.
+Branches
+Dev -> QA -> Prod
 
-I want to use 0mq
+For developing a new feature, a new branch is created off of Dev
+The feature is then implemented, and tested. Once tests are passing it can merge into Dev via PR.
 
-We need the following rough structures
+When new commits land in dev they kick off integration tests / update the dev release artifacts (if any) to reflect the new commit
 
-./worker
-- Connects to configured backend
-./backend
-- Persistence layer, access control, rest backend
-./ui
-- Graphical node based workflow configuration layer
-- worker configuration layer
-- mcp configuration layer
-- claude configuration layer
-./integrations
-- runtimes for running containers and getting gpu resources in the mix
--- runpod.io
--- k8s pytorch job
+After a series of feature(s) land a promotion happens from dev -> QA
+Integration tests are carried out, manual human review steps are carried out
+
+On acceptance, a new version is released in prod
+
+We are creating a ui that allows users to land feature requests.

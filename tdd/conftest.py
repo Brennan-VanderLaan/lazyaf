@@ -97,6 +97,62 @@ def _mark_test(request):
 
 
 # -----------------------------------------------------------------------------
+# Runner Pool and Job Queue Fixtures
+# -----------------------------------------------------------------------------
+
+@pytest_asyncio.fixture
+async def clean_runner_pool():
+    """Clean runner pool state before and after each test.
+
+    This fixture ensures tests have a fresh runner pool state and
+    cleans up afterward to prevent test pollution.
+    """
+    from app.services.runner_pool import runner_pool
+
+    # Clear before
+    runner_pool._runners = {}
+    runner_pool._running = False
+    runner_pool._worker_task = None
+
+    yield runner_pool
+
+    # Clear after
+    if runner_pool._running:
+        await runner_pool.stop()
+    runner_pool._runners = {}
+    runner_pool._running = False
+    runner_pool._worker_task = None
+
+
+@pytest_asyncio.fixture
+async def clean_job_queue():
+    """Clean job queue state before and after each test.
+
+    This fixture ensures tests have a fresh job queue state.
+    """
+    from app.services.job_queue import job_queue
+
+    # Clear before
+    job_queue._pending = {}
+    # Drain the asyncio queue
+    while True:
+        try:
+            job_queue._queue.get_nowait()
+        except Exception:
+            break
+
+    yield job_queue
+
+    # Clear after
+    job_queue._pending = {}
+    while True:
+        try:
+            job_queue._queue.get_nowait()
+        except Exception:
+            break
+
+
+# -----------------------------------------------------------------------------
 # Utility Fixtures
 # -----------------------------------------------------------------------------
 

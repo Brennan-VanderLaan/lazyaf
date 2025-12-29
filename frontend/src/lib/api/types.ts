@@ -56,8 +56,31 @@ export interface Job {
 
 export interface Runner {
   id: string;
-  container_id: string | null;
+  name: string;
   status: RunnerStatus;
   current_job_id: string | null;
   last_heartbeat: string;
+  registered_at: string;
+  log_count: number;
+}
+
+export interface PoolStatus {
+  total_runners: number;
+  idle_runners: number;
+  busy_runners: number;
+  offline_runners: number;
+  queued_jobs: number;
+  pending_jobs: number;
+}
+
+export interface RunnerLogs {
+  logs: string[];
+  total: number;
+}
+
+export interface DockerCommand {
+  command: string;
+  command_with_secrets: string;
+  image: string;
+  env_vars: Record<string, string>;
 }

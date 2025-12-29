@@ -14,8 +14,12 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from app.database import engine
+    from app.services.runner_pool import runner_pool
+
     await init_db()
+    await runner_pool.start()
     yield
+    await runner_pool.stop()
     await engine.dispose()
 
 

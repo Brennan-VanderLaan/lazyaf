@@ -273,7 +273,7 @@ class TestDeleteCard:
 class TestCardLifecycleActions:
     """Tests for card lifecycle endpoints: start, approve, reject."""
 
-    async def test_start_card(self, client, repo):
+    async def test_start_card(self, client, repo, clean_job_queue):
         """POST /api/cards/{id}/start moves card to in_progress."""
         create_response = await client.post(
             f"/api/repos/{repo['id']}/cards",
@@ -283,12 +283,31 @@ class TestCardLifecycleActions:
 
         response = await client.post(f"/api/cards/{card_id}/start")
         assert_status_code(response, 200)
-        assert response.json()["status"] == "in_progress"
+        result = response.json()
+        assert result["status"] == "in_progress"
+        assert result["job_id"] is not None
+        assert result["branch_name"] is not None
 
     async def test_start_card_not_found(self, client):
         """Returns 404 when starting non-existent card."""
         response = await client.post("/api/cards/nonexistent/start")
         assert_not_found(response, "Card")
+
+    async def test_start_card_already_started(self, client, repo, clean_job_queue):
+        """Returns 400 when starting card that is not in todo status."""
+        create_response = await client.post(
+            f"/api/repos/{repo['id']}/cards",
+            json=card_create_payload(title="Already Started"),
+        )
+        card_id = create_response.json()["id"]
+
+        # Start once
+        await client.post(f"/api/cards/{card_id}/start")
+
+        # Try to start again
+        response = await client.post(f"/api/cards/{card_id}/start")
+        assert_status_code(response, 400)
+        assert "todo" in response.json()["detail"]
 
     async def test_approve_card(self, client, repo):
         """POST /api/cards/{id}/approve moves card to done."""

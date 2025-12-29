@@ -5,8 +5,9 @@
   import { websocketStore } from './lib/stores/websocket';
 
   onMount(() => {
-    websocketStore.connect();
-    return () => websocketStore.disconnect();
+    // WebSocket disabled until Phase 4 (agent integration)
+    // websocketStore.connect();
+    // return () => websocketStore.disconnect();
   });
 </script>
 

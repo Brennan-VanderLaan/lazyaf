@@ -1,0 +1,119 @@
+"""
+Custom assertion helpers for API testing.
+
+These helpers provide cleaner, more expressive assertions for common
+patterns in API tests.
+"""
+from typing import Any
+
+from httpx import Response
+
+
+def assert_status_code(response: Response, expected: int) -> None:
+    """Assert response has expected status code with helpful error message."""
+    assert response.status_code == expected, (
+        f"Expected status {expected}, got {response.status_code}. "
+        f"Response body: {response.text}"
+    )
+
+
+def assert_json_contains(response: Response, expected: dict[str, Any]) -> None:
+    """Assert response JSON contains all expected key-value pairs.
+
+    This allows for partial matching - the response can contain additional
+    fields not specified in expected.
+    """
+    actual = response.json()
+    for key, value in expected.items():
+        assert key in actual, f"Expected key '{key}' not found in response: {actual}"
+        assert actual[key] == value, (
+            f"Expected {key}={value!r}, got {key}={actual[key]!r}"
+        )
+
+
+def assert_json_list_length(response: Response, expected_length: int) -> None:
+    """Assert response JSON is a list of expected length."""
+    actual = response.json()
+    assert isinstance(actual, list), f"Expected list, got {type(actual)}"
+    assert len(actual) == expected_length, (
+        f"Expected {expected_length} items, got {len(actual)}"
+    )
+
+
+def assert_json_list_contains(
+    response: Response,
+    expected: dict[str, Any],
+    key: str = "id",
+) -> dict[str, Any]:
+    """Assert response JSON list contains an item matching expected.
+
+    Args:
+        response: HTTP response
+        expected: Dict of key-value pairs to match
+        key: Field to use for identifying the match (default: "id")
+
+    Returns:
+        The matching item from the list
+    """
+    actual = response.json()
+    assert isinstance(actual, list), f"Expected list, got {type(actual)}"
+
+    for item in actual:
+        if all(item.get(k) == v for k, v in expected.items()):
+            return item
+
+    raise AssertionError(
+        f"No item matching {expected} found in response list. "
+        f"Items: {actual}"
+    )
+
+
+def assert_error_response(response: Response, status_code: int, detail: str) -> None:
+    """Assert response is an error with expected status and detail message."""
+    assert_status_code(response, status_code)
+    actual = response.json()
+    assert "detail" in actual, f"Expected 'detail' in error response: {actual}"
+    assert actual["detail"] == detail, (
+        f"Expected detail '{detail}', got '{actual['detail']}'"
+    )
+
+
+def assert_created_response(response: Response, expected: dict[str, Any]) -> dict[str, Any]:
+    """Assert response is a successful creation (201) with expected fields.
+
+    Returns the full response JSON for further assertions.
+    """
+    assert_status_code(response, 201)
+    assert_json_contains(response, expected)
+    actual = response.json()
+    assert "id" in actual, "Created response should include 'id'"
+    return actual
+
+
+def assert_updated_response(response: Response, expected: dict[str, Any]) -> dict[str, Any]:
+    """Assert response is a successful update (200) with expected fields.
+
+    Returns the full response JSON for further assertions.
+    """
+    assert_status_code(response, 200)
+    assert_json_contains(response, expected)
+    return response.json()
+
+
+def assert_deleted_response(response: Response) -> None:
+    """Assert response is a successful deletion (204)."""
+    assert_status_code(response, 204)
+
+
+def assert_not_found(response: Response, resource_type: str = "Resource") -> None:
+    """Assert response is a 404 Not Found error."""
+    assert_error_response(response, 404, f"{resource_type} not found")
+
+
+def assert_validation_error(response: Response) -> dict[str, Any]:
+    """Assert response is a validation error (422).
+
+    Returns the error detail for further inspection.
+    """
+    assert_status_code(response, 422)
+    return response.json()

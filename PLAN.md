@@ -269,12 +269,12 @@ src/
 ### Phase 1: Project Foundation
 **Goal**: Basic project structure, can run both frontend and backend
 
-- [ ] Initialize Python project with uv
-- [ ] Set up FastAPI with basic health endpoint
-- [ ] Initialize Svelte project with Vite
-- [ ] Configure CORS, proxy for dev
-- [ ] Set up SQLite with SQLAlchemy models
-- [ ] Docker Compose for local dev
+- [x] Initialize Python project with uv
+- [x] Set up FastAPI with basic health endpoint
+- [x] Initialize Svelte project with Vite
+- [x] Configure CORS, proxy for dev
+- [x] Set up SQLite with SQLAlchemy models
+- [x] Docker Compose for local dev
 
 **Deliverable**: `docker-compose up` runs both services
 

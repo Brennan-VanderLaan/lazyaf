@@ -37,6 +37,20 @@ function createReposStore() {
       }
     },
 
+    async ingest(data: RepoCreate) {
+      error.set(null);
+      try {
+        const result = await reposApi.ingest(data);
+        // Fetch the full repo object after ingest
+        const repo = await reposApi.get(result.id);
+        update(repos => [...repos, repo]);
+        return repo;
+      } catch (e) {
+        error.set(e instanceof Error ? e.message : 'Failed to ingest repo');
+        throw e;
+      }
+    },
+
     async delete(id: string) {
       error.set(null);
       try {

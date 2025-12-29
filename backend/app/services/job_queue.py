@@ -15,10 +15,11 @@ class QueuedJob:
     card_id: str
     repo_id: str
     repo_url: str
-    repo_path: str
     base_branch: str
     card_title: str
     card_description: str
+    repo_path: str | None = None  # Deprecated, not used with internal git
+    use_internal_git: bool = False  # When True, runner clones from internal git server
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 

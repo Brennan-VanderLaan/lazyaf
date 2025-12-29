@@ -5,17 +5,42 @@ export type RunnerStatus = 'idle' | 'busy' | 'offline';
 export interface Repo {
   id: string;
   name: string;
-  path: string;
   remote_url: string | null;
   default_branch: string;
+  is_ingested: boolean;
+  internal_git_url: string;
   created_at: string;
 }
 
 export interface RepoCreate {
   name: string;
-  path: string;
   remote_url?: string | null;
   default_branch?: string;
+}
+
+export interface RepoIngest {
+  id: string;
+  name: string;
+  internal_git_url: string;
+  clone_url: string;
+}
+
+export interface CloneUrlResponse {
+  clone_url: string;
+  is_ingested: boolean;
+}
+
+export interface BranchInfo {
+  name: string;
+  commit: string;
+  is_default: boolean;
+  is_lazyaf: boolean;
+}
+
+export interface BranchesResponse {
+  branches: BranchInfo[];
+  default_branch: string | null;
+  total: number;
 }
 
 export interface Card {

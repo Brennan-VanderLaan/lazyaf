@@ -21,6 +21,7 @@
   $: canStart = card?.status === 'todo';
   $: canApprove = card?.status === 'in_review';
   $: canReject = card?.status === 'in_review' || card?.status === 'in_progress';
+  $: canRetry = card?.status === 'failed' || card?.status === 'in_review';
 
   async function handleSubmit() {
     if (!title.trim()) return;
@@ -77,6 +78,17 @@
     submitting = true;
     try {
       const updated = await cardsStore.reject(card.id);
+      dispatch('updated', updated);
+    } finally {
+      submitting = false;
+    }
+  }
+
+  async function handleRetry() {
+    if (!card) return;
+    submitting = true;
+    try {
+      const updated = await cardsStore.retry(card.id);
       dispatch('updated', updated);
     } finally {
       submitting = false;
@@ -202,6 +214,16 @@
                 disabled={submitting}
               >
                 ✗ Reject
+              </button>
+            {/if}
+            {#if canRetry}
+              <button
+                type="button"
+                class="btn-action btn-retry"
+                on:click={handleRetry}
+                disabled={submitting}
+              >
+                🔄 Retry
               </button>
             {/if}
             <button type="submit" class="btn-primary" disabled={submitting}>
@@ -419,6 +441,11 @@
     background: transparent;
     color: var(--error-color, #f38ba8);
     border: 1px solid var(--error-color, #f38ba8);
+  }
+
+  .btn-retry {
+    background: #f9e2af;
+    color: #1e1e2e;
   }
 
   button:disabled {

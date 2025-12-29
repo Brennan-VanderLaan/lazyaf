@@ -117,12 +117,19 @@ def execute_job(job: dict):
     """Execute a job."""
     log(f"Starting job {job['id']}: {job['card_title']}")
 
+    repo_id = job.get("repo_id", "")
     repo_url = job.get("repo_url", "")
     repo_path = job.get("repo_path", "")
     base_branch = job.get("base_branch", "main")
     branch_name = job.get("branch_name", "")
     card_title = job.get("card_title", "")
     card_description = job.get("card_description", "")
+    use_internal_git = job.get("use_internal_git", False)
+
+    # If using internal git, construct URL from backend URL
+    if use_internal_git and repo_id:
+        repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
+        log(f"Using internal git server: {repo_url}")
 
     workspace = Path("/workspace/repo")
 
@@ -136,7 +143,7 @@ def execute_job(job: dict):
         if repo_url:
             log(f"Cloning {repo_url}...")
             if workspace.exists():
-                run_command(["rm", "-rf", str(workspace)])
+                run_command(["sudo", "rm", "-rf", str(workspace)])
             exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
             if exit_code != 0:
                 raise Exception("Failed to clone repository")
@@ -147,9 +154,36 @@ def execute_job(job: dict):
 
         # Create feature branch
         log(f"Creating branch {branch_name} from {base_branch}...")
-        run_command(["git", "fetch", "origin"], cwd=str(workspace))
-        run_command(["git", "checkout", base_branch], cwd=str(workspace))
-        run_command(["git", "pull", "origin", base_branch], cwd=str(workspace))
+
+        # Fetch all refs to ensure we have the base branch
+        run_command(["git", "fetch", "--all"], cwd=str(workspace))
+
+        # Try to checkout base branch (may already be on it after clone)
+        exit_code, _, _ = run_command(["git", "checkout", base_branch], cwd=str(workspace))
+        if exit_code != 0:
+            # Base branch might not exist, try to create from origin or HEAD
+            log(f"Could not checkout {base_branch}, trying origin/{base_branch}...")
+            exit_code, _, _ = run_command(
+                ["git", "checkout", "-b", base_branch, f"origin/{base_branch}"],
+                cwd=str(workspace)
+            )
+            if exit_code != 0:
+                # Just use whatever branch we're on (usually main/master after clone)
+                log(f"Base branch {base_branch} not found, using current branch")
+                exit_code, stdout, _ = run_command(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=str(workspace)
+                )
+                if exit_code == 0:
+                    base_branch = stdout.strip()
+                    log(f"Using branch: {base_branch}")
+
+        # Store base commit before creating feature branch
+        exit_code, stdout, _ = run_command(["git", "rev-parse", "HEAD"], cwd=str(workspace))
+        base_commit = stdout.strip() if exit_code == 0 else None
+        log(f"Base commit: {base_commit[:8] if base_commit else 'unknown'}")
+
+        # Create feature branch from current HEAD
         run_command(["git", "checkout", "-b", branch_name], cwd=str(workspace))
 
         # Build prompt for Claude
@@ -165,20 +199,36 @@ def execute_job(job: dict):
         if exit_code != 0:
             raise Exception(f"Claude Code failed with exit code {exit_code}")
 
-        # Check for changes
+        # Check for uncommitted changes first
         exit_code, stdout, _ = run_command(["git", "status", "--porcelain"], cwd=str(workspace))
-        if not stdout.strip():
+        has_uncommitted = bool(stdout.strip())
+
+        if has_uncommitted:
+            # Commit any uncommitted changes Claude left behind
+            log("Committing uncommitted changes...")
+            run_command(["git", "add", "-A"], cwd=str(workspace))
+            run_command(
+                ["git", "commit", "-m", f"feat: {card_title}\n\nImplemented by LazyAF agent"],
+                cwd=str(workspace),
+            )
+
+        # Check if there are any new commits (Claude may have committed directly)
+        exit_code, stdout, _ = run_command(["git", "rev-parse", "HEAD"], cwd=str(workspace))
+        current_commit = stdout.strip() if exit_code == 0 else None
+
+        if base_commit and current_commit and base_commit == current_commit:
             log("No changes made by Claude Code")
             complete_job(success=True, error="No changes were needed")
             return
 
-        # Commit changes
-        log("Committing changes...")
-        run_command(["git", "add", "-A"], cwd=str(workspace))
-        run_command(
-            ["git", "commit", "-m", f"feat: {card_title}\n\nImplemented by LazyAF agent"],
-            cwd=str(workspace),
-        )
+        # Count commits ahead of base
+        if base_commit:
+            exit_code, stdout, _ = run_command(
+                ["git", "rev-list", "--count", f"{base_commit}..HEAD"],
+                cwd=str(workspace)
+            )
+            commit_count = stdout.strip() if exit_code == 0 else "?"
+            log(f"Branch has {commit_count} new commit(s)")
 
         # Push branch
         log(f"Pushing branch {branch_name}...")
@@ -189,23 +239,29 @@ def execute_job(job: dict):
         if exit_code != 0:
             raise Exception("Failed to push branch")
 
-        # Create PR
-        log("Creating pull request...")
-        exit_code, stdout, _ = run_command(
-            [
-                "gh", "pr", "create",
-                "--title", card_title,
-                "--body", f"{card_description}\n\n---\n_Created by LazyAF agent_",
-                "--base", base_branch,
-                "--head", branch_name,
-            ],
-            cwd=str(workspace),
-        )
-
         pr_url = None
-        if exit_code == 0 and stdout.strip():
-            pr_url = stdout.strip().split("\n")[-1]
-            log(f"Created PR: {pr_url}")
+
+        # Skip PR creation when using internal git (no external remote yet)
+        if use_internal_git:
+            log("Using internal git - skipping PR creation")
+            log(f"Branch '{branch_name}' pushed to internal git server")
+        else:
+            # Create PR on external remote
+            log("Creating pull request...")
+            exit_code, stdout, _ = run_command(
+                [
+                    "gh", "pr", "create",
+                    "--title", card_title,
+                    "--body", f"{card_description}\n\n---\n_Created by LazyAF agent_",
+                    "--base", base_branch,
+                    "--head", branch_name,
+                ],
+                cwd=str(workspace),
+            )
+
+            if exit_code == 0 and stdout.strip():
+                pr_url = stdout.strip().split("\n")[-1]
+                log(f"Created PR: {pr_url}")
 
         complete_job(success=True, pr_url=pr_url)
         log("Job completed successfully!")

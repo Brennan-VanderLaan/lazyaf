@@ -55,6 +55,8 @@ async def git_upload_pack(repo_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Repository not found")
 
     body = await request.body()
+    print(f"[git] upload-pack request: {len(body)} bytes")
+    print(f"[git] upload-pack first 200 bytes: {body[:200]}")
 
     try:
         result = git_backend.handle_upload_pack(repo_id, body)
@@ -69,6 +71,8 @@ async def git_upload_pack(repo_id: str, request: Request):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Git error: {e}")
 
 

@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, Card, CardCreate, CardUpdate, Job, Runner, PoolStatus, DockerCommand, RunnerLogs } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, Runner, PoolStatus, DockerCommand, RunnerLogs } from './types';
 
 const BASE_URL = '/api';
 
@@ -31,7 +31,13 @@ export const repos = {
     method: 'POST',
     body: JSON.stringify(data),
   }),
+  ingest: (data: RepoCreate) => request<RepoIngest>('/repos/ingest', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
   delete: (id: string) => request<void>(`/repos/${id}`, { method: 'DELETE' }),
+  cloneUrl: (id: string) => request<CloneUrlResponse>(`/repos/${id}/clone-url`),
+  branches: (id: string) => request<BranchesResponse>(`/repos/${id}/branches`),
 };
 
 // Cards
@@ -50,6 +56,7 @@ export const cards = {
   start: (id: string) => request<Card>(`/cards/${id}/start`, { method: 'POST' }),
   approve: (id: string) => request<Card>(`/cards/${id}/approve`, { method: 'POST' }),
   reject: (id: string) => request<Card>(`/cards/${id}/reject`, { method: 'POST' }),
+  retry: (id: string) => request<Card>(`/cards/${id}/retry`, { method: 'POST' }),
 };
 
 // Jobs

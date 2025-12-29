@@ -153,6 +153,47 @@ async def clean_job_queue():
 
 
 # -----------------------------------------------------------------------------
+# Git Server Fixtures
+# -----------------------------------------------------------------------------
+
+@pytest_asyncio.fixture
+async def clean_git_repos():
+    """Clean git repos directory before and after each test.
+
+    This fixture ensures tests have a fresh git storage state and
+    cleans up any repos created during tests.
+    """
+    import shutil
+    from app.services.git_server import git_repo_manager
+
+    # Clear before - remove all repos
+    if git_repo_manager.repos_dir.exists():
+        shutil.rmtree(git_repo_manager.repos_dir)
+    git_repo_manager.repos_dir.mkdir(parents=True, exist_ok=True)
+
+    yield git_repo_manager
+
+    # Clear after
+    if git_repo_manager.repos_dir.exists():
+        shutil.rmtree(git_repo_manager.repos_dir)
+    git_repo_manager.repos_dir.mkdir(parents=True, exist_ok=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_git_repos_after_session():
+    """Clean up git repos directory after the entire test session."""
+    import shutil
+    from pathlib import Path
+
+    yield
+
+    # Clean up after all tests
+    git_repos_dir = Path(__file__).parent.parent / "backend" / "git_repos"
+    if git_repos_dir.exists():
+        shutil.rmtree(git_repos_dir)
+
+
+# -----------------------------------------------------------------------------
 # Utility Fixtures
 # -----------------------------------------------------------------------------
 

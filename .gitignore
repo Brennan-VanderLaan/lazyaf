@@ -40,5 +40,8 @@ Thumbs.db
 frontend/dist/
 backend/data/
 
+# Git server storage
+backend/git_repos/
+
 # Logs
 *.log

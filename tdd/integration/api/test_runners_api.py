@@ -1,14 +1,13 @@
 """
 Integration tests for Runners API endpoints.
 
-These tests verify runner listing and pool scaling operations.
-Updated for Phase 3 to use runner_pool instead of database.
+These tests verify runner registration, heartbeat, and job polling operations.
+Updated for Phase 3.5 to use persistent runner registration model.
 """
 import sys
 from pathlib import Path
 
 import pytest
-import pytest_asyncio
 
 # Add backend and tdd to path for imports
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
@@ -33,8 +32,9 @@ class TestListRunners:
 
     async def test_list_runners_with_data(self, client, clean_runner_pool):
         """Returns all runners when they exist."""
-        # Scale up to create runners in the pool
-        await clean_runner_pool.scale(2)
+        # Register runners
+        clean_runner_pool.register(name="runner-1")
+        clean_runner_pool.register(name="runner-2")
 
         response = await client.get("/api/runners")
         assert_status_code(response, 200)
@@ -42,7 +42,7 @@ class TestListRunners:
 
     async def test_list_runners_returns_fields(self, client, clean_runner_pool):
         """Returns runners with all expected fields."""
-        await clean_runner_pool.scale(1)
+        clean_runner_pool.register(name="test-runner")
 
         response = await client.get("/api/runners")
         runners = response.json()
@@ -50,10 +50,12 @@ class TestListRunners:
 
         result = runners[0]
         assert "id" in result
+        assert "name" in result
         assert "status" in result
-        assert "container_id" in result
         assert "current_job_id" in result
         assert "last_heartbeat" in result
+        assert "registered_at" in result
+        assert "log_count" in result
 
 
 class TestRunnerStates:
@@ -61,7 +63,7 @@ class TestRunnerStates:
 
     async def test_idle_runner(self, client, clean_runner_pool):
         """Returns idle runner correctly."""
-        await clean_runner_pool.scale(1)
+        clean_runner_pool.register()
 
         response = await client.get("/api/runners")
         result = response.json()[0]
@@ -70,90 +72,170 @@ class TestRunnerStates:
 
     async def test_busy_runner(self, client, clean_runner_pool):
         """Returns busy runner with job ID."""
-        await clean_runner_pool.scale(1)
+        from app.services.job_queue import QueuedJob
 
-        # Mark runner as busy
-        runner = list(clean_runner_pool._runners.values())[0]
+        runner = clean_runner_pool.register()
         runner.status = "busy"
-        runner.current_job_id = "job-id-12345"
-        runner.container_id = "container-abc"
+        runner.current_job = QueuedJob(
+            id="job-12345",
+            card_id="card-1",
+            repo_id="repo-1",
+            repo_url="",
+            repo_path="",
+            base_branch="main",
+            card_title="Test",
+            card_description="",
+        )
 
         response = await client.get("/api/runners")
         result = response.json()[0]
         assert result["status"] == "busy"
-        assert result["current_job_id"] == "job-id-12345"
+        assert result["current_job_id"] == "job-12345"
 
 
-class TestScaleRunners:
-    """Tests for POST /api/runners/scale endpoint."""
+class TestRegisterRunner:
+    """Tests for POST /api/runners/register endpoint."""
 
-    async def test_scale_runners_request(self, client, clean_runner_pool):
-        """Accepts scale request with count."""
+    async def test_register_runner(self, client, clean_runner_pool):
+        """Accepts register request."""
         response = await client.post(
-            "/api/runners/scale",
-            json={"count": 3},
+            "/api/runners/register",
+            json={"name": "my-runner"},
         )
         assert_status_code(response, 200)
         result = response.json()
-        assert result["target"] == 3
-        assert result["current"] == 3
+        assert "runner_id" in result
+        assert result["name"] == "my-runner"
 
-    async def test_scale_runners_to_zero(self, client, clean_runner_pool):
-        """Accepts scale to zero."""
-        await clean_runner_pool.scale(3)
-
+    async def test_register_runner_no_name(self, client, clean_runner_pool):
+        """Accepts register without name."""
         response = await client.post(
-            "/api/runners/scale",
-            json={"count": 0},
-        )
-        assert_status_code(response, 200)
-        assert response.json()["current"] == 0
-
-    async def test_scale_runners_returns_previous_count(self, client, clean_runner_pool):
-        """Scale response includes previous count."""
-        await clean_runner_pool.scale(2)
-
-        response = await client.post(
-            "/api/runners/scale",
-            json={"count": 5},
-        )
-        result = response.json()
-        assert result["previous"] == 2
-        assert result["current"] == 5
-
-    async def test_scale_runners_missing_count_fails(self, client, clean_runner_pool):
-        """Scale request fails without count field."""
-        response = await client.post(
-            "/api/runners/scale",
+            "/api/runners/register",
             json={},
         )
-        assert_status_code(response, 422)
+        assert_status_code(response, 200)
+        result = response.json()
+        assert "runner_id" in result
+        assert "name" in result
 
-    async def test_scale_runners_invalid_count_fails(self, client, clean_runner_pool):
-        """Scale request fails with non-integer count."""
-        response = await client.post(
-            "/api/runners/scale",
-            json={"count": "three"},
-        )
-        assert_status_code(response, 422)
+    async def test_register_creates_in_pool(self, client, clean_runner_pool):
+        """Registration creates runner in pool."""
+        assert clean_runner_pool.runner_count == 0
 
-    async def test_scale_negative_count_rejected(self, client, clean_runner_pool):
-        """Negative count returns error."""
         response = await client.post(
-            "/api/runners/scale",
-            json={"count": -1},
+            "/api/runners/register",
+            json={"name": "test-runner"},
         )
         assert_status_code(response, 200)
-        assert "error" in response.json()
+        assert clean_runner_pool.runner_count == 1
 
-    async def test_scale_above_maximum_rejected(self, client, clean_runner_pool):
-        """Count above 10 returns error."""
+
+class TestHeartbeat:
+    """Tests for POST /api/runners/{id}/heartbeat endpoint."""
+
+    async def test_heartbeat_success(self, client, clean_runner_pool):
+        """Heartbeat returns OK for known runner."""
+        runner = clean_runner_pool.register()
+
+        response = await client.post(f"/api/runners/{runner.id}/heartbeat")
+        assert_status_code(response, 200)
+        assert response.json()["status"] == "ok"
+
+    async def test_heartbeat_unknown_runner(self, client, clean_runner_pool):
+        """Heartbeat returns 404 for unknown runner."""
+        response = await client.post("/api/runners/unknown-id/heartbeat")
+        assert_status_code(response, 404)
+
+
+class TestGetJob:
+    """Tests for GET /api/runners/{id}/job endpoint."""
+
+    async def test_get_job_no_jobs(self, client, clean_runner_pool, clean_job_queue):
+        """Returns null when no jobs available."""
+        runner = clean_runner_pool.register()
+
+        response = await client.get(f"/api/runners/{runner.id}/job")
+        assert_status_code(response, 200)
+        assert response.json()["job"] is None
+
+    async def test_get_job_unknown_runner(self, client, clean_runner_pool):
+        """Returns 404 for unknown runner."""
+        response = await client.get("/api/runners/unknown-id/job")
+        assert_status_code(response, 404)
+
+
+class TestCompleteJob:
+    """Tests for POST /api/runners/{id}/complete endpoint."""
+
+    async def test_complete_job_success(self, client, clean_runner_pool):
+        """Complete job returns OK."""
+        from app.services.job_queue import QueuedJob
+
+        runner = clean_runner_pool.register()
+        runner.status = "busy"
+        runner.current_job = QueuedJob(
+            id="job-1",
+            card_id="card-1",
+            repo_id="repo-1",
+            repo_url="",
+            repo_path="",
+            base_branch="main",
+            card_title="Test",
+            card_description="",
+        )
+
         response = await client.post(
-            "/api/runners/scale",
-            json={"count": 15},
+            f"/api/runners/{runner.id}/complete",
+            json={"success": True},
         )
         assert_status_code(response, 200)
-        assert "error" in response.json()
+
+    async def test_complete_job_unknown_runner(self, client, clean_runner_pool):
+        """Complete returns 404 for unknown runner."""
+        response = await client.post(
+            "/api/runners/unknown-id/complete",
+            json={"success": True},
+        )
+        assert_status_code(response, 404)
+
+
+class TestRunnerLogs:
+    """Tests for runner log endpoints."""
+
+    async def test_append_logs(self, client, clean_runner_pool):
+        """Can append logs to runner."""
+        runner = clean_runner_pool.register()
+
+        response = await client.post(
+            f"/api/runners/{runner.id}/logs",
+            json={"lines": ["log line 1", "log line 2"]},
+        )
+        assert_status_code(response, 200)
+        assert response.json()["total_lines"] == 2
+
+    async def test_get_logs(self, client, clean_runner_pool):
+        """Can get logs from runner."""
+        runner = clean_runner_pool.register()
+        clean_runner_pool.append_log(runner.id, "test log")
+
+        response = await client.get(f"/api/runners/{runner.id}/logs")
+        assert_status_code(response, 200)
+        result = response.json()
+        assert "logs" in result
+        assert "test log" in result["logs"]
+
+    async def test_get_logs_with_offset(self, client, clean_runner_pool):
+        """Can get logs with offset."""
+        runner = clean_runner_pool.register()
+        clean_runner_pool.append_log(runner.id, "line 0")
+        clean_runner_pool.append_log(runner.id, "line 1")
+        clean_runner_pool.append_log(runner.id, "line 2")
+
+        response = await client.get(f"/api/runners/{runner.id}/logs?offset=1")
+        assert_status_code(response, 200)
+        result = response.json()
+        assert len(result["logs"]) == 2
+        assert result["total"] == 3
 
 
 class TestPoolStatus:
@@ -168,75 +250,79 @@ class TestPoolStatus:
         assert result["total_runners"] == 0
         assert result["idle_runners"] == 0
         assert result["busy_runners"] == 0
+        assert result["offline_runners"] == 0
         assert result["queued_jobs"] == 0
         assert result["pending_jobs"] == 0
 
     async def test_pool_status_with_runners(self, client, clean_runner_pool, clean_job_queue):
         """Returns status with runners."""
-        await clean_runner_pool.scale(5)
+        clean_runner_pool.register()
+        clean_runner_pool.register()
+        clean_runner_pool.register()
 
         response = await client.get("/api/runners/status")
         result = response.json()
 
-        assert result["total_runners"] == 5
-        assert result["idle_runners"] == 5
+        assert result["total_runners"] == 3
+        assert result["idle_runners"] == 3
         assert result["busy_runners"] == 0
 
     async def test_pool_status_with_mixed_states(self, client, clean_runner_pool, clean_job_queue):
         """Returns status with mixed runner states."""
-        await clean_runner_pool.scale(4)
+        r1 = clean_runner_pool.register()
+        r2 = clean_runner_pool.register()
+        r3 = clean_runner_pool.register()
+        r4 = clean_runner_pool.register()
 
-        runners = list(clean_runner_pool._runners.values())
-        runners[0].status = "busy"
-        runners[1].status = "busy"
+        r1.status = "busy"
+        r2.status = "busy"
+        r3.status = "offline"
 
         response = await client.get("/api/runners/status")
         result = response.json()
 
         assert result["total_runners"] == 4
-        assert result["idle_runners"] == 2
+        assert result["idle_runners"] == 1
         assert result["busy_runners"] == 2
+        assert result["offline_runners"] == 1
 
 
-class TestRunnerPoolManagement:
-    """Tests for runner pool behavior."""
+class TestDockerCommand:
+    """Tests for GET /api/runners/docker-command endpoint."""
 
-    async def test_multiple_runners_different_states(self, client, clean_runner_pool):
-        """Can retrieve runners in mixed states."""
-        await clean_runner_pool.scale(3)
+    async def test_get_docker_command(self, client):
+        """Returns docker command."""
+        response = await client.get("/api/runners/docker-command")
+        assert_status_code(response, 200)
 
-        runners = list(clean_runner_pool._runners.values())
-        runners[0].status = "idle"
-        runners[1].status = "busy"
-        runners[1].current_job_id = "job1"
-        runners[2].status = "idle"
-
-        response = await client.get("/api/runners")
         result = response.json()
-        assert len(result) == 3
+        assert "command" in result
+        assert "image" in result
+        assert "env_vars" in result
+        assert "lazyaf-runner" in result["image"]
 
-        statuses = [r["status"] for r in result]
-        assert "idle" in statuses
-        assert "busy" in statuses
+    async def test_get_docker_command_with_secrets(self, client):
+        """Returns docker command with secrets flag."""
+        response = await client.get("/api/runners/docker-command?with_secrets=true")
+        assert_status_code(response, 200)
 
-    async def test_scale_preserves_busy_runners(self, client, clean_runner_pool):
-        """Scaling down preserves busy runners."""
-        await clean_runner_pool.scale(4)
-
-        # Mark 2 runners as busy
-        runners = list(clean_runner_pool._runners.values())
-        runners[0].status = "busy"
-        runners[0].current_job_id = "job-1"
-        runners[1].status = "busy"
-        runners[1].current_job_id = "job-2"
-
-        # Try to scale down to 1 (but we have 2 busy)
-        response = await client.post(
-            "/api/runners/scale",
-            json={"count": 1},
-        )
         result = response.json()
+        assert "command_with_secrets" in result
 
-        # Should still have 2 runners (the busy ones)
-        assert result["current"] == 2
-        assert clean_runner_pool.busy_count == 2
+
+class TestUnregisterRunner:
+    """Tests for DELETE /api/runners/{id} endpoint."""
+
+    async def test_unregister_runner(self, client, clean_runner_pool):
+        """Can unregister a runner."""
+        runner = clean_runner_pool.register()
+        assert clean_runner_pool.runner_count == 1
+
+        response = await client.delete(f"/api/runners/{runner.id}")
+        assert_status_code(response, 200)
+        assert clean_runner_pool.runner_count == 0
+
+    async def test_unregister_unknown_runner(self, client, clean_runner_pool):
+        """Returns 404 for unknown runner."""
+        response = await client.delete("/api/runners/unknown-id")
+        assert_status_code(response, 404)

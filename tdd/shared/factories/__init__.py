@@ -6,10 +6,13 @@ from .api import (
     card_create_payload,
     card_update_payload,
     expect_card_response,
+    expect_clone_url_response,
     expect_error_response,
+    expect_ingest_response,
     expect_job_response,
     expect_repo_response,
     repo_create_payload,
+    repo_ingest_payload,
     repo_update_payload,
 )
 
@@ -27,6 +30,7 @@ __all__ = [
     # API factories
     "repo_create_payload",
     "repo_update_payload",
+    "repo_ingest_payload",
     "card_create_payload",
     "card_update_payload",
     # Expected response builders
@@ -34,4 +38,6 @@ __all__ = [
     "expect_card_response",
     "expect_job_response",
     "expect_error_response",
+    "expect_ingest_response",
+    "expect_clone_url_response",
 ]

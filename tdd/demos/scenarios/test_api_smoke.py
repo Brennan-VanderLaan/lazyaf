@@ -48,7 +48,7 @@ class TestAPISmokeTests:
         """Repos create endpoint accepts valid data."""
         response = await client.post(
             "/api/repos",
-            json={"name": "smoke-repo", "path": "/smoke"},
+            json={"name": "smoke-repo"},
         )
         assert response.status_code == 201
         assert "id" in response.json()
@@ -57,7 +57,7 @@ class TestAPISmokeTests:
         """Repos get endpoint retrieves created repo."""
         create_response = await client.post(
             "/api/repos",
-            json={"name": "get-repo", "path": "/get"},
+            json={"name": "get-repo"},
         )
         repo_id = create_response.json()["id"]
 
@@ -68,7 +68,7 @@ class TestAPISmokeTests:
         """Repos update endpoint accepts changes."""
         create_response = await client.post(
             "/api/repos",
-            json={"name": "update-repo", "path": "/update"},
+            json={"name": "update-repo"},
         )
         repo_id = create_response.json()["id"]
 
@@ -82,7 +82,7 @@ class TestAPISmokeTests:
         """Repos delete endpoint removes repo."""
         create_response = await client.post(
             "/api/repos",
-            json={"name": "delete-repo", "path": "/delete"},
+            json={"name": "delete-repo"},
         )
         repo_id = create_response.json()["id"]
 
@@ -93,7 +93,7 @@ class TestAPISmokeTests:
         """Cards list endpoint responds for valid repo."""
         repo_response = await client.post(
             "/api/repos",
-            json={"name": "cards-repo", "path": "/cards"},
+            json={"name": "cards-repo"},
         )
         repo_id = repo_response.json()["id"]
 
@@ -105,7 +105,7 @@ class TestAPISmokeTests:
         """Cards create endpoint accepts valid data."""
         repo_response = await client.post(
             "/api/repos",
-            json={"name": "card-create-repo", "path": "/card-create"},
+            json={"name": "card-create-repo"},
         )
         repo_id = repo_response.json()["id"]
 
@@ -120,7 +120,7 @@ class TestAPISmokeTests:
         """Cards get endpoint retrieves created card."""
         repo_response = await client.post(
             "/api/repos",
-            json={"name": "card-get-repo", "path": "/card-get"},
+            json={"name": "card-get-repo"},
         )
         repo_id = repo_response.json()["id"]
 
@@ -137,7 +137,7 @@ class TestAPISmokeTests:
         """Card lifecycle actions respond correctly."""
         repo_response = await client.post(
             "/api/repos",
-            json={"name": "lifecycle-repo", "path": "/lifecycle"},
+            json={"name": "lifecycle-repo"},
         )
         repo_id = repo_response.json()["id"]
 
@@ -161,14 +161,16 @@ class TestAPISmokeTests:
         assert response.status_code == 200
         assert isinstance(response.json(), list)
 
-    async def test_runners_scale(self, client):
-        """Runners scale endpoint accepts request."""
+    async def test_runners_register(self, client):
+        """Runners register endpoint accepts request."""
         response = await client.post(
-            "/api/runners/scale",
-            json={"count": 2},
+            "/api/runners/register",
+            json={"name": "test-runner"},
         )
         assert response.status_code == 200
-        assert "target" in response.json()
+        data = response.json()
+        assert "runner_id" in data
+        assert "name" in data
 
 
 @pytest.mark.demo
@@ -205,7 +207,7 @@ class TestAPIErrorHandling:
         """Returns 422 for invalid card data."""
         repo_response = await client.post(
             "/api/repos",
-            json={"name": "error-repo", "path": "/error"},
+            json={"name": "error-repo"},
         )
         repo_id = repo_response.json()["id"]
 

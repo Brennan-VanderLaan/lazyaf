@@ -50,7 +50,6 @@ class TestCardWorkflowDemo:
             "/api/repos",
             json={
                 "name": "demo-project",
-                "path": "/repos/demo-project",
                 "remote_url": "https://github.com/org/demo-project.git",
                 "default_branch": "main",
             },
@@ -125,7 +124,7 @@ class TestCardWorkflowDemo:
         # Setup: Create repo and card
         repo_response = await client.post(
             "/api/repos",
-            json={"name": "reject-demo", "path": "/repos/reject-demo"},
+            json={"name": "reject-demo"},
         )
         repo = repo_response.json()
 
@@ -174,7 +173,7 @@ class TestMultiCardBoardDemo:
         # Create repository
         repo_response = await client.post(
             "/api/repos",
-            json={"name": "kanban-demo", "path": "/repos/kanban-demo"},
+            json={"name": "kanban-demo"},
         )
         repo = repo_response.json()
         print(f"Repository: {repo['name']}")

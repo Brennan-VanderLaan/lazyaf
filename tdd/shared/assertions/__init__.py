@@ -4,6 +4,10 @@ from .api import (
     assert_created_response,
     assert_deleted_response,
     assert_error_response,
+    assert_git_head_response,
+    assert_git_info_refs_response,
+    assert_git_pack_response,
+    assert_ingest_response,
     assert_json_contains,
     assert_json_list_contains,
     assert_json_list_length,
@@ -33,6 +37,11 @@ __all__ = [
     "assert_deleted_response",
     "assert_not_found",
     "assert_validation_error",
+    # Git protocol assertions
+    "assert_git_info_refs_response",
+    "assert_git_head_response",
+    "assert_git_pack_response",
+    "assert_ingest_response",
     # Model assertions
     "assert_model_fields",
     "assert_model_has_id",

@@ -281,12 +281,12 @@ src/
 ### Phase 2: Repo & Card Management
 **Goal**: Can attach repos and create/view cards
 
-- [ ] Implement Repo CRUD endpoints
-- [ ] Implement Card CRUD endpoints
-- [ ] Build RepoSelector component
-- [ ] Build Board + Column + Card components
-- [ ] Card drag-and-drop between columns
-- [ ] CardModal for create/edit
+- [x] Implement Repo CRUD endpoints
+- [x] Implement Card CRUD endpoints
+- [x] Build RepoSelector component
+- [x] Build Board + Column + Card components
+- [x] Card drag-and-drop between columns
+- [x] CardModal for create/edit
 
 **Deliverable**: Can create cards on a board for an attached repo
 

@@ -329,7 +329,7 @@ src/
 
 **Deliverable**: Can see runner status, scale pool, and copy docker commands to spin up runners
 
-### Phase 3.75: Internal Git Server
+### Phase 3.75: Internal Git Server ✅
 **Goal**: Host repos internally for iteration isolation - don't pollute real remotes until ready
 
 **Motivation**: During active development/iteration, we don't want to push experimental branches and PRs to GitHub/GitLab. The internal git server lets agents work in isolation. When satisfied with results, users can "land" changes to the real remote.
@@ -367,11 +367,24 @@ src/
 - [x] Update Repo model (add `is_ingested`, remove `path` requirement)
 - [x] Add `/api/repos/ingest` endpoint
 
-**Phase 3.75b: Agent Integration**
-- [ ] Update runner entrypoint to clone from internal git URL
-- [ ] Runner pushes feature branches back to internal server (not origin)
-- [ ] Skip PR creation when working against internal server
-- [ ] Track branches per repo in database
+**Phase 3.75b: Ingest CLI** ✅
+- [x] Create `cli/` package with Click
+- [x] `lazyaf ingest /path/to/repo --name NAME` command
+- [x] CLI calls ingest API, then `git push` to internal server
+- [x] Support `--branch` flag to specify branch to push
+- [x] Support `--all-branches` flag to push all branches
+
+**Phase 3.75c: Agent Integration** ✅
+- [x] Update runner entrypoint to clone from internal git URL
+- [x] Runner pushes feature branches back to internal server (not origin)
+- [x] Skip PR creation when working against internal server
+- [x] Track branches per repo via /repos/{id}/branches endpoint
+
+**Phase 3.75d: Land Flow** ✅
+- [x] CLI `lazyaf land {repo_id} --branch {branch}` command
+- [x] Fetches from internal, pushes to real remote
+- [x] Optional `--pr` flag to create PR via gh CLI
+- [ ] UI button to trigger land flow (later - Phase 6)
 
 **Tech Stack**:
 - `dulwich` - Pure Python git implementation, embeds in FastAPI

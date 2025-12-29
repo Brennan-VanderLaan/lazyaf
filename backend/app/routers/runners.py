@@ -36,12 +36,14 @@ class RegisterResponse(BaseModel):
 class JobResponse(BaseModel):
     id: str
     card_id: str
+    repo_id: str
     repo_url: str
-    repo_path: str
+    repo_path: str | None = None  # Deprecated, not used with internal git
     base_branch: str
     branch_name: str
     card_title: str
     card_description: str
+    use_internal_git: bool = False  # When True, runner clones from internal git server
 
 
 class CompleteRequest(BaseModel):
@@ -115,12 +117,14 @@ async def get_runner_job(runner_id: str):
         "job": JobResponse(
             id=job.id,
             card_id=job.card_id,
+            repo_id=job.repo_id,
             repo_url=job.repo_url,
             repo_path=job.repo_path,
             base_branch=job.base_branch,
             branch_name=f"lazyaf/{job.id[:8]}",
             card_title=job.card_title,
             card_description=job.card_description,
+            use_internal_git=job.use_internal_git,
         )
     }
 

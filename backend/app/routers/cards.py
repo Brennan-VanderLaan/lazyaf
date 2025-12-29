@@ -90,6 +90,13 @@ async def start_card(card_id: str, db: AsyncSession = Depends(get_db)):
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
 
+    # Check if repo is ready for work
+    if not repo.is_ingested:
+        raise HTTPException(
+            status_code=400,
+            detail="Repo must be ingested before starting work. Use the CLI to ingest the repo first."
+        )
+
     # Create a job in the database
     job_id = str(uuid4())
     job = Job(id=job_id, card_id=card.id, status="queued")
@@ -104,15 +111,16 @@ async def start_card(card_id: str, db: AsyncSession = Depends(get_db)):
     await db.refresh(card)
 
     # Queue the job for a runner
+    # Use internal git server for ingested repos (runner constructs URL from BACKEND_URL + repo_id)
     queued_job = QueuedJob(
         id=job_id,
         card_id=card.id,
         repo_id=repo.id,
-        repo_url=repo.remote_url or "",
-        repo_path=repo.path,
+        repo_url=repo.remote_url or "",  # Kept for reference, but runner uses internal git
         base_branch=repo.default_branch,
         card_title=card.title,
         card_description=card.description,
+        use_internal_git=True,  # Always use internal git for ingested repos
     )
     await job_queue.enqueue(queued_job)
 
@@ -148,4 +156,60 @@ async def reject_card(card_id: str, db: AsyncSession = Depends(get_db)):
     card.pr_url = None
     await db.commit()
     await db.refresh(card)
+    return card
+
+
+@router.post("/api/cards/{card_id}/retry", response_model=CardRead)
+async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
+    """Retry a failed card by creating a new job."""
+    result = await db.execute(select(Card).where(Card.id == card_id))
+    card = result.scalar_one_or_none()
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    if card.status not in ("failed", "in_review"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only retry cards in 'failed' or 'in_review' status, current: {card.status}"
+        )
+
+    # Get the repo
+    result = await db.execute(select(Repo).where(Repo.id == card.repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(
+            status_code=400,
+            detail="Repo must be ingested before starting work"
+        )
+
+    # Create a new job
+    job_id = str(uuid4())
+    job = Job(id=job_id, card_id=card.id, status="queued")
+    db.add(job)
+
+    # Update card status and link to new job
+    card.status = "in_progress"
+    card.job_id = job_id
+    card.branch_name = f"lazyaf/{job_id[:8]}"
+    card.pr_url = None  # Clear old PR URL
+
+    await db.commit()
+    await db.refresh(card)
+
+    # Queue the job for a runner
+    queued_job = QueuedJob(
+        id=job_id,
+        card_id=card.id,
+        repo_id=repo.id,
+        repo_url=repo.remote_url or "",
+        base_branch=repo.default_branch,
+        card_title=card.title,
+        card_description=card.description,
+        use_internal_git=True,
+    )
+    await job_queue.enqueue(queued_job)
+
     return card

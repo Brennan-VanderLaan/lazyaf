@@ -116,3 +116,35 @@ async def delete_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
 
     await db.delete(repo)
     await db.commit()
+
+
+@router.get("/{repo_id}/branches")
+async def list_branches(repo_id: str, db: AsyncSession = Depends(get_db)):
+    """List all branches in the internal git repo."""
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    branches = git_repo_manager.list_branches(repo_id)
+    default_branch = git_repo_manager.get_default_branch(repo_id)
+
+    # Get commit SHA for each branch
+    branch_info = []
+    for branch in branches:
+        commit = git_repo_manager.get_branch_commit(repo_id, branch)
+        branch_info.append({
+            "name": branch,
+            "commit": commit,
+            "is_default": branch == default_branch,
+            "is_lazyaf": branch.startswith("lazyaf/"),
+        })
+
+    return {
+        "branches": branch_info,
+        "default_branch": default_branch,
+        "total": len(branches),
+    }

@@ -97,6 +97,18 @@ function createCardsStore() {
       }
     },
 
+    async retry(id: string) {
+      error.set(null);
+      try {
+        const card = await cardsApi.retry(id);
+        update(cards => cards.map(c => c.id === id ? card : c));
+        return card;
+      } catch (e) {
+        error.set(e instanceof Error ? e.message : 'Failed to retry card');
+        throw e;
+      }
+    },
+
     updateLocal(card: Card) {
       update(cards => cards.map(c => c.id === card.id ? card : c));
     },

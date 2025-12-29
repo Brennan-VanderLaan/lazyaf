@@ -2,9 +2,10 @@
   import { onMount } from 'svelte';
   import { reposStore, selectedRepoId, selectedRepo } from '../stores/repos';
   import type { RepoCreate } from '../api/types';
+  import RepoInfo from './RepoInfo.svelte';
 
   let showAddForm = false;
-  let newRepo: RepoCreate = { name: '', path: '', default_branch: 'main' };
+  let newRepo: RepoCreate = { name: '', default_branch: 'main' };
   let submitting = false;
 
   onMount(() => {
@@ -12,13 +13,13 @@
   });
 
   async function handleAdd() {
-    if (!newRepo.name || !newRepo.path) return;
+    if (!newRepo.name) return;
     submitting = true;
     try {
-      const repo = await reposStore.create(newRepo);
+      const repo = await reposStore.ingest(newRepo);
       $selectedRepoId = repo.id;
       showAddForm = false;
-      newRepo = { name: '', path: '', default_branch: 'main' };
+      newRepo = { name: '', default_branch: 'main' };
     } finally {
       submitting = false;
     }
@@ -45,19 +46,13 @@
     <form class="add-form" on:submit|preventDefault={handleAdd}>
       <input
         type="text"
-        placeholder="Name"
+        placeholder="Repository name"
         bind:value={newRepo.name}
         required
       />
       <input
         type="text"
-        placeholder="Local path (e.g., /path/to/repo)"
-        bind:value={newRepo.path}
-        required
-      />
-      <input
-        type="text"
-        placeholder="Remote URL (optional)"
+        placeholder="Remote URL (optional, e.g., github.com/user/repo)"
         bind:value={newRepo.remote_url}
       />
       <input
@@ -66,8 +61,9 @@
         bind:value={newRepo.default_branch}
       />
       <button type="submit" class="btn-primary" disabled={submitting}>
-        {submitting ? 'Adding...' : 'Add Repo'}
+        {submitting ? 'Creating...' : 'Create Repo'}
       </button>
+      <p class="form-hint">After creating, push your local repo to the internal git URL.</p>
     </form>
   {/if}
 
@@ -82,7 +78,12 @@
         tabindex="0"
       >
         <div class="repo-info">
-          <span class="repo-name">{repo.name}</span>
+          <div class="repo-name-row">
+            <span class="repo-name">{repo.name}</span>
+            <span class="repo-status" class:ready={repo.is_ingested} title={repo.is_ingested ? 'Ready' : 'Not ingested'}>
+              {repo.is_ingested ? '●' : '○'}
+            </span>
+          </div>
           <span class="repo-branch">{repo.default_branch}</span>
         </div>
         <button
@@ -97,6 +98,8 @@
       <li class="repo-empty">No repositories added yet</li>
     {/each}
   </ul>
+
+  <RepoInfo />
 </div>
 
 <style>
@@ -179,6 +182,12 @@
     cursor: not-allowed;
   }
 
+  .form-hint {
+    margin: 0.5rem 0 0 0;
+    font-size: 0.75rem;
+    color: var(--text-muted, #6c7086);
+  }
+
   .repo-list {
     list-style: none;
     padding: 0;
@@ -209,9 +218,24 @@
     gap: 0.25rem;
   }
 
+  .repo-name-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
   .repo-name {
     font-weight: 500;
     color: var(--text-color, #cdd6f4);
+  }
+
+  .repo-status {
+    font-size: 0.6rem;
+    color: var(--warning-color, #f9e2af);
+  }
+
+  .repo-status.ready {
+    color: var(--success-color, #a6e3a1);
   }
 
   .repo-branch {

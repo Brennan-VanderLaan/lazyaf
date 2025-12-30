@@ -40,7 +40,7 @@
     <div class="board-header">
       <div class="board-info">
         <h1>{$selectedRepo.name}</h1>
-        <span class="branch-badge">📍 {$selectedRepo.default_branch}</span>
+        <span class="branch-badge"><span class="pin-icon">📍</span> {$selectedRepo.default_branch}</span>
       </div>
       <button class="btn-create" on:click={() => showCreateModal = true}>
         + New Card
@@ -172,6 +172,10 @@
   .branch-badge:hover {
     background: var(--hover-color, #45475a);
     transform: translateY(-1px);
+  }
+
+  .pin-icon {
+    filter: hue-rotate(200deg) saturate(0.8);
   }
 
   .btn-create {

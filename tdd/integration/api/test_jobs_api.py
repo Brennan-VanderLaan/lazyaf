@@ -97,8 +97,11 @@ class TestGetJobLogs:
         """Returns job logs when job exists."""
         response = await client.get(f"/api/jobs/{job.id}/logs")
         assert_status_code(response, 200)
-        # Logs are returned as streaming text
-        assert "Test log entry" in response.text
+        # Logs are returned as JSON with logs, job_id, status
+        result = response.json()
+        assert "Test log entry" in result["logs"]
+        assert result["job_id"] == job.id
+        assert result["status"] == "queued"
 
     async def test_get_job_logs_not_found(self, client):
         """Returns 404 for non-existent job."""
@@ -114,7 +117,9 @@ class TestGetJobLogs:
 
         response = await client.get(f"/api/jobs/{job.id}/logs")
         assert_status_code(response, 200)
-        assert response.text == ""
+        result = response.json()
+        assert result["logs"] == ""
+        assert result["job_id"] == job.id
 
 
 class TestCancelJob:

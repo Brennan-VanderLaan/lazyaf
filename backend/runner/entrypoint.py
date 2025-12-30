@@ -4,6 +4,7 @@ LazyAF Runner - Persistent worker that registers with backend and executes jobs.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -16,10 +17,15 @@ import requests
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 RUNNER_NAME = os.environ.get("RUNNER_NAME", None)
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
+HEARTBEAT_INTERVAL = 10  # Send heartbeat every 10 seconds during job execution
+RECONNECT_INTERVAL = 5  # Seconds between reconnect attempts
+MAX_RECONNECT_BACKOFF = 60  # Maximum backoff for reconnection attempts
 
 # Global state
 runner_id = None
 session = requests.Session()
+heartbeat_stop_event = threading.Event()
+needs_reregister = threading.Event()  # Signal that we need to re-register
 
 
 def log(msg: str):
@@ -56,7 +62,7 @@ def register():
 
 
 def heartbeat():
-    """Send heartbeat to backend."""
+    """Send heartbeat to backend. Returns True if successful, False otherwise."""
     if not runner_id:
         return False
     try:
@@ -64,13 +70,44 @@ def heartbeat():
             f"{BACKEND_URL}/api/runners/{runner_id}/heartbeat",
             timeout=5,
         )
+        if response.status_code == 404:
+            # Runner no longer known by backend - need to re-register
+            log("Backend doesn't recognize this runner - will re-register")
+            needs_reregister.set()
+            return False
         return response.status_code == 200
-    except Exception:
+    except requests.exceptions.ConnectionError:
+        log("Lost connection to backend")
+        needs_reregister.set()
+        return False
+    except Exception as e:
+        log(f"Heartbeat error: {e}")
         return False
 
 
+def heartbeat_thread_func():
+    """Background thread to send heartbeats during job execution."""
+    while not heartbeat_stop_event.is_set():
+        heartbeat()
+        # Wait for interval or until stop event is set
+        heartbeat_stop_event.wait(timeout=HEARTBEAT_INTERVAL)
+
+
+def start_heartbeat_thread():
+    """Start background heartbeat thread."""
+    heartbeat_stop_event.clear()
+    thread = threading.Thread(target=heartbeat_thread_func, daemon=True)
+    thread.start()
+    return thread
+
+
+def stop_heartbeat_thread():
+    """Stop background heartbeat thread."""
+    heartbeat_stop_event.set()
+
+
 def poll_for_job():
-    """Poll for a job from the backend."""
+    """Poll for a job from the backend. Returns job dict, None, or raises NeedsReregister."""
     if not runner_id:
         return None
     try:
@@ -78,12 +115,33 @@ def poll_for_job():
             f"{BACKEND_URL}/api/runners/{runner_id}/job",
             timeout=10,
         )
+        if response.status_code == 404:
+            # Runner no longer known by backend
+            log("Backend doesn't recognize this runner - will re-register")
+            needs_reregister.set()
+            return None
         response.raise_for_status()
         data = response.json()
         return data.get("job")
+    except requests.exceptions.ConnectionError:
+        log("Lost connection to backend")
+        needs_reregister.set()
+        return None
     except Exception as e:
         log(f"Failed to poll for job: {e}")
         return None
+
+
+def report_job_status(job_id: str, status: str, error: str = None, pr_url: str = None):
+    """Report job status via callback endpoint."""
+    try:
+        session.post(
+            f"{BACKEND_URL}/api/jobs/{job_id}/callback",
+            json={"status": status, "error": error, "pr_url": pr_url},
+            timeout=10,
+        )
+    except Exception as e:
+        log(f"Failed to report job status: {e}")
 
 
 def complete_job(success: bool, error: str = None, pr_url: str = None):
@@ -100,6 +158,38 @@ def complete_job(success: bool, error: str = None, pr_url: str = None):
         log(f"Failed to complete job: {e}")
 
 
+def cleanup_workspace():
+    """Clean up the workspace directory between jobs."""
+    workspace = Path("/workspace/repo")
+    if workspace.exists():
+        log("Cleaning up workspace...")
+        try:
+            # Use subprocess for more reliable cleanup (handles permission issues)
+            result = subprocess.run(
+                ["rm", "-rf", str(workspace)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                # Try with sudo as fallback
+                subprocess.run(
+                    ["sudo", "rm", "-rf", str(workspace)],
+                    capture_output=True,
+                    text=True,
+                )
+            log("Workspace cleaned")
+        except Exception as e:
+            log(f"Warning: Failed to clean workspace: {e}")
+
+    # Also clean up any stale git locks
+    git_lock = workspace / ".git" / "index.lock"
+    if git_lock.exists():
+        try:
+            git_lock.unlink()
+        except Exception:
+            pass
+
+
 def run_command(cmd: list[str], cwd: str = None) -> tuple[int, str, str]:
     """Run a command and return exit code, stdout, stderr."""
     log(f"$ {' '.join(cmd)}")
@@ -113,9 +203,66 @@ def run_command(cmd: list[str], cwd: str = None) -> tuple[int, str, str]:
     return result.returncode, result.stdout, result.stderr
 
 
+def run_command_streaming(cmd: list[str], cwd: str = None) -> tuple[int, str, str]:
+    """Run a command with real-time output streaming. Used for long-running commands like Claude."""
+    log(f"$ {' '.join(cmd)}")
+
+    stdout_lines = []
+    stderr_lines = []
+
+    # Use Popen for real-time output
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,  # Line buffered
+    )
+
+    # Read stdout and stderr in separate threads to avoid blocking
+    def read_stdout():
+        for line in process.stdout:
+            line = line.rstrip('\n')
+            stdout_lines.append(line)
+            log(f"  {line}")
+
+    def read_stderr():
+        for line in process.stderr:
+            line = line.rstrip('\n')
+            stderr_lines.append(line)
+            log(f"  [stderr] {line}")
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+
+    stdout_thread.start()
+    stderr_thread.start()
+
+    # Wait for process to complete
+    process.wait()
+
+    # Wait for threads to finish reading
+    stdout_thread.join(timeout=5)
+    stderr_thread.join(timeout=5)
+
+    return process.returncode, '\n'.join(stdout_lines), '\n'.join(stderr_lines)
+
+
 def execute_job(job: dict):
     """Execute a job."""
-    log(f"Starting job {job['id']}: {job['card_title']}")
+    job_id = job['id']
+    log(f"Starting job {job_id}: {job['card_title']}")
+
+    # Clean up workspace from any previous job
+    cleanup_workspace()
+
+    # Start background heartbeat thread to keep runner alive during long operations
+    heartbeat_thread = start_heartbeat_thread()
+    log("Started background heartbeat thread")
+
+    # Report running status immediately
+    report_job_status(job_id, "running")
 
     repo_id = job.get("repo_id", "")
     repo_url = job.get("repo_url", "")
@@ -183,15 +330,40 @@ def execute_job(job: dict):
         base_commit = stdout.strip() if exit_code == 0 else None
         log(f"Base commit: {base_commit[:8] if base_commit else 'unknown'}")
 
-        # Create feature branch from current HEAD
-        run_command(["git", "checkout", "-b", branch_name], cwd=str(workspace))
+        # Check if branch already exists on remote (from previous retry)
+        exit_code, ls_output, _ = run_command(
+            ["git", "ls-remote", "--heads", "origin", branch_name],
+            cwd=str(workspace)
+        )
+        branch_exists_on_remote = exit_code == 0 and branch_name in ls_output
+
+        if branch_exists_on_remote:
+            # Branch exists from previous attempt - fetch and checkout
+            log(f"Branch {branch_name} exists on remote, fetching...")
+            run_command(["git", "fetch", "origin", branch_name], cwd=str(workspace))
+            run_command(["git", "checkout", "-b", branch_name, f"origin/{branch_name}"], cwd=str(workspace))
+            # Merge any new changes from base branch
+            log(f"Merging latest from {base_branch}...")
+            exit_code, _, stderr = run_command(
+                ["git", "merge", base_branch, "-m", f"Merge {base_branch} into {branch_name}"],
+                cwd=str(workspace)
+            )
+            if exit_code != 0:
+                log(f"Merge conflict or error, resetting to base: {stderr}")
+                # If merge fails, reset to base branch and start fresh
+                run_command(["git", "checkout", base_branch], cwd=str(workspace))
+                run_command(["git", "branch", "-D", branch_name], cwd=str(workspace))
+                run_command(["git", "checkout", "-b", branch_name], cwd=str(workspace))
+        else:
+            # Create new feature branch from current HEAD
+            run_command(["git", "checkout", "-b", branch_name], cwd=str(workspace))
 
         # Build prompt for Claude
         prompt = build_prompt(card_title, card_description, workspace)
 
-        # Invoke Claude Code
-        log("Invoking Claude Code...")
-        exit_code, stdout, stderr = run_command(
+        # Invoke Claude Code with streaming output
+        log("Invoking Claude Code (streaming output)...")
+        exit_code, stdout, stderr = run_command_streaming(
             ["claude", "-p", prompt, "--dangerously-skip-permissions"],
             cwd=str(workspace),
         )
@@ -263,12 +435,28 @@ def execute_job(job: dict):
                 pr_url = stdout.strip().split("\n")[-1]
                 log(f"Created PR: {pr_url}")
 
-        complete_job(success=True, pr_url=pr_url)
-        log("Job completed successfully!")
+        log("Reporting job completion...")
+        try:
+            complete_job(success=True, pr_url=pr_url)
+            log("Job completed successfully!")
+        except Exception as ce:
+            log(f"WARNING: Failed to report completion: {ce}")
+            # Job succeeded but we couldn't report it - log but don't fail
 
     except Exception as e:
         log(f"ERROR: {e}")
-        complete_job(success=False, error=str(e))
+        try:
+            complete_job(success=False, error=str(e))
+        except Exception as ce:
+            log(f"WARNING: Failed to report failure: {ce}")
+
+    finally:
+        # Always stop the heartbeat thread
+        stop_heartbeat_thread()
+        log("Stopped background heartbeat thread")
+
+        # Clean up workspace after job completion
+        cleanup_workspace()
 
 
 def build_prompt(title: str, description: str, repo_dir: Path) -> str:
@@ -308,26 +496,78 @@ Description:
     return prompt
 
 
+def wait_for_backend():
+    """Wait for backend to become available with exponential backoff."""
+    backoff = RECONNECT_INTERVAL
+    while True:
+        try:
+            response = session.get(f"{BACKEND_URL}/health", timeout=5)
+            if response.status_code == 200:
+                log("Backend is available")
+                return True
+        except requests.exceptions.ConnectionError:
+            pass
+        except Exception as e:
+            log(f"Health check error: {e}")
+
+        log(f"Backend not available, retrying in {backoff}s...")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF)
+
+
 def main():
+    global runner_id
+
     log(f"LazyAF Runner starting...")
     log(f"Backend URL: {BACKEND_URL}")
 
-    # Keep trying to register
-    while not register():
-        log("Retrying registration in 5 seconds...")
-        time.sleep(5)
-
-    log("Waiting for jobs...")
-
-    # Main loop
+    # Main loop with auto-reconnect
     try:
         while True:
-            job = poll_for_job()
-            if job:
-                execute_job(job)
-                log("Waiting for next job...")
-            else:
-                time.sleep(POLL_INTERVAL)
+            # Clear re-register flag
+            needs_reregister.clear()
+
+            # Wait for backend to be available
+            wait_for_backend()
+
+            # Register with backend
+            backoff = RECONNECT_INTERVAL
+            while not register():
+                log(f"Retrying registration in {backoff}s...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, MAX_RECONNECT_BACKOFF)
+                # Check if backend is still up
+                try:
+                    session.get(f"{BACKEND_URL}/health", timeout=5)
+                except Exception:
+                    log("Backend went away during registration")
+                    break
+
+            if not runner_id:
+                continue  # Restart the loop if registration failed
+
+            log("Waiting for jobs...")
+
+            # Job polling loop
+            while not needs_reregister.is_set():
+                job = poll_for_job()
+                if job:
+                    execute_job(job)
+                    # Check if we need to re-register after job completion
+                    if needs_reregister.is_set():
+                        log("Re-registration required after job")
+                        break
+                    log("Waiting for next job...")
+                else:
+                    if needs_reregister.is_set():
+                        break
+                    time.sleep(POLL_INTERVAL)
+
+            # If we get here, we need to re-register
+            log("Connection lost - will reconnect...")
+            runner_id = None
+            time.sleep(RECONNECT_INTERVAL)
+
     except KeyboardInterrupt:
         log("Shutting down...")
 

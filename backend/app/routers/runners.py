@@ -9,6 +9,7 @@ from app.models import Runner, Job, Card
 from app.schemas import RunnerRead
 from app.services.runner_pool import runner_pool, RunnerPool
 from app.services.job_queue import job_queue
+from app.services.websocket import manager
 
 router = APIRouter(prefix="/api/runners", tags=["runners"])
 
@@ -132,9 +133,14 @@ async def get_runner_job(runner_id: str):
 @router.post("/{runner_id}/complete")
 async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSession = Depends(get_db)):
     """Mark the current job as complete."""
+    from datetime import datetime
+
     runner = runner_pool.get_runner(runner_id)
     if not runner:
         raise HTTPException(status_code=404, detail="Runner not found")
+
+    # Get runner logs before completing (they get cleared)
+    runner_logs = runner_pool.get_logs(runner_id)
 
     job_data = runner_pool.complete_job(runner_id, request.success, request.error)
     if not job_data:
@@ -143,10 +149,16 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
     # Update job in database
     result = await db.execute(select(Job).where(Job.id == job_data.id))
     job = result.scalar_one_or_none()
+    card = None
     if job:
         job.status = "completed" if request.success else "failed"
+        job.completed_at = datetime.utcnow()
         if request.error:
             job.error = request.error
+
+        # Sync runner logs to job
+        if runner_logs:
+            job.logs = "\n".join(runner_logs)
 
         # Update card status
         result = await db.execute(select(Card).where(Card.id == job.card_id))
@@ -160,19 +172,52 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
                 card.status = "failed"
 
         await db.commit()
+        await db.refresh(job)
+
+        # Broadcast job status update via WebSocket
+        await manager.send_job_status({
+            "id": job.id,
+            "card_id": job.card_id,
+            "status": job.status,
+            "error": job.error,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        })
+
+        # Broadcast card update via WebSocket
+        if card:
+            await db.refresh(card)
+            await manager.send_card_updated({
+                "id": card.id,
+                "repo_id": card.repo_id,
+                "title": card.title,
+                "description": card.description,
+                "status": card.status,
+                "branch_name": card.branch_name,
+                "pr_url": card.pr_url,
+                "job_id": card.job_id,
+            })
 
     return {"status": "ok"}
 
 
 @router.post("/{runner_id}/logs")
-async def append_logs(runner_id: str, request: LogRequest):
-    """Append log lines for a runner."""
+async def append_logs(runner_id: str, request: LogRequest, db: AsyncSession = Depends(get_db)):
+    """Append log lines for a runner and sync to job."""
     runner = runner_pool.get_runner(runner_id)
     if not runner:
         raise HTTPException(status_code=404, detail="Runner not found")
 
     for line in request.lines:
         runner_pool.append_log(runner_id, line)
+
+    # Sync logs to Job model if runner has an active job
+    if runner.current_job:
+        result = await db.execute(select(Job).where(Job.id == runner.current_job.id))
+        job = result.scalar_one_or_none()
+        if job:
+            job.logs = "\n".join(runner_pool.get_logs(runner_id))
+            await db.commit()
 
     return {"status": "ok", "total_lines": len(runner_pool.get_logs(runner_id))}
 

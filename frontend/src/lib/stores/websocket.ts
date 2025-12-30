@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store';
 import type { Card } from '../api/types';
 import { cardsStore } from './cards';
+import { jobsStore, type JobStatusUpdate } from './jobs';
 
 export type WebSocketStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
@@ -59,10 +60,10 @@ function createWebSocketStore() {
         cardsStore.updateLocal(message.payload as Card);
         break;
       case 'job_status':
-        // TODO: Update job store
+        jobsStore.updateFromWebSocket(message.payload as JobStatusUpdate);
         break;
       case 'runner_status':
-        // TODO: Update runner store
+        // Runner status is handled by polling in runnersStore
         break;
     }
   }

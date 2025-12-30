@@ -109,3 +109,42 @@ export interface DockerCommand {
   image: string;
   env_vars: Record<string, string>;
 }
+
+export interface JobLogs {
+  logs: string;
+  job_id: string;
+  status: JobStatus;
+}
+
+export interface Commit {
+  sha: string;
+  short_sha: string;
+  message: string;
+  author: string;
+  timestamp: number;
+}
+
+export interface CommitsResponse {
+  branch: string;
+  commits: Commit[];
+  total: number;
+}
+
+export interface FileDiff {
+  path: string;
+  status: 'added' | 'modified' | 'deleted';
+  additions: number;
+  deletions: number;
+  diff: string;
+}
+
+export interface DiffResponse {
+  base_branch: string;
+  head_branch: string;
+  base_sha: string;
+  head_sha: string;
+  commit_count: number;
+  files: FileDiff[];
+  total_additions: number;
+  total_deletions: number;
+}

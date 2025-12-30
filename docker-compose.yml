@@ -9,6 +9,7 @@ services:
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/lazyaf.db
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     restart: unless-stopped
 
   frontend:

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
-  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult } from '../api/types';
+  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
   import { repos } from '../api/client';
@@ -32,7 +32,14 @@
 
   let title = card?.title ?? '';
   let description = card?.description ?? '';
+  let runnerType: RunnerType = card?.runner_type ?? 'any';
   let submitting = false;
+
+  const runnerTypeOptions: { value: RunnerType; label: string }[] = [
+    { value: 'any', label: 'Any Runner' },
+    { value: 'claude-code', label: 'Claude Code' },
+    { value: 'gemini', label: 'Gemini CLI' },
+  ];
 
   $: isEdit = card !== null;
   $: canStart = card?.status === 'todo';
@@ -70,10 +77,10 @@
 
     try {
       if (isEdit && card) {
-        const updated = await cardsStore.update(card.id, { title, description });
+        const updated = await cardsStore.update(card.id, { title, description, runner_type: runnerType });
         dispatch('updated', updated);
       } else {
-        const created = await cardsStore.create(repoId, { title, description });
+        const created = await cardsStore.create(repoId, { title, description, runner_type: runnerType });
         dispatch('created', created);
       }
     } catch (e) {
@@ -261,6 +268,26 @@
         ></textarea>
       </div>
 
+      {#if !isEdit || card?.status === 'todo'}
+        <div class="form-group">
+          <label for="runner-type">Runner Type</label>
+          <select id="runner-type" bind:value={runnerType}>
+            {#each runnerTypeOptions as option}
+              <option value={option.value}>{option.label}</option>
+            {/each}
+          </select>
+          <p class="form-hint">
+            {#if runnerType === 'any'}
+              First available runner will pick up this task.
+            {:else if runnerType === 'claude-code'}
+              Only Claude Code runners will work on this task.
+            {:else if runnerType === 'gemini'}
+              Only Gemini CLI runners will work on this task.
+            {/if}
+          </p>
+        </div>
+      {/if}
+
       {#if isEdit && card}
         <div class="card-meta">
           <div class="meta-item">
@@ -269,6 +296,18 @@
               {statusLabels[card.status]}
             </span>
           </div>
+          {#if card.status !== 'todo'}
+            <div class="meta-item">
+              <span class="meta-label">Runner:</span>
+              <span class="meta-value runner-type-badge" data-runner={card.completed_runner_type || card.runner_type}>
+                {#if card.completed_runner_type}
+                  {runnerTypeOptions.find(o => o.value === card.completed_runner_type)?.label || card.completed_runner_type}
+                {:else}
+                  {runnerTypeOptions.find(o => o.value === card.runner_type)?.label || card.runner_type}
+                {/if}
+              </span>
+            </div>
+          {/if}
           {#if card.branch_name}
             <div class="meta-item">
               <span class="meta-label">Branch:</span>
@@ -536,9 +575,28 @@
   }
 
   .form-group input:focus,
-  .form-group textarea:focus {
+  .form-group textarea:focus,
+  .form-group select:focus {
     outline: none;
     border-color: var(--primary-color, #89b4fa);
+  }
+
+  .form-group select {
+    width: 100%;
+    padding: 0.75rem;
+    background: var(--input-bg, #181825);
+    border: 1px solid var(--border-color, #45475a);
+    border-radius: 6px;
+    color: var(--text-color, #cdd6f4);
+    font-size: 0.95rem;
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  .form-hint {
+    margin: 0.5rem 0 0;
+    font-size: 0.8rem;
+    color: var(--text-muted, #6c7086);
   }
 
   .card-meta {
@@ -587,6 +645,16 @@
   .status-badge[data-status="in_review"] { background: #cba6f733; color: #cba6f7; }
   .status-badge[data-status="done"] { background: #a6e3a133; color: #a6e3a1; }
   .status-badge[data-status="failed"] { background: #f38ba833; color: #f38ba8; }
+
+  .runner-type-badge {
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    font-weight: 500;
+  }
+
+  .runner-type-badge[data-runner="any"] { background: #6c708633; color: #6c7086; }
+  .runner-type-badge[data-runner="claude-code"] { background: #f9a82533; color: #f9a825; }
+  .runner-type-badge[data-runner="gemini"] { background: #4285f433; color: #4285f4; }
 
   .diff-section {
     margin-top: 1.25rem;

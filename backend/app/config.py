@@ -9,6 +9,8 @@ class Settings(BaseModel):
     cors_origins: list[str] = ["http://localhost:5173"]
     docker_host: str | None = None
     anthropic_api_key: str | None = None
+    gemini_api_key: str | None = None
+    default_runner_type: str = "any"  # any, claude-code, gemini
 
     class Config:
         env_file = ".env"
@@ -18,5 +20,7 @@ class Settings(BaseModel):
 def get_settings() -> Settings:
     return Settings(
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        gemini_api_key=os.getenv("GEMINI_API_KEY"),
         docker_host=os.getenv("DOCKER_HOST"),
+        default_runner_type=os.getenv("DEFAULT_RUNNER_TYPE", "any"),
     )

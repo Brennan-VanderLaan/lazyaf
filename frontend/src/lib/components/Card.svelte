@@ -24,6 +24,21 @@
     done: '#a6e3a1',
     failed: '#f38ba8',
   };
+
+  const runnerTypeLabels: Record<string, string> = {
+    'any': 'Any',
+    'claude-code': 'Claude',
+    'gemini': 'Gemini',
+  };
+
+  const runnerTypeColors: Record<string, string> = {
+    'any': '#6c7086',
+    'claude-code': '#f9a825',  // Orange/amber for Claude
+    'gemini': '#4285f4',       // Google blue for Gemini
+  };
+
+  // Show badge for completed runner type, or requested type if specific
+  $: displayRunnerType = card.completed_runner_type || (card.runner_type !== 'any' ? card.runner_type : null);
 </script>
 
 <div
@@ -52,6 +67,14 @@
   <div class="card-footer">
     {#if card.branch_name}
       <span class="branch-name">🌿 {card.branch_name}</span>
+    {/if}
+    {#if displayRunnerType}
+      <span
+        class="runner-badge"
+        style="--badge-color: {runnerTypeColors[displayRunnerType] || '#6c7086'}"
+      >
+        {runnerTypeLabels[displayRunnerType] || displayRunnerType}
+      </span>
     {/if}
   </div>
 </div>
@@ -151,6 +174,10 @@
     margin-top: 0.75rem;
     position: relative;
     z-index: 1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: center;
   }
 
   .branch-name {
@@ -169,5 +196,18 @@
   .branch-name:hover {
     background: var(--hover-color, #313244);
     border-color: var(--success-color, #a6e3a1);
+  }
+
+  .runner-badge {
+    display: inline-block;
+    padding: 0.2rem 0.5rem;
+    background: color-mix(in srgb, var(--badge-color) 20%, transparent);
+    border: 1px solid var(--badge-color);
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--badge-color);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
   }
 </style>

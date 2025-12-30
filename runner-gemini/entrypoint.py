@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LazyAF Runner - Persistent worker that registers with backend and executes jobs.
+LazyAF Runner (Gemini) - Persistent worker that registers with backend and executes jobs.
 """
 
 import os
@@ -16,6 +16,7 @@ import requests
 
 # Configuration from environment
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+RUNNER_TYPE = os.environ.get("RUNNER_TYPE", "gemini")
 RUNNER_NAME = os.environ.get("RUNNER_NAME", None)
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 HEARTBEAT_INTERVAL = 10  # Send heartbeat every 10 seconds during job execution
@@ -53,13 +54,13 @@ def register():
     try:
         response = session.post(
             f"{BACKEND_URL}/api/runners/register",
-            json={"runner_id": RUNNER_UUID, "name": RUNNER_NAME},
+            json={"runner_id": RUNNER_UUID, "name": RUNNER_NAME, "runner_type": RUNNER_TYPE},
             timeout=10,
         )
         response.raise_for_status()
         data = response.json()
         runner_id = data["runner_id"]
-        log(f"Registered as {data['name']} (id: {runner_id})")
+        log(f"Registered as {data['name']} (type: {RUNNER_TYPE}, id: {runner_id})")
         return True
     except Exception as e:
         print(f"[runner] Failed to register: {e}", flush=True)
@@ -209,7 +210,7 @@ def run_command(cmd: list[str], cwd: str = None) -> tuple[int, str, str]:
 
 
 def run_command_streaming(cmd: list[str], cwd: str = None) -> tuple[int, str, str]:
-    """Run a command with real-time output streaming. Used for long-running commands like Claude."""
+    """Run a command with real-time output streaming. Used for long-running commands like Gemini."""
     log(f"$ {' '.join(cmd)}")
 
     stdout_lines = []
@@ -254,46 +255,41 @@ def run_command_streaming(cmd: list[str], cwd: str = None) -> tuple[int, str, st
     return process.returncode, '\n'.join(stdout_lines), '\n'.join(stderr_lines)
 
 
-def fetch_agent_files(agent_file_ids: list[str]) -> list[dict]:
-    """Fetch agent files from backend by their IDs."""
-    if not agent_file_ids:
-        return []
+def setup_gemini_config():
+    """Set up Gemini CLI configuration for automated operation."""
+    import json
+
+    gemini_dir = Path.home() / ".gemini"
+    gemini_dir.mkdir(parents=True, exist_ok=True)
+
+    # Configure settings for auto-accept and no prompts
+    settings_path = gemini_dir / "settings.json"
+    settings = {
+        "tools": {
+            "autoAccept": True,
+        },
+        "security": {
+            "disableYoloMode": False,
+        }
+    }
 
     try:
-        response = session.post(
-            f"{BACKEND_URL}/api/agent-files/batch",
-            json=agent_file_ids,
-            timeout=10,
-        )
-        response.raise_for_status()
-        return response.json()
+        settings_path.write_text(json.dumps(settings, indent=2))
+        log(f"Configured Gemini settings at {settings_path}")
     except Exception as e:
-        log(f"Failed to fetch agent files: {e}")
-        return []
+        log(f"Warning: Failed to configure Gemini settings: {e}")
 
+    # Trust the workspace folder
+    trusted_path = gemini_dir / "trustedFolders.json"
+    trusted = {
+        "folders": ["/workspace", "/workspace/repo"]
+    }
 
-def setup_agent_files(agent_files: list[dict]):
-    """Write agent files to the .claude/agents directory."""
-    if not agent_files:
-        return
-
-    agents_dir = Path.home() / ".claude" / "agents"
-    agents_dir.mkdir(parents=True, exist_ok=True)
-
-    log(f"Setting up {len(agent_files)} agent file(s)...")
-    for agent_file in agent_files:
-        name = agent_file.get("name", "")
-        content = agent_file.get("content", "")
-        if not name or not content:
-            log(f"Skipping invalid agent file: {agent_file}")
-            continue
-
-        agent_path = agents_dir / name
-        try:
-            agent_path.write_text(content)
-            log(f"  Wrote agent file: {name}")
-        except Exception as e:
-            log(f"  Failed to write agent file {name}: {e}")
+    try:
+        trusted_path.write_text(json.dumps(trusted, indent=2))
+        log(f"Configured trusted folders at {trusted_path}")
+    except Exception as e:
+        log(f"Warning: Failed to configure trusted folders: {e}")
 
 
 def execute_job(job: dict):
@@ -319,17 +315,11 @@ def execute_job(job: dict):
     card_title = job.get("card_title", "")
     card_description = job.get("card_description", "")
     use_internal_git = job.get("use_internal_git", False)
-    agent_file_ids = job.get("agent_file_ids", [])
 
     # If using internal git, construct URL from backend URL
     if use_internal_git and repo_id:
         repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
         log(f"Using internal git server: {repo_url}")
-
-    # Fetch and setup agent files
-    if agent_file_ids:
-        agent_files = fetch_agent_files(agent_file_ids)
-        setup_agent_files(agent_files)
 
     workspace = Path("/workspace/repo")
 
@@ -411,25 +401,25 @@ def execute_job(job: dict):
             # Create new feature branch from current HEAD
             run_command(["git", "checkout", "-b", branch_name], cwd=str(workspace))
 
-        # Build prompt for Claude
+        # Build prompt for Gemini
         prompt = build_prompt(card_title, card_description, workspace)
 
-        # Invoke Claude Code with streaming output
-        log("Invoking Claude Code (streaming output)...")
+        # Invoke Gemini CLI with streaming output
+        log("Invoking Gemini CLI (streaming output)...")
         exit_code, stdout, stderr = run_command_streaming(
-            ["claude", "-p", prompt, "--dangerously-skip-permissions"],
+            ["gemini", "-p", prompt, "--yolo"],
             cwd=str(workspace),
         )
 
         if exit_code != 0:
-            raise Exception(f"Claude Code failed with exit code {exit_code}")
+            raise Exception(f"Gemini CLI failed with exit code {exit_code}")
 
         # Check for uncommitted changes first
         exit_code, stdout, _ = run_command(["git", "status", "--porcelain"], cwd=str(workspace))
         has_uncommitted = bool(stdout.strip())
 
         if has_uncommitted:
-            # Commit any uncommitted changes Claude left behind
+            # Commit any uncommitted changes Gemini left behind
             log("Committing uncommitted changes...")
             run_command(["git", "add", "-A"], cwd=str(workspace))
             run_command(
@@ -437,12 +427,12 @@ def execute_job(job: dict):
                 cwd=str(workspace),
             )
 
-        # Check if there are any new commits (Claude may have committed directly)
+        # Check if there are any new commits (Gemini may have committed directly)
         exit_code, stdout, _ = run_command(["git", "rev-parse", "HEAD"], cwd=str(workspace))
         current_commit = stdout.strip() if exit_code == 0 else None
 
         if base_commit and current_commit and base_commit == current_commit:
-            log("No changes made by Claude Code")
+            log("No changes made by Gemini CLI")
             complete_job(success=True, error="No changes were needed")
             return
 
@@ -513,7 +503,7 @@ def execute_job(job: dict):
 
 
 def build_prompt(title: str, description: str, repo_dir: Path) -> str:
-    """Build the prompt for Claude Code."""
+    """Build the prompt for Gemini CLI."""
     readme_content = ""
     for readme_name in ["README.md", "README.rst", "README.txt", "README"]:
         readme_path = repo_dir / readme_name
@@ -572,8 +562,12 @@ def main():
     global runner_id
 
     log(f"LazyAF Runner starting...")
+    log(f"Runner Type: {RUNNER_TYPE}")
     log(f"Runner UUID: {RUNNER_UUID}")
     log(f"Backend URL: {BACKEND_URL}")
+
+    # Configure Gemini CLI for automated operation
+    setup_gemini_config()
 
     # Main loop with auto-reconnect
     try:

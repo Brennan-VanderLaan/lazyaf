@@ -211,3 +211,161 @@ async def get_branch_diff(
         raise HTTPException(status_code=400, detail=diff["error"])
 
     return diff
+
+
+@router.get("/{repo_id}/branches/info")
+async def get_branches_info(
+    repo_id: str,
+    verify: bool = False,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get detailed info about all branches, including orphan detection.
+    Useful for branch management and cleanup.
+
+    Args:
+        verify: If True, verify object integrity for each branch (slower but detects damaged packs)
+    """
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    branches = git_repo_manager.get_branches_info(repo_id)
+    orphaned_count = sum(1 for b in branches if b.get("is_orphaned"))
+    damaged_count = 0
+
+    # Optionally verify integrity
+    if verify:
+        integrity = git_repo_manager.verify_repo_integrity(repo_id)
+        damaged_set = set(integrity.get("damaged_branches", []))
+
+        # Get detailed missing objects info
+        branch_integrity_map = {
+            br.get("branch"): br for br in integrity.get("branches", [])
+        }
+
+        for branch in branches:
+            if branch["name"] in damaged_set:
+                branch["is_damaged"] = True
+                branch_info = branch_integrity_map.get(branch["name"], {})
+                branch["missing_objects"] = branch_info.get("missing_objects", [])
+                branch["objects_checked"] = branch_info.get("objects_checked", 0)
+                damaged_count += 1
+            else:
+                branch["is_damaged"] = False
+                branch["missing_objects"] = []
+
+    return {
+        "branches": branches,
+        "total": len(branches),
+        "orphaned_count": orphaned_count,
+        "damaged_count": damaged_count,
+        "default_branch": repo.default_branch,
+        "remote_url": repo.remote_url,
+    }
+
+
+@router.delete("/{repo_id}/branches/{branch_name:path}")
+async def delete_branch(
+    repo_id: str,
+    branch_name: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Delete a branch from the repository.
+    The default branch cannot be deleted.
+    """
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    result = git_repo_manager.delete_branch(repo_id, branch_name)
+
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    return result
+
+
+@router.post("/{repo_id}/cleanup-orphans")
+async def cleanup_orphaned_branches(repo_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Remove all branches that point to non-existent commits.
+    The default branch is protected and will not be deleted.
+    """
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    result = git_repo_manager.cleanup_orphaned_branches(repo_id)
+    return result
+
+
+@router.post("/{repo_id}/reinitialize")
+async def reinitialize_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Completely reinitialize a repository, deleting all refs and objects.
+    This is the nuclear option for fixing a corrupted repo.
+
+    After calling this, the user must push their local repo again.
+    """
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    reinit_result = git_repo_manager.reinitialize_repo(repo_id)
+
+    if not reinit_result["success"]:
+        raise HTTPException(status_code=500, detail=reinit_result.get("error", "Reinitialize failed"))
+
+    return reinit_result
+
+
+@router.post("/{repo_id}/sync")
+async def sync_repo_from_disk(repo_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Re-sync the repository state from disk.
+    This is a "break-glass" operation to fix corrupted or inconsistent state.
+
+    - Re-reads all refs from the git directory
+    - Removes orphaned branches (refs pointing to non-existent commits)
+    - Returns the cleaned-up list of valid branches
+    """
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    sync_result = git_repo_manager.sync_repo_from_disk(repo_id)
+
+    if not sync_result["success"]:
+        raise HTTPException(status_code=500, detail=sync_result.get("error", "Sync failed"))
+
+    # Update default branch in DB if needed
+    branches = sync_result.get("branches", [])
+    if branches:
+        default_branches = [b for b in branches if b.get("is_default")]
+        if default_branches and default_branches[0]["name"] != repo.default_branch:
+            repo.default_branch = default_branches[0]["name"]
+            await db.commit()
+
+    return sync_result

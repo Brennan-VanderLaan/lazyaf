@@ -16,6 +16,12 @@ class CardStatus(str, Enum):
     FAILED = "failed"
 
 
+class RunnerType(str, Enum):
+    ANY = "any"  # Any available runner
+    CLAUDE_CODE = "claude-code"
+    GEMINI = "gemini"
+
+
 class Card(Base):
     __tablename__ = "cards"
 
@@ -24,9 +30,11 @@ class Card(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     status: Mapped[str] = mapped_column(String(50), default=CardStatus.TODO.value)
+    runner_type: Mapped[str] = mapped_column(String(50), default=RunnerType.ANY.value)
     branch_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     pr_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    completed_runner_type: Mapped[str | None] = mapped_column(String(50), nullable=True)  # Type of runner that completed the job
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

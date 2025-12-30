@@ -28,11 +28,13 @@ class PoolStatus(BaseModel):
 class RegisterRequest(BaseModel):
     runner_id: str | None = None  # Client-provided ID for reconnection
     name: str | None = None
+    runner_type: str = "claude-code"  # claude-code, gemini
 
 
 class RegisterResponse(BaseModel):
     runner_id: str
     name: str
+    runner_type: str
 
 
 class JobResponse(BaseModel):
@@ -63,7 +65,15 @@ class DockerCommand(BaseModel):
     command: str
     command_with_secrets: str
     image: str
+    runner_type: str
     env_vars: dict[str, str]
+
+
+# Runner images per type
+RUNNER_IMAGES = {
+    "claude-code": "lazyaf-runner-claude:latest",
+    "gemini": "lazyaf-runner-gemini:latest",
+}
 
 
 # === Endpoints ===
@@ -90,8 +100,12 @@ async def pool_status():
 @router.post("/register", response_model=RegisterResponse)
 async def register_runner(request: RegisterRequest):
     """Register a runner with the pool. If runner_id is provided and exists, reactivates it."""
-    runner = runner_pool.register(runner_id=request.runner_id, name=request.name)
-    return RegisterResponse(runner_id=runner.id, name=runner.name)
+    runner = runner_pool.register(
+        runner_id=request.runner_id,
+        name=request.name,
+        runner_type=request.runner_type
+    )
+    return RegisterResponse(runner_id=runner.id, name=runner.name, runner_type=runner.runner_type)
 
 
 @router.post("/{runner_id}/heartbeat")
@@ -103,7 +117,7 @@ async def runner_heartbeat(runner_id: str):
 
 
 @router.get("/{runner_id}/job")
-async def get_runner_job(runner_id: str):
+async def get_runner_job(runner_id: str, db: AsyncSession = Depends(get_db)):
     """Poll for a job. Returns null if no job available."""
     runner = runner_pool.get_runner(runner_id)
     if not runner:
@@ -115,6 +129,30 @@ async def get_runner_job(runner_id: str):
     job = await runner_pool.get_job(runner_id)
     if not job:
         return {"job": None}
+
+    # Update card's completed_runner_type to show which runner picked it up
+    result = await db.execute(select(Card).where(Card.id == job.card_id))
+    card = result.scalar_one_or_none()
+    if card:
+        card.completed_runner_type = runner.runner_type
+        await db.commit()
+        await db.refresh(card)
+
+        # Broadcast card update via WebSocket
+        await manager.send_card_updated({
+            "id": card.id,
+            "repo_id": card.repo_id,
+            "title": card.title,
+            "description": card.description,
+            "status": card.status,
+            "runner_type": card.runner_type,
+            "branch_name": card.branch_name,
+            "pr_url": card.pr_url,
+            "job_id": card.job_id,
+            "completed_runner_type": card.completed_runner_type,
+            "created_at": card.created_at.isoformat() if card.created_at else None,
+            "updated_at": card.updated_at.isoformat() if card.updated_at else None,
+        })
 
     return {
         "job": JobResponse(
@@ -142,8 +180,9 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
     if not runner:
         raise HTTPException(status_code=404, detail="Runner not found")
 
-    # Get runner logs before completing (they get cleared)
+    # Get runner logs and type before completing (they get cleared)
     runner_logs = runner_pool.get_logs(runner_id)
+    runner_type = runner.runner_type
 
     job_data = runner_pool.complete_job(runner_id, request.success, request.error)
     if not job_data:
@@ -156,6 +195,7 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
     if job:
         job.status = "completed" if request.success else "failed"
         job.completed_at = datetime.utcnow()
+        job.runner_type = runner_type  # Record which runner type completed the job
         if request.error:
             job.error = request.error
 
@@ -167,6 +207,7 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
         result = await db.execute(select(Card).where(Card.id == job.card_id))
         card = result.scalar_one_or_none()
         if card:
+            card.completed_runner_type = runner_type  # Record which runner type completed
             if request.success:
                 card.status = "in_review"
                 if request.pr_url:
@@ -196,9 +237,13 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
                 "title": card.title,
                 "description": card.description,
                 "status": card.status,
+                "runner_type": card.runner_type,
                 "branch_name": card.branch_name,
                 "pr_url": card.pr_url,
                 "job_id": card.job_id,
+                "completed_runner_type": card.completed_runner_type,
+                "created_at": card.created_at.isoformat() if card.created_at else None,
+                "updated_at": card.updated_at.isoformat() if card.updated_at else None,
             })
 
     return {"status": "ok"}
@@ -245,17 +290,34 @@ async def unregister_runner(runner_id: str):
 
 
 @router.get("/docker-command", response_model=DockerCommand)
-async def get_docker_command(with_secrets: bool = Query(False)):
-    """Get the docker run command for starting a runner."""
+async def get_docker_command(
+    runner_type: str = Query("claude-code", description="Runner type: claude-code or gemini"),
+    with_secrets: bool = Query(False)
+):
+    """Get the docker run command for starting a runner of the specified type."""
     settings = get_settings()
-    image = RunnerPool.RUNNER_IMAGE
 
-    # Environment variables with placeholders
+    # Validate runner type
+    if runner_type not in RUNNER_IMAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid runner type: {runner_type}. Must be one of: {', '.join(RUNNER_IMAGES.keys())}"
+        )
+
+    image = RUNNER_IMAGES[runner_type]
+
+    # Base environment variables
     env_vars = {
         "BACKEND_URL": "http://host.docker.internal:8000",
-        "ANTHROPIC_API_KEY": "<YOUR_ANTHROPIC_API_KEY>",
+        "RUNNER_TYPE": runner_type,
         "GITHUB_TOKEN": "<YOUR_GITHUB_TOKEN>",
     }
+
+    # Add appropriate API key based on runner type
+    if runner_type == "claude-code":
+        env_vars["ANTHROPIC_API_KEY"] = "<YOUR_ANTHROPIC_API_KEY>"
+    elif runner_type == "gemini":
+        env_vars["GEMINI_API_KEY"] = "<YOUR_GEMINI_API_KEY>"
 
     # Build command with placeholders
     env_flags = " ".join(f'-e {k}="{v}"' for k, v in env_vars.items())
@@ -264,9 +326,15 @@ async def get_docker_command(with_secrets: bool = Query(False)):
     # Build command with actual secrets if requested
     secret_env_vars = {
         "BACKEND_URL": "http://host.docker.internal:8000",
-        "ANTHROPIC_API_KEY": settings.anthropic_api_key or "<YOUR_ANTHROPIC_API_KEY>",
+        "RUNNER_TYPE": runner_type,
         "GITHUB_TOKEN": "<YOUR_GITHUB_TOKEN>",
     }
+
+    if runner_type == "claude-code":
+        secret_env_vars["ANTHROPIC_API_KEY"] = settings.anthropic_api_key or "<YOUR_ANTHROPIC_API_KEY>"
+    elif runner_type == "gemini":
+        secret_env_vars["GEMINI_API_KEY"] = settings.gemini_api_key or "<YOUR_GEMINI_API_KEY>"
+
     secret_env_flags = " ".join(f'-e {k}="{v}"' for k, v in secret_env_vars.items())
     command_with_secrets = f"docker run --rm {secret_env_flags} {image}"
 
@@ -274,5 +342,6 @@ async def get_docker_command(with_secrets: bool = Query(False)):
         command=command,
         command_with_secrets=command_with_secrets if with_secrets else command,
         image=image,
+        runner_type=runner_type,
         env_vars=env_vars if not with_secrets else secret_env_vars,
     )

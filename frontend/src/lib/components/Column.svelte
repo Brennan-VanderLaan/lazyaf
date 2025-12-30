@@ -60,53 +60,84 @@
 <style>
   .column {
     background: var(--surface-color, #181825);
-    border-radius: 8px;
-    padding: 0.75rem;
+    border: 1px solid var(--border-color, #45475a);
+    border-radius: 12px;
+    padding: 1rem;
     min-width: 240px;
-    flex: 1;
     display: flex;
     flex-direction: column;
     max-height: 100%;
-    transition: background 0.15s;
+    height: 100%;
+    transition: all 0.2s ease;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  }
+
+  .column:hover {
+    border-color: var(--primary-color, #89b4fa);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
   }
 
   .column.drag-over {
     background: var(--hover-color, #1e1e2e);
     outline: 2px dashed var(--primary-color, #89b4fa);
+    outline-offset: -2px;
+    transform: scale(1.02);
   }
 
   .column-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 0.75rem;
-    padding-bottom: 0.5rem;
-    border-bottom: 1px solid var(--border-color, #45475a);
+    margin-bottom: 1rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 2px solid var(--border-color, #45475a);
   }
 
   .column-header h3 {
     margin: 0;
-    font-size: 0.9rem;
-    font-weight: 600;
+    font-size: 0.95rem;
+    font-weight: 700;
     color: var(--text-color, #cdd6f4);
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.08em;
   }
 
   .count {
-    background: var(--badge-bg, #313244);
-    color: var(--text-muted, #6c7086);
-    padding: 0.15rem 0.5rem;
-    border-radius: 10px;
-    font-size: 0.75rem;
-    font-weight: 500;
+    background: var(--primary-color, #89b4fa);
+    color: var(--primary-text, #1e1e2e);
+    padding: 0.25rem 0.6rem;
+    border-radius: 12px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    min-width: 24px;
+    text-align: center;
   }
 
   .card-list {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: 0.75rem;
     overflow-y: auto;
     flex: 1;
+    padding: 0.25rem;
+    margin: -0.25rem;
+  }
+
+  .card-list::-webkit-scrollbar {
+    width: 8px;
+  }
+
+  .card-list::-webkit-scrollbar-track {
+    background: var(--surface-alt, #181825);
+    border-radius: 4px;
+  }
+
+  .card-list::-webkit-scrollbar-thumb {
+    background: var(--border-color, #45475a);
+    border-radius: 4px;
+  }
+
+  .card-list::-webkit-scrollbar-thumb:hover {
+    background: var(--primary-color, #89b4fa);
   }
 </style>

@@ -46,6 +46,7 @@ class JobResponse(BaseModel):
     card_title: str
     card_description: str
     use_internal_git: bool = False  # When True, runner clones from internal git server
+    agent_file_ids: list[str] = []  # List of agent file IDs to mount
 
 
 class CompleteRequest(BaseModel):
@@ -127,6 +128,7 @@ async def get_runner_job(runner_id: str):
             card_title=job.card_title,
             card_description=job.card_description,
             use_internal_git=job.use_internal_git,
+            agent_file_ids=job.agent_file_ids,
         )
     }
 

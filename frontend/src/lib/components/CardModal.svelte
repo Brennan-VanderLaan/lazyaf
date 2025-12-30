@@ -76,6 +76,9 @@
         const created = await cardsStore.create(repoId, { title, description });
         dispatch('created', created);
       }
+    } catch (e) {
+      // Show error but don't close modal so user can retry
+      alert(e instanceof Error ? e.message : 'Failed to save card');
     } finally {
       submitting = false;
     }

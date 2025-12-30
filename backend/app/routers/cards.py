@@ -225,12 +225,19 @@ async def approve_card(
         )
 
         if not merge_result["success"]:
+            # If there are conflicts, return them without changing card status
+            if "conflicts" in merge_result:
+                return {
+                    "card": CardRead.model_validate(card),
+                    "merge_result": merge_result
+                }
+            # For other errors, raise exception
             raise HTTPException(
                 status_code=400,
                 detail=f"Merge failed: {merge_result['error']}"
             )
 
-    # Update card status
+    # Update card status to done only if merge succeeded
     card.status = "done"
     await db.commit()
     await db.refresh(card)
@@ -256,6 +263,64 @@ async def reject_card(card_id: str, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(card)
     return card
+
+
+@router.post("/api/cards/{card_id}/resolve-conflicts")
+async def resolve_conflicts(
+    card_id: str,
+    request: dict,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Resolve merge conflicts by accepting resolved file contents.
+
+    Request body should contain:
+    - target_branch: str (optional, defaults to repo default branch)
+    - resolutions: list of {"path": str, "content": str}
+    """
+    result = await db.execute(select(Card).where(Card.id == card_id))
+    card = result.scalar_one_or_none()
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    # Get the repo
+    result = await db.execute(select(Repo).where(Repo.id == card.repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    target_branch = request.get("target_branch") or repo.default_branch
+    resolutions = request.get("resolutions", [])
+
+    if not resolutions:
+        raise HTTPException(status_code=400, detail="No conflict resolutions provided")
+
+    # Apply conflict resolutions and merge
+    merge_result = git_repo_manager.resolve_and_merge(
+        repo_id=repo.id,
+        source_branch=card.branch_name,
+        target_branch=target_branch,
+        resolutions=resolutions
+    )
+
+    if not merge_result["success"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Merge failed: {merge_result['error']}"
+        )
+
+    # Update card status to done
+    card.status = "done"
+    await db.commit()
+    await db.refresh(card)
+
+    return {
+        "card": CardRead.model_validate(card),
+        "merge_result": merge_result
+    }
 
 
 @router.post("/api/cards/{card_id}/retry", response_model=CardRead)

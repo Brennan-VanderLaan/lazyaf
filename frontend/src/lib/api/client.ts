@@ -68,6 +68,11 @@ export const cards = {
   }),
   reject: (id: string) => request<Card>(`/cards/${id}/reject`, { method: 'POST' }),
   retry: (id: string) => request<Card>(`/cards/${id}/retry`, { method: 'POST' }),
+  resolveConflicts: (id: string, targetBranch: string | undefined, resolutions: Array<{ path: string; content: string }>) =>
+    request<ApproveResponse>(`/cards/${id}/resolve-conflicts`, {
+      method: 'POST',
+      body: JSON.stringify({ target_branch: targetBranch || null, resolutions }),
+    }),
 };
 
 // Jobs

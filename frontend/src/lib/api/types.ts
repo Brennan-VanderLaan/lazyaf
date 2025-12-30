@@ -149,12 +149,20 @@ export interface DiffResponse {
   total_deletions: number;
 }
 
+export interface ConflictDetail {
+  path: string;
+  base_content: string | null;
+  ours_content: string | null;
+  theirs_content: string | null;
+}
+
 export interface MergeResult {
   success: boolean;
   merge_type: 'fast-forward' | 'merge' | null;
   message: string;
   new_sha: string | null;
   error: string | null;
+  conflicts?: ConflictDetail[];
 }
 
 export interface ApproveResponse {

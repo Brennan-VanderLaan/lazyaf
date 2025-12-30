@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { createEventDispatcher, onMount } from 'svelte';
+  import { createEventDispatcher, onMount, tick } from 'svelte';
   import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
@@ -74,6 +74,9 @@
         dispatch('updated', updated);
       } else {
         const created = await cardsStore.create(repoId, { title, description });
+        // Wait for Svelte to apply all pending state changes before dispatching
+        // This prevents race conditions with WebSocket updates that might interfere with modal closure
+        await tick();
         dispatch('created', created);
       }
     } catch (e) {

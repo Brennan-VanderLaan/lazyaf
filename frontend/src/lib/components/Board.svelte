@@ -107,8 +107,15 @@
     flex: 1;
     display: flex;
     flex-direction: column;
-    padding: 1.0rem;
+    padding: 1.5rem;
     overflow: hidden;
+    max-width: 100%;
+  }
+
+  @media (max-width: 1200px) {
+    .board-container {
+      padding: 1rem;
+    }
   }
 
   .board-header {
@@ -116,49 +123,96 @@
     justify-content: space-between;
     align-items: center;
     margin-bottom: 1.5rem;
+    flex-wrap: wrap;
+    gap: 1rem;
   }
 
   .board-info {
     display: flex;
     align-items: center;
     gap: 1rem;
+    flex-wrap: wrap;
   }
 
   .board-info h1 {
     margin: 0;
-    font-size: 1.5rem;
+    font-size: 1.75rem;
+    font-weight: 700;
     color: var(--text-color, #cdd6f4);
+    background: linear-gradient(135deg, var(--primary-color, #89b4fa) 0%, var(--text-color, #cdd6f4) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
   }
 
   .branch-badge {
-    padding: 0.25rem 0.75rem;
+    padding: 0.4rem 0.9rem;
     background: var(--surface-color, #313244);
+    border: 1px solid var(--border-color, #45475a);
     border-radius: 20px;
-    font-size: 0.8rem;
-    color: var(--text-muted, #6c7086);
+    font-size: 0.85rem;
+    color: var(--text-color, #cdd6f4);
+    font-weight: 500;
+    transition: all 0.2s ease;
+  }
+
+  .branch-badge:hover {
+    background: var(--hover-color, #45475a);
+    transform: translateY(-1px);
   }
 
   .btn-create {
-    padding: 0.6rem 1.2rem;
+    padding: 0.7rem 1.4rem;
     background: var(--primary-color, #89b4fa);
     color: var(--primary-text, #1e1e2e);
     border: none;
-    border-radius: 6px;
+    border-radius: 8px;
     font-weight: 600;
+    font-size: 0.95rem;
     cursor: pointer;
-    transition: opacity 0.15s;
+    transition: all 0.2s ease;
+    box-shadow: 0 2px 8px rgba(137, 180, 250, 0.3);
   }
 
   .btn-create:hover {
-    opacity: 0.9;
+    background: var(--primary-color, #89b4fa);
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(137, 180, 250, 0.4);
+  }
+
+  .btn-create:active {
+    transform: translateY(0);
   }
 
   .board {
-    display: flex;
-    gap: 1rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1.25rem;
     flex: 1;
     overflow-x: auto;
+    overflow-y: hidden;
     padding-bottom: 1rem;
+    align-items: start;
+  }
+
+  @media (min-width: 1400px) {
+    .board {
+      grid-template-columns: repeat(4, 1fr);
+    }
+  }
+
+  @media (max-width: 1200px) {
+    .board {
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1rem;
+    }
+  }
+
+  @media (max-width: 768px) {
+    .board {
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 0.75rem;
+    }
   }
 
   .failed-section {

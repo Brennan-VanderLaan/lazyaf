@@ -77,6 +77,11 @@ export const cards = {
       method: 'POST',
       body: JSON.stringify({ target_branch: targetBranch || null, resolutions }),
     }),
+  resolveRebaseConflicts: (id: string, ontoBranch: string | undefined, resolutions: Array<{ path: string; content: string }>) =>
+    request<RebaseResponse>(`/cards/${id}/resolve-rebase-conflicts`, {
+      method: 'POST',
+      body: JSON.stringify({ onto_branch: ontoBranch || null, resolutions }),
+    }),
 };
 
 // Jobs

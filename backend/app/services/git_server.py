@@ -716,6 +716,112 @@ class GitRepoManager:
             traceback.print_exc()
             return {"success": False, "error": str(e), "new_sha": None, "message": ""}
 
+    def resolve_rebase_conflicts(self, repo_id: str, branch_name: str, onto_branch: str,
+                                  resolutions: list[dict], author: str = "LazyAF <lazyaf@localhost>") -> dict:
+        """
+        Resolve rebase conflicts and create a merge commit on the feature branch.
+
+        Args:
+            repo_id: Repository ID
+            branch_name: Branch being rebased (feature branch)
+            onto_branch: Branch being rebased onto (e.g. main)
+            resolutions: List of dicts with 'path' and 'content' keys
+            author: Author string for the commit
+
+        Returns dict with success, new_sha, message, and error
+        """
+        from dulwich.objects import Commit, Blob
+        import time
+
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"success": False, "error": "Repo not found", "new_sha": None, "message": ""}
+
+        branch_sha = self.get_branch_commit(repo_id, branch_name)
+        onto_sha = self.get_branch_commit(repo_id, onto_branch)
+
+        if not branch_sha:
+            return {"success": False, "error": f"Branch '{branch_name}' not found", "new_sha": None, "message": ""}
+        if not onto_sha:
+            return {"success": False, "error": f"Branch '{onto_branch}' not found", "new_sha": None, "message": ""}
+
+        try:
+            branch_commit = repo.object_store[branch_sha.encode('ascii')]
+            onto_commit = repo.object_store[onto_sha.encode('ascii')]
+
+            # Find merge base
+            merge_base_sha = self._find_merge_base(repo, branch_sha, onto_sha)
+            if not merge_base_sha:
+                return {"success": False, "error": "Cannot find common ancestor", "new_sha": None, "message": ""}
+
+            merge_base_commit = repo.object_store[merge_base_sha.encode('ascii')]
+
+            # Perform recursive merge: base=merge_base, ours=onto, theirs=branch
+            merged_tree_sha, conflicts = self._merge_trees(
+                repo,
+                merge_base_commit.tree,
+                onto_commit.tree,
+                branch_commit.tree
+            )
+
+            # Check we have resolutions for all conflicts
+            resolution_map = {r["path"]: r["content"] for r in resolutions}
+            missing = [c for c in conflicts if c not in resolution_map]
+            if missing:
+                return {
+                    "success": False,
+                    "error": f"Missing resolution for conflicted files: {', '.join(missing)}",
+                    "new_sha": None,
+                    "message": ""
+                }
+
+            # Apply resolutions to the merged tree
+            current_tree_sha = merged_tree_sha
+            for path, content in resolution_map.items():
+                # Create blob with resolved content
+                blob = Blob()
+                blob.data = content.encode('utf-8')
+                repo.object_store.add_object(blob)
+
+                # Update tree with resolved blob
+                current_tree_sha = self._set_blob_at_path(repo, current_tree_sha, path, blob.id)
+
+            # Create merge commit on the feature branch
+            commit = Commit()
+            commit.tree = current_tree_sha
+            commit.parents = [onto_sha.encode('ascii'), branch_sha.encode('ascii')]
+            commit.author = author.encode('utf-8')
+            commit.committer = author.encode('utf-8')
+            commit.commit_time = commit.author_time = int(time.time())
+            commit.commit_timezone = commit.author_timezone = 0
+            commit.encoding = b'UTF-8'
+            commit.message = f"Rebase: merge {onto_branch} into {branch_name} (conflicts resolved)\n".encode('utf-8')
+
+            repo.object_store.add_object(commit)
+
+            # Update feature branch ref (not the target branch)
+            branch_ref = f"refs/heads/{branch_name}".encode()
+            repo.refs[branch_ref] = commit.id
+
+            print(f"[git_server] rebase conflict resolution commit created: {commit.id.decode('ascii')[:8]}")
+            return {
+                "success": True,
+                "new_sha": commit.id.decode('ascii'),
+                "message": f"Rebased {branch_name} onto {onto_branch} with conflict resolution",
+                "error": None
+            }
+
+        except Exception as e:
+            import traceback
+            print(f"[git_server] resolve_rebase_conflicts error: {e}")
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": f"Rebase failed: {str(e)}",
+                "new_sha": None,
+                "message": ""
+            }
+
     def get_diff(self, repo_id: str, base_branch: str, head_branch: str) -> dict:
         """Get diff between two branches.
 

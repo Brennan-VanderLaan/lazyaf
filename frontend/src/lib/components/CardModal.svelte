@@ -152,9 +152,12 @@
     try {
       const response = await cardsStore.rebase(card.id, selectedTargetBranch || undefined);
       rebaseResult = response.rebase_result;
-      dispatch('updated', response.card);
       // Force diff to reload after rebase
       diffRefreshKey++;
+      // Only close modal if rebase succeeded without conflicts
+      if (rebaseResult?.success && !rebaseResult?.conflicts?.length) {
+        dispatch('updated', response.card);
+      }
     } catch (e) {
       // Show error but don't close modal
       alert(e instanceof Error ? e.message : 'Rebase failed');
@@ -180,6 +183,27 @@
   function handleCancelConflictResolution() {
     // Reset merge result to clear conflicts
     mergeResult = null;
+  }
+
+  async function handleResolveRebaseConflicts(resolutions: Array<{ path: string; content: string }>) {
+    if (!card) return;
+    submitting = true;
+    try {
+      const response = await cardsStore.resolveRebaseConflicts(card.id, selectedTargetBranch || undefined, resolutions);
+      rebaseResult = response.rebase_result;
+      // Force diff to reload after conflict resolution
+      diffRefreshKey++;
+      dispatch('updated', response.card);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Conflict resolution failed');
+    } finally {
+      submitting = false;
+    }
+  }
+
+  function handleCancelRebaseConflictResolution() {
+    // Reset rebase result to clear conflicts
+    rebaseResult = null;
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -299,13 +323,14 @@
 
         {#if rebaseResult}
           {#if rebaseResult.conflicts && rebaseResult.conflicts.length > 0}
-            <div class="rebase-conflicts-notice">
-              <div class="notice-icon">⚠️</div>
-              <div class="notice-info">
-                <div class="notice-message">Rebase would cause conflicts. Please resolve conflicts manually or try a different approach.</div>
-                <div class="notice-detail">Conflicted files: {rebaseResult.conflicts.map(c => c.path).join(', ')}</div>
-              </div>
-            </div>
+            <ConflictResolver
+              conflicts={rebaseResult.conflicts}
+              onResolve={handleResolveRebaseConflicts}
+              onCancel={handleCancelRebaseConflictResolution}
+              operation="rebase"
+              sourceBranch={card.branch_name || 'feature'}
+              targetBranch={baseBranch}
+            />
           {:else}
             <div class="rebase-result" class:success={rebaseResult.success}>
               <div class="result-icon">{rebaseResult.success ? '✓' : '✗'}</div>
@@ -325,6 +350,9 @@
               conflicts={mergeResult.conflicts}
               onResolve={handleResolveConflicts}
               onCancel={handleCancelConflictResolution}
+              operation="merge"
+              sourceBranch={card?.branch_name || 'feature'}
+              targetBranch={baseBranch}
             />
           {:else}
             <div class="merge-result" class:success={mergeResult.success}>
@@ -430,11 +458,18 @@
   .modal {
     background: var(--surface-color, #1e1e2e);
     border-radius: 12px;
-    width: 100%;
-    max-width: 800px;
+    width: calc(100% - 2rem);
+    max-width: min(1400px, 95vw);
     max-height: 90vh;
     overflow-y: auto;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  }
+
+  @media (max-width: 900px) {
+    .modal {
+      max-width: 100%;
+      border-radius: 8px;
+    }
   }
 
   .modal-header {
@@ -624,7 +659,7 @@
     cursor: not-allowed;
   }
 
-  .rebase-result, .rebase-conflicts-notice {
+  .rebase-result {
     display: flex;
     align-items: flex-start;
     gap: 0.75rem;
@@ -640,12 +675,7 @@
     background: rgba(166, 227, 161, 0.1);
   }
 
-  .rebase-conflicts-notice {
-    border-color: #f9e2af;
-    background: rgba(249, 226, 175, 0.1);
-  }
-
-  .result-icon, .notice-icon {
+  .result-icon {
     font-size: 1.25rem;
     line-height: 1;
   }

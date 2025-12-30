@@ -123,7 +123,7 @@
           <span class="commits">{diff.commit_count} commit{diff.commit_count !== 1 ? 's' : ''}</span>
           <span class="additions">+{diff.total_additions}</span>
           <span class="deletions">-{diff.total_deletions}</span>
-          <button class="btn-refresh" on:click={refresh} title="Refresh diff">↻</button>
+          <button type="button" class="btn-refresh" on:click={refresh} title="Refresh diff">↻</button>
         </span>
       </div>
     </div>
@@ -135,6 +135,7 @@
         {#each diff.files as file}
           <div class="file-item">
             <button
+              type="button"
               class="file-header"
               on:click={() => toggleFile(file.path)}
             >

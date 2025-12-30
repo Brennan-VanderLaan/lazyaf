@@ -131,3 +131,13 @@ export function getJobForCard(cardId: string) {
     return latestJob;
   });
 }
+
+// Derived store to check if any jobs are currently running
+export const hasRunningJobs = derived(jobsStore, ($jobs) => {
+  for (const job of $jobs.values()) {
+    if (job.status === 'running' || job.status === 'queued') {
+      return true;
+    }
+  }
+  return false;
+});

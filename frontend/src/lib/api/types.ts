@@ -161,3 +161,24 @@ export interface ApproveResponse {
   card: Card;
   merge_result: MergeResult | null;
 }
+
+export interface AgentFile {
+  id: string;
+  name: string;
+  content: string;
+  description: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentFileCreate {
+  name: string;
+  content: string;
+  description?: string | null;
+}
+
+export interface AgentFileUpdate {
+  name?: string;
+  content?: string;
+  description?: string | null;
+}

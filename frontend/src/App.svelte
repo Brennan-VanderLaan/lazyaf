@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import RepoSelector from './lib/components/RepoSelector.svelte';
   import RunnerPanel from './lib/components/RunnerPanel.svelte';
+  import AgentPanel from './lib/components/AgentPanel.svelte';
   import Board from './lib/components/Board.svelte';
   import { websocketStore } from './lib/stores/websocket';
   import { hasRunningJobs } from './lib/stores/jobs';
@@ -23,6 +24,7 @@
     </div>
     <RepoSelector />
     <RunnerPanel />
+    <AgentPanel />
   </aside>
 
   <main class="main">

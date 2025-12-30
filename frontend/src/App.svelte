@@ -1,7 +1,17 @@
 <script lang="ts">
+  import { onMount, onDestroy } from 'svelte';
   import RepoSelector from './lib/components/RepoSelector.svelte';
   import RunnerPanel from './lib/components/RunnerPanel.svelte';
   import Board from './lib/components/Board.svelte';
+  import { websocketStore } from './lib/stores/websocket';
+
+  onMount(() => {
+    websocketStore.connect();
+  });
+
+  onDestroy(() => {
+    websocketStore.disconnect();
+  });
 </script>
 
 <div class="app">

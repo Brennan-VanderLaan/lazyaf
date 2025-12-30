@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
-  import type { Card, CardStatus, BranchInfo, MergeResult } from '../api/types';
+  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
   import { repos } from '../api/client';
@@ -16,6 +16,7 @@
   let loadingBranches = false;
   let selectedTargetBranch: string = '';
   let mergeResult: MergeResult | null = null;
+  let rebaseResult: RebaseResult | null = null;
 
   $: showDiff = card?.branch_name && (card?.status === 'in_review' || card?.status === 'done' || card?.status === 'failed');
   $: baseBranch = selectedTargetBranch || $selectedRepo?.default_branch || 'main';
@@ -37,6 +38,7 @@
   $: canApprove = card?.status === 'in_review';
   $: canReject = card?.status === 'in_review' || card?.status === 'in_progress';
   $: canRetry = card?.status === 'failed' || card?.status === 'in_review';
+  $: canRebase = card?.branch_name && (card?.status === 'in_progress' || card?.status === 'in_review');
 
   onMount(async () => {
     if ($selectedRepo?.is_ingested) {
@@ -132,6 +134,22 @@
     try {
       const updated = await cardsStore.retry(card.id);
       dispatch('updated', updated);
+    } finally {
+      submitting = false;
+    }
+  }
+
+  async function handleRebase() {
+    if (!card) return;
+    submitting = true;
+    rebaseResult = null;
+    try {
+      const response = await cardsStore.rebase(card.id, selectedTargetBranch || undefined);
+      rebaseResult = response.rebase_result;
+      dispatch('updated', response.card);
+    } catch (e) {
+      // Show error but don't close modal
+      alert(e instanceof Error ? e.message : 'Rebase failed');
     } finally {
       submitting = false;
     }
@@ -240,22 +258,57 @@
           <div class="diff-section">
             <div class="diff-header">
               <h3>Code Changes</h3>
-              {#if nonCardBranches.length > 0 && card.status === 'in_review'}
-                <div class="branch-selector">
-                  <label for="target-branch">Merge into:</label>
-                  <select id="target-branch" bind:value={selectedTargetBranch}>
-                    {#each nonCardBranches as branch}
-                      <option value={branch.name}>
-                        {branch.name}
-                        {branch.is_default ? ' (default)' : ''}
-                      </option>
-                    {/each}
-                  </select>
-                </div>
-              {/if}
+              <div class="diff-header-actions">
+                {#if nonCardBranches.length > 0 && (card.status === 'in_review' || card.status === 'in_progress')}
+                  <div class="branch-selector">
+                    <label for="target-branch">Target branch:</label>
+                    <select id="target-branch" bind:value={selectedTargetBranch}>
+                      {#each nonCardBranches as branch}
+                        <option value={branch.name}>
+                          {branch.name}
+                          {branch.is_default ? ' (default)' : ''}
+                        </option>
+                      {/each}
+                    </select>
+                  </div>
+                {/if}
+                {#if canRebase}
+                  <button
+                    type="button"
+                    class="btn-rebase"
+                    on:click={handleRebase}
+                    disabled={submitting}
+                    title="Pull in latest changes from target branch"
+                  >
+                    Update Branch
+                  </button>
+                {/if}
+              </div>
             </div>
             <DiffViewer {repoId} {baseBranch} headBranch={card.branch_name} />
           </div>
+        {/if}
+
+        {#if rebaseResult}
+          {#if rebaseResult.conflicts && rebaseResult.conflicts.length > 0}
+            <div class="rebase-conflicts-notice">
+              <div class="notice-icon">⚠️</div>
+              <div class="notice-info">
+                <div class="notice-message">Rebase would cause conflicts. Please resolve conflicts manually or try a different approach.</div>
+                <div class="notice-detail">Conflicted files: {rebaseResult.conflicts.map(c => c.path).join(', ')}</div>
+              </div>
+            </div>
+          {:else}
+            <div class="rebase-result" class:success={rebaseResult.success}>
+              <div class="result-icon">{rebaseResult.success ? '✓' : '✗'}</div>
+              <div class="result-info">
+                <div class="result-message">{rebaseResult.message}</div>
+                {#if rebaseResult.new_sha}
+                  <div class="result-sha">New commit: <code>{rebaseResult.new_sha.slice(0, 8)}</code></div>
+                {/if}
+              </div>
+            </div>
+          {/if}
         {/if}
 
         {#if mergeResult}
@@ -510,6 +563,13 @@
     color: var(--text-color, #cdd6f4);
   }
 
+  .diff-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
   .branch-selector {
     display: flex;
     align-items: center;
@@ -534,6 +594,79 @@
   .branch-selector select:focus {
     outline: none;
     border-color: var(--primary-color, #89b4fa);
+  }
+
+  .btn-rebase {
+    padding: 0.4rem 0.75rem;
+    background: #89b4fa;
+    color: #1e1e2e;
+    border: none;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .btn-rebase:hover:not(:disabled) {
+    opacity: 0.9;
+  }
+
+  .btn-rebase:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .rebase-result, .rebase-conflicts-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 1rem;
+    margin-top: 1rem;
+    background: var(--surface-alt, #181825);
+    border-radius: 8px;
+    border: 1px solid var(--border-color, #45475a);
+  }
+
+  .rebase-result.success {
+    border-color: var(--success-color, #a6e3a1);
+    background: rgba(166, 227, 161, 0.1);
+  }
+
+  .rebase-conflicts-notice {
+    border-color: #f9e2af;
+    background: rgba(249, 226, 175, 0.1);
+  }
+
+  .result-icon, .notice-icon {
+    font-size: 1.25rem;
+    line-height: 1;
+  }
+
+  .rebase-result.success .result-icon {
+    color: var(--success-color, #a6e3a1);
+  }
+
+  .result-info, .notice-info {
+    flex: 1;
+  }
+
+  .result-message, .notice-message {
+    font-weight: 500;
+    color: var(--text-color, #cdd6f4);
+    margin-bottom: 0.25rem;
+  }
+
+  .result-sha, .notice-detail {
+    font-size: 0.8rem;
+    color: var(--text-muted, #6c7086);
+  }
+
+  .result-sha code, .notice-detail {
+    font-family: monospace;
+    background: var(--badge-bg, #313244);
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    color: var(--primary-color, #89b4fa);
   }
 
   .merge-result {

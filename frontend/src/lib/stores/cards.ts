@@ -1,5 +1,5 @@
 import { writable, derived } from 'svelte/store';
-import type { Card, CardCreate, CardUpdate, CardStatus, ApproveResponse } from '../api/types';
+import type { Card, CardCreate, CardUpdate, CardStatus, ApproveResponse, RebaseResponse } from '../api/types';
 import { cards as cardsApi } from '../api/client';
 import { selectedRepoId } from './repos';
 
@@ -105,6 +105,18 @@ function createCardsStore() {
         return card;
       } catch (e) {
         error.set(e instanceof Error ? e.message : 'Failed to retry card');
+        throw e;
+      }
+    },
+
+    async rebase(id: string, ontoBranch?: string): Promise<RebaseResponse> {
+      error.set(null);
+      try {
+        const response = await cardsApi.rebase(id, ontoBranch);
+        update(cards => cards.map(c => c.id === id ? response.card : c));
+        return response;
+      } catch (e) {
+        error.set(e instanceof Error ? e.message : 'Failed to rebase card');
         throw e;
       }
     },

@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, AgentFile, AgentFileCreate, AgentFileUpdate } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate } from './types';
 
 const BASE_URL = '/api';
 
@@ -68,6 +68,10 @@ export const cards = {
   }),
   reject: (id: string) => request<Card>(`/cards/${id}/reject`, { method: 'POST' }),
   retry: (id: string) => request<Card>(`/cards/${id}/retry`, { method: 'POST' }),
+  rebase: (id: string, ontoBranch?: string) => request<RebaseResponse>(`/cards/${id}/rebase`, {
+    method: 'POST',
+    body: JSON.stringify({ onto_branch: ontoBranch || null }),
+  }),
   resolveConflicts: (id: string, targetBranch: string | undefined, resolutions: Array<{ path: string; content: string }>) =>
     request<ApproveResponse>(`/cards/${id}/resolve-conflicts`, {
       method: 'POST',

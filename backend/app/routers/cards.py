@@ -47,6 +47,8 @@ async def create_card(repo_id: str, card: CardCreate, db: AsyncSession = Depends
         "branch_name": db_card.branch_name,
         "pr_url": db_card.pr_url,
         "job_id": db_card.job_id,
+        "created_at": db_card.created_at.isoformat(),
+        "updated_at": db_card.updated_at.isoformat(),
     })
 
     return db_card
@@ -87,6 +89,8 @@ async def update_card(card_id: str, update: CardUpdate, db: AsyncSession = Depen
         "branch_name": card.branch_name,
         "pr_url": card.pr_url,
         "job_id": card.job_id,
+        "created_at": card.created_at.isoformat(),
+        "updated_at": card.updated_at.isoformat(),
     })
 
     return card
@@ -200,6 +204,8 @@ async def start_card(
         "branch_name": card.branch_name,
         "pr_url": card.pr_url,
         "job_id": card.job_id,
+        "created_at": card.created_at.isoformat(),
+        "updated_at": card.updated_at.isoformat(),
     })
 
     return card
@@ -281,6 +287,8 @@ async def approve_card(
         "branch_name": card.branch_name,
         "pr_url": card.pr_url,
         "job_id": card.job_id,
+        "created_at": card.created_at.isoformat(),
+        "updated_at": card.updated_at.isoformat(),
     })
 
     return {
@@ -314,6 +322,8 @@ async def reject_card(card_id: str, db: AsyncSession = Depends(get_db)):
         "branch_name": card.branch_name,
         "pr_url": card.pr_url,
         "job_id": card.job_id,
+        "created_at": card.created_at.isoformat(),
+        "updated_at": card.updated_at.isoformat(),
     })
 
     return card
@@ -381,6 +391,8 @@ async def resolve_conflicts(
         "branch_name": card.branch_name,
         "pr_url": card.pr_url,
         "job_id": card.job_id,
+        "created_at": card.created_at.isoformat(),
+        "updated_at": card.updated_at.isoformat(),
     })
 
     return {
@@ -462,6 +474,8 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
         "branch_name": card.branch_name,
         "pr_url": card.pr_url,
         "job_id": card.job_id,
+        "created_at": card.created_at.isoformat(),
+        "updated_at": card.updated_at.isoformat(),
     })
 
     return card

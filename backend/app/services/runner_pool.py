@@ -30,7 +30,7 @@ class RunnerInfo:
 
 class RunnerPool:
     RUNNER_IMAGE = "lazyaf-runner:latest"
-    HEARTBEAT_TIMEOUT = 60  # seconds - allow for some latency in heartbeat delivery
+    HEARTBEAT_TIMEOUT = 90  # seconds - allow for network delays and polling intervals
 
     def __init__(self):
         self._runners: dict[str, RunnerInfo] = {}
@@ -61,7 +61,7 @@ class RunnerPool:
         """Periodically clean up dead runners."""
         while self._running:
             try:
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)  # Check every 30 seconds
                 self._cleanup_dead_runners()
             except asyncio.CancelledError:
                 break
@@ -73,7 +73,8 @@ class RunnerPool:
         now = datetime.utcnow()
         for runner in self._runners.values():
             if runner.status != "offline" and not runner.is_alive(self.HEARTBEAT_TIMEOUT):
-                logger.warning(f"Runner {runner.id} timed out, marking offline")
+                time_since_heartbeat = (now - runner.last_heartbeat).total_seconds()
+                logger.warning(f"Runner {runner.id} ({runner.name}) timed out after {time_since_heartbeat:.0f}s, marking offline")
                 runner.status = "offline"
                 # If it had a job, put it back in the queue
                 if runner.current_job:

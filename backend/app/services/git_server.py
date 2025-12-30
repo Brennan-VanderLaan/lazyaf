@@ -502,7 +502,8 @@ class HTTPGitBackend:
         if not refs:
             # Empty repo - send capabilities with zero-id
             if service == "git-upload-pack":
-                caps = b"multi_ack multi_ack_detailed thin-pack side-band side-band-64k ofs-delta shallow no-progress no-done"
+                # Simple capabilities - avoid multi_ack_detailed for simpler negotiation
+                caps = b"thin-pack side-band side-band-64k ofs-delta shallow no-progress"
             else:
                 # No side-band for receive-pack - simpler response handling
                 caps = b"report-status delete-refs ofs-delta"
@@ -512,7 +513,8 @@ class HTTPGitBackend:
             # Send refs with capabilities on first line
             first = True
             if service == "git-upload-pack":
-                caps = b"multi_ack multi_ack_detailed thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag allow-tip-sha1-in-want allow-reachable-sha1-in-want no-done"
+                # Simple capabilities - avoid multi_ack_detailed for simpler negotiation
+                caps = b"thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag allow-tip-sha1-in-want allow-reachable-sha1-in-want"
             else:
                 # No side-band for receive-pack - simpler response handling
                 caps = b"report-status delete-refs ofs-delta"
@@ -691,11 +693,12 @@ class HTTPGitBackend:
                 pack_bytes = pack_content + checksum
                 print(f"[git_server] pack size: {len(pack_bytes)} bytes")
 
-                # Send NAK (we don't do proper negotiation for simplicity)
+                # Send NAK before pack data (simple protocol without multi_ack)
+                output.write(pkt_line(b"NAK\n"))
+                print(f"[git_server] sent NAK")
+
                 if use_sideband:
                     # Sideband: band 1 = pack data, band 2 = progress
-                    output.write(pkt_line(b"NAK\n"))
-
                     # Send pack data through sideband
                     # Max pkt-line = 65520 (0xfff0), minus 4 for length, minus 1 for band = 65515
                     chunk_size = 65515
@@ -709,8 +712,7 @@ class HTTPGitBackend:
 
                     output.write(b"0000")  # Flush
                 else:
-                    # No sideband - just send NAK and pack data directly
-                    output.write(pkt_line(b"NAK\n"))
+                    # No sideband - just send pack data directly
                     output.write(pack_bytes)
                     output.write(b"0000")
 

@@ -107,12 +107,25 @@
     flex: 1;
     display: flex;
     flex-direction: column;
-    padding: 1.5rem;
+    padding: 1.5rem 2rem;
     overflow: hidden;
-    max-width: 100%;
+    width: 100%;
+    min-width: 0;
+  }
+
+  @media (min-width: 1800px) {
+    .board-container {
+      padding: 2rem 3rem;
+    }
   }
 
   @media (max-width: 1200px) {
+    .board-container {
+      padding: 1rem 1.5rem;
+    }
+  }
+
+  @media (max-width: 768px) {
     .board-container {
       padding: 1rem;
     }
@@ -186,24 +199,32 @@
 
   .board {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    gap: 1.25rem;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1.5rem;
     flex: 1;
     overflow-x: auto;
     overflow-y: hidden;
     padding-bottom: 1rem;
     align-items: start;
+    min-width: 0;
   }
 
-  @media (min-width: 1400px) {
+  @media (min-width: 1800px) {
     .board {
-      grid-template-columns: repeat(4, 1fr);
+      gap: 2rem;
     }
   }
 
-  @media (max-width: 1200px) {
+  @media (max-width: 1400px) {
     .board {
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      grid-template-columns: repeat(4, minmax(260px, 1fr));
+      gap: 1.25rem;
+    }
+  }
+
+  @media (max-width: 1100px) {
+    .board {
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
       gap: 1rem;
     }
   }

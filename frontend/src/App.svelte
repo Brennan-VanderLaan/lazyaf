@@ -102,9 +102,9 @@
   }
 
   .sidebar {
-    width: 280px;
+    width: 320px;
     min-width: 280px;
-    max-width: 320px;
+    max-width: 360px;
     background: var(--surface-color);
     border-right: 1px solid var(--border-color);
     display: flex;
@@ -113,16 +113,22 @@
     flex-shrink: 0;
   }
 
+  @media (min-width: 1600px) {
+    .sidebar {
+      width: 340px;
+    }
+  }
+
   @media (max-width: 1200px) {
     .sidebar {
-      width: 260px;
+      width: 280px;
       min-width: 260px;
     }
   }
 
   @media (max-width: 768px) {
     .sidebar {
-      width: 240px;
+      width: 260px;
       min-width: 240px;
     }
   }

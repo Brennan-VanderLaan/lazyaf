@@ -8,6 +8,7 @@
 
   let selectedCard: Card | null = null;
   let showCreateModal = false;
+  let searchQuery = '';
 
   const columns: { status: CardStatus; title: string }[] = [
     { status: 'todo', title: 'To Do' },
@@ -21,6 +22,21 @@
   } else {
     cardsStore.clear();
   }
+
+  $: filteredCardsByStatus = Object.fromEntries(
+    Object.entries($cardsByStatus).map(([status, cards]) => [
+      status,
+      cards.filter(card => {
+        if (!searchQuery.trim()) return true;
+        const query = searchQuery.toLowerCase();
+        return (
+          card.title.toLowerCase().includes(query) ||
+          (card.description && card.description.toLowerCase().includes(query)) ||
+          (card.branch_name && card.branch_name.toLowerCase().includes(query))
+        );
+      })
+    ])
+  ) as typeof $cardsByStatus;
 
   async function handleDrop(e: CustomEvent<{ cardId: string; status: CardStatus }>) {
     const { cardId, status } = e.detail;
@@ -42,9 +58,17 @@
         <h1>{$selectedRepo.name}</h1>
         <span class="branch-badge"><span class="pin-icon">📍</span> {$selectedRepo.default_branch}</span>
       </div>
-      <button class="btn-create" on:click={() => showCreateModal = true}>
-        + New Card
-      </button>
+      <div class="board-actions">
+        <input
+          type="text"
+          class="search-input"
+          placeholder="Search cards..."
+          bind:value={searchQuery}
+        />
+        <button class="btn-create" on:click={() => showCreateModal = true}>
+          + New Card
+        </button>
+      </div>
     </div>
 
     <div class="board">
@@ -52,21 +76,21 @@
         <Column
           {status}
           {title}
-          cards={$cardsByStatus[status]}
+          cards={filteredCardsByStatus[status]}
           on:cardclick={handleCardClick}
           on:drop={handleDrop}
         />
       {/each}
     </div>
 
-    {#if $cardsByStatus.failed.length > 0}
+    {#if filteredCardsByStatus.failed.length > 0}
       <div class="failed-section">
         <h2>Failed</h2>
         <div class="failed-cards">
           <Column
             status="failed"
             title="Failed"
-            cards={$cardsByStatus.failed}
+            cards={filteredCardsByStatus.failed}
             on:cardclick={handleCardClick}
             on:drop={handleDrop}
           />
@@ -117,6 +141,7 @@
     .board-container {
       padding: 2rem 3rem;
     }
+    min-height: 0;
   }
 
   @media (max-width: 1200px) {
@@ -145,6 +170,34 @@
     align-items: center;
     gap: 1rem;
     flex-wrap: wrap;
+  }
+
+  .board-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  .search-input {
+    padding: 0.7rem 1rem;
+    background: var(--input-bg, #1e1e2e);
+    border: 1px solid var(--border-color, #45475a);
+    border-radius: 8px;
+    color: var(--text-color, #cdd6f4);
+    font-size: 0.95rem;
+    min-width: 200px;
+    transition: all 0.2s ease;
+  }
+
+  .search-input:focus {
+    outline: none;
+    border-color: var(--primary-color, #89b4fa);
+    box-shadow: 0 0 0 3px rgba(137, 180, 250, 0.1);
+  }
+
+  .search-input::placeholder {
+    color: var(--text-muted, #6c7086);
   }
 
   .board-info h1 {
@@ -209,7 +262,8 @@
     overflow-x: auto;
     overflow-y: hidden;
     padding-bottom: 1rem;
-    align-items: start;
+    align-items: stretch;
+    min-height: 0;
     min-width: 0;
   }
 

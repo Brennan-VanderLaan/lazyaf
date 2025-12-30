@@ -260,7 +260,6 @@
     gap: 1.5rem;
     flex: 1;
     overflow-x: auto;
-    overflow-y: hidden;
     padding-bottom: 1rem;
     align-items: stretch;
     min-height: 0;

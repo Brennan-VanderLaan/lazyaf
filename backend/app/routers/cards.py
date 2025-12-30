@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Card, Repo, Job
+from app.models import Card, Repo, Job, AgentFile
 from app.schemas import CardCreate, CardRead, CardUpdate
 from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
@@ -77,9 +77,19 @@ async def delete_card(card_id: str, db: AsyncSession = Depends(get_db)):
     await db.commit()
 
 
+class StartCardRequest(BaseModel):
+    agent_file_ids: list[str] = []
+
+
 @router.post("/api/cards/{card_id}/start", response_model=CardRead)
-async def start_card(card_id: str, db: AsyncSession = Depends(get_db)):
+async def start_card(
+    card_id: str,
+    request: StartCardRequest = None,
+    db: AsyncSession = Depends(get_db)
+):
     """Trigger agent work on this card."""
+    if request is None:
+        request = StartCardRequest()
     result = await db.execute(select(Card).where(Card.id == card_id))
     card = result.scalar_one_or_none()
     if not card:
@@ -100,6 +110,18 @@ async def start_card(card_id: str, db: AsyncSession = Depends(get_db)):
             status_code=400,
             detail="Repo must be ingested before starting work. Use the CLI to ingest the repo first."
         )
+
+    # Validate agent file IDs
+    if request.agent_file_ids:
+        result = await db.execute(select(AgentFile).where(AgentFile.id.in_(request.agent_file_ids)))
+        existing_agent_files = result.scalars().all()
+        existing_ids = {af.id for af in existing_agent_files}
+        missing_ids = set(request.agent_file_ids) - existing_ids
+        if missing_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Agent files not found: {', '.join(missing_ids)}"
+            )
 
     # Create a job in the database
     job_id = str(uuid4())
@@ -125,6 +147,7 @@ async def start_card(card_id: str, db: AsyncSession = Depends(get_db)):
         card_title=card.title,
         card_description=card.description,
         use_internal_git=True,  # Always use internal git for ingested repos
+        agent_file_ids=request.agent_file_ids,
     )
     await job_queue.enqueue(queued_job)
 

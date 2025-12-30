@@ -20,6 +20,7 @@ class QueuedJob:
     card_description: str
     repo_path: str | None = None  # Deprecated, not used with internal git
     use_internal_git: bool = False  # When True, runner clones from internal git server
+    agent_file_ids: list[str] = field(default_factory=list)  # List of agent file IDs to mount
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 

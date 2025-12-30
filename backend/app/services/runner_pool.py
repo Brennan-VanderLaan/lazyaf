@@ -80,9 +80,24 @@ class RunnerPool:
                     asyncio.create_task(job_queue.enqueue(runner.current_job))
                     runner.current_job = None
 
-    def register(self, name: str | None = None) -> RunnerInfo:
-        """Register a new runner."""
-        runner_id = str(uuid4())
+    def register(self, runner_id: str | None = None, name: str | None = None) -> RunnerInfo:
+        """Register a runner. If runner_id is provided and exists, reactivate it."""
+        # Use provided ID or generate a new one
+        if runner_id is None:
+            runner_id = str(uuid4())
+
+        # Check if runner already exists (reconnection case)
+        if runner_id in self._runners:
+            runner = self._runners[runner_id]
+            runner.last_heartbeat = datetime.utcnow()
+            runner.status = "idle"
+            # Update name if provided
+            if name:
+                runner.name = name
+            logger.info(f"Runner {runner_id} ({runner.name}) reconnected")
+            return runner
+
+        # Create new runner
         runner = RunnerInfo(id=runner_id, name=name)
         self._runners[runner_id] = runner
         logger.info(f"Runner {runner_id} ({runner.name}) registered")

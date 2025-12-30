@@ -10,6 +10,7 @@ import sys
 import time
 import threading
 from pathlib import Path
+from uuid import uuid4
 
 import requests
 
@@ -20,6 +21,10 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 HEARTBEAT_INTERVAL = 10  # Send heartbeat every 10 seconds during job execution
 RECONNECT_INTERVAL = 5  # Seconds between reconnect attempts
 MAX_RECONNECT_BACKOFF = 60  # Maximum backoff for reconnection attempts
+
+# Generate persistent runner ID for lifetime of this process
+# This allows reconnection without getting a new ID each time
+RUNNER_UUID = str(uuid4())
 
 # Global state
 runner_id = None
@@ -43,12 +48,12 @@ def log(msg: str):
 
 
 def register():
-    """Register with the backend."""
+    """Register with the backend using our persistent UUID."""
     global runner_id
     try:
         response = session.post(
             f"{BACKEND_URL}/api/runners/register",
-            json={"name": RUNNER_NAME},
+            json={"runner_id": RUNNER_UUID, "name": RUNNER_NAME},
             timeout=10,
         )
         response.raise_for_status()
@@ -519,6 +524,7 @@ def main():
     global runner_id
 
     log(f"LazyAF Runner starting...")
+    log(f"Runner UUID: {RUNNER_UUID}")
     log(f"Backend URL: {BACKEND_URL}")
 
     # Main loop with auto-reconnect

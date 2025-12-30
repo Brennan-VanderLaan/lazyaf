@@ -143,6 +143,218 @@ class GitRepoManager:
 
         return commits
 
+    def merge_branch(self, repo_id: str, source_branch: str, target_branch: str,
+                     author: str = "LazyAF <lazyaf@localhost>") -> dict:
+        """
+        Merge source_branch into target_branch.
+
+        Returns dict with:
+            - success: bool
+            - merge_type: 'fast-forward' | 'merge' | None
+            - message: str
+            - new_sha: str | None (commit sha after merge)
+            - error: str | None
+        """
+        from dulwich.objects import Commit
+        import time
+
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"success": False, "error": "Repo not found", "merge_type": None, "new_sha": None, "message": ""}
+
+        source_sha = self.get_branch_commit(repo_id, source_branch)
+        target_sha = self.get_branch_commit(repo_id, target_branch)
+
+        if not source_sha:
+            return {"success": False, "error": f"Branch '{source_branch}' not found", "merge_type": None, "new_sha": None, "message": ""}
+        if not target_sha:
+            return {"success": False, "error": f"Branch '{target_branch}' not found", "merge_type": None, "new_sha": None, "message": ""}
+
+        if source_sha == target_sha:
+            return {"success": True, "merge_type": None, "new_sha": target_sha, "message": "Already up to date", "error": None}
+
+        try:
+            source_commit = repo.object_store[source_sha.encode('ascii')]
+            target_commit = repo.object_store[target_sha.encode('ascii')]
+
+            # Check if fast-forward is possible (target is ancestor of source)
+            if self._is_ancestor(repo, target_sha, source_sha):
+                # Fast-forward: just update the target ref to point to source
+                target_ref = f"refs/heads/{target_branch}".encode()
+                repo.refs[target_ref] = source_sha.encode('ascii')
+                print(f"[git_server] fast-forward merge: {target_branch} -> {source_sha[:8]}")
+                return {
+                    "success": True,
+                    "merge_type": "fast-forward",
+                    "new_sha": source_sha,
+                    "message": f"Fast-forward merge of {source_branch} into {target_branch}",
+                    "error": None
+                }
+
+            # Check for merge conflicts by comparing trees
+            source_tree = repo.object_store[source_commit.tree]
+            target_tree = repo.object_store[target_commit.tree]
+
+            # Find merge base
+            merge_base_sha = self._find_merge_base(repo, source_sha, target_sha)
+            if not merge_base_sha:
+                return {
+                    "success": False,
+                    "error": "Cannot find common ancestor for merge",
+                    "merge_type": None,
+                    "new_sha": None,
+                    "message": ""
+                }
+
+            merge_base_commit = repo.object_store[merge_base_sha.encode('ascii')]
+            merge_base_tree = repo.object_store[merge_base_commit.tree]
+
+            # Attempt three-way merge of trees
+            merged_tree_sha, conflicts = self._merge_trees(
+                repo, merge_base_tree.id, target_tree.id, source_tree.id
+            )
+
+            if conflicts:
+                return {
+                    "success": False,
+                    "error": f"Merge conflicts in: {', '.join(conflicts)}",
+                    "merge_type": None,
+                    "new_sha": None,
+                    "message": ""
+                }
+
+            # Create merge commit
+            commit = Commit()
+            commit.tree = merged_tree_sha
+            commit.parents = [target_sha.encode('ascii'), source_sha.encode('ascii')]
+            commit.author = author.encode('utf-8')
+            commit.committer = author.encode('utf-8')
+            commit.commit_time = commit.author_time = int(time.time())
+            commit.commit_timezone = commit.author_timezone = 0
+            commit.encoding = b'UTF-8'
+            commit.message = f"Merge branch '{source_branch}' into {target_branch}\n".encode('utf-8')
+
+            # Add commit to object store
+            repo.object_store.add_object(commit)
+
+            # Update target branch ref
+            target_ref = f"refs/heads/{target_branch}".encode()
+            repo.refs[target_ref] = commit.id
+
+            print(f"[git_server] merge commit created: {commit.id.decode('ascii')[:8]}")
+            return {
+                "success": True,
+                "merge_type": "merge",
+                "new_sha": commit.id.decode('ascii'),
+                "message": f"Merged {source_branch} into {target_branch}",
+                "error": None
+            }
+
+        except Exception as e:
+            import traceback
+            print(f"[git_server] merge error: {e}")
+            traceback.print_exc()
+            return {"success": False, "error": str(e), "merge_type": None, "new_sha": None, "message": ""}
+
+    def _is_ancestor(self, repo, ancestor_sha: str, descendant_sha: str) -> bool:
+        """Check if ancestor_sha is an ancestor of descendant_sha."""
+        from dulwich.walk import Walker
+
+        try:
+            walker = Walker(repo.object_store, [descendant_sha.encode('ascii')], max_entries=1000)
+            for entry in walker:
+                if entry.commit.id.decode('ascii') == ancestor_sha:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _find_merge_base(self, repo, sha1: str, sha2: str) -> str | None:
+        """Find the common ancestor (merge base) of two commits."""
+        from dulwich.walk import Walker
+
+        try:
+            # Get all ancestors of sha1
+            ancestors1 = set()
+            walker = Walker(repo.object_store, [sha1.encode('ascii')], max_entries=1000)
+            for entry in walker:
+                ancestors1.add(entry.commit.id.decode('ascii'))
+
+            # Find first ancestor of sha2 that's also in ancestors1
+            walker = Walker(repo.object_store, [sha2.encode('ascii')], max_entries=1000)
+            for entry in walker:
+                commit_sha = entry.commit.id.decode('ascii')
+                if commit_sha in ancestors1:
+                    return commit_sha
+        except Exception as e:
+            print(f"[git_server] merge base error: {e}")
+        return None
+
+    def _merge_trees(self, repo, base_tree_sha, ours_tree_sha, theirs_tree_sha) -> tuple[bytes, list[str]]:
+        """
+        Perform a three-way merge of trees.
+
+        Returns (merged_tree_sha, list_of_conflicts)
+        For simplicity, this does a tree-level merge:
+        - If file unchanged in ours, take theirs
+        - If file unchanged in theirs, take ours
+        - If both changed the same way, take either
+        - If both changed differently, conflict
+        """
+        from dulwich.objects import Tree
+        from dulwich.diff_tree import tree_changes
+
+        base_tree = repo.object_store[base_tree_sha]
+        ours_tree = repo.object_store[ours_tree_sha]
+        theirs_tree = repo.object_store[theirs_tree_sha]
+
+        # Get all entries from both sides
+        base_entries = {e.path: (e.mode, e.sha) for e in base_tree.items()}
+        ours_entries = {e.path: (e.mode, e.sha) for e in ours_tree.items()}
+        theirs_entries = {e.path: (e.mode, e.sha) for e in theirs_tree.items()}
+
+        all_paths = set(base_entries.keys()) | set(ours_entries.keys()) | set(theirs_entries.keys())
+
+        merged_entries = {}
+        conflicts = []
+
+        for path in all_paths:
+            base = base_entries.get(path)
+            ours = ours_entries.get(path)
+            theirs = theirs_entries.get(path)
+
+            if ours == theirs:
+                # Both sides same - use either (or None if both deleted)
+                if ours:
+                    merged_entries[path] = ours
+            elif ours == base:
+                # Ours unchanged from base, take theirs
+                if theirs:
+                    merged_entries[path] = theirs
+                # else: theirs deleted it, so don't include
+            elif theirs == base:
+                # Theirs unchanged from base, take ours
+                if ours:
+                    merged_entries[path] = ours
+                # else: ours deleted it, so don't include
+            else:
+                # Both changed - conflict
+                conflicts.append(path.decode('utf-8', errors='replace'))
+                # For now, take theirs (source branch) on conflict
+                # A real implementation would create conflict markers
+                if theirs:
+                    merged_entries[path] = theirs
+                elif ours:
+                    merged_entries[path] = ours
+
+        # Build merged tree
+        merged_tree = Tree()
+        for path, (mode, sha) in sorted(merged_entries.items()):
+            merged_tree.add(path, mode, sha)
+
+        repo.object_store.add_object(merged_tree)
+        return merged_tree.id, conflicts
+
     def get_diff(self, repo_id: str, base_branch: str, head_branch: str) -> dict:
         """Get diff between two branches."""
         from dulwich.diff_tree import tree_changes
@@ -650,6 +862,7 @@ class HTTPGitBackend:
                 return output.getvalue()
 
             # Apply ref updates
+            first_branch_pushed = None
             for old_sha, new_sha, ref_name in ref_updates:
                 try:
                     # Convert hex to bytes if needed
@@ -657,6 +870,11 @@ class HTTPGitBackend:
                         repo.refs[ref_name] = new_sha
                         print(f"[git_server] updated ref {ref_name.decode()}")
                         output_lines.append(f"ok {ref_name.decode()}")
+                        # Track first non-lazyaf branch for HEAD
+                        if ref_name.startswith(b'refs/heads/') and not first_branch_pushed:
+                            branch_name = ref_name[11:].decode()
+                            if not branch_name.startswith('lazyaf/'):
+                                first_branch_pushed = branch_name
                     else:
                         # Delete ref
                         del repo.refs[ref_name]
@@ -664,6 +882,25 @@ class HTTPGitBackend:
                 except Exception as e:
                     print(f"[git_server] ref update error: {e}")
                     output_lines.append(f"ng {ref_name.decode()} {e}")
+
+            # Set HEAD if it doesn't point to a valid branch yet
+            if first_branch_pushed:
+                try:
+                    current_head = repo.refs.read_ref(b"HEAD")
+                    # Check if HEAD points to a valid branch
+                    if current_head and current_head.startswith(b"ref: refs/heads/"):
+                        head_branch = current_head[16:].decode()
+                        head_ref = b"refs/heads/" + head_branch.encode()
+                        if head_ref not in repo.refs:
+                            # HEAD points to non-existent branch, update it
+                            repo.refs.set_symbolic_ref(b"HEAD", f"refs/heads/{first_branch_pushed}".encode())
+                            print(f"[git_server] updated HEAD to {first_branch_pushed}")
+                    elif not current_head or current_head == b"ref: refs/heads/main":
+                        # No HEAD or default HEAD, set to first branch
+                        repo.refs.set_symbolic_ref(b"HEAD", f"refs/heads/{first_branch_pushed}".encode())
+                        print(f"[git_server] set HEAD to {first_branch_pushed}")
+                except Exception as e:
+                    print(f"[git_server] HEAD update skipped: {e}")
 
             # Build response in pkt-line format
             output = BytesIO()

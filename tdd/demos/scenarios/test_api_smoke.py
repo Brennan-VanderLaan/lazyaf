@@ -152,9 +152,13 @@ class TestAPISmokeTests:
         start_response = await client.post(f"/api/cards/{card_id}/start")
         assert start_response.status_code == 200
 
-        # Approve
-        approve_response = await client.post(f"/api/cards/{card_id}/approve")
+        # Approve (now returns {card, merge_result})
+        approve_response = await client.post(
+            f"/api/cards/{card_id}/approve",
+            json={"target_branch": None},
+        )
         assert approve_response.status_code == 200
+        assert approve_response.json()["card"]["status"] == "done"
 
     async def test_runners_list(self, client):
         """Runners list endpoint responds."""

@@ -1,16 +1,24 @@
 <script lang="ts">
-  import { createEventDispatcher } from 'svelte';
-  import type { Card, CardStatus } from '../api/types';
+  import { createEventDispatcher, onMount } from 'svelte';
+  import type { Card, CardStatus, BranchInfo, MergeResult } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
+  import { repos } from '../api/client';
   import JobStatus from './JobStatus.svelte';
   import DiffViewer from './DiffViewer.svelte';
 
   export let repoId: string;
   export let card: Card | null = null;
 
+  // Branch state
+  let branches: BranchInfo[] = [];
+  let loadingBranches = false;
+  let selectedTargetBranch: string = '';
+  let mergeResult: MergeResult | null = null;
+
   $: showDiff = card?.branch_name && (card?.status === 'in_review' || card?.status === 'done' || card?.status === 'failed');
-  $: baseBranch = $selectedRepo?.default_branch || 'main';
+  $: baseBranch = selectedTargetBranch || $selectedRepo?.default_branch || 'main';
+  $: nonCardBranches = branches.filter(b => b.name !== card?.branch_name);
 
   const dispatch = createEventDispatcher<{
     close: void;
@@ -28,6 +36,29 @@
   $: canApprove = card?.status === 'in_review';
   $: canReject = card?.status === 'in_review' || card?.status === 'in_progress';
   $: canRetry = card?.status === 'failed' || card?.status === 'in_review';
+
+  onMount(async () => {
+    if ($selectedRepo?.is_ingested) {
+      loadBranches();
+    }
+  });
+
+  async function loadBranches() {
+    loadingBranches = true;
+    try {
+      const response = await repos.branches(repoId);
+      branches = response.branches;
+      // Set default target branch
+      const defaultBranch = branches.find(b => b.is_default);
+      if (defaultBranch) {
+        selectedTargetBranch = defaultBranch.name;
+      }
+    } catch (e) {
+      console.error('Failed to load branches:', e);
+    } finally {
+      loadingBranches = false;
+    }
+  }
 
   async function handleSubmit() {
     if (!title.trim()) return;
@@ -72,8 +103,12 @@
     if (!card) return;
     submitting = true;
     try {
-      const updated = await cardsStore.approve(card.id);
-      dispatch('updated', updated);
+      const response = await cardsStore.approve(card.id, selectedTargetBranch || undefined);
+      mergeResult = response.merge_result;
+      dispatch('updated', response.card);
+    } catch (e) {
+      // Show error but don't close modal
+      alert(e instanceof Error ? e.message : 'Merge failed');
     } finally {
       submitting = false;
     }
@@ -183,8 +218,38 @@
 
         {#if showDiff && card.branch_name}
           <div class="diff-section">
-            <h3>Code Changes</h3>
+            <div class="diff-header">
+              <h3>Code Changes</h3>
+              {#if nonCardBranches.length > 0 && card.status === 'in_review'}
+                <div class="branch-selector">
+                  <label for="target-branch">Merge into:</label>
+                  <select id="target-branch" bind:value={selectedTargetBranch}>
+                    {#each nonCardBranches as branch}
+                      <option value={branch.name}>
+                        {branch.name}
+                        {branch.is_default ? ' (default)' : ''}
+                      </option>
+                    {/each}
+                  </select>
+                </div>
+              {/if}
+            </div>
             <DiffViewer {repoId} {baseBranch} headBranch={card.branch_name} />
+          </div>
+        {/if}
+
+        {#if mergeResult}
+          <div class="merge-result" class:success={mergeResult.success}>
+            <div class="merge-icon">{mergeResult.success ? '✓' : '✗'}</div>
+            <div class="merge-info">
+              <div class="merge-message">{mergeResult.message}</div>
+              {#if mergeResult.merge_type}
+                <div class="merge-type">Type: {mergeResult.merge_type}</div>
+              {/if}
+              {#if mergeResult.new_sha}
+                <div class="merge-sha">New commit: <code>{mergeResult.new_sha.slice(0, 8)}</code></div>
+              {/if}
+            </div>
           </div>
         {/if}
       {/if}
@@ -402,10 +467,93 @@
     border-top: 1px solid var(--border-color, #45475a);
   }
 
+  .diff-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
   .diff-section h3 {
-    margin: 0 0 0.75rem 0;
+    margin: 0;
     font-size: 1rem;
     color: var(--text-color, #cdd6f4);
+  }
+
+  .branch-selector {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .branch-selector label {
+    font-size: 0.85rem;
+    color: var(--text-muted, #6c7086);
+  }
+
+  .branch-selector select {
+    padding: 0.4rem 0.75rem;
+    background: var(--surface-alt, #181825);
+    border: 1px solid var(--border-color, #45475a);
+    border-radius: 4px;
+    color: var(--text-color, #cdd6f4);
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  .branch-selector select:focus {
+    outline: none;
+    border-color: var(--primary-color, #89b4fa);
+  }
+
+  .merge-result {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 1rem;
+    margin-top: 1rem;
+    background: var(--surface-alt, #181825);
+    border-radius: 8px;
+    border: 1px solid var(--border-color, #45475a);
+  }
+
+  .merge-result.success {
+    border-color: var(--success-color, #a6e3a1);
+    background: rgba(166, 227, 161, 0.1);
+  }
+
+  .merge-icon {
+    font-size: 1.25rem;
+    line-height: 1;
+  }
+
+  .merge-result.success .merge-icon {
+    color: var(--success-color, #a6e3a1);
+  }
+
+  .merge-info {
+    flex: 1;
+  }
+
+  .merge-message {
+    font-weight: 500;
+    color: var(--text-color, #cdd6f4);
+    margin-bottom: 0.25rem;
+  }
+
+  .merge-type, .merge-sha {
+    font-size: 0.8rem;
+    color: var(--text-muted, #6c7086);
+  }
+
+  .merge-sha code {
+    font-family: monospace;
+    background: var(--badge-bg, #313244);
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    color: var(--primary-color, #89b4fa);
   }
 
   .modal-actions {

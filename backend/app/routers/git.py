@@ -4,11 +4,30 @@ Git HTTP smart protocol endpoints.
 Implements the server side of git clone/fetch/push over HTTP.
 """
 
+import gzip
+
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from app.services.git_server import git_backend, git_repo_manager
 
 router = APIRouter(prefix="/git", tags=["git"])
+
+
+async def get_request_body(request: Request) -> bytes:
+    """Get request body, decompressing gzip if needed."""
+    body = await request.body()
+    content_encoding = request.headers.get("content-encoding", "").lower()
+
+    if content_encoding == "gzip" or (len(body) > 2 and body[:2] == b'\x1f\x8b'):
+        # Decompress gzip data
+        try:
+            body = gzip.decompress(body)
+            print(f"[git] Decompressed gzip: {len(body)} bytes")
+        except Exception as e:
+            print(f"[git] Failed to decompress gzip: {e}")
+            # Continue with original body if decompression fails
+
+    return body
 
 
 @router.get("/{repo_id}.git/info/refs")
@@ -54,9 +73,8 @@ async def git_upload_pack(repo_id: str, request: Request):
     if not git_repo_manager.repo_exists(repo_id):
         raise HTTPException(status_code=404, detail="Repository not found")
 
-    body = await request.body()
+    body = await get_request_body(request)
     print(f"[git] upload-pack request: {len(body)} bytes")
-    print(f"[git] upload-pack first 200 bytes: {body[:200]}")
 
     try:
         result = git_backend.handle_upload_pack(repo_id, body)
@@ -86,7 +104,7 @@ async def git_receive_pack(repo_id: str, request: Request):
     if not git_repo_manager.repo_exists(repo_id):
         raise HTTPException(status_code=404, detail="Repository not found")
 
-    body = await request.body()
+    body = await get_request_body(request)
 
     try:
         result = git_backend.handle_receive_pack(repo_id, body)

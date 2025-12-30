@@ -34,7 +34,7 @@ class TestCardWorkflowDemo:
     This test documents the happy path for feature development.
     """
 
-    async def test_complete_card_lifecycle(self, client):
+    async def test_complete_card_lifecycle(self, client, clean_git_repos, clean_job_queue):
         """
         SCENARIO: Feature Development Lifecycle
 
@@ -44,10 +44,10 @@ class TestCardWorkflowDemo:
         AND approves the resulting PR
         THEN the card should reach DONE status
         """
-        # Step 1: Attach a repository
+        # Step 1: Attach a repository (must be ingested to start cards)
         print("\n=== Step 1: Attaching Repository ===")
         repo_response = await client.post(
-            "/api/repos",
+            "/api/repos/ingest",
             json={
                 "name": "demo-project",
                 "remote_url": "https://github.com/org/demo-project.git",

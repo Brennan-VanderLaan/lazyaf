@@ -133,10 +133,11 @@ class TestAPISmokeTests:
         response = await client.get(f"/api/cards/{card_id}")
         assert response.status_code == 200
 
-    async def test_cards_lifecycle_actions(self, client):
+    async def test_cards_lifecycle_actions(self, client, clean_git_repos, clean_job_queue):
         """Card lifecycle actions respond correctly."""
+        # Must use ingested repo to start cards
         repo_response = await client.post(
-            "/api/repos",
+            "/api/repos/ingest",
             json={"name": "lifecycle-repo"},
         )
         repo_id = repo_response.json()["id"]
@@ -147,7 +148,7 @@ class TestAPISmokeTests:
         )
         card_id = card_response.json()["id"]
 
-        # Start
+        # Start (requires ingested repo)
         start_response = await client.post(f"/api/cards/{card_id}/start")
         assert start_response.status_code == 200
 

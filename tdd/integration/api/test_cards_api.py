@@ -16,7 +16,7 @@ tdd_path = Path(__file__).parent.parent.parent.parent / "tdd"
 sys.path.insert(0, str(backend_path))
 sys.path.insert(0, str(tdd_path))
 
-from shared.factories import repo_create_payload, card_create_payload, card_update_payload
+from shared.factories import repo_create_payload, repo_ingest_payload, card_create_payload, card_update_payload
 from shared.assertions import (
     assert_status_code,
     assert_created_response,
@@ -34,6 +34,16 @@ async def repo(client):
     response = await client.post(
         "/api/repos",
         json=repo_create_payload(name="CardTestRepo"),
+    )
+    return response.json()
+
+
+@pytest_asyncio.fixture
+async def ingested_repo(client, clean_git_repos):
+    """Create an ingested repo for card lifecycle tests that require starting jobs."""
+    response = await client.post(
+        "/api/repos/ingest",
+        json=repo_ingest_payload(name="IngestedCardTestRepo"),
     )
     return response.json()
 
@@ -273,10 +283,10 @@ class TestDeleteCard:
 class TestCardLifecycleActions:
     """Tests for card lifecycle endpoints: start, approve, reject."""
 
-    async def test_start_card(self, client, repo, clean_job_queue):
+    async def test_start_card(self, client, ingested_repo, clean_job_queue):
         """POST /api/cards/{id}/start moves card to in_progress."""
         create_response = await client.post(
-            f"/api/repos/{repo['id']}/cards",
+            f"/api/repos/{ingested_repo['id']}/cards",
             json=card_create_payload(title="Feature to Start"),
         )
         card_id = create_response.json()["id"]
@@ -293,10 +303,10 @@ class TestCardLifecycleActions:
         response = await client.post("/api/cards/nonexistent/start")
         assert_not_found(response, "Card")
 
-    async def test_start_card_already_started(self, client, repo, clean_job_queue):
+    async def test_start_card_already_started(self, client, ingested_repo, clean_job_queue):
         """Returns 400 when starting card that is not in todo status."""
         create_response = await client.post(
-            f"/api/repos/{repo['id']}/cards",
+            f"/api/repos/{ingested_repo['id']}/cards",
             json=card_create_payload(title="Already Started"),
         )
         card_id = create_response.json()["id"]
@@ -307,7 +317,7 @@ class TestCardLifecycleActions:
         # Try to start again
         response = await client.post(f"/api/cards/{card_id}/start")
         assert_status_code(response, 400)
-        assert "todo" in response.json()["detail"]
+        assert "todo" in response.json()["detail"].lower()
 
     async def test_approve_card(self, client, repo):
         """POST /api/cards/{id}/approve moves card to done."""
@@ -353,4 +363,58 @@ class TestCardLifecycleActions:
     async def test_reject_card_not_found(self, client):
         """Returns 404 when rejecting non-existent card."""
         response = await client.post("/api/cards/nonexistent/reject")
+        assert_not_found(response, "Card")
+
+    async def test_retry_failed_card(self, client, ingested_repo, clean_job_queue):
+        """POST /api/cards/{id}/retry retries a failed card."""
+        # Create card and move to failed status
+        create_response = await client.post(
+            f"/api/repos/{ingested_repo['id']}/cards",
+            json=card_create_payload(title="Feature to Retry"),
+        )
+        card_id = create_response.json()["id"]
+
+        # Set card to failed status
+        await client.patch(f"/api/cards/{card_id}", json={"status": "failed"})
+
+        # Retry the card
+        response = await client.post(f"/api/cards/{card_id}/retry")
+        assert_status_code(response, 200)
+        result = response.json()
+        assert result["status"] == "in_progress"
+        assert result["job_id"] is not None
+        assert result["branch_name"] is not None
+
+    async def test_retry_in_review_card(self, client, ingested_repo, clean_job_queue):
+        """POST /api/cards/{id}/retry can retry a card in review."""
+        create_response = await client.post(
+            f"/api/repos/{ingested_repo['id']}/cards",
+            json=card_create_payload(title="Feature to Re-Review"),
+        )
+        card_id = create_response.json()["id"]
+
+        # Move to in_review status
+        await client.patch(f"/api/cards/{card_id}", json={"status": "in_review"})
+
+        # Retry the card
+        response = await client.post(f"/api/cards/{card_id}/retry")
+        assert_status_code(response, 200)
+        result = response.json()
+        assert result["status"] == "in_progress"
+
+    async def test_retry_todo_card_fails(self, client, ingested_repo):
+        """Cannot retry a card in todo status."""
+        create_response = await client.post(
+            f"/api/repos/{ingested_repo['id']}/cards",
+            json=card_create_payload(title="Todo Card"),
+        )
+        card_id = create_response.json()["id"]
+
+        response = await client.post(f"/api/cards/{card_id}/retry")
+        assert_status_code(response, 400)
+        assert "failed" in response.json()["detail"].lower() or "in_review" in response.json()["detail"].lower()
+
+    async def test_retry_card_not_found(self, client):
+        """Returns 404 when retrying non-existent card."""
+        response = await client.post("/api/cards/nonexistent/retry")
         assert_not_found(response, "Card")

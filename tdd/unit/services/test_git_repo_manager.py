@@ -382,3 +382,159 @@ class TestEdgeCases:
         assert repo1 is not None
         assert repo2 is not None
         # Different instances, but same underlying repo
+
+
+# -----------------------------------------------------------------------------
+# Rebase Branch Tests
+# -----------------------------------------------------------------------------
+
+class TestRebaseBranch:
+    """Tests for GitRepoManager.rebase_branch() method."""
+
+    @pytest.fixture
+    def repo_with_branches(self, repo_manager, sample_repo_id):
+        """Create a repo with branches for testing."""
+        from dulwich.objects import Blob, Tree, Commit
+        from dulwich.repo import Repo as DulwichRepo
+        import time
+
+        # Create repo
+        repo_manager.create_bare_repo(sample_repo_id)
+        repo = repo_manager.get_repo(sample_repo_id)
+
+        # Create initial commit on main
+        blob = Blob()
+        blob.data = b"Initial content"
+        repo.object_store.add_object(blob)
+
+        tree = Tree()
+        tree.add(b"file.txt", 0o100644, blob.id)
+        repo.object_store.add_object(tree)
+
+        commit1 = Commit()
+        commit1.tree = tree.id
+        commit1.author = commit1.committer = b"Test <test@example.com>"
+        commit1.author_time = commit1.commit_time = int(time.time())
+        commit1.author_timezone = commit1.commit_timezone = 0
+        commit1.encoding = b"UTF-8"
+        commit1.message = b"Initial commit"
+        repo.object_store.add_object(commit1)
+
+        # Set main branch
+        repo.refs[b"refs/heads/main"] = commit1.id
+        repo.refs.set_symbolic_ref(b"HEAD", b"refs/heads/main")
+
+        # Create feature branch from main
+        repo.refs[b"refs/heads/feature"] = commit1.id
+
+        return repo_manager, sample_repo_id, repo
+
+    def test_rebase_branch_returns_dict(self, repo_with_branches):
+        """Returns a dict with result information."""
+        manager, repo_id, _ = repo_with_branches
+        result = manager.rebase_branch(repo_id, "feature", "main")
+        assert isinstance(result, dict)
+        assert "success" in result
+        assert "message" in result
+        assert "new_sha" in result
+        assert "error" in result
+
+    def test_rebase_branch_same_commit_already_up_to_date(self, repo_with_branches):
+        """Returns success when branches point to same commit."""
+        manager, repo_id, _ = repo_with_branches
+        result = manager.rebase_branch(repo_id, "feature", "main")
+        assert result["success"] is True
+        assert "up to date" in result["message"].lower()
+
+    def test_rebase_branch_nonexistent_repo(self, repo_manager):
+        """Returns error for nonexistent repo."""
+        result = repo_manager.rebase_branch("nonexistent", "feature", "main")
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_rebase_branch_nonexistent_branch(self, repo_with_branches):
+        """Returns error for nonexistent branch."""
+        manager, repo_id, _ = repo_with_branches
+        result = manager.rebase_branch(repo_id, "nonexistent", "main")
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_rebase_branch_nonexistent_onto_branch(self, repo_with_branches):
+        """Returns error for nonexistent onto branch."""
+        manager, repo_id, _ = repo_with_branches
+        result = manager.rebase_branch(repo_id, "feature", "nonexistent")
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_rebase_branch_fast_forward(self, repo_with_branches):
+        """Successfully fast-forwards when possible."""
+        from dulwich.objects import Blob, Tree, Commit
+        import time
+
+        manager, repo_id, repo = repo_with_branches
+
+        # Add new commit to main
+        blob = Blob()
+        blob.data = b"Updated content"
+        repo.object_store.add_object(blob)
+
+        tree = Tree()
+        tree.add(b"file.txt", 0o100644, blob.id)
+        repo.object_store.add_object(tree)
+
+        # Get current main commit
+        main_sha = repo.refs[b"refs/heads/main"]
+
+        commit2 = Commit()
+        commit2.tree = tree.id
+        commit2.parents = [main_sha]
+        commit2.author = commit2.committer = b"Test <test@example.com>"
+        commit2.author_time = commit2.commit_time = int(time.time())
+        commit2.author_timezone = commit2.commit_timezone = 0
+        commit2.encoding = b"UTF-8"
+        commit2.message = b"Update on main"
+        repo.object_store.add_object(commit2)
+
+        # Update main
+        repo.refs[b"refs/heads/main"] = commit2.id
+
+        # Now rebase feature onto main (should fast-forward)
+        result = manager.rebase_branch(repo_id, "feature", "main")
+        assert result["success"] is True
+        assert "fast-forward" in result["message"].lower()
+        assert result["new_sha"] == commit2.id.decode("ascii")
+
+    def test_rebase_branch_already_ahead(self, repo_with_branches):
+        """Returns success when branch is already ahead."""
+        from dulwich.objects import Blob, Tree, Commit
+        import time
+
+        manager, repo_id, repo = repo_with_branches
+
+        # Add new commit to feature (making it ahead of main)
+        blob = Blob()
+        blob.data = b"Feature content"
+        repo.object_store.add_object(blob)
+
+        tree = Tree()
+        tree.add(b"feature.txt", 0o100644, blob.id)
+        repo.object_store.add_object(tree)
+
+        feature_sha = repo.refs[b"refs/heads/feature"]
+
+        commit2 = Commit()
+        commit2.tree = tree.id
+        commit2.parents = [feature_sha]
+        commit2.author = commit2.committer = b"Test <test@example.com>"
+        commit2.author_time = commit2.commit_time = int(time.time())
+        commit2.author_timezone = commit2.commit_timezone = 0
+        commit2.encoding = b"UTF-8"
+        commit2.message = b"Feature commit"
+        repo.object_store.add_object(commit2)
+
+        repo.refs[b"refs/heads/feature"] = commit2.id
+
+        # Rebase feature onto main (feature is already ahead)
+        result = manager.rebase_branch(repo_id, "feature", "main")
+        assert result["success"] is True
+        assert "up to date" in result["message"].lower()

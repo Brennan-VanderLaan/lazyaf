@@ -539,6 +539,126 @@ class GitRepoManager:
                 "message": ""
             }
 
+    def rebase_branch(self, repo_id: str, branch_name: str, onto_branch: str) -> dict:
+        """
+        Rebase branch_name onto onto_branch (pull in latest changes from onto_branch).
+
+        This is essentially a fast-forward or merge operation where we update branch_name
+        to include the latest commits from onto_branch.
+
+        Returns dict with:
+            - success: bool
+            - message: str
+            - new_sha: str | None (commit sha after rebase)
+            - error: str | None
+        """
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"success": False, "error": "Repo not found", "new_sha": None, "message": ""}
+
+        branch_sha = self.get_branch_commit(repo_id, branch_name)
+        onto_sha = self.get_branch_commit(repo_id, onto_branch)
+
+        if not branch_sha:
+            return {"success": False, "error": f"Branch '{branch_name}' not found", "new_sha": None, "message": ""}
+        if not onto_sha:
+            return {"success": False, "error": f"Branch '{onto_branch}' not found", "new_sha": None, "message": ""}
+
+        if branch_sha == onto_sha:
+            return {"success": True, "new_sha": branch_sha, "message": "Already up to date", "error": None}
+
+        try:
+            # Check if onto_branch is ancestor of branch (branch is ahead, no update needed)
+            if self._is_ancestor(repo, onto_sha, branch_sha):
+                return {"success": True, "new_sha": branch_sha, "message": "Branch is already up to date with target", "error": None}
+
+            # Check if branch is ancestor of onto (can fast-forward)
+            if self._is_ancestor(repo, branch_sha, onto_sha):
+                # Fast-forward: just update the branch ref to point to onto
+                branch_ref = f"refs/heads/{branch_name}".encode()
+                repo.refs[branch_ref] = onto_sha.encode('ascii')
+                print(f"[git_server] fast-forward rebase: {branch_name} -> {onto_sha[:8]}")
+                return {
+                    "success": True,
+                    "new_sha": onto_sha,
+                    "message": f"Fast-forwarded {branch_name} to {onto_branch}",
+                    "error": None
+                }
+
+            # Branches have diverged - need to do a merge-style rebase
+            # For simplicity, we'll create a merge commit rather than replaying commits
+            from dulwich.objects import Commit
+            import time
+
+            branch_commit = repo.object_store[branch_sha.encode('ascii')]
+            onto_commit = repo.object_store[onto_sha.encode('ascii')]
+
+            # Find merge base
+            merge_base_sha = self._find_merge_base(repo, branch_sha, onto_sha)
+            if not merge_base_sha:
+                return {
+                    "success": False,
+                    "error": "Cannot find common ancestor for rebase",
+                    "new_sha": None,
+                    "message": ""
+                }
+
+            merge_base_commit = repo.object_store[merge_base_sha.encode('ascii')]
+            merge_base_tree = repo.object_store[merge_base_commit.tree]
+            branch_tree = repo.object_store[branch_commit.tree]
+            onto_tree = repo.object_store[onto_commit.tree]
+
+            # Attempt three-way merge of trees
+            # In this case: base=merge_base, ours=onto (what we're rebasing onto), theirs=branch (our changes)
+            merged_tree_sha, conflicts = self._merge_trees(
+                repo, merge_base_tree.id, onto_tree.id, branch_tree.id
+            )
+
+            if conflicts:
+                # Get detailed conflict information
+                conflict_details = self._get_conflict_details(
+                    repo, merge_base_tree.id, onto_tree.id, branch_tree.id, conflicts
+                )
+                return {
+                    "success": False,
+                    "error": f"Rebase conflicts in: {', '.join(conflicts)}",
+                    "new_sha": None,
+                    "message": "",
+                    "conflicts": conflict_details
+                }
+
+            # Create merge commit
+            commit = Commit()
+            commit.tree = merged_tree_sha
+            commit.parents = [onto_sha.encode('ascii'), branch_sha.encode('ascii')]
+            commit.author = b"LazyAF <lazyaf@localhost>"
+            commit.committer = b"LazyAF <lazyaf@localhost>"
+            commit.commit_time = commit.author_time = int(time.time())
+            commit.commit_timezone = commit.author_timezone = 0
+            commit.encoding = b'UTF-8'
+            commit.message = f"Rebase: merge {onto_branch} into {branch_name}\n".encode('utf-8')
+
+            # Add commit to object store
+            repo.object_store.add_object(commit)
+
+            # Update branch ref
+            branch_ref = f"refs/heads/{branch_name}".encode()
+            repo.refs[branch_ref] = commit.id
+
+            print(f"[git_server] rebase commit created: {commit.id.decode('ascii')[:8]}")
+            return {
+                "success": True,
+                "new_sha": commit.id.decode('ascii'),
+                "message": f"Rebased {branch_name} onto {onto_branch}",
+                "error": None
+            }
+
+        except Exception as e:
+            import traceback
+            print(f"[git_server] rebase error: {e}")
+            traceback.print_exc()
+            return {"success": False, "error": str(e), "new_sha": None, "message": ""}
+
     def get_diff(self, repo_id: str, base_branch: str, head_branch: str) -> dict:
         """Get diff between two branches."""
         from dulwich.diff_tree import tree_changes

@@ -170,6 +170,19 @@ export interface ApproveResponse {
   merge_result: MergeResult | null;
 }
 
+export interface RebaseResult {
+  success: boolean;
+  message: string;
+  new_sha: string | null;
+  error: string | null;
+  conflicts?: ConflictDetail[];
+}
+
+export interface RebaseResponse {
+  card: Card;
+  rebase_result: RebaseResult | null;
+}
+
 export interface AgentFile {
   id: string;
   name: string;

@@ -399,3 +399,78 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
     })
 
     return card
+
+
+class RebaseRequest(BaseModel):
+    onto_branch: Optional[str] = None  # If None, uses repo's default branch
+
+
+class RebaseResponse(BaseModel):
+    card: CardRead
+    rebase_result: Optional[dict] = None
+
+
+@router.post("/api/cards/{card_id}/rebase")
+async def rebase_card_branch(
+    card_id: str,
+    request: RebaseRequest = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Rebase the card's branch onto the target branch (pull in latest changes).
+
+    This updates the card's branch to include the latest commits from the target branch,
+    helping to avoid merge conflicts when the card is eventually approved.
+
+    If onto_branch is not specified, uses the repo's default branch.
+    Returns the card and rebase result details.
+    """
+    if request is None:
+        request = RebaseRequest()
+
+    result = await db.execute(select(Card).where(Card.id == card_id))
+    card = result.scalar_one_or_none()
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    if not card.branch_name:
+        raise HTTPException(status_code=400, detail="Card has no branch to rebase")
+
+    # Get the repo
+    result = await db.execute(select(Repo).where(Repo.id == card.repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    onto_branch = request.onto_branch or repo.default_branch
+
+    # Perform the rebase
+    rebase_result = git_repo_manager.rebase_branch(
+        repo_id=repo.id,
+        branch_name=card.branch_name,
+        onto_branch=onto_branch
+    )
+
+    if not rebase_result["success"]:
+        # If there are conflicts, return them without changing anything
+        if "conflicts" in rebase_result:
+            return {
+                "card": CardRead.model_validate(card),
+                "rebase_result": rebase_result
+            }
+        # For other errors, raise exception
+        raise HTTPException(
+            status_code=400,
+            detail=f"Rebase failed: {rebase_result['error']}"
+        )
+
+    # Refresh card to reflect any changes
+    await db.refresh(card)
+
+    return {
+        "card": CardRead.model_validate(card),
+        "rebase_result": rebase_result
+    }

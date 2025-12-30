@@ -23,6 +23,44 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json();
 }
 
+// Branch info type
+export interface BranchInfo {
+  name: string;
+  sha: string;
+  short_sha: string | null;
+  is_default: boolean;
+  is_orphaned: boolean;
+  is_damaged?: boolean;
+  missing_objects?: string[];  // List of SHA strings
+  objects_checked?: number;
+  commit_message: string | null;
+  commit_time: number | null;
+}
+
+export interface BranchesInfoResponse {
+  branches: BranchInfo[];
+  total: number;
+  orphaned_count: number;
+  damaged_count: number;
+  default_branch: string;
+  remote_url: string | null;
+}
+
+export interface SyncResult {
+  success: boolean;
+  branches: BranchInfo[];
+  cleanup: {
+    success: boolean;
+    deleted_branches: string[];
+    errors: string[] | null;
+  };
+  integrity?: {
+    valid: boolean;
+    damaged_branches: string[];
+  };
+  message: string;
+}
+
 // Repos
 export const repos = {
   list: () => request<Repo[]>('/repos'),
@@ -38,6 +76,18 @@ export const repos = {
   delete: (id: string) => request<void>(`/repos/${id}`, { method: 'DELETE' }),
   cloneUrl: (id: string) => request<CloneUrlResponse>(`/repos/${id}/clone-url`),
   branches: (id: string) => request<BranchesResponse>(`/repos/${id}/branches`),
+  branchesInfo: (id: string, verify: boolean = false) =>
+    request<BranchesInfoResponse>(`/repos/${id}/branches/info${verify ? '?verify=true' : ''}`),
+  deleteBranch: (repoId: string, branchName: string) =>
+    request<{ success: boolean; message: string }>(`/repos/${repoId}/branches/${encodeURIComponent(branchName)}`, {
+      method: 'DELETE',
+    }),
+  cleanupOrphans: (id: string) =>
+    request<{ success: boolean; deleted_branches: string[]; errors: string[] | null }>(`/repos/${id}/cleanup-orphans`, {
+      method: 'POST',
+    }),
+  sync: (id: string) => request<SyncResult>(`/repos/${id}/sync`, { method: 'POST' }),
+  reinitialize: (id: string) => request<{ success: boolean; message: string }>(`/repos/${id}/reinitialize`, { method: 'POST' }),
   commits: (id: string, branch?: string, limit: number = 20) => {
     const params = new URLSearchParams();
     if (branch) params.set('branch', branch);
@@ -97,8 +147,8 @@ export const runners = {
   status: () => request<PoolStatus>('/runners/status'),
   logs: (runnerId: string, offset: number = 0) =>
     request<RunnerLogs>(`/runners/${runnerId}/logs?offset=${offset}`),
-  dockerCommand: (withSecrets: boolean = false) =>
-    request<DockerCommand>(`/runners/docker-command?with_secrets=${withSecrets}`),
+  dockerCommand: (runnerType: string = 'claude-code', withSecrets: boolean = false) =>
+    request<DockerCommand>(`/runners/docker-command?runner_type=${runnerType}&with_secrets=${withSecrets}`),
 };
 
 // Agent Files

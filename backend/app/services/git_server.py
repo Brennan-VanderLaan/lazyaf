@@ -96,6 +96,373 @@ class GitRepoManager:
                 branches.append(branch_name)
         return sorted(branches)
 
+    def get_branches_info(self, repo_id: str) -> list[dict]:
+        """Get detailed info about all branches in a repo."""
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return []
+
+        default_branch = self.get_default_branch(repo_id)
+        refs = self.get_refs(repo_id)
+        branches = []
+
+        for ref_name, ref_sha in refs.items():
+            if not ref_name.startswith(b"refs/heads/"):
+                continue
+
+            branch_name = ref_name[11:].decode("utf-8")
+            commit_sha = ref_sha.decode("ascii") if isinstance(ref_sha, bytes) else ref_sha
+
+            # Check if the commit actually exists (not orphaned)
+            commit_exists = False
+            commit_message = None
+            commit_time = None
+            try:
+                commit = repo.object_store[ref_sha]
+                commit_exists = True
+                commit_message = commit.message.decode('utf-8', errors='replace').strip().split('\n')[0][:100]
+                commit_time = commit.commit_time
+            except (KeyError, Exception):
+                commit_exists = False
+
+            branches.append({
+                "name": branch_name,
+                "sha": commit_sha,
+                "short_sha": commit_sha[:8] if commit_sha else None,
+                "is_default": branch_name == default_branch,
+                "is_orphaned": not commit_exists,
+                "commit_message": commit_message,
+                "commit_time": commit_time,
+            })
+
+        # Sort: default first, then by name
+        branches.sort(key=lambda b: (not b["is_default"], b["name"]))
+        return branches
+
+    def delete_branch(self, repo_id: str, branch_name: str, force: bool = False) -> dict:
+        """
+        Delete a branch from the repository.
+
+        Args:
+            repo_id: Repository ID
+            branch_name: Name of the branch to delete
+            force: If True, allow deleting orphaned branches even if they might have issues
+
+        Returns:
+            dict with success, message, and error fields
+        """
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"success": False, "error": "Repository not found", "message": ""}
+
+        default_branch = self.get_default_branch(repo_id)
+
+        # Protect default branch
+        if branch_name == default_branch:
+            return {
+                "success": False,
+                "error": f"Cannot delete the default branch '{branch_name}'",
+                "message": ""
+            }
+
+        ref_name = f"refs/heads/{branch_name}".encode()
+
+        # Check if branch exists
+        if ref_name not in repo.refs:
+            return {
+                "success": False,
+                "error": f"Branch '{branch_name}' does not exist",
+                "message": ""
+            }
+
+        try:
+            del repo.refs[ref_name]
+            return {
+                "success": True,
+                "message": f"Deleted branch '{branch_name}'",
+                "error": None
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Failed to delete branch: {str(e)}",
+                "message": ""
+            }
+
+    def cleanup_orphaned_branches(self, repo_id: str) -> dict:
+        """
+        Remove branches that point to non-existent commits.
+
+        Returns:
+            dict with success, deleted_branches list, and error
+        """
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"success": False, "error": "Repository not found", "deleted_branches": []}
+
+        default_branch = self.get_default_branch(repo_id)
+        refs = dict(repo.refs.as_dict())  # Copy to avoid modification during iteration
+        deleted = []
+        errors = []
+
+        for ref_name, ref_sha in refs.items():
+            if not ref_name.startswith(b"refs/heads/"):
+                continue
+
+            branch_name = ref_name[11:].decode("utf-8")
+
+            # Never delete default branch
+            if branch_name == default_branch:
+                continue
+
+            # Check if commit exists
+            try:
+                repo.object_store[ref_sha]
+            except KeyError:
+                # Commit doesn't exist - delete the branch
+                try:
+                    del repo.refs[ref_name]
+                    deleted.append(branch_name)
+                    print(f"[git_server] Deleted orphaned branch: {branch_name}")
+                except Exception as e:
+                    errors.append(f"{branch_name}: {str(e)}")
+
+        return {
+            "success": len(errors) == 0,
+            "deleted_branches": deleted,
+            "errors": errors if errors else None
+        }
+
+    def verify_branch_integrity(self, repo_id: str, branch_name: str) -> dict:
+        """
+        Verify that all objects reachable from a branch are accessible.
+
+        Walks through the commit, its tree, and all blobs to verify they can be read.
+
+        Returns:
+            dict with:
+                - valid: bool
+                - missing_objects: list of SHAs that couldn't be read
+                - error: str | None
+        """
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"valid": False, "missing_objects": [], "error": "Repository not found"}
+
+        branch_sha = self.get_branch_commit(repo_id, branch_name)
+        if not branch_sha:
+            return {"valid": False, "missing_objects": [], "error": "Branch not found"}
+
+        missing_objects = []
+        checked = set()
+        to_check = [branch_sha.encode('ascii')]
+
+        while to_check:
+            sha = to_check.pop()
+            if sha in checked:
+                continue
+            checked.add(sha)
+
+            try:
+                obj = repo.object_store[sha]
+
+                # Add child objects to check
+                if obj.type_name == b'commit':
+                    to_check.append(obj.tree)
+                    to_check.extend(obj.parents)
+                elif obj.type_name == b'tree':
+                    for entry in obj.items():
+                        to_check.append(entry.sha)
+                # Blobs have no children
+
+            except KeyError:
+                sha_str = sha.decode('ascii') if isinstance(sha, bytes) else sha
+                missing_objects.append(sha_str)
+            except Exception as e:
+                sha_str = sha.decode('ascii') if isinstance(sha, bytes) else sha
+                missing_objects.append(f"{sha_str} (error: {str(e)})")
+
+        return {
+            "valid": len(missing_objects) == 0,
+            "missing_objects": missing_objects,
+            "objects_checked": len(checked),
+            "error": None
+        }
+
+    def verify_repo_integrity(self, repo_id: str) -> dict:
+        """
+        Verify integrity of all branches in the repository.
+
+        Returns:
+            dict with:
+                - valid: bool (all branches valid)
+                - branches: list of branch integrity results
+                - damaged_branches: list of branch names with missing objects
+        """
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"valid": False, "branches": [], "damaged_branches": [], "error": "Repository not found"}
+
+        branches = self.list_branches(repo_id)
+        results = []
+        damaged = []
+
+        for branch_name in branches:
+            result = self.verify_branch_integrity(repo_id, branch_name)
+            result["branch"] = branch_name
+            results.append(result)
+
+            if not result["valid"]:
+                damaged.append(branch_name)
+                print(f"[git_server] branch '{branch_name}' has {len(result['missing_objects'])} missing objects")
+
+        return {
+            "valid": len(damaged) == 0,
+            "branches": results,
+            "damaged_branches": damaged,
+            "error": None
+        }
+
+    def reinitialize_repo(self, repo_id: str) -> dict:
+        """
+        Completely reinitialize a repository, deleting all refs and objects.
+        This is the nuclear option for fixing a corrupted repo.
+
+        After calling this, the user must push their local repo again.
+
+        Returns:
+            dict with success, message, and error
+        """
+        import gc
+        import time
+        import stat
+
+        repo_path = self.get_repo_path(repo_id)
+        if not repo_path.exists():
+            return {"success": False, "error": "Repository not found", "message": ""}
+
+        def force_remove_readonly(func, path, excinfo):
+            """Error handler for shutil.rmtree to handle read-only files on Windows."""
+            # Clear the read-only flag and retry
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+
+        try:
+            # Force garbage collection multiple times to release any cached repo objects
+            # and their file handles (especially pack files on Windows)
+            for _ in range(3):
+                gc.collect()
+                time.sleep(0.1)
+
+            # On Windows, we may need to retry a few times as handles release
+            max_retries = 5
+
+            for attempt in range(max_retries):
+                try:
+                    # Delete the entire repo directory with error handler for read-only files
+                    shutil.rmtree(repo_path, onerror=force_remove_readonly)
+                    break
+                except (PermissionError, OSError) as e:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # Exponential backoff: 2, 4, 6, 8 seconds
+                        print(f"[git_server] Retry {attempt + 1}/{max_retries} - waiting {wait_time}s for file handles to release...")
+                        gc.collect()
+                        time.sleep(wait_time)
+                    else:
+                        # Give a helpful error message
+                        locked_file = str(e).split("'")[1] if "'" in str(e) else "unknown"
+                        raise PermissionError(
+                            f"Cannot delete repo - file still locked: {Path(locked_file).name}. "
+                            f"Please restart the backend server and try again."
+                        )
+
+            # Recreate as a fresh bare repo
+            repo_path.mkdir(parents=True, exist_ok=True)
+            DulwichRepo.init_bare(str(repo_path))
+
+            print(f"[git_server] Reinitialized repository {repo_id}")
+            return {
+                "success": True,
+                "message": "Repository reinitialized. Push your local repo to restore it.",
+                "error": None
+            }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": f"Failed to reinitialize: {str(e)}. You may need to restart the server to release file handles.",
+                "message": ""
+            }
+
+    def sync_repo_from_disk(self, repo_id: str) -> dict:
+        """
+        Re-read the repository state from disk, cleaning up any inconsistencies.
+        This is a "break-glass" operation to fix corrupted state.
+
+        Now includes full object integrity verification to detect damaged pack files.
+
+        Returns:
+            dict with success, branches list, integrity info, and any cleanup performed
+        """
+        repo_path = self.get_repo_path(repo_id)
+        if not repo_path.exists():
+            return {"success": False, "error": "Repository directory not found", "branches": []}
+
+        try:
+            # Re-open the repo fresh from disk
+            repo = DulwichRepo(str(repo_path))
+
+            # Get current refs from disk
+            refs = repo.refs.as_dict()
+
+            # Clean up orphaned branches (refs pointing to non-existent commits)
+            cleanup_result = self.cleanup_orphaned_branches(repo_id)
+
+            # Verify object integrity for all branches
+            integrity_result = self.verify_repo_integrity(repo_id)
+
+            # Get final branch list with integrity status
+            branches_info = self.get_branches_info(repo_id)
+
+            # Mark damaged branches
+            damaged_set = set(integrity_result.get("damaged_branches", []))
+            for branch in branches_info:
+                branch["is_damaged"] = branch["name"] in damaged_set
+
+                # Get missing object count for damaged branches
+                if branch["is_damaged"]:
+                    for br in integrity_result.get("branches", []):
+                        if br.get("branch") == branch["name"]:
+                            branch["missing_objects"] = len(br.get("missing_objects", []))
+                            break
+
+            message_parts = [f"Synced repo from disk. Found {len(branches_info)} branches."]
+            if cleanup_result.get("deleted_branches"):
+                message_parts.append(f"Cleaned up {len(cleanup_result['deleted_branches'])} orphaned refs.")
+            if damaged_set:
+                message_parts.append(f"WARNING: {len(damaged_set)} branch(es) have missing objects and may be damaged.")
+
+            return {
+                "success": True,
+                "branches": branches_info,
+                "cleanup": cleanup_result,
+                "integrity": {
+                    "valid": integrity_result.get("valid", False),
+                    "damaged_branches": list(damaged_set),
+                },
+                "message": " ".join(message_parts)
+            }
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": f"Failed to sync repo: {str(e)}",
+                "branches": []
+            }
+
     def get_branch_commit(self, repo_id: str, branch_name: str) -> str | None:
         """Get the commit SHA for a branch."""
         refs = self.get_refs(repo_id)

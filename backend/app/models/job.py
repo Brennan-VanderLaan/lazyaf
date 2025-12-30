@@ -21,6 +21,7 @@ class Job(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     card_id: Mapped[str] = mapped_column(String(36), ForeignKey("cards.id"), nullable=False)
     runner_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    runner_type: Mapped[str | None] = mapped_column(String(50), nullable=True)  # Type of runner that executed the job
     status: Mapped[str] = mapped_column(String(50), default=JobStatus.QUEUED.value)
     logs: Mapped[str] = mapped_column(Text, default="")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

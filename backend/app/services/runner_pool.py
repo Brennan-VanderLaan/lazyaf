@@ -15,9 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 class RunnerInfo:
-    def __init__(self, id: str, name: str | None = None):
+    def __init__(self, id: str, name: str | None = None, runner_type: str = "claude-code"):
         self.id = id
         self.name = name or f"runner-{id[:8]}"
+        self.runner_type = runner_type  # claude-code, gemini
         self.status: str = "idle"  # idle, busy, offline
         self.current_job: QueuedJob | None = None
         self.last_heartbeat: datetime = datetime.utcnow()
@@ -81,8 +82,11 @@ class RunnerPool:
                     asyncio.create_task(job_queue.enqueue(runner.current_job))
                     runner.current_job = None
 
-    def register(self, runner_id: str | None = None, name: str | None = None) -> RunnerInfo:
+    def register(self, runner_id: str | None = None, name: str | None = None, runner_type: str = "claude-code") -> RunnerInfo:
         """Register a runner. If runner_id is provided and exists, reactivate it."""
+        # Normalize runner_type to string
+        runner_type = str(runner_type) if runner_type else "claude-code"
+
         # Use provided ID or generate a new one
         if runner_id is None:
             runner_id = str(uuid4())
@@ -95,13 +99,15 @@ class RunnerPool:
             # Update name if provided
             if name:
                 runner.name = name
-            logger.info(f"Runner {runner_id} ({runner.name}) reconnected")
+            # Always update runner_type to latest value
+            runner.runner_type = runner_type
+            logger.info(f"Runner {runner_id} ({runner.name}, type={runner.runner_type!r}) reconnected")
             return runner
 
         # Create new runner
-        runner = RunnerInfo(id=runner_id, name=name)
+        runner = RunnerInfo(id=runner_id, name=name, runner_type=runner_type)
         self._runners[runner_id] = runner
-        logger.info(f"Runner {runner_id} ({runner.name}) registered")
+        logger.info(f"Runner {runner_id} ({runner.name}, type={runner_type!r}) registered")
         return runner
 
     def unregister(self, runner_id: str) -> bool:
@@ -126,7 +132,7 @@ class RunnerPool:
         return False
 
     async def get_job(self, runner_id: str) -> QueuedJob | None:
-        """Get a job for a runner if one is available."""
+        """Get a job for a runner if one is available that matches the runner's type."""
         if runner_id not in self._runners:
             return None
 
@@ -134,12 +140,20 @@ class RunnerPool:
         if runner.status != "idle":
             return None
 
-        job = await job_queue.dequeue()
+        # Pass runner type to get a matching job
+        logger.debug(f"Runner {runner_id} (type={runner.runner_type!r}) requesting job")
+        job = await job_queue.dequeue(runner_type=runner.runner_type)
         if job:
+            # Verify the match (should always be true if dequeue works correctly)
+            job_type = str(job.runner_type) if job.runner_type else "any"
+            runner_type = str(runner.runner_type) if runner.runner_type else "unknown"
+            if job_type != "any" and job_type != runner_type:
+                logger.error(f"BUG: Job {job.id} (type={job_type!r}) was dequeued for runner {runner_id} (type={runner_type!r}) - types don't match!")
+
             runner.status = "busy"
             runner.current_job = job
             runner.logs = []  # Clear logs for new job
-            logger.info(f"Assigned job {job.id} to runner {runner_id}")
+            logger.info(f"Assigned job {job.id} (type={job_type!r}) to runner {runner_id} (type={runner_type!r})")
         return job
 
     def complete_job(self, runner_id: str, success: bool, error: str | None = None) -> QueuedJob | None:
@@ -181,6 +195,7 @@ class RunnerPool:
             {
                 "id": r.id,
                 "name": r.name,
+                "runner_type": r.runner_type,
                 "status": r.status,
                 "current_job_id": r.current_job.id if r.current_job else None,
                 "last_heartbeat": r.last_heartbeat.isoformat(),

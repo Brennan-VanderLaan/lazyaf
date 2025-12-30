@@ -117,9 +117,13 @@ async def job_callback(job_id: str, callback: JobCallback, db: AsyncSession = De
             "title": card.title,
             "description": card.description,
             "status": card.status,
+            "runner_type": card.runner_type,
             "branch_name": card.branch_name,
             "pr_url": card.pr_url,
             "job_id": card.job_id,
+            "completed_runner_type": card.completed_runner_type,
+            "created_at": card.created_at.isoformat() if card.created_at else None,
+            "updated_at": card.updated_at.isoformat() if card.updated_at else None,
         })
 
     # Mark runner as idle

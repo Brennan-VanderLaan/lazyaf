@@ -3,6 +3,9 @@
   import { selectedRepo } from '../stores/repos';
   import { repos } from '../api/client';
   import type { BranchInfo, Commit } from '../api/types';
+  import BranchManager from './BranchManager.svelte';
+
+  let showBranchManager = false;
 
   let cloneUrl = '';
   let branches: BranchInfo[] = [];
@@ -160,7 +163,12 @@
 
       {#if branches.length > 0}
         <div class="info-section">
-          <label>Branches ({branches.length})</label>
+          <div class="section-header">
+            <label>Branches ({branches.length})</label>
+            <button type="button" class="btn-manage" on:click={() => showBranchManager = true} title="Manage branches">
+              Manage
+            </button>
+          </div>
           <div class="branch-selector">
             <select bind:value={selectedBranch}>
               {#each branches as branch}
@@ -240,6 +248,16 @@
       </div>
     {/if}
   </div>
+
+  {#if showBranchManager}
+    <BranchManager
+      repoId={$selectedRepo.id}
+      repoName={$selectedRepo.name}
+      cloneUrl={cloneUrl}
+      on:close={() => showBranchManager = false}
+      on:updated={loadRepoDetails}
+    />
+  {/if}
 {/if}
 
 <style>
@@ -294,6 +312,35 @@
     text-transform: uppercase;
     letter-spacing: 0.5px;
     margin-bottom: 0.5rem;
+  }
+
+  .section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+
+  .section-header label {
+    margin-bottom: 0;
+  }
+
+  .btn-manage {
+    font-size: 0.7rem;
+    padding: 0.25rem 0.5rem;
+    background: var(--surface-alt, #181825);
+    color: var(--text-muted, #6c7086);
+    border: 1px solid var(--border-color, #45475a);
+    border-radius: 4px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .btn-manage:hover {
+    background: var(--primary-color, #89b4fa);
+    color: #1e1e2e;
+    border-color: var(--primary-color, #89b4fa);
   }
 
   .info-section.warning {

@@ -24,13 +24,16 @@ Use these tools to:
 - Create and manage cards (feature requests)
 - Start agent work on cards
 - Monitor job progress and logs
+- Check runner availability
 
 Typical workflow:
 1. list_repos() to see available repositories
 2. list_cards(repo_id) to see existing work items
-3. create_card(repo_id, title, description) to add new work
-4. start_card(card_id) to trigger AI agent work
-5. get_job_logs(job_id) to monitor progress
+3. get_runner_status() to check available runners
+4. create_card(repo_id, title, description, runner_type) to add new work
+   - runner_type can be "any" (default), "claude-code", or "gemini"
+5. start_card(card_id) to trigger AI agent work
+6. get_job_logs(job_id) to monitor progress
 """
 )
 
@@ -75,7 +78,7 @@ def list_cards(repo_id: str) -> list[dict]:
 
 
 @mcp.tool()
-def create_card(repo_id: str, title: str, description: str = "") -> dict:
+def create_card(repo_id: str, title: str, description: str = "", runner_type: str = "any") -> dict:
     """
     Create a new card in a repository.
 
@@ -83,13 +86,19 @@ def create_card(repo_id: str, title: str, description: str = "") -> dict:
         repo_id: The repository ID (UUID string)
         title: Card title describing the feature or task
         description: Detailed description of what needs to be done
+        runner_type: Which runner type to use - "any" (default), "claude-code", or "gemini"
 
     Returns the created card details.
     """
+    # Validate runner_type
+    valid_types = ["any", "claude-code", "gemini"]
+    if runner_type not in valid_types:
+        return {"error": f"Invalid runner_type '{runner_type}'. Must be one of: {', '.join(valid_types)}"}
+
     with _get_client() as client:
         response = client.post(
             f"/api/repos/{repo_id}/cards",
-            json={"title": title, "description": description}
+            json={"title": title, "description": description, "runner_type": runner_type}
         )
         if response.status_code == 404:
             return {"error": f"Repo {repo_id} not found"}
@@ -151,7 +160,8 @@ def start_card(card_id: str) -> dict:
     Trigger agent work on a card.
 
     The card must be in 'todo' status and the repo must be ingested.
-    This queues a job that will be picked up by an available runner.
+    This queues a job that will be picked up by an available runner matching
+    the card's runner_type (any, claude-code, or gemini).
 
     Args:
         card_id: The card ID (UUID string) to start
@@ -242,3 +252,48 @@ def repos_resource() -> str:
                 lines.append(f"  Default branch: {repo['default_branch']}")
 
         return '\n'.join(lines)
+
+
+@mcp.tool()
+def get_runner_status() -> dict:
+    """
+    Get the status of the runner pool.
+
+    Shows how many runners are available, their types (claude-code or gemini),
+    and how many jobs are queued.
+
+    Returns pool status and list of active runners.
+    """
+    with _get_client() as client:
+        # Get pool status
+        status_response = client.get("/api/runners/status")
+        if status_response.status_code != 200:
+            return {"error": f"Failed to get runner status: {status_response.text}"}
+
+        status = status_response.json()
+
+        # Get runner list
+        runners_response = client.get("/api/runners")
+        runners = []
+        if runners_response.status_code == 200:
+            runners = runners_response.json()
+
+        return {
+            "pool": {
+                "total_runners": status.get("total_runners", 0),
+                "idle_runners": status.get("idle_runners", 0),
+                "busy_runners": status.get("busy_runners", 0),
+                "offline_runners": status.get("offline_runners", 0),
+                "queued_jobs": status.get("queued_jobs", 0),
+            },
+            "runners": [
+                {
+                    "id": r.get("id"),
+                    "name": r.get("name"),
+                    "type": r.get("runner_type", "unknown"),
+                    "status": r.get("status"),
+                }
+                for r in runners
+            ],
+            "available_runner_types": ["any", "claude-code", "gemini"],
+        }

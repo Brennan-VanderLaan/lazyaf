@@ -1,6 +1,7 @@
 export type CardStatus = 'todo' | 'in_progress' | 'in_review' | 'done' | 'failed';
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
 export type RunnerStatus = 'idle' | 'busy' | 'offline';
+export type RunnerType = 'any' | 'claude-code' | 'gemini';
 
 export interface Repo {
   id: string;
@@ -49,9 +50,11 @@ export interface Card {
   title: string;
   description: string;
   status: CardStatus;
+  runner_type: RunnerType;
   branch_name: string | null;
   pr_url: string | null;
   job_id: string | null;
+  completed_runner_type: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -59,18 +62,21 @@ export interface Card {
 export interface CardCreate {
   title: string;
   description?: string;
+  runner_type?: RunnerType;
 }
 
 export interface CardUpdate {
   title?: string;
   description?: string;
   status?: CardStatus;
+  runner_type?: RunnerType;
 }
 
 export interface Job {
   id: string;
   card_id: string;
   runner_id: string | null;
+  runner_type: string | null;
   status: JobStatus;
   logs: string;
   error: string | null;
@@ -82,6 +88,7 @@ export interface Job {
 export interface Runner {
   id: string;
   name: string;
+  runner_type: string;
   status: RunnerStatus;
   current_job_id: string | null;
   last_heartbeat: string;
@@ -107,6 +114,7 @@ export interface DockerCommand {
   command: string;
   command_with_secrets: string;
   image: string;
+  runner_type: string;
   env_vars: Record<string, string>;
 }
 

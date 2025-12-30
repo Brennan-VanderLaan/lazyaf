@@ -8,6 +8,7 @@ class JobRead(BaseModel):
     id: str
     card_id: str
     runner_id: str | None = None
+    runner_type: str | None = None
     status: JobStatus
     logs: str = ""
     error: str | None = None

@@ -16,6 +16,24 @@ from app.services.git_server import git_repo_manager
 router = APIRouter(tags=["cards"])
 
 
+def card_to_ws_dict(card: Card) -> dict:
+    """Convert a Card model to a dict for websocket broadcast."""
+    return {
+        "id": card.id,
+        "repo_id": card.repo_id,
+        "title": card.title,
+        "description": card.description,
+        "status": card.status,
+        "runner_type": card.runner_type,
+        "branch_name": card.branch_name,
+        "pr_url": card.pr_url,
+        "job_id": card.job_id,
+        "completed_runner_type": card.completed_runner_type,
+        "created_at": card.created_at.isoformat() if card.created_at else None,
+        "updated_at": card.updated_at.isoformat() if card.updated_at else None,
+    }
+
+
 @router.get("/api/repos/{repo_id}/cards", response_model=list[CardRead])
 async def list_cards(repo_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Repo).where(Repo.id == repo_id))
@@ -38,18 +56,7 @@ async def create_card(repo_id: str, card: CardCreate, db: AsyncSession = Depends
     await db.refresh(db_card)
 
     # Broadcast card creation via WebSocket
-    await manager.send_card_updated({
-        "id": db_card.id,
-        "repo_id": db_card.repo_id,
-        "title": db_card.title,
-        "description": db_card.description,
-        "status": db_card.status,
-        "branch_name": db_card.branch_name,
-        "pr_url": db_card.pr_url,
-        "job_id": db_card.job_id,
-        "created_at": db_card.created_at.isoformat(),
-        "updated_at": db_card.updated_at.isoformat(),
-    })
+    await manager.send_card_updated(card_to_ws_dict(db_card))
 
     return db_card
 
@@ -74,24 +81,15 @@ async def update_card(card_id: str, update: CardUpdate, db: AsyncSession = Depen
     for key, value in update_data.items():
         if key == "status" and value is not None:
             value = value.value
+        elif key == "runner_type" and value is not None:
+            value = value.value
         setattr(card, key, value)
 
     await db.commit()
     await db.refresh(card)
 
     # Broadcast card update via WebSocket
-    await manager.send_card_updated({
-        "id": card.id,
-        "repo_id": card.repo_id,
-        "title": card.title,
-        "description": card.description,
-        "status": card.status,
-        "branch_name": card.branch_name,
-        "pr_url": card.pr_url,
-        "job_id": card.job_id,
-        "created_at": card.created_at.isoformat(),
-        "updated_at": card.updated_at.isoformat(),
-    })
+    await manager.send_card_updated(card_to_ws_dict(card))
 
     return card
 
@@ -165,6 +163,7 @@ async def start_card(
     card.status = "in_progress"
     card.job_id = job_id
     card.branch_name = f"lazyaf/{job_id[:8]}"
+    card.completed_runner_type = None  # Clear in case this is a re-start
 
     await db.commit()
     await db.refresh(card)
@@ -179,6 +178,7 @@ async def start_card(
         base_branch=repo.default_branch,
         card_title=card.title,
         card_description=card.description,
+        runner_type=card.runner_type,  # Pass runner type from card
         use_internal_git=True,  # Always use internal git for ingested repos
         agent_file_ids=request.agent_file_ids,
     )
@@ -195,18 +195,7 @@ async def start_card(
     })
 
     # Broadcast card update via WebSocket
-    await manager.send_card_updated({
-        "id": card.id,
-        "repo_id": card.repo_id,
-        "title": card.title,
-        "description": card.description,
-        "status": card.status,
-        "branch_name": card.branch_name,
-        "pr_url": card.pr_url,
-        "job_id": card.job_id,
-        "created_at": card.created_at.isoformat(),
-        "updated_at": card.updated_at.isoformat(),
-    })
+    await manager.send_card_updated(card_to_ws_dict(card))
 
     return card
 
@@ -278,18 +267,7 @@ async def approve_card(
     await db.refresh(card)
 
     # Broadcast card update via WebSocket
-    await manager.send_card_updated({
-        "id": card.id,
-        "repo_id": card.repo_id,
-        "title": card.title,
-        "description": card.description,
-        "status": card.status,
-        "branch_name": card.branch_name,
-        "pr_url": card.pr_url,
-        "job_id": card.job_id,
-        "created_at": card.created_at.isoformat(),
-        "updated_at": card.updated_at.isoformat(),
-    })
+    await manager.send_card_updated(card_to_ws_dict(card))
 
     return {
         "card": CardRead.model_validate(card),
@@ -313,18 +291,7 @@ async def reject_card(card_id: str, db: AsyncSession = Depends(get_db)):
     await db.refresh(card)
 
     # Broadcast card update via WebSocket
-    await manager.send_card_updated({
-        "id": card.id,
-        "repo_id": card.repo_id,
-        "title": card.title,
-        "description": card.description,
-        "status": card.status,
-        "branch_name": card.branch_name,
-        "pr_url": card.pr_url,
-        "job_id": card.job_id,
-        "created_at": card.created_at.isoformat(),
-        "updated_at": card.updated_at.isoformat(),
-    })
+    await manager.send_card_updated(card_to_ws_dict(card))
 
     return card
 
@@ -382,18 +349,7 @@ async def resolve_conflicts(
     await db.refresh(card)
 
     # Broadcast card update via WebSocket
-    await manager.send_card_updated({
-        "id": card.id,
-        "repo_id": card.repo_id,
-        "title": card.title,
-        "description": card.description,
-        "status": card.status,
-        "branch_name": card.branch_name,
-        "pr_url": card.pr_url,
-        "job_id": card.job_id,
-        "created_at": card.created_at.isoformat(),
-        "updated_at": card.updated_at.isoformat(),
-    })
+    await manager.send_card_updated(card_to_ws_dict(card))
 
     return {
         "card": CardRead.model_validate(card),
@@ -437,6 +393,7 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
     card.job_id = job_id
     card.branch_name = f"lazyaf/{job_id[:8]}"
     card.pr_url = None  # Clear old PR URL
+    card.completed_runner_type = None  # Clear so new runner's type will show
 
     await db.commit()
     await db.refresh(card)
@@ -450,6 +407,7 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
         base_branch=repo.default_branch,
         card_title=card.title,
         card_description=card.description,
+        runner_type=card.runner_type,  # Pass runner type from card
         use_internal_git=True,
     )
     await job_queue.enqueue(queued_job)
@@ -465,18 +423,7 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
     })
 
     # Broadcast card update via WebSocket
-    await manager.send_card_updated({
-        "id": card.id,
-        "repo_id": card.repo_id,
-        "title": card.title,
-        "description": card.description,
-        "status": card.status,
-        "branch_name": card.branch_name,
-        "pr_url": card.pr_url,
-        "job_id": card.job_id,
-        "created_at": card.created_at.isoformat(),
-        "updated_at": card.updated_at.isoformat(),
-    })
+    await manager.send_card_updated(card_to_ws_dict(card))
 
     return card
 
@@ -613,16 +560,7 @@ async def resolve_rebase_conflicts(
     await db.refresh(card)
 
     # Broadcast card update via WebSocket (branch sha changed)
-    await manager.send_card_updated({
-        "id": card.id,
-        "repo_id": card.repo_id,
-        "title": card.title,
-        "description": card.description,
-        "status": card.status,
-        "branch_name": card.branch_name,
-        "pr_url": card.pr_url,
-        "job_id": card.job_id,
-    })
+    await manager.send_card_updated(card_to_ws_dict(card))
 
     return {
         "card": CardRead.model_validate(card),

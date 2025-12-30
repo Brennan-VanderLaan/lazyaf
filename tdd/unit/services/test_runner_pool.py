@@ -107,7 +107,7 @@ class TestRunnerInfo:
     def test_runner_info_is_alive_expired(self):
         """Runner with old heartbeat is not alive."""
         runner = RunnerInfo(id="runner-1")
-        runner.last_heartbeat = datetime.utcnow() - timedelta(seconds=60)
+        runner.last_heartbeat = datetime.utcnow() - timedelta(seconds=120)
         assert runner.is_alive(timeout_seconds=30) is False
 
 
@@ -566,7 +566,7 @@ class TestCleanup:
     def test_cleanup_marks_dead_runners_offline(self, pool):
         """Dead runners are marked offline."""
         runner = pool.register()
-        runner.last_heartbeat = datetime.utcnow() - timedelta(seconds=60)
+        runner.last_heartbeat = datetime.utcnow() - timedelta(seconds=120)
         pool._cleanup_dead_runners()
         assert runner.status == "offline"
 
@@ -574,7 +574,7 @@ class TestCleanup:
         """Already offline runners are not affected."""
         runner = pool.register()
         runner.status = "offline"
-        runner.last_heartbeat = datetime.utcnow() - timedelta(seconds=60)
+        runner.last_heartbeat = datetime.utcnow() - timedelta(seconds=120)
         pool._cleanup_dead_runners()
         assert runner.status == "offline"
 
@@ -584,7 +584,7 @@ class TestCleanup:
         runner.status = "busy"
         job = make_job("orphan-job")
         runner.current_job = job
-        runner.last_heartbeat = datetime.utcnow() - timedelta(seconds=60)
+        runner.last_heartbeat = datetime.utcnow() - timedelta(seconds=120)
 
         with patch("asyncio.create_task") as mock_create_task:
             pool._cleanup_dead_runners()

@@ -430,12 +430,91 @@ src/
 **Goal**: Usable daily driver
 
 - [ ] Improve error states and messaging
-- [ ] Add card filtering/search
+- [x] Add card filtering/search
 - [ ] Runner scaling controls
 - [ ] Basic auth (optional, local tool)
 - [ ] Persist runner pool config
 
 **Deliverable**: You're using this for real work
+
+### Phase 7: MCP Interface
+**Goal**: Allow LLM clients (Claude Desktop, etc.) to orchestrate LazyAF via Model Context Protocol
+
+**Problem Being Solved**: Want to interact with LazyAF from chat interfaces - "create a card for adding dark mode" without opening the UI.
+
+**MVP Scope**:
+- [ ] MCP server with stdio transport (for Claude Desktop)
+- [ ] Tool: `list_repos` - returns repo names, IDs, and ingest status
+- [ ] Tool: `list_cards` - returns cards for a repo with status, branch, PR info
+- [ ] Tool: `create_card` - creates a card given repo_id, title, description
+- [ ] Tool: `get_card` - returns full card details including job logs
+- [ ] Tool: `start_card` - triggers agent work on a card
+- [ ] Tool: `get_job_logs` - fetch logs from a job run
+- [ ] Resource: repos (list of available repositories)
+- [ ] Configuration for Claude Desktop integration
+
+**Explicit Non-Goals (This Phase)**:
+- HTTP/SSE transport (stdio only for MVP)
+- Runner management via MCP
+- Complex auth (local tool assumption)
+
+**Key Files**:
+```
+backend/
+├── mcp/
+│   ├── __init__.py
+│   ├── server.py         # MCP server implementation
+│   └── tools.py          # Tool definitions wrapping existing API
+```
+
+**Tech Stack**:
+- `mcp` Python package for server implementation
+- stdio transport for Claude Desktop compatibility
+- Thin wrapper around existing FastAPI services
+
+**Deliverable**: Can list repos, create cards, and start work from Claude Desktop
+
+### Phase 8: Test Result Capture
+**Goal**: Visibility into whether agent-produced code passes tests
+
+**Problem Being Solved**: Agents complete work but may have broken tests. No visibility into test results, and manual checking is tedious. Want LazyAF to be the source of truth for test status, not GHA.
+
+**MVP Scope**:
+- [ ] Runner detects test framework (package.json scripts, pytest.ini, etc.)
+- [ ] Runner runs tests after Claude Code completes
+- [ ] Test results stored on Job model (pass_count, fail_count, output)
+- [ ] Test summary displayed in CardModal when viewing completed cards
+- [ ] Cards with failing tests get "failed" status with test output visible
+- [ ] Test output included in job logs
+
+**Explicit Non-Goals (This Phase)**:
+- Separate test dashboard (use existing UI)
+- Automatic retry on test failure (manual retry exists)
+- Coverage reports
+- Test trend analysis
+- External CI integration (this IS the CI)
+
+**Key Files**:
+- `backend/runner/entrypoint.py` - Add test detection and execution
+- `backend/app/models/job.py` - Add test result fields
+- `frontend/src/lib/components/CardModal.svelte` - Display test results
+
+**Test Framework Detection**:
+```python
+# Priority order for detection:
+1. package.json → scripts.test → "npm test"
+2. pytest.ini / pyproject.toml [tool.pytest] → "pytest"
+3. Cargo.toml → "cargo test"
+4. go.mod → "go test ./..."
+5. Makefile with test target → "make test"
+```
+
+**Decision Points**:
+- If no tests detected: treat as "no tests" (not pass or fail)
+- Test failure blocks card from going to "in_review" (stays as "failed")
+- Test timeout: 5 minutes default, configurable per repo
+
+**Deliverable**: After agent work, see "Tests: 42 passed, 3 failed" in card modal. Failed tests = failed card.
 
 ---
 
@@ -468,6 +547,10 @@ lazyaf/
 │   │   │   ├── job_queue.py
 │   │   │   ├── websocket.py
 │   │   │   └── git_server.py    # Bare repo management
+│   │   ├── mcp/                  # MCP server (Phase 7)
+│   │   │   ├── __init__.py
+│   │   │   ├── server.py         # MCP server entry point
+│   │   │   └── tools.py          # Tool definitions
 │   │   └── schemas/
 │   │       ├── __init__.py
 │   │       └── ...              # Pydantic models
@@ -515,7 +598,8 @@ lazyaf/
 ## Current Status
 
 **Completed**: Phases 1-5
-**Current**: Phase 6 (Polish)
+**Current**: Phase 6 (Polish) - in progress
+**Next**: Phase 7 (MCP Interface), Phase 8 (Test Result Capture)
 
 The core workflow is functional:
 1. Ingest repos via CLI
@@ -524,4 +608,7 @@ The core workflow is functional:
 4. Review diffs in card modal
 5. Approve/Reject to complete cycle
 
-**Ready for Phase 6 polish items and real-world usage testing.**
+**Roadmap**:
+- Phase 6: Polish - quality of life improvements for daily use
+- Phase 7: MCP Interface - orchestrate LazyAF from Claude Desktop
+- Phase 8: Test Result Capture - visibility into test pass/fail, replace GHA dependency

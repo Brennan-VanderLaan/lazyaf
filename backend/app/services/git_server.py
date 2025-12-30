@@ -295,19 +295,19 @@ class GitRepoManager:
             print(f"[git_server] merge base error: {e}")
         return None
 
-    def _merge_trees(self, repo, base_tree_sha, ours_tree_sha, theirs_tree_sha) -> tuple[bytes, list[str]]:
+    def _merge_trees(self, repo, base_tree_sha, ours_tree_sha, theirs_tree_sha, path_prefix: str = "") -> tuple[bytes, list[str]]:
         """
-        Perform a three-way merge of trees.
+        Perform a three-way merge of trees (recursively for subdirectories).
 
         Returns (merged_tree_sha, list_of_conflicts)
-        For simplicity, this does a tree-level merge:
-        - If file unchanged in ours, take theirs
-        - If file unchanged in theirs, take ours
+        - If entry unchanged in ours, take theirs
+        - If entry unchanged in theirs, take ours
         - If both changed the same way, take either
-        - If both changed differently, conflict
+        - If both changed a subdirectory, recursively merge
+        - If both changed a file differently, conflict
         """
         from dulwich.objects import Tree
-        from dulwich.diff_tree import tree_changes
+        import stat
 
         base_tree = repo.object_store[base_tree_sha]
         ours_tree = repo.object_store[ours_tree_sha]
@@ -328,6 +328,8 @@ class GitRepoManager:
             ours = ours_entries.get(path)
             theirs = theirs_entries.get(path)
 
+            full_path = f"{path_prefix}{path.decode('utf-8', errors='replace')}"
+
             if ours == theirs:
                 # Both sides same - use either (or None if both deleted)
                 if ours:
@@ -343,14 +345,38 @@ class GitRepoManager:
                     merged_entries[path] = ours
                 # else: ours deleted it, so don't include
             else:
-                # Both changed - conflict
-                conflicts.append(path.decode('utf-8', errors='replace'))
-                # For now, take theirs (source branch) on conflict
-                # A real implementation would create conflict markers
-                if theirs:
-                    merged_entries[path] = theirs
-                elif ours:
-                    merged_entries[path] = ours
+                # Both changed - check if it's a directory we can recursively merge
+                ours_is_tree = ours and stat.S_ISDIR(ours[0])
+                theirs_is_tree = theirs and stat.S_ISDIR(theirs[0])
+                base_is_tree = base and stat.S_ISDIR(base[0])
+
+                if ours_is_tree and theirs_is_tree and base_is_tree:
+                    # Both sides modified a directory - recursively merge
+                    merged_subtree_sha, sub_conflicts = self._merge_trees(
+                        repo, base[1], ours[1], theirs[1],
+                        path_prefix=f"{full_path}/"
+                    )
+                    merged_entries[path] = (ours[0], merged_subtree_sha)  # Keep mode from ours
+                    conflicts.extend(sub_conflicts)
+                elif ours_is_tree and theirs_is_tree and not base_is_tree:
+                    # New directory on both sides - try to merge
+                    # Use an empty tree as base if directory didn't exist
+                    empty_tree = Tree()
+                    repo.object_store.add_object(empty_tree)
+                    merged_subtree_sha, sub_conflicts = self._merge_trees(
+                        repo, empty_tree.id, ours[1], theirs[1],
+                        path_prefix=f"{full_path}/"
+                    )
+                    merged_entries[path] = (ours[0], merged_subtree_sha)
+                    conflicts.extend(sub_conflicts)
+                else:
+                    # File conflict (or type changed file<->dir)
+                    conflicts.append(full_path)
+                    # Take theirs (source branch) on conflict
+                    if theirs:
+                        merged_entries[path] = theirs
+                    elif ours:
+                        merged_entries[path] = ours
 
         # Build merged tree
         merged_tree = Tree()
@@ -360,50 +386,110 @@ class GitRepoManager:
         repo.object_store.add_object(merged_tree)
         return merged_tree.id, conflicts
 
+    def _get_blob_at_path(self, repo, tree_sha, path: str) -> bytes | None:
+        """
+        Get blob content at a nested path in a tree.
+        Returns None if path doesn't exist or isn't a blob.
+        """
+        from dulwich.objects import Blob, Tree
+        import stat
+
+        parts = path.split('/')
+        current_sha = tree_sha
+
+        for i, part in enumerate(parts):
+            try:
+                obj = repo.object_store[current_sha]
+                if not isinstance(obj, Tree):
+                    return None
+
+                # Find the entry matching this part
+                part_bytes = part.encode('utf-8')
+                found = False
+                for entry in obj.items():
+                    if entry.path == part_bytes:
+                        current_sha = entry.sha
+                        found = True
+                        break
+
+                if not found:
+                    return None
+
+            except KeyError:
+                return None
+
+        # current_sha should now point to the blob
+        try:
+            obj = repo.object_store[current_sha]
+            if isinstance(obj, Blob):
+                return obj.data
+        except KeyError:
+            pass
+
+        return None
+
     def _get_conflict_details(self, repo, base_tree_sha, ours_tree_sha, theirs_tree_sha, conflict_paths: list[str]) -> list[dict]:
         """
         Get detailed conflict information including file contents from all three versions.
         Returns a list of conflict dicts with file path and content from base, ours, and theirs.
+        Handles nested paths like 'backend/app/main.py'.
         """
-        from dulwich.objects import Blob
-
-        base_tree = repo.object_store[base_tree_sha]
-        ours_tree = repo.object_store[ours_tree_sha]
-        theirs_tree = repo.object_store[theirs_tree_sha]
-
-        base_entries = {e.path: (e.mode, e.sha) for e in base_tree.items()}
-        ours_entries = {e.path: (e.mode, e.sha) for e in ours_tree.items()}
-        theirs_entries = {e.path: (e.mode, e.sha) for e in theirs_tree.items()}
-
         conflict_details = []
         for path_str in conflict_paths:
-            path = path_str.encode('utf-8')
-
-            # Get content from each version
-            base_content = None
-            ours_content = None
-            theirs_content = None
-
-            if path in base_entries:
-                blob = repo.object_store[base_entries[path][1]]
-                base_content = blob.data.decode('utf-8', errors='replace') if isinstance(blob, Blob) else None
-
-            if path in ours_entries:
-                blob = repo.object_store[ours_entries[path][1]]
-                ours_content = blob.data.decode('utf-8', errors='replace') if isinstance(blob, Blob) else None
-
-            if path in theirs_entries:
-                blob = repo.object_store[theirs_entries[path][1]]
-                theirs_content = blob.data.decode('utf-8', errors='replace') if isinstance(blob, Blob) else None
+            # Get content from each version using nested path lookup
+            base_data = self._get_blob_at_path(repo, base_tree_sha, path_str)
+            ours_data = self._get_blob_at_path(repo, ours_tree_sha, path_str)
+            theirs_data = self._get_blob_at_path(repo, theirs_tree_sha, path_str)
 
             conflict_details.append({
                 "path": path_str,
-                "base_content": base_content,
-                "ours_content": ours_content,
-                "theirs_content": theirs_content
+                "base_content": base_data.decode('utf-8', errors='replace') if base_data else None,
+                "ours_content": ours_data.decode('utf-8', errors='replace') if ours_data else None,
+                "theirs_content": theirs_data.decode('utf-8', errors='replace') if theirs_data else None
             })
 
         return conflict_details
+
+    def _set_blob_at_path(self, repo, tree_sha, path: str, blob_sha, mode: int = 0o100644):
+        """
+        Create a new tree with a blob set at the given nested path.
+        Returns the new root tree SHA.
+        """
+        from dulwich.objects import Tree
+
+        parts = path.split('/')
+        if len(parts) == 1:
+            # Base case: update this tree directly
+            tree = repo.object_store[tree_sha]
+            new_tree = Tree()
+            found = False
+            for entry in tree.items():
+                if entry.path == parts[0].encode('utf-8'):
+                    new_tree.add(entry.path, mode, blob_sha)
+                    found = True
+                else:
+                    new_tree.add(entry.path, entry.mode, entry.sha)
+            if not found:
+                new_tree.add(parts[0].encode('utf-8'), mode, blob_sha)
+            repo.object_store.add_object(new_tree)
+            return new_tree.id
+
+        # Recursive case: update subtree and rebuild parent
+        tree = repo.object_store[tree_sha]
+        new_tree = Tree()
+        subdir = parts[0].encode('utf-8')
+        rest_path = '/'.join(parts[1:])
+
+        for entry in tree.items():
+            if entry.path == subdir:
+                # Recurse into this subtree
+                new_subtree_sha = self._set_blob_at_path(repo, entry.sha, rest_path, blob_sha, mode)
+                new_tree.add(entry.path, entry.mode, new_subtree_sha)
+            else:
+                new_tree.add(entry.path, entry.mode, entry.sha)
+
+        repo.object_store.add_object(new_tree)
+        return new_tree.id
 
     def resolve_and_merge(self, repo_id: str, source_branch: str, target_branch: str,
                           resolutions: list[dict], author: str = "LazyAF <lazyaf@localhost>") -> dict:
@@ -414,7 +500,7 @@ class GitRepoManager:
             repo_id: Repository ID
             source_branch: Source branch to merge from
             target_branch: Target branch to merge into
-            resolutions: List of dicts with 'path' and 'content' keys
+            resolutions: List of dicts with 'path' and 'content' keys (supports nested paths)
             author: Author string for the commit
 
         Returns dict with success, merge_type, message, new_sha, and error
@@ -442,70 +528,41 @@ class GitRepoManager:
                 return {"success": False, "error": "Cannot find common ancestor", "merge_type": None, "new_sha": None, "message": ""}
 
             merge_base_commit = repo.object_store[merge_base_sha.encode('ascii')]
-            merge_base_tree = repo.object_store[merge_base_commit.tree]
-            source_tree = repo.object_store[source_commit.tree]
-            target_tree = repo.object_store[target_commit.tree]
 
-            # Perform initial merge to get all entries
+            # Perform recursive merge (handles subdirectories)
             merged_tree_sha, conflicts = self._merge_trees(
-                repo, merge_base_tree.id, target_tree.id, source_tree.id
+                repo,
+                merge_base_commit.tree,
+                target_commit.tree,
+                source_commit.tree
             )
 
-            # Build a merged tree with resolved conflicts
-            base_entries = {e.path: (e.mode, e.sha) for e in merge_base_tree.items()}
-            ours_entries = {e.path: (e.mode, e.sha) for e in target_tree.items()}
-            theirs_entries = {e.path: (e.mode, e.sha) for e in source_tree.items()}
-
-            all_paths = set(base_entries.keys()) | set(ours_entries.keys()) | set(theirs_entries.keys())
-            merged_entries = {}
-
-            # Create a map of resolutions
+            # Check we have resolutions for all conflicts
             resolution_map = {r["path"]: r["content"] for r in resolutions}
+            missing = [c for c in conflicts if c not in resolution_map]
+            if missing:
+                return {
+                    "success": False,
+                    "error": f"Missing resolution for conflicted files: {', '.join(missing)}",
+                    "merge_type": None,
+                    "new_sha": None,
+                    "message": ""
+                }
 
-            for path in all_paths:
-                base = base_entries.get(path)
-                ours = ours_entries.get(path)
-                theirs = theirs_entries.get(path)
-                path_str = path.decode('utf-8', errors='replace')
+            # Apply resolutions to the merged tree
+            current_tree_sha = merged_tree_sha
+            for path, content in resolution_map.items():
+                # Create blob with resolved content
+                blob = Blob()
+                blob.data = content.encode('utf-8')
+                repo.object_store.add_object(blob)
 
-                if ours == theirs:
-                    if ours:
-                        merged_entries[path] = ours
-                elif ours == base:
-                    if theirs:
-                        merged_entries[path] = theirs
-                elif theirs == base:
-                    if ours:
-                        merged_entries[path] = ours
-                else:
-                    # Conflict - use resolution if provided
-                    if path_str in resolution_map:
-                        # Create new blob with resolved content
-                        blob = Blob()
-                        blob.data = resolution_map[path_str].encode('utf-8')
-                        repo.object_store.add_object(blob)
-                        # Use mode from ours (target) or theirs (source) if ours doesn't exist
-                        mode = ours[0] if ours else theirs[0]
-                        merged_entries[path] = (mode, blob.id)
-                    else:
-                        return {
-                            "success": False,
-                            "error": f"Missing resolution for conflicted file: {path_str}",
-                            "merge_type": None,
-                            "new_sha": None,
-                            "message": ""
-                        }
-
-            # Build merged tree
-            merged_tree = Tree()
-            for path, (mode, sha) in sorted(merged_entries.items()):
-                merged_tree.add(path, mode, sha)
-
-            repo.object_store.add_object(merged_tree)
+                # Update tree with resolved blob
+                current_tree_sha = self._set_blob_at_path(repo, current_tree_sha, path, blob.id)
 
             # Create merge commit
             commit = Commit()
-            commit.tree = merged_tree.id
+            commit.tree = current_tree_sha
             commit.parents = [target_sha.encode('ascii'), source_sha.encode('ascii')]
             commit.author = author.encode('utf-8')
             commit.committer = author.encode('utf-8')
@@ -660,7 +717,11 @@ class GitRepoManager:
             return {"success": False, "error": str(e), "new_sha": None, "message": ""}
 
     def get_diff(self, repo_id: str, base_branch: str, head_branch: str) -> dict:
-        """Get diff between two branches."""
+        """Get diff between two branches.
+
+        Shows changes unique to head_branch by diffing from merge base to head.
+        This prevents showing parallel work on base_branch as "deletions".
+        """
         from dulwich.diff_tree import tree_changes
         from dulwich.objects import Blob
 
@@ -675,13 +736,20 @@ class GitRepoManager:
             return {"error": "Branch not found", "files": []}
 
         try:
-            base_commit = repo.object_store[base_sha.encode('ascii')]
+            # Find merge base to show only changes unique to head_branch
+            # Without this, parallel work on base_branch appears as "deletions"
+            merge_base_sha = self._find_merge_base(repo, base_sha, head_sha)
+
+            # Use merge base for diff if found, otherwise fall back to base
+            diff_base_sha = merge_base_sha if merge_base_sha else base_sha
+
+            diff_base_commit = repo.object_store[diff_base_sha.encode('ascii')]
             head_commit = repo.object_store[head_sha.encode('ascii')]
 
-            base_tree = repo.object_store[base_commit.tree]
+            diff_base_tree = repo.object_store[diff_base_commit.tree]
             head_tree = repo.object_store[head_commit.tree]
 
-            changes = tree_changes(repo.object_store, base_tree.id, head_tree.id)
+            changes = tree_changes(repo.object_store, diff_base_tree.id, head_tree.id)
 
             files = []
             for change in changes:
@@ -742,23 +810,34 @@ class GitRepoManager:
 
                 files.append(file_info)
 
-            # Count commits between branches
+            # Count commits unique to head_branch (in head but not in base)
+            # This handles diverged branches correctly by using set difference
             commit_count = 0
             try:
                 from dulwich.walk import Walker
-                walker = Walker(repo.object_store, [head_sha.encode('ascii')], max_entries=100)
-                for entry in walker:
-                    if entry.commit.id.decode('ascii') == base_sha:
-                        break
-                    commit_count += 1
-            except Exception:
-                pass
+
+                # Get commits reachable from base
+                base_commits = set()
+                base_walker = Walker(repo.object_store, [base_sha.encode('ascii')], max_entries=1000)
+                for entry in base_walker:
+                    base_commits.add(entry.commit.id.decode('ascii'))
+
+                # Count commits reachable from head that aren't in base
+                head_walker = Walker(repo.object_store, [head_sha.encode('ascii')], max_entries=1000)
+                for entry in head_walker:
+                    commit_sha = entry.commit.id.decode('ascii')
+                    if commit_sha not in base_commits:
+                        commit_count += 1
+            except Exception as e:
+                print(f"[git_server] Error counting commits: {e}")
 
             return {
                 "base_branch": base_branch,
                 "head_branch": head_branch,
                 "base_sha": base_sha,
                 "head_sha": head_sha,
+                "merge_base_sha": merge_base_sha,  # Where feature branched off
+                "diff_base_sha": diff_base_sha,    # What we're actually diffing from
                 "commit_count": commit_count,
                 "files": files,
                 "total_additions": sum(f["additions"] for f in files),

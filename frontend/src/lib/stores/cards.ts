@@ -134,7 +134,18 @@ function createCardsStore() {
     },
 
     updateLocal(card: Card) {
-      update(cards => cards.map(c => c.id === card.id ? card : c));
+      update(cards => {
+        const existing = cards.find(c => c.id === card.id);
+        if (existing) {
+          return cards.map(c => c.id === card.id ? card : c);
+        } else {
+          return [...cards, card];
+        }
+      });
+    },
+
+    deleteLocal(id: string) {
+      update(cards => cards.filter(c => c.id !== id));
     },
 
     clear() {

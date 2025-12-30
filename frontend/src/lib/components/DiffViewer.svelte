@@ -6,13 +6,14 @@
   export let repoId: string;
   export let baseBranch: string;
   export let headBranch: string;
+  export let refreshKey: number = 0;  // Increment to force reload
 
   let diff: DiffResponse | null = null;
   let loading = true;
   let error: string | null = null;
   let expandedFiles: Set<string> = new Set();
 
-  $: if (repoId && baseBranch && headBranch) {
+  $: if (repoId && baseBranch && headBranch && refreshKey >= 0) {
     loadDiff();
   }
 

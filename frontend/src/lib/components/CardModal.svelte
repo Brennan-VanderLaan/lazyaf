@@ -17,6 +17,7 @@
   let selectedTargetBranch: string = '';
   let mergeResult: MergeResult | null = null;
   let rebaseResult: RebaseResult | null = null;
+  let diffRefreshKey: number = 0;  // Increment to force diff reload
 
   $: showDiff = card?.branch_name && (card?.status === 'in_review' || card?.status === 'done' || card?.status === 'failed');
   $: baseBranch = selectedTargetBranch || $selectedRepo?.default_branch || 'main';
@@ -108,7 +109,12 @@
     try {
       const response = await cardsStore.approve(card.id, selectedTargetBranch || undefined);
       mergeResult = response.merge_result;
-      dispatch('updated', response.card);
+
+      // Only close modal if merge succeeded
+      // If there are conflicts or errors, keep modal open to show them
+      if (response.merge_result?.success !== false) {
+        dispatch('updated', response.card);
+      }
     } catch (e) {
       // Show error but don't close modal
       alert(e instanceof Error ? e.message : 'Merge failed');
@@ -147,6 +153,8 @@
       const response = await cardsStore.rebase(card.id, selectedTargetBranch || undefined);
       rebaseResult = response.rebase_result;
       dispatch('updated', response.card);
+      // Force diff to reload after rebase
+      diffRefreshKey++;
     } catch (e) {
       // Show error but don't close modal
       alert(e instanceof Error ? e.message : 'Rebase failed');
@@ -285,7 +293,7 @@
                 {/if}
               </div>
             </div>
-            <DiffViewer {repoId} {baseBranch} headBranch={card.branch_name} />
+            <DiffViewer {repoId} {baseBranch} headBranch={card.branch_name} refreshKey={diffRefreshKey} />
           </div>
         {/if}
 

@@ -30,6 +30,9 @@ class ConnectionManager:
     async def send_card_updated(self, card_data: dict):
         await self.broadcast("card_updated", card_data)
 
+    async def send_card_deleted(self, card_id: str):
+        await self.broadcast("card_deleted", {"id": card_id})
+
     async def send_job_status(self, job_data: dict):
         await self.broadcast("job_status", job_data)
 

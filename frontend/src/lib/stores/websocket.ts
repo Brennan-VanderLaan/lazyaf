@@ -6,7 +6,7 @@ import { jobsStore, type JobStatusUpdate } from './jobs';
 export type WebSocketStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
 interface WebSocketMessage {
-  type: 'card_updated' | 'job_status' | 'runner_status';
+  type: 'card_updated' | 'card_deleted' | 'job_status' | 'runner_status';
   payload: unknown;
 }
 
@@ -58,6 +58,9 @@ function createWebSocketStore() {
     switch (message.type) {
       case 'card_updated':
         cardsStore.updateLocal(message.payload as Card);
+        break;
+      case 'card_deleted':
+        cardsStore.deleteLocal((message.payload as { id: string }).id);
         break;
       case 'job_status':
         jobsStore.updateFromWebSocket(message.payload as JobStatusUpdate);

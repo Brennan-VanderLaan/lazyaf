@@ -254,6 +254,48 @@ def run_command_streaming(cmd: list[str], cwd: str = None) -> tuple[int, str, st
     return process.returncode, '\n'.join(stdout_lines), '\n'.join(stderr_lines)
 
 
+def fetch_agent_files(agent_file_ids: list[str]) -> list[dict]:
+    """Fetch agent files from backend by their IDs."""
+    if not agent_file_ids:
+        return []
+
+    try:
+        response = session.post(
+            f"{BACKEND_URL}/api/agent-files/batch",
+            json=agent_file_ids,
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        log(f"Failed to fetch agent files: {e}")
+        return []
+
+
+def setup_agent_files(agent_files: list[dict]):
+    """Write agent files to the .claude/agents directory."""
+    if not agent_files:
+        return
+
+    agents_dir = Path.home() / ".claude" / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+
+    log(f"Setting up {len(agent_files)} agent file(s)...")
+    for agent_file in agent_files:
+        name = agent_file.get("name", "")
+        content = agent_file.get("content", "")
+        if not name or not content:
+            log(f"Skipping invalid agent file: {agent_file}")
+            continue
+
+        agent_path = agents_dir / name
+        try:
+            agent_path.write_text(content)
+            log(f"  Wrote agent file: {name}")
+        except Exception as e:
+            log(f"  Failed to write agent file {name}: {e}")
+
+
 def execute_job(job: dict):
     """Execute a job."""
     job_id = job['id']
@@ -277,11 +319,17 @@ def execute_job(job: dict):
     card_title = job.get("card_title", "")
     card_description = job.get("card_description", "")
     use_internal_git = job.get("use_internal_git", False)
+    agent_file_ids = job.get("agent_file_ids", [])
 
     # If using internal git, construct URL from backend URL
     if use_internal_git and repo_id:
         repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
         log(f"Using internal git server: {repo_url}")
+
+    # Fetch and setup agent files
+    if agent_file_ids:
+        agent_files = fetch_agent_files(agent_file_ids)
+        setup_agent_files(agent_files)
 
     workspace = Path("/workspace/repo")
 

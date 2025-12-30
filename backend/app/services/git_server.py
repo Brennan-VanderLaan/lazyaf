@@ -502,8 +502,8 @@ class HTTPGitBackend:
         if not refs:
             # Empty repo - send capabilities with zero-id
             if service == "git-upload-pack":
-                # Simple capabilities - avoid multi_ack_detailed for simpler negotiation
-                caps = b"thin-pack side-band side-band-64k ofs-delta shallow no-progress"
+                # no-done tells client to send everything in one request (no multi-round negotiation)
+                caps = b"thin-pack side-band side-band-64k ofs-delta shallow no-progress no-done"
             else:
                 # No side-band for receive-pack - simpler response handling
                 caps = b"report-status delete-refs ofs-delta"
@@ -513,8 +513,8 @@ class HTTPGitBackend:
             # Send refs with capabilities on first line
             first = True
             if service == "git-upload-pack":
-                # Simple capabilities - avoid multi_ack_detailed for simpler negotiation
-                caps = b"thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag allow-tip-sha1-in-want allow-reachable-sha1-in-want"
+                # no-done tells client to send everything in one request (no multi-round negotiation)
+                caps = b"thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag allow-tip-sha1-in-want allow-reachable-sha1-in-want no-done"
             else:
                 # No side-band for receive-pack - simpler response handling
                 caps = b"report-status delete-refs ofs-delta"
@@ -561,6 +561,7 @@ class HTTPGitBackend:
             wants = []
             haves = []
             capabilities = []
+            got_done = False
 
             # Parse pkt-lines for wants and haves
             while True:
@@ -581,7 +582,7 @@ class HTTPGitBackend:
                 if line.endswith(b'\n'):
                     line = line[:-1]
 
-                print(f"[git_server] pkt-line: {line[:80]}")
+                print(f"[git_server] pkt-line: {line}")
 
                 if line.startswith(b'want '):
                     # Parse: want <sha> [capabilities]
@@ -596,11 +597,13 @@ class HTTPGitBackend:
                     sha = line[5:].strip()
                     haves.append(sha)
                 elif line == b'done':
+                    got_done = True
                     break
 
             print(f"[git_server] wants: {[w[:8].decode() if isinstance(w, bytes) else w[:8] for w in wants]}")
             print(f"[git_server] haves: {len(haves)} objects")
             print(f"[git_server] caps: {capabilities}")
+            print(f"[git_server] got_done: {got_done}, no-done in caps: {b'no-done' in capabilities}")
 
             # Debug: check pack directory
             pack_dir = Path(repo.object_store.path) / "pack"
@@ -622,6 +625,16 @@ class HTTPGitBackend:
 
             # Build pack with requested objects
             output = BytesIO()
+
+            # Check if client is using no-done capability (sends everything in one request)
+            client_uses_no_done = b'no-done' in capabilities
+
+            # If we haven't received "done" and client isn't using no-done, this is just negotiation
+            # Send NAK and wait for the next request with "done"
+            if not got_done and not client_uses_no_done and haves:
+                print(f"[git_server] No 'done' received - sending NAK for negotiation")
+                output.write(pkt_line(b"NAK\n"))
+                return output.getvalue()
 
             if wants:
                 # dulwich 0.25+ expects hex SHA for object_store lookups
@@ -694,8 +707,10 @@ class HTTPGitBackend:
                 print(f"[git_server] pack size: {len(pack_bytes)} bytes")
 
                 # Send NAK before pack data (simple protocol without multi_ack)
-                output.write(pkt_line(b"NAK\n"))
-                print(f"[git_server] sent NAK")
+                nak_pkt = pkt_line(b"NAK\n")
+                print(f"[git_server] NAK pkt: {nak_pkt!r}")
+                output.write(nak_pkt)
+                print(f"[git_server] sent NAK, output so far: {output.getvalue()[:50]!r}")
 
                 if use_sideband:
                     # Sideband: band 1 = pack data, band 2 = progress
@@ -716,7 +731,10 @@ class HTTPGitBackend:
                     output.write(pack_bytes)
                     output.write(b"0000")
 
-            return output.getvalue()
+            result = output.getvalue()
+            print(f"[git_server] final response: first 100 bytes = {result[:100]!r}")
+            print(f"[git_server] final response length: {len(result)} bytes")
+            return result
 
         except Exception as e:
             import traceback

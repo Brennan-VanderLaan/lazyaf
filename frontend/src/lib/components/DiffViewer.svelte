@@ -17,6 +17,10 @@
     loadDiff();
   }
 
+  export function refresh() {
+    loadDiff();
+  }
+
   async function loadDiff() {
     loading = true;
     error = null;
@@ -119,6 +123,7 @@
           <span class="commits">{diff.commit_count} commit{diff.commit_count !== 1 ? 's' : ''}</span>
           <span class="additions">+{diff.total_additions}</span>
           <span class="deletions">-{diff.total_deletions}</span>
+          <button class="btn-refresh" on:click={refresh} title="Refresh diff">↻</button>
         </span>
       </div>
     </div>
@@ -261,6 +266,22 @@
 
   .deletions {
     color: var(--error-color, #f38ba8);
+  }
+
+  .btn-refresh {
+    background: none;
+    border: none;
+    color: var(--text-muted, #6c7086);
+    cursor: pointer;
+    font-size: 1rem;
+    padding: 0.2rem 0.4rem;
+    border-radius: 4px;
+    margin-left: 0.25rem;
+  }
+
+  .btn-refresh:hover {
+    color: var(--text-color, #cdd6f4);
+    background: var(--hover-color, #313244);
   }
 
   .no-changes {

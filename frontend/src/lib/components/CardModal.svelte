@@ -6,6 +6,7 @@
   import { repos } from '../api/client';
   import JobStatus from './JobStatus.svelte';
   import DiffViewer from './DiffViewer.svelte';
+  import ConflictResolver from './ConflictResolver.svelte';
 
   export let repoId: string;
   export let card: Card | null = null;
@@ -136,6 +137,25 @@
     }
   }
 
+  async function handleResolveConflicts(resolutions: Array<{ path: string; content: string }>) {
+    if (!card) return;
+    submitting = true;
+    try {
+      const response = await cardsStore.resolveConflicts(card.id, selectedTargetBranch || undefined, resolutions);
+      mergeResult = response.merge_result;
+      dispatch('updated', response.card);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Conflict resolution failed');
+    } finally {
+      submitting = false;
+    }
+  }
+
+  function handleCancelConflictResolution() {
+    // Reset merge result to clear conflicts
+    mergeResult = null;
+  }
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       dispatch('close');
@@ -239,18 +259,26 @@
         {/if}
 
         {#if mergeResult}
-          <div class="merge-result" class:success={mergeResult.success}>
-            <div class="merge-icon">{mergeResult.success ? '✓' : '✗'}</div>
-            <div class="merge-info">
-              <div class="merge-message">{mergeResult.message}</div>
-              {#if mergeResult.merge_type}
-                <div class="merge-type">Type: {mergeResult.merge_type}</div>
-              {/if}
-              {#if mergeResult.new_sha}
-                <div class="merge-sha">New commit: <code>{mergeResult.new_sha.slice(0, 8)}</code></div>
-              {/if}
+          {#if mergeResult.conflicts && mergeResult.conflicts.length > 0}
+            <ConflictResolver
+              conflicts={mergeResult.conflicts}
+              onResolve={handleResolveConflicts}
+              onCancel={handleCancelConflictResolution}
+            />
+          {:else}
+            <div class="merge-result" class:success={mergeResult.success}>
+              <div class="merge-icon">{mergeResult.success ? '✓' : '✗'}</div>
+              <div class="merge-info">
+                <div class="merge-message">{mergeResult.message}</div>
+                {#if mergeResult.merge_type}
+                  <div class="merge-type">Type: {mergeResult.merge_type}</div>
+                {/if}
+                {#if mergeResult.new_sha}
+                  <div class="merge-sha">New commit: <code>{mergeResult.new_sha.slice(0, 8)}</code></div>
+                {/if}
+              </div>
             </div>
-          </div>
+          {/if}
         {/if}
       {/if}
 

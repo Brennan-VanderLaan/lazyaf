@@ -109,6 +109,18 @@ function createCardsStore() {
       }
     },
 
+    async resolveConflicts(id: string, targetBranch: string | undefined, resolutions: Array<{ path: string; content: string }>): Promise<ApproveResponse> {
+      error.set(null);
+      try {
+        const response = await cardsApi.resolveConflicts(id, targetBranch, resolutions);
+        update(cards => cards.map(c => c.id === id ? response.card : c));
+        return response;
+      } catch (e) {
+        error.set(e instanceof Error ? e.message : 'Failed to resolve conflicts');
+        throw e;
+      }
+    },
+
     updateLocal(card: Card) {
       update(cards => cards.map(c => c.id === card.id ? card : c));
     },

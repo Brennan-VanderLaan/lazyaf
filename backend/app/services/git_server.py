@@ -215,12 +215,17 @@ class GitRepoManager:
             )
 
             if conflicts:
+                # Get detailed conflict information for each file
+                conflict_details = self._get_conflict_details(
+                    repo, merge_base_tree.id, target_tree.id, source_tree.id, conflicts
+                )
                 return {
                     "success": False,
                     "error": f"Merge conflicts in: {', '.join(conflicts)}",
                     "merge_type": None,
                     "new_sha": None,
-                    "message": ""
+                    "message": "",
+                    "conflicts": conflict_details
                 }
 
             # Create merge commit
@@ -354,6 +359,185 @@ class GitRepoManager:
 
         repo.object_store.add_object(merged_tree)
         return merged_tree.id, conflicts
+
+    def _get_conflict_details(self, repo, base_tree_sha, ours_tree_sha, theirs_tree_sha, conflict_paths: list[str]) -> list[dict]:
+        """
+        Get detailed conflict information including file contents from all three versions.
+        Returns a list of conflict dicts with file path and content from base, ours, and theirs.
+        """
+        from dulwich.objects import Blob
+
+        base_tree = repo.object_store[base_tree_sha]
+        ours_tree = repo.object_store[ours_tree_sha]
+        theirs_tree = repo.object_store[theirs_tree_sha]
+
+        base_entries = {e.path: (e.mode, e.sha) for e in base_tree.items()}
+        ours_entries = {e.path: (e.mode, e.sha) for e in ours_tree.items()}
+        theirs_entries = {e.path: (e.mode, e.sha) for e in theirs_tree.items()}
+
+        conflict_details = []
+        for path_str in conflict_paths:
+            path = path_str.encode('utf-8')
+
+            # Get content from each version
+            base_content = None
+            ours_content = None
+            theirs_content = None
+
+            if path in base_entries:
+                blob = repo.object_store[base_entries[path][1]]
+                base_content = blob.data.decode('utf-8', errors='replace') if isinstance(blob, Blob) else None
+
+            if path in ours_entries:
+                blob = repo.object_store[ours_entries[path][1]]
+                ours_content = blob.data.decode('utf-8', errors='replace') if isinstance(blob, Blob) else None
+
+            if path in theirs_entries:
+                blob = repo.object_store[theirs_entries[path][1]]
+                theirs_content = blob.data.decode('utf-8', errors='replace') if isinstance(blob, Blob) else None
+
+            conflict_details.append({
+                "path": path_str,
+                "base_content": base_content,
+                "ours_content": ours_content,
+                "theirs_content": theirs_content
+            })
+
+        return conflict_details
+
+    def resolve_and_merge(self, repo_id: str, source_branch: str, target_branch: str,
+                          resolutions: list[dict], author: str = "LazyAF <lazyaf@localhost>") -> dict:
+        """
+        Resolve merge conflicts and create a merge commit.
+
+        Args:
+            repo_id: Repository ID
+            source_branch: Source branch to merge from
+            target_branch: Target branch to merge into
+            resolutions: List of dicts with 'path' and 'content' keys
+            author: Author string for the commit
+
+        Returns dict with success, merge_type, message, new_sha, and error
+        """
+        from dulwich.objects import Commit, Tree, Blob
+        import time
+
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"success": False, "error": "Repo not found", "merge_type": None, "new_sha": None, "message": ""}
+
+        source_sha = self.get_branch_commit(repo_id, source_branch)
+        target_sha = self.get_branch_commit(repo_id, target_branch)
+
+        if not source_sha or not target_sha:
+            return {"success": False, "error": "Branch not found", "merge_type": None, "new_sha": None, "message": ""}
+
+        try:
+            source_commit = repo.object_store[source_sha.encode('ascii')]
+            target_commit = repo.object_store[target_sha.encode('ascii')]
+
+            # Find merge base
+            merge_base_sha = self._find_merge_base(repo, source_sha, target_sha)
+            if not merge_base_sha:
+                return {"success": False, "error": "Cannot find common ancestor", "merge_type": None, "new_sha": None, "message": ""}
+
+            merge_base_commit = repo.object_store[merge_base_sha.encode('ascii')]
+            merge_base_tree = repo.object_store[merge_base_commit.tree]
+            source_tree = repo.object_store[source_commit.tree]
+            target_tree = repo.object_store[target_commit.tree]
+
+            # Perform initial merge to get all entries
+            merged_tree_sha, conflicts = self._merge_trees(
+                repo, merge_base_tree.id, target_tree.id, source_tree.id
+            )
+
+            # Build a merged tree with resolved conflicts
+            base_entries = {e.path: (e.mode, e.sha) for e in merge_base_tree.items()}
+            ours_entries = {e.path: (e.mode, e.sha) for e in target_tree.items()}
+            theirs_entries = {e.path: (e.mode, e.sha) for e in source_tree.items()}
+
+            all_paths = set(base_entries.keys()) | set(ours_entries.keys()) | set(theirs_entries.keys())
+            merged_entries = {}
+
+            # Create a map of resolutions
+            resolution_map = {r["path"]: r["content"] for r in resolutions}
+
+            for path in all_paths:
+                base = base_entries.get(path)
+                ours = ours_entries.get(path)
+                theirs = theirs_entries.get(path)
+                path_str = path.decode('utf-8', errors='replace')
+
+                if ours == theirs:
+                    if ours:
+                        merged_entries[path] = ours
+                elif ours == base:
+                    if theirs:
+                        merged_entries[path] = theirs
+                elif theirs == base:
+                    if ours:
+                        merged_entries[path] = ours
+                else:
+                    # Conflict - use resolution if provided
+                    if path_str in resolution_map:
+                        # Create new blob with resolved content
+                        blob = Blob()
+                        blob.data = resolution_map[path_str].encode('utf-8')
+                        repo.object_store.add_object(blob)
+                        # Use mode from ours (target) or theirs (source) if ours doesn't exist
+                        mode = ours[0] if ours else theirs[0]
+                        merged_entries[path] = (mode, blob.id)
+                    else:
+                        return {
+                            "success": False,
+                            "error": f"Missing resolution for conflicted file: {path_str}",
+                            "merge_type": None,
+                            "new_sha": None,
+                            "message": ""
+                        }
+
+            # Build merged tree
+            merged_tree = Tree()
+            for path, (mode, sha) in sorted(merged_entries.items()):
+                merged_tree.add(path, mode, sha)
+
+            repo.object_store.add_object(merged_tree)
+
+            # Create merge commit
+            commit = Commit()
+            commit.tree = merged_tree.id
+            commit.parents = [target_sha.encode('ascii'), source_sha.encode('ascii')]
+            commit.author = author.encode('utf-8')
+            commit.committer = author.encode('utf-8')
+            commit.commit_time = commit.author_time = int(time.time())
+            commit.commit_timezone = commit.author_timezone = 0
+            commit.encoding = b'UTF-8'
+            commit.message = f"Merge branch '{source_branch}' into {target_branch} (conflicts resolved)\n".encode('utf-8')
+
+            repo.object_store.add_object(commit)
+
+            # Update target branch ref
+            target_ref = f"refs/heads/{target_branch}".encode()
+            repo.refs[target_ref] = commit.id
+
+            print(f"[git_server] conflict resolution merge commit created: {commit.id.decode('ascii')[:8]}")
+            return {
+                "success": True,
+                "merge_type": "merge",
+                "new_sha": commit.id.decode('ascii'),
+                "message": f"Merged {source_branch} into {target_branch} with conflict resolution",
+                "error": None
+            }
+
+        except Exception as e:
+            print(f"[git_server] resolve_and_merge error: {e}")
+            return {
+                "success": False,
+                "error": f"Merge failed: {str(e)}",
+                "merge_type": None,
+                "new_sha": None,
+                "message": ""
+            }
 
     def get_diff(self, repo_id: str, base_branch: str, head_branch: str) -> dict:
         """Get diff between two branches."""

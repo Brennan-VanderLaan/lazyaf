@@ -133,6 +133,18 @@ function createCardsStore() {
       }
     },
 
+    async resolveRebaseConflicts(id: string, ontoBranch: string | undefined, resolutions: Array<{ path: string; content: string }>): Promise<RebaseResponse> {
+      error.set(null);
+      try {
+        const response = await cardsApi.resolveRebaseConflicts(id, ontoBranch, resolutions);
+        update(cards => cards.map(c => c.id === id ? response.card : c));
+        return response;
+      } catch (e) {
+        error.set(e instanceof Error ? e.message : 'Failed to resolve rebase conflicts');
+        throw e;
+      }
+    },
+
     updateLocal(card: Card) {
       update(cards => {
         const existing = cards.find(c => c.id === card.id);

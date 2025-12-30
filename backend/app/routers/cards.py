@@ -540,3 +540,77 @@ async def rebase_card_branch(
         "card": CardRead.model_validate(card),
         "rebase_result": rebase_result
     }
+
+
+@router.post("/api/cards/{card_id}/resolve-rebase-conflicts")
+async def resolve_rebase_conflicts(
+    card_id: str,
+    request: dict,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Resolve rebase conflicts by accepting resolved file contents.
+
+    Request body should contain:
+    - onto_branch: str (optional, defaults to repo default branch)
+    - resolutions: list of {"path": str, "content": str}
+
+    Unlike resolve-conflicts (for merges), this updates the feature branch
+    rather than the target branch.
+    """
+    result = await db.execute(select(Card).where(Card.id == card_id))
+    card = result.scalar_one_or_none()
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    if not card.branch_name:
+        raise HTTPException(status_code=400, detail="Card has no branch to rebase")
+
+    # Get the repo
+    result = await db.execute(select(Repo).where(Repo.id == card.repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    onto_branch = request.get("onto_branch") or repo.default_branch
+    resolutions = request.get("resolutions", [])
+
+    if not resolutions:
+        raise HTTPException(status_code=400, detail="No conflict resolutions provided")
+
+    # Apply conflict resolutions and complete rebase
+    rebase_result = git_repo_manager.resolve_rebase_conflicts(
+        repo_id=repo.id,
+        branch_name=card.branch_name,
+        onto_branch=onto_branch,
+        resolutions=resolutions
+    )
+
+    if not rebase_result["success"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Rebase failed: {rebase_result['error']}"
+        )
+
+    # Card status stays the same (in_review) - rebase just updates the branch
+    await db.refresh(card)
+
+    # Broadcast card update via WebSocket (branch sha changed)
+    await manager.send_card_updated({
+        "id": card.id,
+        "repo_id": card.repo_id,
+        "title": card.title,
+        "description": card.description,
+        "status": card.status,
+        "branch_name": card.branch_name,
+        "pr_url": card.pr_url,
+        "job_id": card.job_id,
+    })
+
+    return {
+        "card": CardRead.model_validate(card),
+        "rebase_result": rebase_result
+    }

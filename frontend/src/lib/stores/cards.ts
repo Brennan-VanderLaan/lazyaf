@@ -1,5 +1,5 @@
 import { writable, derived } from 'svelte/store';
-import type { Card, CardCreate, CardUpdate, CardStatus } from '../api/types';
+import type { Card, CardCreate, CardUpdate, CardStatus, ApproveResponse } from '../api/types';
 import { cards as cardsApi } from '../api/client';
 import { selectedRepoId } from './repos';
 
@@ -73,12 +73,12 @@ function createCardsStore() {
       }
     },
 
-    async approve(id: string) {
+    async approve(id: string, targetBranch?: string): Promise<ApproveResponse> {
       error.set(null);
       try {
-        const card = await cardsApi.approve(id);
-        update(cards => cards.map(c => c.id === id ? card : c));
-        return card;
+        const response = await cardsApi.approve(id, targetBranch);
+        update(cards => cards.map(c => c.id === id ? response.card : c));
+        return response;
       } catch (e) {
         error.set(e instanceof Error ? e.message : 'Failed to approve card');
         throw e;

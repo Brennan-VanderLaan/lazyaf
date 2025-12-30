@@ -19,12 +19,13 @@
   async function loadDiff() {
     loading = true;
     error = null;
+    // Reset expanded files when diff changes
+    expandedFiles = new Set();
     try {
       diff = await repos.diff(repoId, baseBranch, headBranch);
       // Auto-expand first few files
       if (diff.files.length > 0) {
-        diff.files.slice(0, 3).forEach(f => expandedFiles.add(f.path));
-        expandedFiles = expandedFiles;
+        expandedFiles = new Set(diff.files.slice(0, 3).map(f => f.path));
       }
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load diff';

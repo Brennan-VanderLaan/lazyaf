@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse } from './types';
 
 const BASE_URL = '/api';
 
@@ -62,7 +62,10 @@ export const cards = {
   }),
   delete: (id: string) => request<void>(`/cards/${id}`, { method: 'DELETE' }),
   start: (id: string) => request<Card>(`/cards/${id}/start`, { method: 'POST' }),
-  approve: (id: string) => request<Card>(`/cards/${id}/approve`, { method: 'POST' }),
+  approve: (id: string, targetBranch?: string) => request<ApproveResponse>(`/cards/${id}/approve`, {
+    method: 'POST',
+    body: JSON.stringify({ target_branch: targetBranch || null }),
+  }),
   reject: (id: string) => request<Card>(`/cards/${id}/reject`, { method: 'POST' }),
   retry: (id: string) => request<Card>(`/cards/${id}/retry`, { method: 'POST' }),
 };

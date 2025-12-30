@@ -121,6 +121,43 @@
         </div>
       </div>
 
+      <div class="info-section">
+        <label>Pull Agent Work</label>
+        <div class="instructions">
+          <p class="instruction-note">Fetch and merge agent changes to your local repo:</p>
+          <div class="cmd-group">
+            <code>git fetch lazyaf</code>
+            <button class="btn-copy-sm" on:click={() => copyToClipboard('git fetch lazyaf')} title="Copy">
+              {copied ? '!' : '+'}
+            </button>
+          </div>
+          {#if selectedBranch}
+            <div class="cmd-group">
+              <code>git merge lazyaf/{selectedBranch}</code>
+              <button class="btn-copy-sm" on:click={() => copyToClipboard(`git merge lazyaf/${selectedBranch}`)} title="Copy">
+                {copied ? '!' : '+'}
+              </button>
+            </div>
+          {/if}
+          <p class="instruction-note">Or checkout the branch directly:</p>
+          {#if selectedBranch}
+            <div class="cmd-group">
+              <code>git checkout -b {selectedBranch} lazyaf/{selectedBranch}</code>
+              <button class="btn-copy-sm" on:click={() => copyToClipboard(`git checkout -b ${selectedBranch} lazyaf/${selectedBranch}`)} title="Copy">
+                {copied ? '!' : '+'}
+              </button>
+            </div>
+          {/if}
+          <p class="instruction-note">Then push to GitHub:</p>
+          <div class="cmd-group">
+            <code>git push origin {selectedBranch || $selectedRepo.default_branch}</code>
+            <button class="btn-copy-sm" on:click={() => copyToClipboard(`git push origin ${selectedBranch || $selectedRepo.default_branch}`)} title="Copy">
+              {copied ? '!' : '+'}
+            </button>
+          </div>
+        </div>
+      </div>
+
       {#if branches.length > 0}
         <div class="info-section">
           <label>Branches ({branches.length})</label>
@@ -325,6 +362,44 @@
   .instructions p {
     margin: 0.5rem 0 0.25rem 0;
     font-size: 0.8rem;
+  }
+
+  .instruction-note {
+    color: var(--text-muted, #6c7086);
+    font-size: 0.75rem;
+    margin: 0.5rem 0 0.25rem 0;
+  }
+
+  .instruction-note:first-child {
+    margin-top: 0;
+  }
+
+  .cmd-group {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .cmd-group code {
+    flex: 1;
+  }
+
+  .btn-copy-sm {
+    padding: 0.25rem 0.4rem;
+    background: var(--surface-color, #1e1e2e);
+    color: var(--text-muted, #6c7086);
+    border: 1px solid var(--border-color, #45475a);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.7rem;
+    font-weight: 600;
+    line-height: 1;
+  }
+
+  .btn-copy-sm:hover {
+    background: var(--primary-color, #89b4fa);
+    color: var(--primary-text, #1e1e2e);
+    border-color: var(--primary-color, #89b4fa);
   }
 
   .branch-list {

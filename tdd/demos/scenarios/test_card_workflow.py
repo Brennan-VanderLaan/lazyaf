@@ -101,11 +101,17 @@ class TestCardWorkflowDemo:
 
         # Step 5: Approve the work
         print("\n=== Step 5: Approving Work ===")
-        approve_response = await client.post(f"/api/cards/{card['id']}/approve")
+        approve_response = await client.post(
+            f"/api/cards/{card['id']}/approve",
+            json={"target_branch": None},
+        )
         assert approve_response.status_code == 200
-        card = approve_response.json()
+        result = approve_response.json()
+        card = result["card"]
         print(f"Final card status: {card['status']}")
         assert card["status"] == "done"
+        if result.get("merge_result"):
+            print(f"Merge result: {result['merge_result']['message']}")
 
         print("\n=== Workflow Complete ===")
         print(f"Card '{card['title']}' successfully completed!")

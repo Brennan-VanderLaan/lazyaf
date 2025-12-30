@@ -148,3 +148,16 @@ export interface DiffResponse {
   total_additions: number;
   total_deletions: number;
 }
+
+export interface MergeResult {
+  success: boolean;
+  merge_type: 'fast-forward' | 'merge' | null;
+  message: string;
+  new_sha: string | null;
+  error: string | null;
+}
+
+export interface ApproveResponse {
+  card: Card;
+  merge_result: MergeResult | null;
+}

@@ -320,7 +320,7 @@ class TestCardLifecycleActions:
         assert "todo" in response.json()["detail"].lower()
 
     async def test_approve_card(self, client, repo):
-        """POST /api/cards/{id}/approve moves card to done."""
+        """POST /api/cards/{id}/approve moves card to done and returns merge result."""
         create_response = await client.post(
             f"/api/repos/{repo['id']}/cards",
             json=card_create_payload(title="Feature to Approve"),
@@ -330,9 +330,16 @@ class TestCardLifecycleActions:
         # Move to in_review first
         await client.patch(f"/api/cards/{card_id}", json={"status": "in_review"})
 
-        response = await client.post(f"/api/cards/{card_id}/approve")
+        response = await client.post(
+            f"/api/cards/{card_id}/approve",
+            json={"target_branch": None},
+        )
         assert_status_code(response, 200)
-        assert response.json()["status"] == "done"
+        result = response.json()
+        # Response includes card and merge_result
+        assert result["card"]["status"] == "done"
+        # merge_result may be None if repo is not ingested
+        assert "merge_result" in result
 
     async def test_approve_card_not_found(self, client):
         """Returns 404 when approving non-existent card."""

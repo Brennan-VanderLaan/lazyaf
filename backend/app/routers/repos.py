@@ -130,7 +130,21 @@ async def list_branches(repo_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Repo is not ingested")
 
     branches = git_repo_manager.list_branches(repo_id)
-    default_branch = git_repo_manager.get_default_branch(repo_id)
+    git_default_branch = git_repo_manager.get_default_branch(repo_id)
+
+    # Sync default branch from git repo to database if it differs
+    # This handles the case where user pushed with a different default branch
+    if git_default_branch and git_default_branch != repo.default_branch:
+        repo.default_branch = git_default_branch
+        await db.commit()
+        await db.refresh(repo)
+
+    # Use git repo's default, or fall back to repo model's default, or first branch
+    default_branch = git_default_branch or repo.default_branch
+    if not default_branch and branches:
+        # No HEAD set yet, use first non-lazyaf branch or just first branch
+        non_lazyaf = [b for b in branches if not b.startswith("lazyaf/")]
+        default_branch = non_lazyaf[0] if non_lazyaf else branches[0]
 
     # Get commit SHA for each branch
     branch_info = []

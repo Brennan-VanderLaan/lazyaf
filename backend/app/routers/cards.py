@@ -1,6 +1,8 @@
+from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,6 +11,7 @@ from app.models import Card, Repo, Job
 from app.schemas import CardCreate, CardRead, CardUpdate
 from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
+from app.services.git_server import git_repo_manager
 
 router = APIRouter(tags=["cards"])
 
@@ -150,19 +153,69 @@ async def start_card(card_id: str, db: AsyncSession = Depends(get_db)):
     return card
 
 
-@router.post("/api/cards/{card_id}/approve", response_model=CardRead)
-async def approve_card(card_id: str, db: AsyncSession = Depends(get_db)):
-    """Approve PR and move card to done."""
+class ApproveRequest(BaseModel):
+    target_branch: Optional[str] = None  # If None, uses repo's default branch
+
+
+class ApproveResponse(BaseModel):
+    card: CardRead
+    merge_result: Optional[dict] = None
+
+
+@router.post("/api/cards/{card_id}/approve")
+async def approve_card(
+    card_id: str,
+    request: ApproveRequest = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Approve and merge the card's branch into target branch.
+
+    If target_branch is not specified, uses the repo's default branch.
+    Returns the card and merge result details.
+    """
+    if request is None:
+        request = ApproveRequest()
+
     result = await db.execute(select(Card).where(Card.id == card_id))
     card = result.scalar_one_or_none()
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
 
-    # TODO: Merge PR via GitHub API
+    # Get the repo
+    result = await db.execute(select(Repo).where(Repo.id == card.repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    merge_result = None
+
+    # Only merge if card has a branch
+    if card.branch_name and repo.is_ingested:
+        target_branch = request.target_branch or repo.default_branch
+
+        # Perform the merge
+        merge_result = git_repo_manager.merge_branch(
+            repo_id=repo.id,
+            source_branch=card.branch_name,
+            target_branch=target_branch
+        )
+
+        if not merge_result["success"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Merge failed: {merge_result['error']}"
+            )
+
+    # Update card status
     card.status = "done"
     await db.commit()
     await db.refresh(card)
-    return card
+
+    return {
+        "card": CardRead.model_validate(card),
+        "merge_result": merge_result
+    }
 
 
 @router.post("/api/cards/{card_id}/reject", response_model=CardRead)

@@ -129,6 +129,42 @@ class TestRegisterRunner:
         assert_status_code(response, 200)
         assert clean_runner_pool.runner_count == 1
 
+    async def test_register_with_runner_id(self, client, clean_runner_pool):
+        """Registration with client-provided runner_id uses that ID."""
+        response = await client.post(
+            "/api/runners/register",
+            json={"runner_id": "my-custom-uuid", "name": "custom-runner"},
+        )
+        assert_status_code(response, 200)
+        result = response.json()
+        assert result["runner_id"] == "my-custom-uuid"
+        assert result["name"] == "custom-runner"
+
+    async def test_register_reconnect_same_id(self, client, clean_runner_pool):
+        """Re-registering with same runner_id reuses existing runner."""
+        runner_id = "persistent-runner-id"
+
+        # First registration
+        response1 = await client.post(
+            "/api/runners/register",
+            json={"runner_id": runner_id, "name": "runner-v1"},
+        )
+        assert_status_code(response1, 200)
+        assert clean_runner_pool.runner_count == 1
+
+        # Second registration with same ID (simulating reconnect)
+        response2 = await client.post(
+            "/api/runners/register",
+            json={"runner_id": runner_id, "name": "runner-v2"},
+        )
+        assert_status_code(response2, 200)
+        result = response2.json()
+        assert result["runner_id"] == runner_id
+        assert result["name"] == "runner-v2"  # Name updated
+
+        # Should still be just one runner in pool
+        assert clean_runner_pool.runner_count == 1
+
 
 class TestHeartbeat:
     """Tests for POST /api/runners/{id}/heartbeat endpoint."""

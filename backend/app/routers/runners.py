@@ -26,6 +26,7 @@ class PoolStatus(BaseModel):
 
 
 class RegisterRequest(BaseModel):
+    runner_id: str | None = None  # Client-provided ID for reconnection
     name: str | None = None
 
 
@@ -87,8 +88,8 @@ async def pool_status():
 
 @router.post("/register", response_model=RegisterResponse)
 async def register_runner(request: RegisterRequest):
-    """Register a new runner with the pool."""
-    runner = runner_pool.register(name=request.name)
+    """Register a runner with the pool. If runner_id is provided and exists, reactivates it."""
+    runner = runner_pool.register(runner_id=request.runner_id, name=request.name)
     return RegisterResponse(runner_id=runner.id, name=runner.name)
 
 

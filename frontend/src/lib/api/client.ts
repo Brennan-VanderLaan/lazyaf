@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, Runner, PoolStatus, DockerCommand, RunnerLogs } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse } from './types';
 
 const BASE_URL = '/api';
 
@@ -38,6 +38,14 @@ export const repos = {
   delete: (id: string) => request<void>(`/repos/${id}`, { method: 'DELETE' }),
   cloneUrl: (id: string) => request<CloneUrlResponse>(`/repos/${id}/clone-url`),
   branches: (id: string) => request<BranchesResponse>(`/repos/${id}/branches`),
+  commits: (id: string, branch?: string, limit: number = 20) => {
+    const params = new URLSearchParams();
+    if (branch) params.set('branch', branch);
+    params.set('limit', limit.toString());
+    return request<CommitsResponse>(`/repos/${id}/commits?${params}`);
+  },
+  diff: (id: string, base: string, head: string) =>
+    request<DiffResponse>(`/repos/${id}/diff?base=${encodeURIComponent(base)}&head=${encodeURIComponent(head)}`),
 };
 
 // Cards
@@ -63,6 +71,7 @@ export const cards = {
 export const jobs = {
   get: (id: string) => request<Job>(`/jobs/${id}`),
   cancel: (id: string) => request<Job>(`/jobs/${id}/cancel`, { method: 'POST' }),
+  logs: (id: string) => request<JobLogs>(`/jobs/${id}/logs`),
 };
 
 // Runners

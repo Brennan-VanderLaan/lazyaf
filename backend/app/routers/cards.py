@@ -8,6 +8,7 @@ from app.database import get_db
 from app.models import Card, Repo, Job
 from app.schemas import CardCreate, CardRead, CardUpdate
 from app.services.job_queue import job_queue, QueuedJob
+from app.services.websocket import manager
 
 router = APIRouter(tags=["cards"])
 
@@ -124,6 +125,28 @@ async def start_card(card_id: str, db: AsyncSession = Depends(get_db)):
     )
     await job_queue.enqueue(queued_job)
 
+    # Broadcast job queued status via WebSocket
+    await manager.send_job_status({
+        "id": job_id,
+        "card_id": card.id,
+        "status": "queued",
+        "error": None,
+        "started_at": None,
+        "completed_at": None,
+    })
+
+    # Broadcast card update via WebSocket
+    await manager.send_card_updated({
+        "id": card.id,
+        "repo_id": card.repo_id,
+        "title": card.title,
+        "description": card.description,
+        "status": card.status,
+        "branch_name": card.branch_name,
+        "pr_url": card.pr_url,
+        "job_id": card.job_id,
+    })
+
     return card
 
 
@@ -211,5 +234,27 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
         use_internal_git=True,
     )
     await job_queue.enqueue(queued_job)
+
+    # Broadcast job queued status via WebSocket
+    await manager.send_job_status({
+        "id": job_id,
+        "card_id": card.id,
+        "status": "queued",
+        "error": None,
+        "started_at": None,
+        "completed_at": None,
+    })
+
+    # Broadcast card update via WebSocket
+    await manager.send_card_updated({
+        "id": card.id,
+        "repo_id": card.repo_id,
+        "title": card.title,
+        "description": card.description,
+        "status": card.status,
+        "branch_name": card.branch_name,
+        "pr_url": card.pr_url,
+        "job_id": card.job_id,
+    })
 
     return card

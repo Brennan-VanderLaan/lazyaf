@@ -105,6 +105,156 @@ class GitRepoManager:
             return refs[ref_key].decode("ascii")
         return None
 
+    def get_commit_log(self, repo_id: str, branch_name: str = None, max_count: int = 20) -> list[dict]:
+        """Get commit history for a branch."""
+        from dulwich.walk import Walker
+
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return []
+
+        # Determine the starting commit
+        if branch_name:
+            commit_sha = self.get_branch_commit(repo_id, branch_name)
+            if not commit_sha:
+                return []
+            head = commit_sha.encode('ascii')
+        else:
+            # Use HEAD
+            try:
+                head = repo.refs[b'HEAD']
+            except KeyError:
+                return []
+
+        commits = []
+        try:
+            walker = Walker(repo.object_store, [head], max_entries=max_count)
+            for entry in walker:
+                commit = entry.commit
+                commits.append({
+                    "sha": commit.id.decode('ascii'),
+                    "short_sha": commit.id.decode('ascii')[:8],
+                    "message": commit.message.decode('utf-8', errors='replace').strip(),
+                    "author": commit.author.decode('utf-8', errors='replace'),
+                    "timestamp": commit.commit_time,
+                })
+        except Exception as e:
+            print(f"[git_server] Error walking commits: {e}")
+
+        return commits
+
+    def get_diff(self, repo_id: str, base_branch: str, head_branch: str) -> dict:
+        """Get diff between two branches."""
+        from dulwich.diff_tree import tree_changes
+        from dulwich.objects import Blob
+
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"error": "Repo not found", "files": []}
+
+        base_sha = self.get_branch_commit(repo_id, base_branch)
+        head_sha = self.get_branch_commit(repo_id, head_branch)
+
+        if not base_sha or not head_sha:
+            return {"error": "Branch not found", "files": []}
+
+        try:
+            base_commit = repo.object_store[base_sha.encode('ascii')]
+            head_commit = repo.object_store[head_sha.encode('ascii')]
+
+            base_tree = repo.object_store[base_commit.tree]
+            head_tree = repo.object_store[head_commit.tree]
+
+            changes = tree_changes(repo.object_store, base_tree.id, head_tree.id)
+
+            files = []
+            for change in changes:
+                # change.old and change.new can be None entirely for adds/deletes
+                old_path = change.old.path if change.old else None
+                new_path = change.new.path if change.new else None
+                old_sha = change.old.sha if change.old else None
+                new_sha = change.new.sha if change.new else None
+
+                file_info = {
+                    "path": (new_path or old_path).decode('utf-8', errors='replace'),
+                    "status": "modified",
+                    "additions": 0,
+                    "deletions": 0,
+                    "diff": "",
+                }
+
+                # Determine change type
+                if old_sha is None:
+                    file_info["status"] = "added"
+                elif new_sha is None:
+                    file_info["status"] = "deleted"
+
+                # Get file contents for diff
+                old_content = ""
+                new_content = ""
+
+                if old_sha:
+                    try:
+                        old_blob = repo.object_store[old_sha]
+                        if isinstance(old_blob, Blob):
+                            old_content = old_blob.data.decode('utf-8', errors='replace')
+                    except Exception:
+                        pass
+
+                if new_sha:
+                    try:
+                        new_blob = repo.object_store[new_sha]
+                        if isinstance(new_blob, Blob):
+                            new_content = new_blob.data.decode('utf-8', errors='replace')
+                    except Exception:
+                        pass
+
+                # Generate unified diff
+                import difflib
+                old_lines = old_content.splitlines(keepends=True)
+                new_lines = new_content.splitlines(keepends=True)
+
+                diff_lines = list(difflib.unified_diff(
+                    old_lines, new_lines,
+                    fromfile=f"a/{file_info['path']}",
+                    tofile=f"b/{file_info['path']}",
+                ))
+
+                file_info["diff"] = "".join(diff_lines)
+                file_info["additions"] = sum(1 for line in diff_lines if line.startswith('+') and not line.startswith('+++'))
+                file_info["deletions"] = sum(1 for line in diff_lines if line.startswith('-') and not line.startswith('---'))
+
+                files.append(file_info)
+
+            # Count commits between branches
+            commit_count = 0
+            try:
+                from dulwich.walk import Walker
+                walker = Walker(repo.object_store, [head_sha.encode('ascii')], max_entries=100)
+                for entry in walker:
+                    if entry.commit.id.decode('ascii') == base_sha:
+                        break
+                    commit_count += 1
+            except Exception:
+                pass
+
+            return {
+                "base_branch": base_branch,
+                "head_branch": head_branch,
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+                "commit_count": commit_count,
+                "files": files,
+                "total_additions": sum(f["additions"] for f in files),
+                "total_deletions": sum(f["deletions"] for f in files),
+            }
+
+        except Exception as e:
+            print(f"[git_server] Error getting diff: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"error": str(e), "files": []}
+
 
 class HTTPGitBackend:
     """HTTP smart protocol handler for git operations."""

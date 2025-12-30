@@ -393,27 +393,38 @@ src/
 
 **Deliverable**: Can ingest local repos, agents work in isolation, land changes when ready
 
-### Phase 4: Agent Integration
+### Phase 4: Agent Integration ✅
 **Goal**: Cards trigger Claude Code, results in PRs (or internal branches)
 
-- [ ] Runner entrypoint script (clone from internal server, branch, invoke Claude)
-- [ ] Claude Code invocation with card context
-- [ ] Push results back to internal git server
-- [ ] Job status callbacks
-- [ ] Link branches/PRs back to cards
-- [ ] WebSocket status updates
+- [x] Runner entrypoint script (clone from internal server, branch, invoke Claude)
+- [x] Claude Code invocation with card context
+- [x] Push results back to internal git server
+- [x] Job status callbacks (running/completed/failed)
+- [x] Link branches back to cards
+- [x] WebSocket status updates (job_status, card_updated broadcasts)
+- [x] Jobs store in frontend for real-time tracking
+- [x] JobStatus component (spinner, duration, logs viewer)
+- [x] Background heartbeat thread during long Claude operations
+- [x] Streaming output from Claude Code
+- [x] Runner auto-reconnect when backend restarts
+- [x] Workspace cleanup between job runs
+- [x] Handle branch already exists on retry (fetch + merge)
 
 **Deliverable**: Creating a card and clicking "Start" produces changes in the internal repo
 
-### Phase 5: Review Flow
+### Phase 5: Review Flow ✅
 **Goal**: Complete the human review loop
 
-- [ ] "Approve" action merges PR
-- [ ] "Reject" action closes PR, resets card
-- [ ] Job logs viewer
-- [ ] Error handling and retry
+- [x] Job logs viewer (real-time polling, expandable panel)
+- [x] Error handling and retry (retry button on failed cards)
+- [x] Git graph visualization (commit history per branch)
+- [x] Branch selector in RepoInfo panel
+- [x] Diff viewer in CardModal for code review
+- [x] "Approve" action moves card to done
+- [x] "Reject" action resets card to todo
+- [ ] "Approve" actually merges branch to default (later - requires merge logic)
 
-**Deliverable**: Full loop from card → PR → merge works
+**Deliverable**: Full loop from card → agent work → review → approve/reject works
 
 ### Phase 6: Polish
 **Goal**: Usable daily driver
@@ -501,8 +512,16 @@ lazyaf/
 
 ---
 
-## Next Steps
+## Current Status
 
-1. Review this plan
-2. Approve or request changes
-3. Begin Phase 1 implementation
+**Completed**: Phases 1-5
+**Current**: Phase 6 (Polish)
+
+The core workflow is functional:
+1. Ingest repos via CLI
+2. Create cards describing features
+3. Start work → agent clones, implements, pushes
+4. Review diffs in card modal
+5. Approve/Reject to complete cycle
+
+**Ready for Phase 6 polish items and real-world usage testing.**

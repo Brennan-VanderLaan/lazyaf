@@ -2,9 +2,15 @@
   import { createEventDispatcher } from 'svelte';
   import type { Card, CardStatus } from '../api/types';
   import { cardsStore } from '../stores/cards';
+  import { selectedRepo } from '../stores/repos';
+  import JobStatus from './JobStatus.svelte';
+  import DiffViewer from './DiffViewer.svelte';
 
   export let repoId: string;
   export let card: Card | null = null;
+
+  $: showDiff = card?.branch_name && (card?.status === 'in_review' || card?.status === 'done' || card?.status === 'failed');
+  $: baseBranch = $selectedRepo?.default_branch || 'main';
 
   const dispatch = createEventDispatcher<{
     close: void;
@@ -170,6 +176,17 @@
             </div>
           {/if}
         </div>
+
+        {#if card.job_id && (card.status === 'in_progress' || card.status === 'in_review' || card.status === 'failed')}
+          <JobStatus cardId={card.id} jobId={card.job_id} />
+        {/if}
+
+        {#if showDiff && card.branch_name}
+          <div class="diff-section">
+            <h3>Code Changes</h3>
+            <DiffViewer {repoId} {baseBranch} headBranch={card.branch_name} />
+          </div>
+        {/if}
       {/if}
 
       <div class="modal-actions">
@@ -260,7 +277,7 @@
     background: var(--surface-color, #1e1e2e);
     border-radius: 12px;
     width: 100%;
-    max-width: 560px;
+    max-width: 800px;
     max-height: 90vh;
     overflow-y: auto;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
@@ -378,6 +395,18 @@
   .status-badge[data-status="in_review"] { background: #cba6f733; color: #cba6f7; }
   .status-badge[data-status="done"] { background: #a6e3a133; color: #a6e3a1; }
   .status-badge[data-status="failed"] { background: #f38ba833; color: #f38ba8; }
+
+  .diff-section {
+    margin-top: 1.25rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--border-color, #45475a);
+  }
+
+  .diff-section h3 {
+    margin: 0 0 0.75rem 0;
+    font-size: 1rem;
+    color: var(--text-color, #cdd6f4);
+  }
 
   .modal-actions {
     display: flex;

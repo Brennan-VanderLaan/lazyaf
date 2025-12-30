@@ -148,3 +148,52 @@ async def list_branches(repo_id: str, db: AsyncSession = Depends(get_db)):
         "default_branch": default_branch,
         "total": len(branches),
     }
+
+
+@router.get("/{repo_id}/commits")
+async def list_commits(
+    repo_id: str,
+    branch: str = None,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get commit history for a branch."""
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    commits = git_repo_manager.get_commit_log(repo_id, branch, max_count=min(limit, 100))
+
+    return {
+        "branch": branch or git_repo_manager.get_default_branch(repo_id),
+        "commits": commits,
+        "total": len(commits),
+    }
+
+
+@router.get("/{repo_id}/diff")
+async def get_branch_diff(
+    repo_id: str,
+    base: str,
+    head: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get diff between two branches."""
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    diff = git_repo_manager.get_diff(repo_id, base, head)
+
+    if "error" in diff and diff["error"]:
+        raise HTTPException(status_code=400, detail=diff["error"])
+
+    return diff

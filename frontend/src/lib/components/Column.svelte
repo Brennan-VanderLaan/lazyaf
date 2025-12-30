@@ -62,8 +62,7 @@
     background: var(--surface-color, #181825);
     border-radius: 8px;
     padding: 0.75rem;
-    min-width: 280px;
-    max-width: 320px;
+    min-width: 240px;
     flex: 1;
     display: flex;
     flex-direction: column;

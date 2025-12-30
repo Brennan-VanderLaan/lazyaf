@@ -2,15 +2,22 @@
   import { onMount } from 'svelte';
   import { selectedRepo } from '../stores/repos';
   import { repos } from '../api/client';
-  import type { BranchInfo } from '../api/types';
+  import type { BranchInfo, Commit } from '../api/types';
 
   let cloneUrl = '';
   let branches: BranchInfo[] = [];
+  let commits: Commit[] = [];
   let loadingBranches = false;
+  let loadingCommits = false;
   let copied = false;
+  let selectedBranch: string | null = null;
 
   $: if ($selectedRepo) {
     loadRepoDetails();
+  }
+
+  $: if ($selectedRepo && selectedBranch) {
+    loadCommits(selectedBranch);
   }
 
   async function loadRepoDetails() {
@@ -28,6 +35,11 @@
       try {
         const branchResponse = await repos.branches($selectedRepo.id);
         branches = branchResponse.branches;
+        // Auto-select default branch
+        const defaultBranch = branches.find(b => b.is_default);
+        if (defaultBranch && !selectedBranch) {
+          selectedBranch = defaultBranch.name;
+        }
       } catch (e) {
         branches = [];
       } finally {
@@ -35,6 +47,20 @@
       }
     } else {
       branches = [];
+      commits = [];
+    }
+  }
+
+  async function loadCommits(branch: string) {
+    if (!$selectedRepo) return;
+    loadingCommits = true;
+    try {
+      const response = await repos.commits($selectedRepo.id, branch, 15);
+      commits = response.commits;
+    } catch (e) {
+      commits = [];
+    } finally {
+      loadingCommits = false;
     }
   }
 
@@ -42,6 +68,24 @@
     await navigator.clipboard.writeText(text);
     copied = true;
     setTimeout(() => copied = false, 2000);
+  }
+
+  function formatTimestamp(timestamp: number): string {
+    const date = new Date(timestamp * 1000);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMins / 60);
+    const diffDays = Math.floor(diffHours / 24);
+
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    return date.toLocaleDateString();
+  }
+
+  function getBranchesAtCommit(sha: string): BranchInfo[] {
+    return branches.filter(b => b.commit === sha);
   }
 </script>
 
@@ -80,22 +124,55 @@
       {#if branches.length > 0}
         <div class="info-section">
           <label>Branches ({branches.length})</label>
-          <ul class="branch-list">
-            {#each branches as branch}
-              <li class="branch-item" class:lazyaf={branch.is_lazyaf}>
-                <span class="branch-name">
+          <div class="branch-selector">
+            <select bind:value={selectedBranch}>
+              {#each branches as branch}
+                <option value={branch.name}>
                   {branch.name}
-                  {#if branch.is_default}
-                    <span class="badge default">default</span>
-                  {/if}
-                  {#if branch.is_lazyaf}
-                    <span class="badge lazyaf">agent</span>
-                  {/if}
-                </span>
-                <span class="commit">{branch.commit?.slice(0, 7) || ''}</span>
-              </li>
-            {/each}
-          </ul>
+                  {branch.is_default ? ' (default)' : ''}
+                  {branch.is_lazyaf ? ' [agent]' : ''}
+                </option>
+              {/each}
+            </select>
+          </div>
+        </div>
+
+        <div class="info-section">
+          <label>Commit History</label>
+          {#if loadingCommits}
+            <p class="muted">Loading commits...</p>
+          {:else if commits.length > 0}
+            <div class="git-graph">
+              {#each commits as commit, i}
+                {@const branchesHere = getBranchesAtCommit(commit.sha)}
+                <div class="commit-row">
+                  <div class="graph-line">
+                    <div class="node" class:head={i === 0}></div>
+                    {#if i < commits.length - 1}
+                      <div class="connector"></div>
+                    {/if}
+                  </div>
+                  <div class="commit-info">
+                    <div class="commit-header">
+                      <code class="commit-sha">{commit.short_sha}</code>
+                      {#each branchesHere as branch}
+                        <span class="branch-tag" class:default={branch.is_default} class:lazyaf={branch.is_lazyaf}>
+                          {branch.name}
+                        </span>
+                      {/each}
+                      <span class="commit-time">{formatTimestamp(commit.timestamp)}</span>
+                    </div>
+                    <div class="commit-message" title={commit.message}>
+                      {commit.message.split('\n')[0]}
+                    </div>
+                    <div class="commit-author">{commit.author}</div>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {:else}
+            <p class="muted">No commits found.</p>
+          {/if}
         </div>
       {:else if loadingBranches}
         <div class="info-section">
@@ -320,5 +397,130 @@
     color: var(--text-muted, #6c7086);
     font-size: 0.8rem;
     margin: 0;
+  }
+
+  .branch-selector {
+    margin-bottom: 0.5rem;
+  }
+
+  .branch-selector select {
+    width: 100%;
+    padding: 0.5rem;
+    background: var(--surface-alt, #181825);
+    border: 1px solid var(--border-color, #45475a);
+    border-radius: 4px;
+    color: var(--text-color, #cdd6f4);
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  .branch-selector select:focus {
+    outline: none;
+    border-color: var(--primary-color, #89b4fa);
+  }
+
+  .git-graph {
+    max-height: 300px;
+    overflow-y: auto;
+    background: var(--surface-alt, #181825);
+    border-radius: 6px;
+    padding: 0.5rem;
+  }
+
+  .commit-row {
+    display: flex;
+    gap: 0.75rem;
+    min-height: 48px;
+  }
+
+  .graph-line {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 16px;
+    flex-shrink: 0;
+  }
+
+  .node {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--text-muted, #6c7086);
+    border: 2px solid var(--surface-alt, #181825);
+    z-index: 1;
+  }
+
+  .node.head {
+    background: var(--success-color, #a6e3a1);
+    box-shadow: 0 0 6px var(--success-color, #a6e3a1);
+  }
+
+  .connector {
+    width: 2px;
+    flex: 1;
+    background: var(--border-color, #45475a);
+    margin-top: -2px;
+  }
+
+  .commit-info {
+    flex: 1;
+    min-width: 0;
+    padding-bottom: 0.5rem;
+  }
+
+  .commit-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.25rem;
+  }
+
+  .commit-sha {
+    font-family: monospace;
+    font-size: 0.75rem;
+    background: var(--badge-bg, #313244);
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+    color: var(--primary-color, #89b4fa);
+  }
+
+  .branch-tag {
+    font-size: 0.65rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    background: var(--border-color, #45475a);
+    color: var(--text-color, #cdd6f4);
+    font-weight: 600;
+  }
+
+  .branch-tag.default {
+    background: var(--primary-color, #89b4fa);
+    color: #1e1e2e;
+  }
+
+  .branch-tag.lazyaf {
+    background: var(--accent-color, #cba6f7);
+    color: #1e1e2e;
+  }
+
+  .commit-time {
+    font-size: 0.7rem;
+    color: var(--text-muted, #6c7086);
+    margin-left: auto;
+  }
+
+  .commit-message {
+    font-size: 0.8rem;
+    color: var(--text-color, #cdd6f4);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 0.15rem;
+  }
+
+  .commit-author {
+    font-size: 0.7rem;
+    color: var(--text-muted, #6c7086);
   }
 </style>

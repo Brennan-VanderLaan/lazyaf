@@ -30,7 +30,7 @@ class RunnerInfo:
 
 class RunnerPool:
     RUNNER_IMAGE = "lazyaf-runner:latest"
-    HEARTBEAT_TIMEOUT = 30  # seconds
+    HEARTBEAT_TIMEOUT = 60  # seconds - allow for some latency in heartbeat delivery
 
     def __init__(self):
         self._runners: dict[str, RunnerInfo] = {}

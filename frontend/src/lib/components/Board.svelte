@@ -107,7 +107,7 @@
     flex: 1;
     display: flex;
     flex-direction: column;
-    padding: 1.5rem;
+    padding: 1.0rem;
     overflow: hidden;
   }
 

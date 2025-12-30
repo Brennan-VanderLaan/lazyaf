@@ -1,7 +1,6 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +9,7 @@ from app.database import get_db
 from app.models import Job, Card
 from app.schemas import JobRead
 from app.services.runner_pool import runner_pool
+from app.services.websocket import manager
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -23,18 +23,24 @@ async def get_job(job_id: str, db: AsyncSession = Depends(get_db)):
     return job
 
 
-@router.get("/{job_id}/logs")
+class JobLogsResponse(BaseModel):
+    logs: str
+    job_id: str
+    status: str
+
+
+@router.get("/{job_id}/logs", response_model=JobLogsResponse)
 async def get_job_logs(job_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Job).where(Job.id == job_id))
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    async def generate():
-        # TODO: Stream logs from job
-        yield job.logs
-
-    return StreamingResponse(generate(), media_type="text/plain")
+    return JobLogsResponse(
+        logs=job.logs or "",
+        job_id=job.id,
+        status=job.status,
+    )
 
 
 @router.post("/{job_id}/cancel", response_model=JobRead)
@@ -90,6 +96,31 @@ async def job_callback(job_id: str, callback: JobCallback, db: AsyncSession = De
             card.status = "failed"
 
     await db.commit()
+    await db.refresh(job)
+
+    # Broadcast job status update via WebSocket
+    await manager.send_job_status({
+        "id": job.id,
+        "card_id": job.card_id,
+        "status": job.status,
+        "error": job.error,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    })
+
+    # Broadcast card update via WebSocket if card was modified
+    if card and callback.status in ("completed", "failed"):
+        await db.refresh(card)
+        await manager.send_card_updated({
+            "id": card.id,
+            "repo_id": card.repo_id,
+            "title": card.title,
+            "description": card.description,
+            "status": card.status,
+            "branch_name": card.branch_name,
+            "pr_url": card.pr_url,
+            "job_id": card.job_id,
+        })
 
     # Mark runner as idle
     if callback.status in ("completed", "failed"):

@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, AgentFile, AgentFileCreate, AgentFileUpdate } from './types';
 
 const BASE_URL = '/api';
 
@@ -85,6 +85,21 @@ export const runners = {
     request<RunnerLogs>(`/runners/${runnerId}/logs?offset=${offset}`),
   dockerCommand: (withSecrets: boolean = false) =>
     request<DockerCommand>(`/runners/docker-command?with_secrets=${withSecrets}`),
+};
+
+// Agent Files
+export const agentFiles = {
+  list: () => request<AgentFile[]>('/agent-files'),
+  get: (id: string) => request<AgentFile>(`/agent-files/${id}`),
+  create: (data: AgentFileCreate) => request<AgentFile>('/agent-files', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  update: (id: string, data: AgentFileUpdate) => request<AgentFile>(`/agent-files/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  }),
+  delete: (id: string) => request<void>(`/agent-files/${id}`, { method: 'DELETE' }),
 };
 
 // Health

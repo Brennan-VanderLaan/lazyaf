@@ -36,6 +36,19 @@ async def create_card(repo_id: str, card: CardCreate, db: AsyncSession = Depends
     db.add(db_card)
     await db.commit()
     await db.refresh(db_card)
+
+    # Broadcast card creation via WebSocket
+    await manager.send_card_updated({
+        "id": db_card.id,
+        "repo_id": db_card.repo_id,
+        "title": db_card.title,
+        "description": db_card.description,
+        "status": db_card.status,
+        "branch_name": db_card.branch_name,
+        "pr_url": db_card.pr_url,
+        "job_id": db_card.job_id,
+    })
+
     return db_card
 
 
@@ -63,6 +76,19 @@ async def update_card(card_id: str, update: CardUpdate, db: AsyncSession = Depen
 
     await db.commit()
     await db.refresh(card)
+
+    # Broadcast card update via WebSocket
+    await manager.send_card_updated({
+        "id": card.id,
+        "repo_id": card.repo_id,
+        "title": card.title,
+        "description": card.description,
+        "status": card.status,
+        "branch_name": card.branch_name,
+        "pr_url": card.pr_url,
+        "job_id": card.job_id,
+    })
+
     return card
 
 
@@ -75,6 +101,9 @@ async def delete_card(card_id: str, db: AsyncSession = Depends(get_db)):
 
     await db.delete(card)
     await db.commit()
+
+    # Broadcast card deletion via WebSocket
+    await manager.send_card_deleted(card_id)
 
 
 class StartCardRequest(BaseModel):
@@ -242,6 +271,18 @@ async def approve_card(
     await db.commit()
     await db.refresh(card)
 
+    # Broadcast card update via WebSocket
+    await manager.send_card_updated({
+        "id": card.id,
+        "repo_id": card.repo_id,
+        "title": card.title,
+        "description": card.description,
+        "status": card.status,
+        "branch_name": card.branch_name,
+        "pr_url": card.pr_url,
+        "job_id": card.job_id,
+    })
+
     return {
         "card": CardRead.model_validate(card),
         "merge_result": merge_result
@@ -262,6 +303,19 @@ async def reject_card(card_id: str, db: AsyncSession = Depends(get_db)):
     card.pr_url = None
     await db.commit()
     await db.refresh(card)
+
+    # Broadcast card update via WebSocket
+    await manager.send_card_updated({
+        "id": card.id,
+        "repo_id": card.repo_id,
+        "title": card.title,
+        "description": card.description,
+        "status": card.status,
+        "branch_name": card.branch_name,
+        "pr_url": card.pr_url,
+        "job_id": card.job_id,
+    })
+
     return card
 
 
@@ -316,6 +370,18 @@ async def resolve_conflicts(
     card.status = "done"
     await db.commit()
     await db.refresh(card)
+
+    # Broadcast card update via WebSocket
+    await manager.send_card_updated({
+        "id": card.id,
+        "repo_id": card.repo_id,
+        "title": card.title,
+        "description": card.description,
+        "status": card.status,
+        "branch_name": card.branch_name,
+        "pr_url": card.pr_url,
+        "job_id": card.job_id,
+    })
 
     return {
         "card": CardRead.model_validate(card),

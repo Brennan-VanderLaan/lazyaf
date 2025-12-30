@@ -4,6 +4,7 @@
   import RunnerPanel from './lib/components/RunnerPanel.svelte';
   import Board from './lib/components/Board.svelte';
   import { websocketStore } from './lib/stores/websocket';
+  import { hasRunningJobs } from './lib/stores/jobs';
 
   onMount(() => {
     websocketStore.connect();
@@ -17,7 +18,7 @@
 <div class="app">
   <aside class="sidebar">
     <div class="logo">
-      <span class="logo-icon">😴</span>
+      <span class="logo-icon">{$hasRunningJobs ? '⚙️' : '😴'}</span>
       <span class="logo-text">LazyAF</span>
     </div>
     <RepoSelector />

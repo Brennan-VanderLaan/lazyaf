@@ -340,11 +340,9 @@ async def get_docker_command(
 
     image = RUNNER_IMAGES[runner_type]
 
-    # Base environment variables
+    # Environment variables (container already knows its type from the image)
     env_vars = {
         "BACKEND_URL": "http://host.docker.internal:8000",
-        "RUNNER_TYPE": runner_type,
-        "GITHUB_TOKEN": "<YOUR_GITHUB_TOKEN>",
     }
 
     # Add appropriate API key based on runner type
@@ -360,8 +358,6 @@ async def get_docker_command(
     # Build command with actual secrets if requested
     secret_env_vars = {
         "BACKEND_URL": "http://host.docker.internal:8000",
-        "RUNNER_TYPE": runner_type,
-        "GITHUB_TOKEN": "<YOUR_GITHUB_TOKEN>",
     }
 
     if runner_type == "claude-code":

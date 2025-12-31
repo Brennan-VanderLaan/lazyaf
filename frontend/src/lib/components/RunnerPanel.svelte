@@ -245,8 +245,6 @@
               {:else}
                 <li><code>GEMINI_API_KEY</code> - Your Gemini API key (required)</li>
               {/if}
-              <li><code>GITHUB_TOKEN</code> - GitHub token for creating PRs (optional)</li>
-              <li><code>RUNNER_NAME</code> - Custom name for the runner (optional)</li>
             </ul>
           </div>
         {:else}

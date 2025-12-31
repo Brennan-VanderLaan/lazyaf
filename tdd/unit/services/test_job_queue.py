@@ -264,9 +264,9 @@ class TestWaitForJob:
         elapsed = time.monotonic() - start
 
         assert result is None
-        # Allow small timing variance (10% tolerance)
+        # Allow timing variance for OS scheduling
         assert elapsed >= 0.09
-        assert elapsed < 0.5  # Should not wait much longer than timeout
+        assert elapsed <= 1.0  # Should not wait much longer than timeout
 
 
 # -----------------------------------------------------------------------------

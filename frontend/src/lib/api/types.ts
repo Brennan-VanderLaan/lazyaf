@@ -253,6 +253,7 @@ export interface PipelineStepConfig {
   on_success: string;  // "next" | "stop" | "trigger:{card_id}" | "merge:{branch}"
   on_failure: string;  // "next" | "stop" | "trigger:{card_id}"
   timeout: number;
+  continue_in_context?: boolean;  // If true, next step runs in same container with preserved workspace
 }
 
 export interface Pipeline {

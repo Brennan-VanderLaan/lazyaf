@@ -15,6 +15,7 @@ class PipelineStepConfig(BaseModel):
     on_success: str = "next"  # "next" | "stop" | "trigger:{card_id}" | "merge:{branch}"
     on_failure: str = "stop"  # "next" | "stop" | "trigger:{card_id}"
     timeout: int = 300  # Seconds
+    continue_in_context: bool = False  # If true, next step runs in same container with preserved workspace
 
 
 class PipelineBase(BaseModel):

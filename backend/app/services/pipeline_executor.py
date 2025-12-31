@@ -151,8 +151,26 @@ class PipelineExecutor:
         step_type = step.get("type", "script")
         step_config = step.get("config", {})
         timeout = step.get("timeout", 300)
+        continue_in_context = step.get("continue_in_context", False)
 
-        logger.info(f"Executing step {step_index}: {step_name} (type={step_type})")
+        # Check if this step is a continuation from the previous step
+        is_continuation = False
+        previous_step_logs = None
+        if step_index > 0:
+            prev_step_config = steps[step_index - 1]
+            is_continuation = prev_step_config.get("continue_in_context", False)
+
+            # Get previous step logs
+            prev_step_run = await db.execute(
+                select(StepRun)
+                .where(StepRun.pipeline_run_id == pipeline_run.id)
+                .where(StepRun.step_index == step_index - 1)
+            )
+            prev_step = prev_step_run.scalar_one_or_none()
+            if prev_step and prev_step.logs:
+                previous_step_logs = prev_step.logs
+
+        logger.info(f"Executing step {step_index}: {step_name} (type={step_type}, continue_in_context={continue_in_context}, is_continuation={is_continuation})")
 
         # Create the step run
         step_run = StepRun(
@@ -228,6 +246,11 @@ class PipelineExecutor:
             use_internal_git=True,
             step_type=step_type,
             step_config=step_config,
+            # Pipeline context
+            continue_in_context=continue_in_context,
+            is_continuation=is_continuation,
+            previous_step_logs=previous_step_logs,
+            pipeline_run_id=pipeline_run.id,
         )
         await job_queue.enqueue(queued_job)
 

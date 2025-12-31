@@ -419,15 +419,16 @@
           {/if}
         {:else if stepType === 'script'}
           <div class="form-group">
-            <label for="step-command">Command</label>
-            <input
+            <label for="step-command">Script</label>
+            <textarea
               id="step-command"
-              type="text"
+              class="script-input"
               bind:value={stepCommand}
-              placeholder="npm test"
+              placeholder={'npm install\nnpm test'}
+              rows="4"
               required
-            />
-            <p class="form-hint">Shell command to run in the repository root.</p>
+            ></textarea>
+            <p class="form-hint">Shell script to run in the repository. Supports multi-line scripts.</p>
           </div>
           <div class="form-group">
             <label for="step-working-dir">Working Directory (optional)</label>
@@ -453,14 +454,15 @@
           </div>
           <div class="form-group">
             <label for="step-command">Command</label>
-            <input
+            <textarea
               id="step-command"
-              type="text"
+              class="script-input"
               bind:value={stepCommand}
-              placeholder="npm test"
+              placeholder={'npm install\nnpm test'}
+              rows="3"
               required
-            />
-            <p class="form-hint">Command to run inside the container.</p>
+            ></textarea>
+            <p class="form-hint">Command to run inside the container. Supports multi-line scripts.</p>
           </div>
         {/if}
       {/if}
@@ -1226,5 +1228,14 @@
     border-radius: 3px;
     font-family: monospace;
     font-size: 0.85em;
+  }
+
+  /* Script/command textarea styling */
+  .script-input {
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
+    font-size: 0.9rem;
+    line-height: 1.4;
+    resize: vertical;
+    min-height: 60px;
   }
 </style>

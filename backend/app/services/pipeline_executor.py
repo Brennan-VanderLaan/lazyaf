@@ -348,6 +348,7 @@ class PipelineExecutor:
         - "next": Execute next step
         - "stop": Complete pipeline (status based on step_success)
         - "trigger:{card_id}": Clone card as template and run it
+        - "trigger:pipeline:{pipeline_id}": Start another pipeline
         - "merge:{branch}": Merge current branch to target
         """
         logger.info(f"Handling action '{action}' after step {current_step} (success={step_success})")
@@ -364,6 +365,11 @@ class PipelineExecutor:
             await db.refresh(pipeline_run)
             await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
             logger.info(f"Pipeline run {pipeline_run.id[:8]} stopped with status {pipeline_run.status}")
+
+        elif action.startswith("trigger:pipeline:"):
+            # Start another pipeline
+            target_pipeline_id = action[17:]  # Remove "trigger:pipeline:" prefix
+            await self._trigger_pipeline(db, pipeline_run, repo, steps, current_step, target_pipeline_id)
 
         elif action.startswith("trigger:"):
             # Clone card as template and run it
@@ -487,6 +493,58 @@ class PipelineExecutor:
             "started_at": None,
             "completed_at": None,
         })
+
+    async def _trigger_pipeline(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        repo: Repo,
+        steps: list[dict],
+        current_step: int,
+        target_pipeline_id: str,
+    ) -> None:
+        """
+        Trigger another pipeline and wait for it to complete, then continue.
+
+        The triggered pipeline runs independently, and we continue to the next step
+        regardless of its outcome (it's fire-and-forget for now).
+        """
+        # Get the target pipeline
+        result = await db.execute(select(Pipeline).where(Pipeline.id == target_pipeline_id))
+        target_pipeline = result.scalar_one_or_none()
+        if not target_pipeline:
+            logger.error(f"Target pipeline {target_pipeline_id} not found for trigger action")
+            # Continue to next step anyway
+            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
+            return
+
+        # Get the target repo (may be different from current)
+        result = await db.execute(select(Repo).where(Repo.id == target_pipeline.repo_id))
+        target_repo = result.scalar_one_or_none()
+        if not target_repo:
+            logger.error(f"Repo {target_pipeline.repo_id} not found for triggered pipeline")
+            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
+            return
+
+        if not target_repo.is_ingested:
+            logger.error(f"Repo {target_repo.id} is not ingested, cannot run pipeline")
+            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
+            return
+
+        logger.info(f"Triggering pipeline {target_pipeline.name} (id: {target_pipeline_id})")
+
+        # Start the target pipeline (fire-and-forget for now)
+        # The triggered pipeline runs independently
+        await self.start_pipeline(
+            db=db,
+            pipeline=target_pipeline,
+            repo=target_repo,
+            trigger_type="pipeline",
+            trigger_ref=pipeline_run.id,  # Reference to the triggering pipeline run
+        )
+
+        # Continue to next step immediately (don't wait for triggered pipeline)
+        await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
 
     async def _merge_branch(
         self,

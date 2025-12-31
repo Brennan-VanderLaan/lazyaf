@@ -38,3 +38,5 @@ class Job(Base):
     test_fail_count: Mapped[int | None] = mapped_column(nullable=True)
     test_skip_count: Mapped[int | None] = mapped_column(nullable=True)
     test_output: Mapped[str | None] = mapped_column(Text, nullable=True)  # Raw test output
+    # Pipeline step reference (Phase 9)
+    step_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)  # FK to step_runs when job is part of pipeline

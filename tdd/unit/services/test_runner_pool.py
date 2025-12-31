@@ -177,7 +177,12 @@ class TestUnregister:
         runner.status = "busy"
         runner.current_job = job
 
-        with patch("asyncio.create_task"):
+        # Mock create_task to close the coroutine (prevents "never awaited" warning)
+        def close_coro(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("asyncio.create_task", side_effect=close_coro):
             pool.unregister(runner.id)
 
         assert pool.runner_count == 0
@@ -586,7 +591,12 @@ class TestCleanup:
         runner.current_job = job
         runner.last_heartbeat = datetime.utcnow() - timedelta(seconds=120)
 
-        with patch("asyncio.create_task") as mock_create_task:
+        # Mock create_task to close the coroutine (prevents "never awaited" warning)
+        def close_coro(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("asyncio.create_task", side_effect=close_coro) as mock_create_task:
             pool._cleanup_dead_runners()
 
         assert runner.status == "offline"

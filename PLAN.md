@@ -611,19 +611,19 @@ class Webhook:
     created_at: datetime
 ```
 
-### Phase 8.5: CI/CD Foundation (Non-AI Steps)
+### Phase 8.5: CI/CD Foundation (Non-AI Steps) ✅
 **Goal**: Runners can execute scripts and docker commands, not just AI agents
 
 **Problem Being Solved**: Currently all "work" must go through an AI agent. Want deterministic CI steps (lint, test, build) that run reliably every time.
 
 **MVP Scope**:
-- [ ] Add `step_type` enum: `agent | script | docker`
-- [ ] Extend Job model with step type and config fields
-- [ ] Update runner entrypoint to handle all three step types
-- [ ] Script steps: run shell command, capture output
-- [ ] Docker steps: run command in specified image, capture output
-- [ ] UI: Cards can specify step type (default: agent)
-- [ ] MCP: `create_card` accepts `step_type` parameter
+- [x] Add `step_type` enum: `agent | script | docker`
+- [x] Extend Card and Job models with step type and config fields
+- [x] Update runner entrypoint to handle all three step types
+- [x] Script steps: run shell command in cloned repo, capture output
+- [x] Docker steps: run command in specified container image, capture output
+- [x] UI: Cards can specify step type with config inputs (command, image, working_dir)
+- [x] MCP: `create_card` accepts `step_type`, `command`, `image`, `working_dir` parameters
 
 **Step Type Implementations**:
 ```python
@@ -648,7 +648,7 @@ job.config = {"image": "node:20", "command": "npm run build"}
 - Webhooks
 - Step chaining
 
-**Deliverable**: Can create a card that runs `npm test` directly without AI
+**Deliverable**: Can create a card with step_type=script or docker that runs commands directly without AI. UI has step type selector with config inputs. MCP create_card supports all step types.
 
 ### Phase 9: Pipelines
 **Goal**: Chain steps with conditional logic into reusable workflows
@@ -887,23 +887,23 @@ lazyaf/
 
 ## Current Status
 
-**Completed**: Phases 1-5, Phase 7 (MCP Interface), Phase 8 (Test Result Capture)
-**Current**: Phase 8.5 (CI/CD Foundation) - starting
-**Next**: Phase 9 (Pipelines), Phase 9.5 (Webhooks)
+**Completed**: Phases 1-5, Phase 7 (MCP Interface), Phase 8 (Test Result Capture), Phase 8.5 (CI/CD Foundation)
+**Current**: Phase 9 (Pipelines) - planning
+**Next**: Phase 9.5 (Webhooks), Phase 10 (Events & Triggers)
 
 The core workflow is functional:
 1. Ingest repos via CLI
-2. Create cards describing features
-3. Start work → agent clones, implements, pushes
-4. Review diffs in card modal
+2. Create cards describing features (or CI steps: script/docker)
+3. Start work → runner clones repo, executes step (AI agent, shell script, or docker command)
+4. Review diffs in card modal (for agent steps)
 5. Approve/Reject to complete cycle
 
 **Roadmap**:
 - Phase 6: Polish - in progress (quality of life improvements)
 - Phase 7: MCP Interface - ✅ COMPLETE
 - Phase 8: Test Result Capture - ✅ COMPLETE
-- Phase 8.5: CI/CD Foundation - **STARTING** (non-AI runner steps)
-- Phase 9: Pipelines - planned (multi-step workflows)
+- Phase 8.5: CI/CD Foundation - ✅ COMPLETE (non-AI runner steps: script, docker)
+- Phase 9: Pipelines - **NEXT** (multi-step workflows with branching)
 - Phase 9.5: Webhooks - planned (external triggers)
 - Phase 10: Events & Triggers - planned (push, schedule, card completion)
 - Phase 11: Reporting & Artifacts - future (test trends, coverage, build artifacts)

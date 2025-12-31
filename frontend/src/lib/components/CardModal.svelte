@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, tick } from 'svelte';
-  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType } from '../api/types';
+  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType, StepType, StepConfig } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
   import { repos } from '../api/client';
@@ -33,6 +33,10 @@
   let title = card?.title ?? '';
   let description = card?.description ?? '';
   let runnerType: RunnerType = card?.runner_type ?? 'any';
+  let stepType: StepType = card?.step_type ?? 'agent';
+  let stepCommand: string = card?.step_config?.command ?? '';
+  let stepImage: string = card?.step_config?.image ?? '';
+  let stepWorkingDir: string = card?.step_config?.working_dir ?? '';
   let submitting = false;
 
   const runnerTypeOptions: { value: RunnerType; label: string }[] = [
@@ -40,6 +44,24 @@
     { value: 'claude-code', label: 'Claude Code' },
     { value: 'gemini', label: 'Gemini CLI' },
   ];
+
+  const stepTypeOptions: { value: StepType; label: string; description: string }[] = [
+    { value: 'agent', label: 'AI Agent', description: 'AI implements the feature using Claude or Gemini' },
+    { value: 'script', label: 'Shell Script', description: 'Run a shell command directly in the repo' },
+    { value: 'docker', label: 'Docker Container', description: 'Run a command inside a Docker container' },
+  ];
+
+  // Build step config from individual fields
+  function buildStepConfig(): StepConfig | null {
+    if (stepType === 'agent') return null;
+
+    const config: StepConfig = {};
+    if (stepCommand) config.command = stepCommand;
+    if (stepImage && stepType === 'docker') config.image = stepImage;
+    if (stepWorkingDir && stepType === 'script') config.working_dir = stepWorkingDir;
+
+    return Object.keys(config).length > 0 ? config : null;
+  }
 
   $: isEdit = card !== null;
   $: canStart = card?.status === 'todo';
@@ -76,11 +98,25 @@
     submitting = true;
 
     try {
+      const stepConfig = buildStepConfig();
+
       if (isEdit && card) {
-        const updated = await cardsStore.update(card.id, { title, description, runner_type: runnerType });
+        const updated = await cardsStore.update(card.id, {
+          title,
+          description,
+          runner_type: runnerType,
+          step_type: stepType,
+          step_config: stepConfig,
+        });
         dispatch('updated', updated);
       } else {
-        const created = await cardsStore.create(repoId, { title, description, runner_type: runnerType });
+        const created = await cardsStore.create(repoId, {
+          title,
+          description,
+          runner_type: runnerType,
+          step_type: stepType,
+          step_config: stepConfig,
+        });
         // Wait for Svelte to apply all pending state changes before dispatching
         // This prevents race conditions with WebSocket updates that might interfere with modal closure
         await tick();
@@ -273,22 +309,86 @@
 
       {#if !isEdit || card?.status === 'todo'}
         <div class="form-group">
-          <label for="runner-type">Runner Type</label>
-          <select id="runner-type" bind:value={runnerType}>
-            {#each runnerTypeOptions as option}
-              <option value={option.value}>{option.label}</option>
+          <label for="step-type">Step Type</label>
+          <div class="step-type-selector">
+            {#each stepTypeOptions as option}
+              <button
+                type="button"
+                class="step-type-option"
+                class:selected={stepType === option.value}
+                on:click={() => stepType = option.value}
+              >
+                <span class="step-type-label">{option.label}</span>
+                <span class="step-type-desc">{option.description}</span>
+              </button>
             {/each}
-          </select>
-          <p class="form-hint">
-            {#if runnerType === 'any'}
-              First available runner will pick up this task.
-            {:else if runnerType === 'claude-code'}
-              Only Claude Code runners will work on this task.
-            {:else if runnerType === 'gemini'}
-              Only Gemini CLI runners will work on this task.
-            {/if}
-          </p>
+          </div>
         </div>
+
+        {#if stepType === 'agent'}
+          <div class="form-group">
+            <label for="runner-type">Runner Type</label>
+            <select id="runner-type" bind:value={runnerType}>
+              {#each runnerTypeOptions as option}
+                <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
+            <p class="form-hint">
+              {#if runnerType === 'any'}
+                First available runner will pick up this task.
+              {:else if runnerType === 'claude-code'}
+                Only Claude Code runners will work on this task.
+              {:else if runnerType === 'gemini'}
+                Only Gemini CLI runners will work on this task.
+              {/if}
+            </p>
+          </div>
+        {:else if stepType === 'script'}
+          <div class="form-group">
+            <label for="step-command">Command</label>
+            <input
+              id="step-command"
+              type="text"
+              bind:value={stepCommand}
+              placeholder="npm test"
+              required
+            />
+            <p class="form-hint">Shell command to run in the repository root.</p>
+          </div>
+          <div class="form-group">
+            <label for="step-working-dir">Working Directory (optional)</label>
+            <input
+              id="step-working-dir"
+              type="text"
+              bind:value={stepWorkingDir}
+              placeholder="Leave empty for repo root"
+            />
+            <p class="form-hint">Relative path from repo root.</p>
+          </div>
+        {:else if stepType === 'docker'}
+          <div class="form-group">
+            <label for="step-image">Docker Image</label>
+            <input
+              id="step-image"
+              type="text"
+              bind:value={stepImage}
+              placeholder="node:20"
+              required
+            />
+            <p class="form-hint">Docker image to run the command in.</p>
+          </div>
+          <div class="form-group">
+            <label for="step-command">Command</label>
+            <input
+              id="step-command"
+              type="text"
+              bind:value={stepCommand}
+              placeholder="npm test"
+              required
+            />
+            <p class="form-hint">Command to run inside the container.</p>
+          </div>
+        {/if}
       {/if}
 
       {#if isEdit && card}
@@ -299,7 +399,27 @@
               {statusLabels[card.status]}
             </span>
           </div>
-          {#if card.status !== 'todo'}
+          <div class="meta-item">
+            <span class="meta-label">Type:</span>
+            <span class="meta-value step-type-badge" data-step={card.step_type}>
+              {stepTypeOptions.find(o => o.value === card.step_type)?.label || card.step_type}
+            </span>
+          </div>
+          {#if card.step_type !== 'agent' && card.step_config}
+            {#if card.step_config.command}
+              <div class="meta-item">
+                <span class="meta-label">Command:</span>
+                <code class="meta-value">{card.step_config.command}</code>
+              </div>
+            {/if}
+            {#if card.step_config.image}
+              <div class="meta-item">
+                <span class="meta-label">Image:</span>
+                <code class="meta-value">{card.step_config.image}</code>
+              </div>
+            {/if}
+          {/if}
+          {#if card.status !== 'todo' && card.step_type === 'agent'}
             <div class="meta-item">
               <span class="meta-label">Runner:</span>
               <span class="meta-value runner-type-badge" data-runner={card.completed_runner_type || card.runner_type}>
@@ -659,6 +779,16 @@
   .runner-type-badge[data-runner="claude-code"] { background: #f9a82533; color: #f9a825; }
   .runner-type-badge[data-runner="gemini"] { background: #4285f433; color: #4285f4; }
 
+  .step-type-badge {
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    font-weight: 500;
+  }
+
+  .step-type-badge[data-step="agent"] { background: #89b4fa33; color: #89b4fa; }
+  .step-type-badge[data-step="script"] { background: #a6e3a133; color: #a6e3a1; }
+  .step-type-badge[data-step="docker"] { background: #cba6f733; color: #cba6f7; }
+
   .diff-section {
     margin-top: 1.25rem;
     padding-top: 1.25rem;
@@ -905,5 +1035,51 @@
 
   button:not(:disabled):hover {
     opacity: 0.9;
+  }
+
+  /* Step type selector styles */
+  .step-type-selector {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  .step-type-option {
+    flex: 1;
+    min-width: 150px;
+    padding: 0.75rem;
+    background: var(--surface-alt, #181825);
+    border: 2px solid var(--border-color, #45475a);
+    border-radius: 8px;
+    cursor: pointer;
+    text-align: left;
+    transition: border-color 0.15s, background 0.15s;
+  }
+
+  .step-type-option:hover {
+    border-color: var(--primary-color, #89b4fa);
+    background: var(--input-bg, #181825);
+  }
+
+  .step-type-option.selected {
+    border-color: var(--primary-color, #89b4fa);
+    background: rgba(137, 180, 250, 0.1);
+  }
+
+  .step-type-label {
+    display: block;
+    font-weight: 600;
+    color: var(--text-color, #cdd6f4);
+    margin-bottom: 0.25rem;
+  }
+
+  .step-type-desc {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--text-muted, #6c7086);
+  }
+
+  .step-type-option.selected .step-type-label {
+    color: var(--primary-color, #89b4fa);
   }
 </style>

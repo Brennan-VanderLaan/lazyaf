@@ -1,3 +1,4 @@
+import json
 from typing import Optional
 from uuid import uuid4
 
@@ -16,6 +17,23 @@ from app.services.git_server import git_repo_manager
 router = APIRouter(tags=["cards"])
 
 
+def parse_step_config(config_str: str | None) -> dict | None:
+    """Parse step_config from JSON string to dict."""
+    if not config_str:
+        return None
+    try:
+        return json.loads(config_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def serialize_step_config(config: dict | None) -> str | None:
+    """Serialize step_config from dict to JSON string."""
+    if not config:
+        return None
+    return json.dumps(config)
+
+
 def card_to_ws_dict(card: Card) -> dict:
     """Convert a Card model to a dict for websocket broadcast."""
     return {
@@ -25,6 +43,8 @@ def card_to_ws_dict(card: Card) -> dict:
         "description": card.description,
         "status": card.status,
         "runner_type": card.runner_type,
+        "step_type": card.step_type,
+        "step_config": parse_step_config(card.step_config),
         "branch_name": card.branch_name,
         "pr_url": card.pr_url,
         "job_id": card.job_id,
@@ -50,7 +70,11 @@ async def create_card(repo_id: str, card: CardCreate, db: AsyncSession = Depends
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Repo not found")
 
-    db_card = Card(repo_id=repo_id, **card.model_dump())
+    # Handle step_config serialization (dict -> JSON string)
+    card_data = card.model_dump()
+    card_data["step_config"] = serialize_step_config(card_data.get("step_config"))
+
+    db_card = Card(repo_id=repo_id, **card_data)
     db.add(db_card)
     await db.commit()
     await db.refresh(db_card)
@@ -83,6 +107,10 @@ async def update_card(card_id: str, update: CardUpdate, db: AsyncSession = Depen
             value = value.value
         elif key == "runner_type" and value is not None:
             value = value.value
+        elif key == "step_type" and value is not None:
+            value = value.value
+        elif key == "step_config":
+            value = serialize_step_config(value)
         setattr(card, key, value)
 
     await db.commit()
@@ -154,9 +182,18 @@ async def start_card(
                 detail=f"Agent files not found: {', '.join(missing_ids)}"
             )
 
-    # Create a job in the database
+    # Parse step_config from card
+    step_config = parse_step_config(card.step_config)
+
+    # Create a job in the database with step info
     job_id = str(uuid4())
-    job = Job(id=job_id, card_id=card.id, status="queued")
+    job = Job(
+        id=job_id,
+        card_id=card.id,
+        status="queued",
+        step_type=card.step_type,
+        step_config=card.step_config,  # Already JSON string
+    )
     db.add(job)
 
     # Update card status and link to job
@@ -181,6 +218,8 @@ async def start_card(
         runner_type=card.runner_type,  # Pass runner type from card
         use_internal_git=True,  # Always use internal git for ingested repos
         agent_file_ids=request.agent_file_ids,
+        step_type=card.step_type,
+        step_config=step_config,
     )
     await job_queue.enqueue(queued_job)
 
@@ -383,9 +422,18 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
             detail="Repo must be ingested before starting work"
         )
 
-    # Create a new job
+    # Parse step_config from card
+    step_config = parse_step_config(card.step_config)
+
+    # Create a new job with step info
     job_id = str(uuid4())
-    job = Job(id=job_id, card_id=card.id, status="queued")
+    job = Job(
+        id=job_id,
+        card_id=card.id,
+        status="queued",
+        step_type=card.step_type,
+        step_config=card.step_config,  # Already JSON string
+    )
     db.add(job)
 
     # Update card status and link to new job
@@ -409,6 +457,8 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
         card_description=card.description,
         runner_type=card.runner_type,  # Pass runner type from card
         use_internal_git=True,
+        step_type=card.step_type,
+        step_config=step_config,
     )
     await job_queue.enqueue(queued_job)
 

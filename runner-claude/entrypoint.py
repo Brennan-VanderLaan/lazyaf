@@ -303,10 +303,161 @@ def setup_agent_files(agent_files: list[dict]):
             log(f"  Failed to write agent file {name}: {e}")
 
 
-def execute_job(job: dict):
-    """Execute a job."""
+def execute_script_step(job: dict):
+    """Execute a script step (run shell command directly)."""
     job_id = job['id']
-    log(f"Starting job {job_id}: {job['card_title']}")
+    step_config = job.get('step_config', {}) or {}
+    command = step_config.get('command', '')
+
+    if not command:
+        log("ERROR: No command specified in step_config")
+        complete_job(success=False, error="No command specified in step_config")
+        return
+
+    log(f"Executing script step: {command}")
+
+    # Start heartbeat
+    heartbeat_thread = start_heartbeat_thread()
+
+    # Report running status
+    report_job_status(job_id, "running")
+
+    try:
+        # Clone repo for context (script may need repo files)
+        repo_id = job.get("repo_id", "")
+        use_internal_git = job.get("use_internal_git", False)
+        workspace = Path("/workspace/repo")
+
+        if use_internal_git and repo_id:
+            repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
+            log(f"Cloning from internal git: {repo_url}")
+
+            # Configure git
+            run_command(["git", "config", "--global", "user.email", "lazyaf@localhost"])
+            run_command(["git", "config", "--global", "user.name", "LazyAF Agent"])
+
+            if workspace.exists():
+                run_command(["sudo", "rm", "-rf", str(workspace)])
+            exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
+            if exit_code != 0:
+                raise Exception("Failed to clone repository")
+
+            working_dir = str(workspace)
+        else:
+            working_dir = step_config.get('working_dir', '/workspace')
+
+        # Execute the command
+        log(f"Running command in {working_dir}...")
+        exit_code, stdout, stderr = run_command_streaming(
+            ["bash", "-c", command],
+            cwd=working_dir,
+        )
+
+        if exit_code == 0:
+            log("Script completed successfully")
+            complete_job(success=True)
+        else:
+            log(f"Script failed with exit code {exit_code}")
+            complete_job(success=False, error=f"Command failed with exit code {exit_code}")
+
+    except Exception as e:
+        log(f"ERROR: {e}")
+        complete_job(success=False, error=str(e))
+
+    finally:
+        stop_heartbeat_thread()
+        cleanup_workspace()
+
+
+def execute_docker_step(job: dict):
+    """Execute a docker step (run command in specified container image)."""
+    job_id = job['id']
+    step_config = job.get('step_config', {}) or {}
+    image = step_config.get('image', '')
+    command = step_config.get('command', '')
+
+    if not image:
+        log("ERROR: No image specified in step_config")
+        complete_job(success=False, error="No image specified in step_config")
+        return
+
+    if not command:
+        log("ERROR: No command specified in step_config")
+        complete_job(success=False, error="No command specified in step_config")
+        return
+
+    log(f"Executing docker step: {image} -> {command}")
+
+    # Start heartbeat
+    heartbeat_thread = start_heartbeat_thread()
+
+    # Report running status
+    report_job_status(job_id, "running")
+
+    try:
+        # Clone repo first (so we can mount it into the container)
+        repo_id = job.get("repo_id", "")
+        use_internal_git = job.get("use_internal_git", False)
+        workspace = Path("/workspace/repo")
+
+        if use_internal_git and repo_id:
+            repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
+            log(f"Cloning from internal git: {repo_url}")
+
+            # Configure git
+            run_command(["git", "config", "--global", "user.email", "lazyaf@localhost"])
+            run_command(["git", "config", "--global", "user.name", "LazyAF Agent"])
+
+            if workspace.exists():
+                run_command(["sudo", "rm", "-rf", str(workspace)])
+            exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
+            if exit_code != 0:
+                raise Exception("Failed to clone repository")
+
+        # Build docker run command
+        env_vars = step_config.get('env', {})
+        volumes = step_config.get('volumes', [])
+
+        docker_cmd = [
+            "docker", "run", "--rm",
+            "-v", f"{workspace}:/workspace",
+            "-w", "/workspace",
+        ]
+
+        # Add environment variables
+        for key, value in env_vars.items():
+            docker_cmd.extend(["-e", f"{key}={value}"])
+
+        # Add additional volumes
+        for vol in volumes:
+            docker_cmd.extend(["-v", vol])
+
+        docker_cmd.append(image)
+        docker_cmd.extend(["bash", "-c", command])
+
+        log(f"Running: docker run {image} ...")
+        exit_code, stdout, stderr = run_command_streaming(docker_cmd, cwd=str(workspace))
+
+        if exit_code == 0:
+            log("Docker step completed successfully")
+            complete_job(success=True)
+        else:
+            log(f"Docker step failed with exit code {exit_code}")
+            complete_job(success=False, error=f"Docker command failed with exit code {exit_code}")
+
+    except Exception as e:
+        log(f"ERROR: {e}")
+        complete_job(success=False, error=str(e))
+
+    finally:
+        stop_heartbeat_thread()
+        cleanup_workspace()
+
+
+def execute_agent_step(job: dict):
+    """Execute an agent step (Claude Code implements feature). This is the original execute_job logic."""
+    job_id = job['id']
+    log(f"Starting agent job {job_id}: {job['card_title']}")
 
     # Clean up workspace from any previous job
     cleanup_workspace()
@@ -529,6 +680,22 @@ def execute_job(job: dict):
 
         # Clean up workspace after job completion
         cleanup_workspace()
+
+
+def execute_job(job: dict):
+    """Execute a job based on its step type."""
+    step_type = job.get('step_type', 'agent')
+    job_id = job.get('id', 'unknown')
+
+    log(f"Job {job_id[:8]}: step_type={step_type}")
+
+    if step_type == 'script':
+        execute_script_step(job)
+    elif step_type == 'docker':
+        execute_docker_step(job)
+    else:
+        # Default to agent step
+        execute_agent_step(job)
 
 
 # ============================================================================

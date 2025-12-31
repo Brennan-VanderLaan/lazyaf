@@ -22,6 +22,12 @@ class RunnerType(str, Enum):
     GEMINI = "gemini"
 
 
+class StepType(str, Enum):
+    AGENT = "agent"      # AI agent (Claude/Gemini) implements feature
+    SCRIPT = "script"    # Run shell command directly
+    DOCKER = "docker"    # Run command in specified container image
+
+
 class Card(Base):
     __tablename__ = "cards"
 
@@ -31,6 +37,9 @@ class Card(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     status: Mapped[str] = mapped_column(String(50), default=CardStatus.TODO.value)
     runner_type: Mapped[str] = mapped_column(String(50), default=RunnerType.ANY.value)
+    # Step type and config (Phase 8.5)
+    step_type: Mapped[str] = mapped_column(String(50), default=StepType.AGENT.value)
+    step_config: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON config for script/docker steps
     branch_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     pr_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

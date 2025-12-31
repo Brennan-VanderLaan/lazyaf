@@ -49,6 +49,9 @@ class JobResponse(BaseModel):
     card_description: str
     use_internal_git: bool = False  # When True, runner clones from internal git server
     agent_file_ids: list[str] = []  # List of agent file IDs to mount
+    # Step type and config (Phase 8.5)
+    step_type: str = "agent"  # agent, script, docker
+    step_config: dict | None = None  # Config for the step
 
 
 class TestResultsPayload(BaseModel):
@@ -178,6 +181,8 @@ async def get_runner_job(runner_id: str, db: AsyncSession = Depends(get_db)):
             card_description=job.card_description,
             use_internal_git=job.use_internal_git,
             agent_file_ids=job.agent_file_ids,
+            step_type=job.step_type,
+            step_config=job.step_config,
         )
     }
 

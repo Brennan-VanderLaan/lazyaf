@@ -17,18 +17,31 @@
   let description = agentFile?.description ?? '';
   let submitting = false;
 
+  // Normalize agent name to CLI-safe format
+  function normalizeAgentName(input: string): string {
+    return input
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9-]/g, '-')  // Replace non-alphanumeric with hyphens
+      .replace(/-+/g, '-')          // Collapse multiple hyphens
+      .replace(/^-|-$/g, '');       // Remove leading/trailing hyphens
+  }
+
+  $: normalizedName = normalizeAgentName(name);
   $: isEdit = agentFile !== null;
 
   async function handleSubmit() {
     if (!name.trim() || !content.trim()) return;
+    if (!normalizedName) return;  // Must have a valid normalized name
     submitting = true;
 
     try {
+      // Always save the normalized name for CLI compatibility
       if (isEdit && agentFile) {
-        const updated = await agentFilesStore.update(agentFile.id, name, content, description || null);
+        const updated = await agentFilesStore.update(agentFile.id, normalizedName, content, description || null);
         dispatch('updated', updated);
       } else {
-        const created = await agentFilesStore.create(name, content, description || null);
+        const created = await agentFilesStore.create(normalizedName, content, description || null);
         dispatch('created', created);
       }
     } finally {
@@ -69,14 +82,27 @@
 
     <form on:submit|preventDefault={handleSubmit}>
       <div class="form-group">
-        <label for="name">Name</label>
+        <label for="name">Agent Name</label>
         <input
           id="name"
           type="text"
           bind:value={name}
-          placeholder="e.g., python-expert, documentation-writer"
+          placeholder="e.g., Python Expert, Documentation Writer"
           required
         />
+        {#if normalizedName}
+          <p class="invocation-hint">
+            CLI name: <code>@{normalizedName}</code>
+          </p>
+        {:else if name.trim()}
+          <p class="form-hint error">
+            Name must contain at least one letter or number
+          </p>
+        {:else}
+          <p class="form-hint">
+            Enter a name - it will be normalized for CLI use (e.g., "Python Expert" becomes @python-expert)
+          </p>
+        {/if}
       </div>
 
       <div class="form-group">
@@ -90,14 +116,17 @@
       </div>
 
       <div class="form-group">
-        <label for="content">Content</label>
+        <label for="content">Agent Prompt</label>
         <textarea
           id="content"
           bind:value={content}
-          placeholder="Agent implementation, prompt, or script..."
+          placeholder="Define the agent's system prompt and capabilities..."
           rows="12"
           required
         ></textarea>
+        <p class="form-hint">
+          This prompt will be used when the agent is invoked with <code>@{normalizedName || 'agent-name'}</code>
+        </p>
       </div>
 
       {#if isEdit && agentFile}
@@ -320,5 +349,36 @@
 
   button:not(:disabled):hover {
     opacity: 0.9;
+  }
+
+  .form-hint {
+    margin: 0.5rem 0 0;
+    font-size: 0.8rem;
+    color: var(--text-muted, #6c7086);
+  }
+
+  .form-hint.error {
+    color: var(--error-color, #f38ba8);
+  }
+
+  .form-hint code,
+  .invocation-hint code {
+    background: var(--badge-bg, #313244);
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    font-family: monospace;
+    font-size: 0.9em;
+  }
+
+  .invocation-hint {
+    margin: 0.5rem 0 0;
+    font-size: 0.85rem;
+    color: var(--primary-color, #89b4fa);
+  }
+
+  .invocation-hint code {
+    background: rgba(137, 180, 250, 0.2);
+    color: var(--primary-color, #89b4fa);
+    font-weight: 500;
   }
 </style>

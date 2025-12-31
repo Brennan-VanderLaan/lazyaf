@@ -1,8 +1,9 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, tick } from 'svelte';
-  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType, StepType, StepConfig } from '../api/types';
+  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType, StepType, StepConfig, AgentFile } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
+  import { agentFilesStore } from '../stores/agentFiles';
   import { repos } from '../api/client';
   import JobStatus from './JobStatus.svelte';
   import DiffViewer from './DiffViewer.svelte';
@@ -37,7 +38,23 @@
   let stepCommand: string = card?.step_config?.command ?? '';
   let stepImage: string = card?.step_config?.image ?? '';
   let stepWorkingDir: string = card?.step_config?.working_dir ?? '';
+  let promptTemplate: string = card?.prompt_template ?? '';
+  let selectedAgentFileIds: string[] = card?.agent_file_ids ?? [];
+  let showPromptTemplate = false;  // Toggle for advanced options
   let submitting = false;
+
+  // Agent files from store
+  $: agentFiles = $agentFilesStore;
+
+  // Normalize agent name to CLI-safe format (same as AgentFileModal)
+  function normalizeAgentName(input: string): string {
+    return input
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+  }
 
   const runnerTypeOptions: { value: RunnerType; label: string }[] = [
     { value: 'any', label: 'Any Runner' },
@@ -74,6 +91,8 @@
     if ($selectedRepo?.is_ingested) {
       loadBranches();
     }
+    // Load agent files for multi-select
+    agentFilesStore.load();
   });
 
   async function loadBranches() {
@@ -99,6 +118,9 @@
 
     try {
       const stepConfig = buildStepConfig();
+      // Only include prompt_template and agent_file_ids for agent step type
+      const agentPrompt = stepType === 'agent' && promptTemplate.trim() ? promptTemplate : null;
+      const agentFiles = stepType === 'agent' && selectedAgentFileIds.length > 0 ? selectedAgentFileIds : null;
 
       if (isEdit && card) {
         const updated = await cardsStore.update(card.id, {
@@ -107,6 +129,8 @@
           runner_type: runnerType,
           step_type: stepType,
           step_config: stepConfig,
+          prompt_template: agentPrompt,
+          agent_file_ids: agentFiles,
         });
         dispatch('updated', updated);
       } else {
@@ -116,6 +140,8 @@
           runner_type: runnerType,
           step_type: stepType,
           step_config: stepConfig,
+          prompt_template: agentPrompt,
+          agent_file_ids: agentFiles,
         });
         // Wait for Svelte to apply all pending state changes before dispatching
         // This prevents race conditions with WebSocket updates that might interfere with modal closure
@@ -341,6 +367,56 @@
               {/if}
             </p>
           </div>
+
+          {#if agentFiles.length > 0}
+            <div class="form-group">
+              <label>Available Agents</label>
+              <div class="agent-file-selector">
+                {#each agentFiles as agent}
+                  {@const cliName = normalizeAgentName(agent.name) || agent.name}
+                  <label class="agent-checkbox">
+                    <input
+                      type="checkbox"
+                      bind:group={selectedAgentFileIds}
+                      value={agent.id}
+                    />
+                    <span class="agent-name">@{cliName}</span>
+                    {#if agent.description}
+                      <span class="agent-desc">{agent.description}</span>
+                    {/if}
+                  </label>
+                {/each}
+              </div>
+              <p class="form-hint">
+                Selected agents will be available via <code>@agent-name</code> syntax.
+              </p>
+            </div>
+          {/if}
+
+          <div class="form-group">
+            <button
+              type="button"
+              class="btn-toggle-advanced"
+              on:click={() => showPromptTemplate = !showPromptTemplate}
+            >
+              {showPromptTemplate ? '- Hide' : '+ Show'} Custom Prompt
+            </button>
+          </div>
+
+          {#if showPromptTemplate}
+            <div class="form-group">
+              <label for="prompt-template">Custom Prompt Template</label>
+              <textarea
+                id="prompt-template"
+                bind:value={promptTemplate}
+                placeholder={'Override the default prompt. Use {{title}} and {{description}} as placeholders.'}
+                rows="6"
+              ></textarea>
+              <p class="form-hint">
+                Leave empty to use the default prompt. Placeholders: <code>{'{{title}}'}</code>, <code>{'{{description}}'}</code>
+              </p>
+            </div>
+          {/if}
         {:else if stepType === 'script'}
           <div class="form-group">
             <label for="step-command">Command</label>
@@ -1079,5 +1155,76 @@
 
   .step-type-option.selected .step-type-label {
     color: var(--primary-color, #89b4fa);
+  }
+
+  /* Agent file selector styles */
+  .agent-file-selector {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background: var(--surface-alt, #181825);
+    border: 1px solid var(--border-color, #45475a);
+    border-radius: 6px;
+    padding: 0.75rem;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .agent-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    padding: 0.4rem;
+    border-radius: 4px;
+    transition: background 0.15s;
+  }
+
+  .agent-checkbox:hover {
+    background: var(--badge-bg, #313244);
+  }
+
+  .agent-checkbox input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+  }
+
+  .agent-name {
+    font-family: monospace;
+    font-weight: 500;
+    color: var(--primary-color, #89b4fa);
+    font-size: 0.9rem;
+  }
+
+  .agent-desc {
+    color: var(--text-muted, #6c7086);
+    font-size: 0.8rem;
+    margin-left: auto;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 200px;
+  }
+
+  .btn-toggle-advanced {
+    background: none;
+    border: none;
+    color: var(--text-muted, #6c7086);
+    cursor: pointer;
+    font-size: 0.85rem;
+    padding: 0;
+    text-decoration: underline;
+  }
+
+  .btn-toggle-advanced:hover {
+    color: var(--text-color, #cdd6f4);
+  }
+
+  .form-hint code {
+    background: var(--badge-bg, #313244);
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    font-family: monospace;
+    font-size: 0.85em;
   }
 </style>

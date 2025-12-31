@@ -279,28 +279,48 @@ def fetch_agent_files(agent_file_ids: list[str]) -> list[dict]:
         return []
 
 
-def setup_agent_files(agent_files: list[dict]):
-    """Write agent files to the .claude/agents directory."""
+def normalize_agent_name(name: str) -> str:
+    """Normalize agent name to CLI-safe format (lowercase, hyphenated)."""
+    import re
+    normalized = name.lower().strip()
+    normalized = re.sub(r'[^a-z0-9-]', '-', normalized)  # Replace non-alphanumeric with hyphens
+    normalized = re.sub(r'-+', '-', normalized)          # Collapse multiple hyphens
+    normalized = re.sub(r'^-|-$', '', normalized)        # Remove leading/trailing hyphens
+    return normalized
+
+
+def build_agents_json(agent_files: list[dict]) -> str | None:
+    """Build JSON string for --agents CLI flag from agent files."""
     if not agent_files:
-        return
+        return None
 
-    agents_dir = Path.home() / ".claude" / "agents"
-    agents_dir.mkdir(parents=True, exist_ok=True)
-
-    log(f"Setting up {len(agent_files)} agent file(s)...")
+    agents_dict = {}
     for agent_file in agent_files:
         name = agent_file.get("name", "")
         content = agent_file.get("content", "")
+        description = agent_file.get("description", "")
         if not name or not content:
             log(f"Skipping invalid agent file: {agent_file}")
             continue
 
-        agent_path = agents_dir / name
-        try:
-            agent_path.write_text(content)
-            log(f"  Wrote agent file: {name}")
-        except Exception as e:
-            log(f"  Failed to write agent file {name}: {e}")
+        # Normalize name for CLI compatibility
+        cli_name = normalize_agent_name(name)
+        if not cli_name:
+            log(f"Skipping agent with invalid name: {name}")
+            continue
+
+        # Build agent definition for Claude Code CLI
+        agents_dict[cli_name] = {
+            "description": description or f"Agent: {cli_name}",
+            "prompt": content,
+        }
+        log(f"  Configured agent: @{cli_name}")
+
+    if not agents_dict:
+        return None
+
+    import json
+    return json.dumps(agents_dict)
 
 
 def execute_script_step(job: dict):
@@ -478,16 +498,20 @@ def execute_agent_step(job: dict):
     card_description = job.get("card_description", "")
     use_internal_git = job.get("use_internal_git", False)
     agent_file_ids = job.get("agent_file_ids", [])
+    prompt_template = job.get("prompt_template", "")
 
     # If using internal git, construct URL from backend URL
     if use_internal_git and repo_id:
         repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
         log(f"Using internal git server: {repo_url}")
 
-    # Fetch and setup agent files
+    # Fetch agent files and build --agents JSON
+    agents_json = None
     if agent_file_ids:
         agent_files = fetch_agent_files(agent_file_ids)
-        setup_agent_files(agent_files)
+        agents_json = build_agents_json(agent_files)
+        if agents_json:
+            log(f"Built agents JSON for {len(agent_files)} agent(s)")
 
     workspace = Path("/workspace/repo")
 
@@ -569,13 +593,27 @@ def execute_agent_step(job: dict):
             # Create new feature branch from current HEAD
             run_command(["git", "checkout", "-b", branch_name], cwd=str(workspace))
 
-        # Build prompt for Claude
-        prompt = build_prompt(card_title, card_description, workspace)
+        # Build prompt for Claude - use custom template if provided, else default
+        if prompt_template:
+            # Replace placeholders in the template
+            prompt = prompt_template.replace("{{title}}", card_title).replace("{{description}}", card_description)
+            log("Using custom prompt template")
+        else:
+            prompt = build_prompt(card_title, card_description, workspace)
+            log("Using default prompt template")
+
+        # Build Claude command
+        claude_cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
+
+        # Add --agents flag if we have agent files
+        if agents_json:
+            claude_cmd.extend(["--agents", agents_json])
+            log(f"Added --agents flag with {len(agent_file_ids)} agent(s)")
 
         # Invoke Claude Code with streaming output
         log("Invoking Claude Code (streaming output)...")
         exit_code, stdout, stderr = run_command_streaming(
-            ["claude", "-p", prompt, "--dangerously-skip-permissions"],
+            claude_cmd,
             cwd=str(workspace),
         )
 

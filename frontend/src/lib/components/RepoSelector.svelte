@@ -105,9 +105,9 @@
 <style>
   .repo-selector {
     background: var(--surface-color, #1e1e2e);
-    border-radius: 8px;
-    padding: 1rem;
+    padding: 0 1rem 1rem;
     min-width: 280px;
+    border-bottom: 1px solid var(--border-color, #45475a);
   }
 
   .repo-header {

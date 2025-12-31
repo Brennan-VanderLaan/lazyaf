@@ -30,7 +30,6 @@
       <span class="logo-icon">{$hasRunningJobs || $hasActiveRuns ? '⚙️' : '😴'}</span>
       <span class="logo-text">LazyAF</span>
     </div>
-    <RepoSelector />
 
     <nav class="nav">
       <a href="/" use:link class="nav-item" class:active={$location === '/'}>
@@ -45,6 +44,8 @@
         {/if}
       </a>
     </nav>
+
+    <RepoSelector />
 
     <div class="sidebar-panels">
       <RunnerPanel />
@@ -184,6 +185,8 @@
     flex-direction: column;
     padding: 0.5rem;
     gap: 0.25rem;
+    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 0.5rem;
   }
 
   .nav-item {
@@ -233,8 +236,6 @@
   .sidebar-panels {
     flex: 1;
     overflow-y: auto;
-    border-top: 1px solid var(--border-color);
-    margin-top: 0.5rem;
   }
 
   .main {

@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
 from app.models import Card, Repo, Job, AgentFile
 from app.schemas import CardCreate, CardRead, CardUpdate
@@ -34,6 +35,23 @@ def serialize_step_config(config: dict | None) -> str | None:
     return json.dumps(config)
 
 
+def parse_agent_file_ids(ids_str: str | None) -> list[str] | None:
+    """Parse agent_file_ids from JSON string to list."""
+    if not ids_str:
+        return None
+    try:
+        return json.loads(ids_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def serialize_agent_file_ids(ids: list[str] | None) -> str | None:
+    """Serialize agent_file_ids from list to JSON string."""
+    if not ids:
+        return None
+    return json.dumps(ids)
+
+
 def card_to_ws_dict(card: Card) -> dict:
     """Convert a Card model to a dict for websocket broadcast."""
     return {
@@ -45,6 +63,8 @@ def card_to_ws_dict(card: Card) -> dict:
         "runner_type": card.runner_type,
         "step_type": card.step_type,
         "step_config": parse_step_config(card.step_config),
+        "prompt_template": card.prompt_template,
+        "agent_file_ids": parse_agent_file_ids(card.agent_file_ids),
         "branch_name": card.branch_name,
         "pr_url": card.pr_url,
         "job_id": card.job_id,
@@ -70,9 +90,10 @@ async def create_card(repo_id: str, card: CardCreate, db: AsyncSession = Depends
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Repo not found")
 
-    # Handle step_config serialization (dict -> JSON string)
+    # Handle JSON field serialization (dict/list -> JSON string)
     card_data = card.model_dump()
     card_data["step_config"] = serialize_step_config(card_data.get("step_config"))
+    card_data["agent_file_ids"] = serialize_agent_file_ids(card_data.get("agent_file_ids"))
 
     db_card = Card(repo_id=repo_id, **card_data)
     db.add(db_card)
@@ -111,6 +132,8 @@ async def update_card(card_id: str, update: CardUpdate, db: AsyncSession = Depen
             value = value.value
         elif key == "step_config":
             value = serialize_step_config(value)
+        elif key == "agent_file_ids":
+            value = serialize_agent_file_ids(value)
         setattr(card, key, value)
 
     await db.commit()
@@ -136,19 +159,12 @@ async def delete_card(card_id: str, db: AsyncSession = Depends(get_db)):
     await manager.send_card_deleted(card_id)
 
 
-class StartCardRequest(BaseModel):
-    agent_file_ids: list[str] = []
-
-
 @router.post("/api/cards/{card_id}/start", response_model=CardRead)
 async def start_card(
     card_id: str,
-    request: StartCardRequest = None,
     db: AsyncSession = Depends(get_db)
 ):
     """Trigger agent work on this card."""
-    if request is None:
-        request = StartCardRequest()
     result = await db.execute(select(Card).where(Card.id == card_id))
     card = result.scalar_one_or_none()
     if not card:
@@ -170,12 +186,15 @@ async def start_card(
             detail="Repo must be ingested before starting work. Use the CLI to ingest the repo first."
         )
 
-    # Validate agent file IDs
-    if request.agent_file_ids:
-        result = await db.execute(select(AgentFile).where(AgentFile.id.in_(request.agent_file_ids)))
+    # Get agent file IDs from the card
+    agent_file_ids = parse_agent_file_ids(card.agent_file_ids) or []
+
+    # Validate agent file IDs exist
+    if agent_file_ids:
+        result = await db.execute(select(AgentFile).where(AgentFile.id.in_(agent_file_ids)))
         existing_agent_files = result.scalars().all()
         existing_ids = {af.id for af in existing_agent_files}
-        missing_ids = set(request.agent_file_ids) - existing_ids
+        missing_ids = set(agent_file_ids) - existing_ids
         if missing_ids:
             raise HTTPException(
                 status_code=400,
@@ -205,6 +224,10 @@ async def start_card(
     await db.commit()
     await db.refresh(card)
 
+    # Get prompt template: card-specific > global default > None (runner uses built-in)
+    settings = get_settings()
+    prompt_template = card.prompt_template or settings.default_prompt_template
+
     # Queue the job for a runner
     # Use internal git server for ingested repos (runner constructs URL from BACKEND_URL + repo_id)
     queued_job = QueuedJob(
@@ -217,7 +240,8 @@ async def start_card(
         card_description=card.description,
         runner_type=card.runner_type,  # Pass runner type from card
         use_internal_git=True,  # Always use internal git for ingested repos
-        agent_file_ids=request.agent_file_ids,
+        agent_file_ids=agent_file_ids,
+        prompt_template=prompt_template,
         step_type=card.step_type,
         step_config=step_config,
     )
@@ -446,6 +470,13 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(card)
 
+    # Get agent file IDs from the card
+    agent_file_ids = parse_agent_file_ids(card.agent_file_ids) or []
+
+    # Get prompt template: card-specific > global default > None (runner uses built-in)
+    settings = get_settings()
+    prompt_template = card.prompt_template or settings.default_prompt_template
+
     # Queue the job for a runner
     queued_job = QueuedJob(
         id=job_id,
@@ -457,6 +488,8 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
         card_description=card.description,
         runner_type=card.runner_type,  # Pass runner type from card
         use_internal_git=True,
+        agent_file_ids=agent_file_ids,
+        prompt_template=prompt_template,
         step_type=card.step_type,
         step_config=step_config,
     )

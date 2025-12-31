@@ -28,3 +28,10 @@ class Job(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Test result fields (Phase 8)
+    tests_run: Mapped[bool] = mapped_column(default=False)  # Whether tests were detected and run
+    tests_passed: Mapped[bool | None] = mapped_column(nullable=True)  # None = not run, True = all passed, False = some failed
+    test_pass_count: Mapped[int | None] = mapped_column(nullable=True)
+    test_fail_count: Mapped[int | None] = mapped_column(nullable=True)
+    test_skip_count: Mapped[int | None] = mapped_column(nullable=True)
+    test_output: Mapped[str | None] = mapped_column(Text, nullable=True)  # Raw test output

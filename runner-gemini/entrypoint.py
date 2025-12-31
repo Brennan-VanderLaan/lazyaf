@@ -138,26 +138,32 @@ def poll_for_job():
         return None
 
 
-def report_job_status(job_id: str, status: str, error: str = None, pr_url: str = None):
+def report_job_status(job_id: str, status: str, error: str = None, pr_url: str = None, test_results: dict = None):
     """Report job status via callback endpoint."""
     try:
+        payload = {"status": status, "error": error, "pr_url": pr_url}
+        if test_results:
+            payload["test_results"] = test_results
         session.post(
             f"{BACKEND_URL}/api/jobs/{job_id}/callback",
-            json={"status": status, "error": error, "pr_url": pr_url},
+            json=payload,
             timeout=10,
         )
     except Exception as e:
         log(f"Failed to report job status: {e}")
 
 
-def complete_job(success: bool, error: str = None, pr_url: str = None):
+def complete_job(success: bool, error: str = None, pr_url: str = None, test_results: dict = None):
     """Mark job as complete."""
     if not runner_id:
         return
     try:
+        payload = {"success": success, "error": error, "pr_url": pr_url}
+        if test_results:
+            payload["test_results"] = test_results
         session.post(
             f"{BACKEND_URL}/api/runners/{runner_id}/complete",
-            json={"success": success, "error": error, "pr_url": pr_url},
+            json=payload,
             timeout=10,
         )
     except Exception as e:
@@ -478,10 +484,22 @@ def execute_job(job: dict):
                 pr_url = stdout.strip().split("\n")[-1]
                 log(f"Created PR: {pr_url}")
 
+        # Run tests after code changes (Phase 8)
+        test_results = run_tests(workspace)
+
+        # Determine success based on test results
+        job_success = True
+        if test_results and not test_results.get("tests_passed"):
+            job_success = False
+            log("Job marked as failed due to test failures")
+
         log("Reporting job completion...")
         try:
-            complete_job(success=True, pr_url=pr_url)
-            log("Job completed successfully!")
+            complete_job(success=job_success, pr_url=pr_url, test_results=test_results)
+            if job_success:
+                log("Job completed successfully!")
+            else:
+                log("Job completed with test failures")
         except Exception as ce:
             log(f"WARNING: Failed to report completion: {ce}")
             # Job succeeded but we couldn't report it - log but don't fail
@@ -500,6 +518,217 @@ def execute_job(job: dict):
 
         # Clean up workspace after job completion
         cleanup_workspace()
+
+
+# ============================================================================
+# Test Framework Detection and Execution (Phase 8)
+# ============================================================================
+
+TEST_TIMEOUT = int(os.environ.get("TEST_TIMEOUT", "300"))  # 5 minutes default
+
+
+def detect_test_framework(workspace: Path) -> tuple[str | None, list[str]]:
+    """
+    Detect the test framework and return the command to run tests.
+    Returns (framework_name, command_list) or (None, []) if no framework detected.
+    """
+    # Priority order as per PLAN.md
+
+    # 1. package.json -> scripts.test -> "npm test"
+    package_json = workspace / "package.json"
+    if package_json.exists():
+        try:
+            import json
+            pkg = json.loads(package_json.read_text())
+            scripts = pkg.get("scripts", {})
+            if "test" in scripts:
+                test_script = scripts["test"]
+                # Skip if test script is a placeholder or error
+                if test_script and "no test" not in test_script.lower() and "exit 1" not in test_script:
+                    log(f"Detected npm test framework: {test_script}")
+                    return ("npm", ["npm", "test", "--", "--reporter=verbose"])
+        except Exception as e:
+            log(f"Failed to parse package.json: {e}")
+
+    # 2. pytest.ini / pyproject.toml [tool.pytest] -> "pytest"
+    pytest_ini = workspace / "pytest.ini"
+    pyproject = workspace / "pyproject.toml"
+    if pytest_ini.exists():
+        log("Detected pytest (pytest.ini)")
+        return ("pytest", ["pytest", "-v", "--tb=short"])
+    if pyproject.exists():
+        try:
+            content = pyproject.read_text()
+            if "[tool.pytest" in content or "[pytest" in content:
+                log("Detected pytest (pyproject.toml)")
+                return ("pytest", ["pytest", "-v", "--tb=short"])
+        except Exception:
+            pass
+
+    # Check for tests directory with Python files (common pytest setup)
+    tests_dir = workspace / "tests"
+    test_dir = workspace / "test"
+    if (tests_dir.exists() and any(tests_dir.glob("test_*.py"))) or \
+       (test_dir.exists() and any(test_dir.glob("test_*.py"))):
+        log("Detected pytest (tests directory)")
+        return ("pytest", ["pytest", "-v", "--tb=short"])
+
+    # 3. Cargo.toml -> "cargo test"
+    cargo_toml = workspace / "Cargo.toml"
+    if cargo_toml.exists():
+        log("Detected Cargo test framework")
+        return ("cargo", ["cargo", "test"])
+
+    # 4. go.mod -> "go test ./..."
+    go_mod = workspace / "go.mod"
+    if go_mod.exists():
+        log("Detected Go test framework")
+        return ("go", ["go", "test", "-v", "./..."])
+
+    # 5. Makefile with test target -> "make test"
+    makefile = workspace / "Makefile"
+    if makefile.exists():
+        try:
+            content = makefile.read_text()
+            if "test:" in content or "test :" in content:
+                log("Detected Makefile test target")
+                return ("make", ["make", "test"])
+        except Exception:
+            pass
+
+    log("No test framework detected")
+    return (None, [])
+
+
+def parse_test_output(framework: str, output: str, exit_code: int) -> dict:
+    """
+    Parse test output to extract pass/fail counts.
+    Returns dict with tests_run, tests_passed, pass_count, fail_count, skip_count.
+    """
+    result = {
+        "tests_run": True,
+        "tests_passed": exit_code == 0,
+        "pass_count": None,
+        "fail_count": None,
+        "skip_count": None,
+        "output": output[-10000:] if len(output) > 10000 else output,  # Truncate if needed
+    }
+
+    import re
+
+    if framework == "pytest":
+        # Match: "5 passed, 2 failed, 1 skipped"
+        match = re.search(r"(\d+) passed", output)
+        if match:
+            result["pass_count"] = int(match.group(1))
+        match = re.search(r"(\d+) failed", output)
+        if match:
+            result["fail_count"] = int(match.group(1))
+        match = re.search(r"(\d+) skipped", output)
+        if match:
+            result["skip_count"] = int(match.group(1))
+
+    elif framework == "npm":
+        # Jest format: "Tests: 5 passed, 2 failed, 7 total"
+        match = re.search(r"Tests:\s*(\d+)\s*passed", output)
+        if match:
+            result["pass_count"] = int(match.group(1))
+        match = re.search(r"Tests:\s*\d+\s*passed,\s*(\d+)\s*failed", output)
+        if match:
+            result["fail_count"] = int(match.group(1))
+        # Mocha format: "5 passing" "2 failing"
+        if result["pass_count"] is None:
+            match = re.search(r"(\d+)\s+passing", output)
+            if match:
+                result["pass_count"] = int(match.group(1))
+        if result["fail_count"] is None:
+            match = re.search(r"(\d+)\s+failing", output)
+            if match:
+                result["fail_count"] = int(match.group(1))
+
+    elif framework == "cargo":
+        # Match: "test result: ok. 5 passed; 0 failed; 0 ignored"
+        match = re.search(r"(\d+)\s+passed", output)
+        if match:
+            result["pass_count"] = int(match.group(1))
+        match = re.search(r"(\d+)\s+failed", output)
+        if match:
+            result["fail_count"] = int(match.group(1))
+        match = re.search(r"(\d+)\s+ignored", output)
+        if match:
+            result["skip_count"] = int(match.group(1))
+
+    elif framework == "go":
+        # Match: "ok" and "FAIL" lines, or "--- PASS:" and "--- FAIL:"
+        pass_count = len(re.findall(r"--- PASS:", output))
+        fail_count = len(re.findall(r"--- FAIL:", output))
+        if pass_count or fail_count:
+            result["pass_count"] = pass_count
+            result["fail_count"] = fail_count
+
+    return result
+
+
+def run_tests(workspace: Path) -> dict | None:
+    """
+    Detect and run tests in the workspace.
+    Returns test results dict or None if no tests detected.
+    """
+    framework, cmd = detect_test_framework(workspace)
+    if not framework:
+        return None
+
+    log(f"Running tests with {framework}...")
+
+    try:
+        # Run tests with timeout
+        result = subprocess.run(
+            cmd,
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            timeout=TEST_TIMEOUT,
+        )
+
+        output = result.stdout + "\n" + result.stderr
+        exit_code = result.returncode
+
+        # Log test output
+        for line in output.strip().split("\n")[-50:]:  # Last 50 lines
+            log(f"  [test] {line}")
+
+        test_results = parse_test_output(framework, output, exit_code)
+
+        if test_results["tests_passed"]:
+            log(f"Tests PASSED (passed={test_results['pass_count']}, failed={test_results['fail_count']})")
+        else:
+            log(f"Tests FAILED (passed={test_results['pass_count']}, failed={test_results['fail_count']})")
+
+        return test_results
+
+    except subprocess.TimeoutExpired:
+        log(f"Tests timed out after {TEST_TIMEOUT}s")
+        return {
+            "tests_run": True,
+            "tests_passed": False,
+            "pass_count": None,
+            "fail_count": None,
+            "skip_count": None,
+            "output": f"Tests timed out after {TEST_TIMEOUT} seconds",
+        }
+    except Exception as e:
+        log(f"Test execution error: {e}")
+        return {
+            "tests_run": True,
+            "tests_passed": False,
+            "pass_count": None,
+            "fail_count": None,
+            "skip_count": None,
+            "output": f"Test execution error: {e}",
+        }
+
+
+# ============================================================================
 
 
 def build_prompt(title: str, description: str, repo_dir: Path) -> str:

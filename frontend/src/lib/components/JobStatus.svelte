@@ -128,6 +128,30 @@
       </div>
     {/if}
 
+    {#if job?.tests_run}
+      <div class="test-results" class:passed={job.tests_passed} class:failed={!job.tests_passed}>
+        <div class="test-header">
+          <span class="test-icon">{job.tests_passed ? '✓' : '✗'}</span>
+          <span class="test-label">Tests {job.tests_passed ? 'Passed' : 'Failed'}</span>
+        </div>
+        <div class="test-counts">
+          {#if job.test_pass_count !== null}
+            <span class="count passed">{job.test_pass_count} passed</span>
+          {/if}
+          {#if job.test_fail_count !== null && job.test_fail_count > 0}
+            <span class="count failed">{job.test_fail_count} failed</span>
+          {/if}
+          {#if job.test_skip_count !== null && job.test_skip_count > 0}
+            <span class="count skipped">{job.test_skip_count} skipped</span>
+          {/if}
+        </div>
+      </div>
+    {:else if job?.status === 'completed' || job?.status === 'failed'}
+      <div class="test-results no-tests">
+        <span class="test-label">No tests detected</span>
+      </div>
+    {/if}
+
     <button class="btn-logs" on:click={toggleLogs} type="button">
       {showLogs ? 'Hide Logs' : 'View Logs'}
     </button>
@@ -299,5 +323,81 @@
   @keyframes pulse {
     0%, 100% { opacity: 0.4; }
     50% { opacity: 1; }
+  }
+
+  /* Test Results Styles */
+  .test-results {
+    background: var(--surface-color, #1e1e2e);
+    border: 1px solid var(--border-color, #45475a);
+    border-radius: 6px;
+    padding: 0.75rem;
+    margin: 0.75rem 0;
+  }
+
+  .test-results.passed {
+    border-color: #a6e3a1;
+    background: rgba(166, 227, 161, 0.1);
+  }
+
+  .test-results.failed {
+    border-color: #f38ba8;
+    background: rgba(243, 139, 168, 0.1);
+  }
+
+  .test-results.no-tests {
+    border-color: var(--border-color, #45475a);
+    background: var(--surface-alt, #181825);
+  }
+
+  .test-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .test-icon {
+    font-size: 1.1rem;
+  }
+
+  .test-results.passed .test-icon {
+    color: #a6e3a1;
+  }
+
+  .test-results.failed .test-icon {
+    color: #f38ba8;
+  }
+
+  .test-label {
+    font-weight: 500;
+    color: var(--text-color, #cdd6f4);
+    font-size: 0.9rem;
+  }
+
+  .test-results.no-tests .test-label {
+    color: var(--text-muted, #6c7086);
+    font-weight: normal;
+  }
+
+  .test-counts {
+    display: flex;
+    gap: 1rem;
+    font-size: 0.85rem;
+  }
+
+  .test-counts .count {
+    font-family: monospace;
+  }
+
+  .test-counts .count.passed {
+    color: #a6e3a1;
+  }
+
+  .test-counts .count.failed {
+    color: #f38ba8;
+  }
+
+  .test-counts .count.skipped {
+    color: #f9e2af;
   }
 </style>

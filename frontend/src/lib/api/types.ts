@@ -83,6 +83,13 @@ export interface Job {
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
+  // Test result fields (Phase 8)
+  tests_run: boolean;
+  tests_passed: boolean | null;
+  test_pass_count: number | null;
+  test_fail_count: number | null;
+  test_skip_count: number | null;
+  test_output: string | null;
 }
 
 export interface Runner {

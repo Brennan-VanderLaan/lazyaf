@@ -17,22 +17,29 @@ BACKEND_URL = os.environ.get("LAZYAF_BACKEND_URL", "http://localhost:8000")
 
 mcp = FastMCP(
     name="lazyaf",
-    instructions="""LazyAF is a visual orchestrator for AI agents to handle feature development.
+    instructions="""LazyAF is a visual orchestrator for AI agents and CI/CD tasks.
 
 Use these tools to:
 - List and inspect repositories
-- Create and manage cards (feature requests)
-- Start agent work on cards
+- Create and manage cards (feature requests or CI tasks)
+- Start work on cards (AI agent or script/docker execution)
 - Monitor job progress and logs
 - Check runner availability
+
+Card Types (step_type):
+- "agent": AI implements a feature using Claude Code or Gemini CLI
+- "script": Run a shell command directly in the cloned repo
+- "docker": Run a command inside a Docker container
 
 Typical workflow:
 1. list_repos() to see available repositories
 2. list_cards(repo_id) to see existing work items
 3. get_runner_status() to check available runners
-4. create_card(repo_id, title, description, runner_type) to add new work
-   - runner_type can be "any" (default), "claude-code", or "gemini"
-5. start_card(card_id) to trigger AI agent work
+4. create_card(repo_id, title, description, ...) to add new work
+   - For AI work: step_type="agent", runner_type="any"|"claude-code"|"gemini"
+   - For CI tasks: step_type="script", command="npm test"
+   - For containerized CI: step_type="docker", image="node:20", command="npm test"
+5. start_card(card_id) to trigger execution
 6. get_job_logs(job_id) to monitor progress
 """
 )
@@ -78,7 +85,16 @@ def list_cards(repo_id: str) -> list[dict]:
 
 
 @mcp.tool()
-def create_card(repo_id: str, title: str, description: str = "", runner_type: str = "any") -> dict:
+def create_card(
+    repo_id: str,
+    title: str,
+    description: str = "",
+    runner_type: str = "any",
+    step_type: str = "agent",
+    command: str = "",
+    image: str = "",
+    working_dir: str = ""
+) -> dict:
     """
     Create a new card in a repository.
 
@@ -87,19 +103,56 @@ def create_card(repo_id: str, title: str, description: str = "", runner_type: st
         title: Card title describing the feature or task
         description: Detailed description of what needs to be done
         runner_type: Which runner type to use - "any" (default), "claude-code", or "gemini"
+            Only relevant for step_type="agent"
+        step_type: Type of step - "agent" (AI implements feature), "script" (run shell command),
+            or "docker" (run command in container). Default is "agent".
+        command: Shell command to run. Required for step_type="script" or "docker".
+        image: Docker image to use. Required for step_type="docker".
+        working_dir: Working directory for script steps (relative to repo root).
 
     Returns the created card details.
     """
     # Validate runner_type
-    valid_types = ["any", "claude-code", "gemini"]
-    if runner_type not in valid_types:
-        return {"error": f"Invalid runner_type '{runner_type}'. Must be one of: {', '.join(valid_types)}"}
+    valid_runner_types = ["any", "claude-code", "gemini"]
+    if runner_type not in valid_runner_types:
+        return {"error": f"Invalid runner_type '{runner_type}'. Must be one of: {', '.join(valid_runner_types)}"}
+
+    # Validate step_type
+    valid_step_types = ["agent", "script", "docker"]
+    if step_type not in valid_step_types:
+        return {"error": f"Invalid step_type '{step_type}'. Must be one of: {', '.join(valid_step_types)}"}
+
+    # Validate required fields for non-agent steps
+    if step_type == "script" and not command:
+        return {"error": "command is required for step_type='script'"}
+    if step_type == "docker":
+        if not command:
+            return {"error": "command is required for step_type='docker'"}
+        if not image:
+            return {"error": "image is required for step_type='docker'"}
+
+    # Build step_config
+    step_config = None
+    if step_type != "agent":
+        step_config = {}
+        if command:
+            step_config["command"] = command
+        if image and step_type == "docker":
+            step_config["image"] = image
+        if working_dir and step_type == "script":
+            step_config["working_dir"] = working_dir
 
     with _get_client() as client:
-        response = client.post(
-            f"/api/repos/{repo_id}/cards",
-            json={"title": title, "description": description, "runner_type": runner_type}
-        )
+        payload = {
+            "title": title,
+            "description": description,
+            "runner_type": runner_type,
+            "step_type": step_type,
+        }
+        if step_config:
+            payload["step_config"] = step_config
+
+        response = client.post(f"/api/repos/{repo_id}/cards", json=payload)
         if response.status_code == 404:
             return {"error": f"Repo {repo_id} not found"}
         if response.status_code not in (200, 201):

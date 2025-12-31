@@ -28,6 +28,9 @@ class Job(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Step type and config (Phase 8.5)
+    step_type: Mapped[str] = mapped_column(String(50), default="agent")  # agent, script, docker
+    step_config: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON config for the step
     # Test result fields (Phase 8)
     tests_run: Mapped[bool] = mapped_column(default=False)  # Whether tests were detected and run
     tests_passed: Mapped[bool | None] = mapped_column(nullable=True)  # None = not run, True = all passed, False = some failed

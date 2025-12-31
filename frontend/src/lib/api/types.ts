@@ -2,6 +2,15 @@ export type CardStatus = 'todo' | 'in_progress' | 'in_review' | 'done' | 'failed
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
 export type RunnerStatus = 'idle' | 'busy' | 'offline';
 export type RunnerType = 'any' | 'claude-code' | 'gemini';
+export type StepType = 'agent' | 'script' | 'docker';
+
+export interface StepConfig {
+  command?: string;        // For script/docker steps
+  image?: string;          // For docker steps
+  working_dir?: string;    // For script steps
+  env?: Record<string, string>;  // For docker steps
+  volumes?: string[];      // For docker steps
+}
 
 export interface Repo {
   id: string;
@@ -51,6 +60,8 @@ export interface Card {
   description: string;
   status: CardStatus;
   runner_type: RunnerType;
+  step_type: StepType;
+  step_config: StepConfig | null;
   branch_name: string | null;
   pr_url: string | null;
   job_id: string | null;
@@ -63,6 +74,8 @@ export interface CardCreate {
   title: string;
   description?: string;
   runner_type?: RunnerType;
+  step_type?: StepType;
+  step_config?: StepConfig | null;
 }
 
 export interface CardUpdate {
@@ -70,6 +83,8 @@ export interface CardUpdate {
   description?: string;
   status?: CardStatus;
   runner_type?: RunnerType;
+  step_type?: StepType;
+  step_config?: StepConfig | null;
 }
 
 export interface Job {
@@ -83,6 +98,9 @@ export interface Job {
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
+  // Step type and config (Phase 8.5)
+  step_type: StepType;
+  step_config: StepConfig | null;
   // Test result fields (Phase 8)
   tests_run: boolean;
   tests_passed: boolean | null;

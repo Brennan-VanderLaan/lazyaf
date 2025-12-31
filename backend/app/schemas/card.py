@@ -1,7 +1,9 @@
+import json
 from datetime import datetime
-from pydantic import BaseModel
+from typing import Any
+from pydantic import BaseModel, field_validator
 
-from app.models.card import CardStatus, RunnerType
+from app.models.card import CardStatus, RunnerType, StepType
 
 
 class CardBase(BaseModel):
@@ -11,6 +13,8 @@ class CardBase(BaseModel):
 
 class CardCreate(CardBase):
     runner_type: RunnerType = RunnerType.ANY
+    step_type: StepType = StepType.AGENT
+    step_config: dict[str, Any] | None = None  # {command: str} for script, {image: str, command: str} for docker
 
 
 class CardUpdate(BaseModel):
@@ -18,6 +22,8 @@ class CardUpdate(BaseModel):
     description: str | None = None
     status: CardStatus | None = None
     runner_type: RunnerType | None = None
+    step_type: StepType | None = None
+    step_config: dict[str, Any] | None = None
 
 
 class CardRead(CardBase):
@@ -25,12 +31,25 @@ class CardRead(CardBase):
     repo_id: str
     status: CardStatus
     runner_type: RunnerType = RunnerType.ANY
+    step_type: StepType = StepType.AGENT
+    step_config: dict[str, Any] | None = None
     branch_name: str | None = None
     pr_url: str | None = None
     job_id: str | None = None
     completed_runner_type: str | None = None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("step_config", mode="before")
+    @classmethod
+    def parse_step_config(cls, v):
+        """Parse step_config from JSON string if needed."""
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return v
 
     class Config:
         from_attributes = True

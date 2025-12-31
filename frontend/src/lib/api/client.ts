@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse } from './types';
 
 const BASE_URL = '/api';
 
@@ -164,6 +164,45 @@ export const agentFiles = {
     body: JSON.stringify(data),
   }),
   delete: (id: string) => request<void>(`/agent-files/${id}`, { method: 'DELETE' }),
+};
+
+// Pipelines (Phase 9)
+export const pipelines = {
+  list: (repoId?: string) => {
+    const params = repoId ? `?repo_id=${repoId}` : '';
+    return request<Pipeline[]>(`/pipelines${params}`);
+  },
+  listForRepo: (repoId: string) => request<Pipeline[]>(`/repos/${repoId}/pipelines`),
+  get: (id: string) => request<Pipeline>(`/pipelines/${id}`),
+  create: (repoId: string, data: PipelineCreate) => request<Pipeline>(`/repos/${repoId}/pipelines`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  update: (id: string, data: PipelineUpdate) => request<Pipeline>(`/pipelines/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  }),
+  delete: (id: string) => request<void>(`/pipelines/${id}`, { method: 'DELETE' }),
+  run: (id: string, data?: PipelineRunCreate) => request<PipelineRun>(`/pipelines/${id}/run`, {
+    method: 'POST',
+    body: JSON.stringify(data || {}),
+  }),
+  runs: (id: string, limit: number = 20) => request<PipelineRun[]>(`/pipelines/${id}/runs?limit=${limit}`),
+};
+
+// Pipeline Runs (Phase 9)
+export const pipelineRuns = {
+  list: (filters?: { pipeline_id?: string; status?: string; limit?: number }) => {
+    const params = new URLSearchParams();
+    if (filters?.pipeline_id) params.set('pipeline_id', filters.pipeline_id);
+    if (filters?.status) params.set('status', filters.status);
+    if (filters?.limit) params.set('limit', filters.limit.toString());
+    return request<PipelineRun[]>(`/pipeline-runs?${params}`);
+  },
+  get: (runId: string) => request<PipelineRun>(`/pipeline-runs/${runId}`),
+  cancel: (runId: string) => request<PipelineRun>(`/pipeline-runs/${runId}/cancel`, { method: 'POST' }),
+  stepLogs: (runId: string, stepIndex: number) =>
+    request<StepLogsResponse>(`/pipeline-runs/${runId}/steps/${stepIndex}/logs`),
 };
 
 // Health

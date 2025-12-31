@@ -261,10 +261,8 @@
     }
   }
 
-  function handleBackdropClick(e: MouseEvent) {
-    if (e.target === e.currentTarget) {
-      dispatch('close');
-    }
+  function handleBackdropClick() {
+    dispatch('close');
   }
 
   const statusLabels: Record<CardStatus, string> = {
@@ -279,7 +277,7 @@
 <svelte:window on:keydown={handleKeydown} />
 
 <div class="modal-backdrop" on:click={handleBackdropClick} role="dialog" aria-modal="true">
-  <div class="modal">
+  <div class="modal" on:click|stopPropagation role="document">
     <div class="modal-header">
       <h2>{isEdit ? 'Edit Card' : 'New Card'}</h2>
       <button class="btn-close" on:click={() => dispatch('close')}>✕</button>

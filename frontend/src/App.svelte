@@ -1,11 +1,19 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import Router, { location, link } from 'svelte-spa-router';
   import RepoSelector from './lib/components/RepoSelector.svelte';
   import RunnerPanel from './lib/components/RunnerPanel.svelte';
   import AgentPanel from './lib/components/AgentPanel.svelte';
-  import Board from './lib/components/Board.svelte';
+  import BoardPage from './lib/pages/BoardPage.svelte';
+  import PipelinesPage from './lib/pages/PipelinesPage.svelte';
   import { websocketStore } from './lib/stores/websocket';
   import { hasRunningJobs } from './lib/stores/jobs';
+  import { hasActiveRuns } from './lib/stores/pipelines';
+
+  const routes = {
+    '/': BoardPage,
+    '/pipelines': PipelinesPage,
+  };
 
   onMount(() => {
     websocketStore.connect();
@@ -19,16 +27,33 @@
 <div class="app">
   <aside class="sidebar">
     <div class="logo">
-      <span class="logo-icon">{$hasRunningJobs ? '⚙️' : '😴'}</span>
+      <span class="logo-icon">{$hasRunningJobs || $hasActiveRuns ? '⚙️' : '😴'}</span>
       <span class="logo-text">LazyAF</span>
     </div>
     <RepoSelector />
-    <RunnerPanel />
-    <AgentPanel />
+
+    <nav class="nav">
+      <a href="/" use:link class="nav-item" class:active={$location === '/'}>
+        <span class="nav-icon">📋</span>
+        <span class="nav-label">Board</span>
+      </a>
+      <a href="/pipelines" use:link class="nav-item" class:active={$location === '/pipelines'}>
+        <span class="nav-icon">{$hasActiveRuns ? '⚙️' : '🔄'}</span>
+        <span class="nav-label">Pipelines</span>
+        {#if $hasActiveRuns}
+          <span class="nav-badge"></span>
+        {/if}
+      </a>
+    </nav>
+
+    <div class="sidebar-panels">
+      <RunnerPanel />
+      <AgentPanel />
+    </div>
   </aside>
 
   <main class="main">
-    <Board />
+    <Router {routes} />
   </main>
 </div>
 
@@ -152,6 +177,64 @@
     font-size: 1.5rem;
     font-weight: 700;
     color: var(--text-color);
+  }
+
+  .nav {
+    display: flex;
+    flex-direction: column;
+    padding: 0.5rem;
+    gap: 0.25rem;
+  }
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    border-radius: 8px;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 0.95rem;
+    font-weight: 500;
+    position: relative;
+  }
+
+  .nav-item:hover {
+    background: var(--hover-color);
+    color: var(--text-color);
+  }
+
+  .nav-item.active {
+    background: var(--selected-color);
+    color: var(--primary-color);
+  }
+
+  .nav-icon {
+    font-size: 1.1rem;
+  }
+
+  .nav-label {
+    flex: 1;
+  }
+
+  .nav-badge {
+    width: 8px;
+    height: 8px;
+    background: var(--warning-color);
+    border-radius: 50%;
+    animation: pulse 1.5s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .sidebar-panels {
+    flex: 1;
+    overflow-y: auto;
+    border-top: 1px solid var(--border-color);
+    margin-top: 0.5rem;
   }
 
   .main {

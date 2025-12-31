@@ -140,8 +140,8 @@
   @media (min-width: 1800px) {
     .board-container {
       padding: 2rem 3rem;
+      min-height: 0;
     }
-    min-height: 0;
   }
 
   @media (max-width: 1200px) {

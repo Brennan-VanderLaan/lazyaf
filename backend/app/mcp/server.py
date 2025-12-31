@@ -22,6 +22,7 @@ mcp = FastMCP(
 Use these tools to:
 - List and inspect repositories
 - Create and manage cards (feature requests or CI tasks)
+- Create and run pipelines (multi-step workflows)
 - Start work on cards (AI agent or script/docker execution)
 - Monitor job progress and logs
 - Check runner availability
@@ -30,6 +31,11 @@ Card Types (step_type):
 - "agent": AI implements a feature using Claude Code or Gemini CLI
 - "script": Run a shell command directly in the cloned repo
 - "docker": Run a command inside a Docker container
+
+Pipeline Features:
+- Chain multiple steps (script, docker, agent) into reusable workflows
+- Conditional branching: on_success and on_failure actions
+- Actions: "next" (continue), "stop" (end), "trigger:{card_id}" (spawn AI fix), "merge:{branch}"
 
 Typical workflow:
 1. list_repos() to see available repositories
@@ -41,6 +47,11 @@ Typical workflow:
    - For containerized CI: step_type="docker", image="node:20", command="npm test"
 5. start_card(card_id) to trigger execution
 6. get_job_logs(job_id) to monitor progress
+
+Pipeline workflow:
+1. create_pipeline(repo_id, name, steps) to define a multi-step workflow
+2. run_pipeline(pipeline_id) to start execution
+3. get_pipeline_run(run_id) to monitor progress
 """
 )
 
@@ -350,3 +361,305 @@ def get_runner_status() -> dict:
             ],
             "available_runner_types": ["any", "claude-code", "gemini"],
         }
+
+
+# =============================================================================
+# Pipeline Tools (Phase 9)
+# =============================================================================
+
+@mcp.tool()
+def list_pipelines(repo_id: str = "") -> list[dict]:
+    """
+    List pipelines, optionally filtered by repository.
+
+    Args:
+        repo_id: Optional repository ID to filter by. If empty, lists all pipelines.
+
+    Returns list of pipelines with their steps and configuration.
+    """
+    with _get_client() as client:
+        if repo_id:
+            response = client.get(f"/api/repos/{repo_id}/pipelines")
+        else:
+            response = client.get("/api/pipelines")
+
+        if response.status_code == 404:
+            return {"error": f"Repo {repo_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to list pipelines: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def create_pipeline(
+    repo_id: str,
+    name: str,
+    steps: list[dict],
+    description: str = ""
+) -> dict:
+    """
+    Create a new pipeline for a repository.
+
+    Args:
+        repo_id: Repository ID
+        name: Pipeline name (e.g., "PR Validation", "Deploy")
+        steps: List of step definitions. Each step has:
+            - name: Step name (e.g., "Lint", "Test", "Build")
+            - type: "agent", "script", or "docker"
+            - config: Type-specific config:
+                - script: {"command": "npm test"}
+                - docker: {"image": "node:20", "command": "npm build"}
+                - agent: {"runner_type": "any", "title": "...", "description": "..."}
+            - on_success: "next" | "stop" | "merge:{branch}" (default: "next")
+            - on_failure: "next" | "stop" | "trigger:{card_id}" (default: "stop")
+            - timeout: Seconds (default: 300)
+        description: Optional description
+
+    Example steps:
+    [
+        {"name": "Lint", "type": "script", "config": {"command": "npm run lint"}},
+        {"name": "Test", "type": "script", "config": {"command": "npm test"}, "on_failure": "stop"},
+        {"name": "Build", "type": "docker", "config": {"image": "node:20", "command": "npm build"}}
+    ]
+
+    Returns the created pipeline.
+    """
+    if not steps:
+        return {"error": "At least one step is required"}
+
+    # Normalize steps with defaults
+    normalized_steps = []
+    for i, step in enumerate(steps):
+        if not step.get("name"):
+            return {"error": f"Step {i + 1} is missing 'name'"}
+        if not step.get("type"):
+            return {"error": f"Step '{step['name']}' is missing 'type'"}
+        if step["type"] not in ["agent", "script", "docker"]:
+            return {"error": f"Step '{step['name']}' has invalid type '{step['type']}'"}
+
+        normalized_step = {
+            "name": step["name"],
+            "type": step["type"],
+            "config": step.get("config", {}),
+            "on_success": step.get("on_success", "next"),
+            "on_failure": step.get("on_failure", "stop"),
+            "timeout": step.get("timeout", 300),
+        }
+        normalized_steps.append(normalized_step)
+
+    with _get_client() as client:
+        payload = {
+            "name": name,
+            "description": description,
+            "steps": normalized_steps,
+        }
+
+        response = client.post(f"/api/repos/{repo_id}/pipelines", json=payload)
+        if response.status_code == 404:
+            return {"error": f"Repo {repo_id} not found"}
+        if response.status_code not in (200, 201):
+            return {"error": f"Failed to create pipeline: {response.text}"}
+
+        pipeline = response.json()
+        pipeline["message"] = f"Pipeline '{name}' created with {len(normalized_steps)} steps"
+        return pipeline
+
+
+@mcp.tool()
+def get_pipeline(pipeline_id: str) -> dict:
+    """
+    Get full pipeline details including steps configuration.
+
+    Args:
+        pipeline_id: Pipeline ID (UUID string)
+
+    Returns complete pipeline details.
+    """
+    with _get_client() as client:
+        response = client.get(f"/api/pipelines/{pipeline_id}")
+        if response.status_code == 404:
+            return {"error": f"Pipeline {pipeline_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to get pipeline: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def update_pipeline(
+    pipeline_id: str,
+    name: str = "",
+    steps: list[dict] = None,
+    description: str = None
+) -> dict:
+    """
+    Update an existing pipeline.
+
+    Args:
+        pipeline_id: Pipeline ID to update
+        name: New name (optional)
+        steps: New steps list (optional, replaces existing)
+        description: New description (optional)
+
+    Returns updated pipeline.
+    """
+    payload = {}
+    if name:
+        payload["name"] = name
+    if steps is not None:
+        payload["steps"] = steps
+    if description is not None:
+        payload["description"] = description
+
+    if not payload:
+        return {"error": "No fields to update"}
+
+    with _get_client() as client:
+        response = client.patch(f"/api/pipelines/{pipeline_id}", json=payload)
+        if response.status_code == 404:
+            return {"error": f"Pipeline {pipeline_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to update pipeline: {response.text}"}
+
+        pipeline = response.json()
+        pipeline["message"] = "Pipeline updated successfully"
+        return pipeline
+
+
+@mcp.tool()
+def delete_pipeline(pipeline_id: str) -> dict:
+    """
+    Delete a pipeline and all its runs.
+
+    Args:
+        pipeline_id: Pipeline ID to delete
+
+    Returns success status.
+    """
+    with _get_client() as client:
+        response = client.delete(f"/api/pipelines/{pipeline_id}")
+        if response.status_code == 404:
+            return {"error": f"Pipeline {pipeline_id} not found"}
+        if response.status_code not in (200, 204):
+            return {"error": f"Failed to delete pipeline: {response.text}"}
+        return {"success": True, "message": "Pipeline deleted"}
+
+
+@mcp.tool()
+def run_pipeline(pipeline_id: str) -> dict:
+    """
+    Trigger a pipeline run.
+
+    The repo must be ingested and have at least one step defined.
+    Runs execute steps sequentially, following on_success/on_failure branching.
+
+    Args:
+        pipeline_id: Pipeline to run
+
+    Returns the pipeline run details with run_id for monitoring.
+    """
+    with _get_client() as client:
+        response = client.post(f"/api/pipelines/{pipeline_id}/run", json={})
+        if response.status_code == 404:
+            return {"error": f"Pipeline {pipeline_id} not found"}
+        if response.status_code == 400:
+            error_detail = response.json().get("detail", "Bad request")
+            return {"error": error_detail}
+        if response.status_code not in (200, 201):
+            return {"error": f"Failed to run pipeline: {response.text}"}
+
+        run = response.json()
+        run["message"] = f"Pipeline started with {run.get('steps_total', 0)} steps"
+        return run
+
+
+@mcp.tool()
+def get_pipeline_run(run_id: str) -> dict:
+    """
+    Get pipeline run status with step-by-step details.
+
+    Args:
+        run_id: Pipeline run ID
+
+    Returns run status, current step, completed steps, and each step's status/logs.
+    """
+    with _get_client() as client:
+        response = client.get(f"/api/pipeline-runs/{run_id}")
+        if response.status_code == 404:
+            return {"error": f"Pipeline run {run_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to get pipeline run: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def list_pipeline_runs(
+    pipeline_id: str = "",
+    status: str = "",
+    limit: int = 20
+) -> list[dict]:
+    """
+    List pipeline runs with optional filters.
+
+    Args:
+        pipeline_id: Filter by pipeline (optional)
+        status: Filter by status: pending, running, passed, failed, cancelled (optional)
+        limit: Maximum results (default 20)
+
+    Returns list of pipeline runs.
+    """
+    with _get_client() as client:
+        params = {"limit": limit}
+        if pipeline_id:
+            params["pipeline_id"] = pipeline_id
+        if status:
+            params["status"] = status
+
+        response = client.get("/api/pipeline-runs", params=params)
+        if response.status_code != 200:
+            return {"error": f"Failed to list runs: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def cancel_pipeline_run(run_id: str) -> dict:
+    """
+    Cancel a running pipeline.
+
+    Args:
+        run_id: Pipeline run ID to cancel
+
+    Returns updated run status.
+    """
+    with _get_client() as client:
+        response = client.post(f"/api/pipeline-runs/{run_id}/cancel")
+        if response.status_code == 404:
+            return {"error": f"Pipeline run {run_id} not found"}
+        if response.status_code == 400:
+            error_detail = response.json().get("detail", "Bad request")
+            return {"error": error_detail}
+        if response.status_code != 200:
+            return {"error": f"Failed to cancel run: {response.text}"}
+
+        run = response.json()
+        run["message"] = "Pipeline run cancelled"
+        return run
+
+
+@mcp.tool()
+def get_step_logs(run_id: str, step_index: int) -> dict:
+    """
+    Get logs for a specific step in a pipeline run.
+
+    Args:
+        run_id: Pipeline run ID
+        step_index: Step index (0-based)
+
+    Returns step logs and status.
+    """
+    with _get_client() as client:
+        response = client.get(f"/api/pipeline-runs/{run_id}/steps/{step_index}/logs")
+        if response.status_code == 404:
+            return {"error": f"Step not found (run_id={run_id}, step={step_index})"}
+        if response.status_code != 200:
+            return {"error": f"Failed to get step logs: {response.text}"}
+        return response.json()

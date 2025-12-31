@@ -22,6 +22,7 @@ class Repo(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     cards: Mapped[list["Card"]] = relationship("Card", back_populates="repo", cascade="all, delete-orphan")
+    pipelines: Mapped[list["Pipeline"]] = relationship("Pipeline", back_populates="repo", cascade="all, delete-orphan")
 
     @property
     def internal_git_url(self) -> str:

@@ -3,6 +3,15 @@ from app.schemas.card import CardCreate, CardRead, CardUpdate
 from app.schemas.job import JobRead
 from app.schemas.runner import RunnerRead
 from app.schemas.agent_file import AgentFileCreate, AgentFileRead, AgentFileUpdate
+from app.schemas.pipeline import (
+    PipelineStepConfig,
+    PipelineCreate,
+    PipelineRead,
+    PipelineUpdate,
+    PipelineRunRead,
+    PipelineRunCreate,
+    StepRunRead,
+)
 
 __all__ = [
     "RepoCreate",
@@ -17,4 +26,11 @@ __all__ = [
     "AgentFileCreate",
     "AgentFileRead",
     "AgentFileUpdate",
+    "PipelineStepConfig",
+    "PipelineCreate",
+    "PipelineRead",
+    "PipelineUpdate",
+    "PipelineRunRead",
+    "PipelineRunCreate",
+    "StepRunRead",
 ]

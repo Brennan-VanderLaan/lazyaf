@@ -236,3 +236,82 @@ export interface AgentFileUpdate {
   content?: string;
   description?: string | null;
 }
+
+// Pipeline types (Phase 9)
+export type RunStatus = 'pending' | 'running' | 'passed' | 'failed' | 'cancelled';
+
+export interface PipelineStepConfig {
+  name: string;
+  type: StepType;
+  config: StepConfig & { runner_type?: RunnerType; title?: string; description?: string };
+  on_success: string;  // "next" | "stop" | "trigger:{card_id}" | "merge:{branch}"
+  on_failure: string;  // "next" | "stop" | "trigger:{card_id}"
+  timeout: number;
+}
+
+export interface Pipeline {
+  id: string;
+  repo_id: string;
+  name: string;
+  description: string | null;
+  steps: PipelineStepConfig[];
+  is_template: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PipelineCreate {
+  name: string;
+  description?: string;
+  steps: PipelineStepConfig[];
+  is_template?: boolean;
+}
+
+export interface PipelineUpdate {
+  name?: string;
+  description?: string;
+  steps?: PipelineStepConfig[];
+  is_template?: boolean;
+}
+
+export interface StepRun {
+  id: string;
+  pipeline_run_id: string;
+  step_index: number;
+  step_name: string;
+  status: RunStatus;
+  job_id: string | null;
+  logs: string;
+  error: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface PipelineRun {
+  id: string;
+  pipeline_id: string;
+  status: RunStatus;
+  trigger_type: string;
+  trigger_ref: string | null;
+  current_step: number;
+  steps_completed: number;
+  steps_total: number;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  step_runs: StepRun[];
+}
+
+export interface PipelineRunCreate {
+  trigger_type?: string;
+  trigger_ref?: string;
+  params?: Record<string, unknown>;
+}
+
+export interface StepLogsResponse {
+  step_index: number;
+  step_name: string;
+  logs: string;
+  error: string | null;
+  status: RunStatus;
+}

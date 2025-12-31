@@ -168,3 +168,117 @@ class RunnerFactory(BaseFactory):
         no_container = factory.Trait(
             container_id=None,
         )
+
+
+# Import Pipeline models
+from app.models.pipeline import Pipeline, PipelineRun, StepRun, RunStatus
+
+
+class PipelineFactory(BaseFactory):
+    """Factory for creating Pipeline instances."""
+
+    class Meta:
+        model = Pipeline
+
+    id = factory.LazyFunction(generate_uuid)
+    repo_id = factory.LazyFunction(generate_uuid)
+    name = factory.LazyFunction(lambda: fake.word().capitalize() + " Pipeline")
+    description = factory.LazyFunction(lambda: fake.sentence())
+    steps = "[]"  # JSON string of steps
+    is_template = False
+    created_at = factory.LazyFunction(datetime.utcnow)
+    updated_at = factory.LazyFunction(datetime.utcnow)
+
+    class Params:
+        """Parameters for creating pipelines in specific states."""
+
+        with_steps = factory.Trait(
+            steps='[{"name": "Test", "type": "script", "config": {"command": "npm test"}, "on_success": "next", "on_failure": "stop", "timeout": 300}]',
+        )
+        multi_step = factory.Trait(
+            steps='[{"name": "Lint", "type": "script", "config": {"command": "npm run lint"}, "on_success": "next", "on_failure": "stop", "timeout": 300}, {"name": "Test", "type": "script", "config": {"command": "npm test"}, "on_success": "next", "on_failure": "stop", "timeout": 300}, {"name": "Build", "type": "script", "config": {"command": "npm run build"}, "on_success": "stop", "on_failure": "stop", "timeout": 300}]',
+        )
+
+
+class PipelineRunFactory(BaseFactory):
+    """Factory for creating PipelineRun instances."""
+
+    class Meta:
+        model = PipelineRun
+
+    id = factory.LazyFunction(generate_uuid)
+    pipeline_id = factory.LazyFunction(generate_uuid)
+    status = RunStatus.PENDING.value
+    trigger_type = "manual"
+    trigger_ref = None
+    current_step = 0
+    steps_completed = 0
+    steps_total = 0
+    started_at = None
+    completed_at = None
+    created_at = factory.LazyFunction(datetime.utcnow)
+
+    class Params:
+        """Parameters for creating pipeline runs in specific states."""
+
+        running = factory.Trait(
+            status=RunStatus.RUNNING.value,
+            started_at=factory.LazyFunction(datetime.utcnow),
+        )
+        passed = factory.Trait(
+            status=RunStatus.PASSED.value,
+            started_at=factory.LazyFunction(datetime.utcnow),
+            completed_at=factory.LazyFunction(datetime.utcnow),
+        )
+        failed = factory.Trait(
+            status=RunStatus.FAILED.value,
+            started_at=factory.LazyFunction(datetime.utcnow),
+            completed_at=factory.LazyFunction(datetime.utcnow),
+        )
+        cancelled = factory.Trait(
+            status=RunStatus.CANCELLED.value,
+            started_at=factory.LazyFunction(datetime.utcnow),
+            completed_at=factory.LazyFunction(datetime.utcnow),
+        )
+
+
+class StepRunFactory(BaseFactory):
+    """Factory for creating StepRun instances."""
+
+    class Meta:
+        model = StepRun
+
+    id = factory.LazyFunction(generate_uuid)
+    pipeline_run_id = factory.LazyFunction(generate_uuid)
+    step_index = 0
+    step_name = factory.LazyFunction(lambda: fake.word().capitalize() + " Step")
+    status = RunStatus.PENDING.value
+    job_id = None
+    logs = ""
+    error = None
+    started_at = None
+    completed_at = None
+
+    class Params:
+        """Parameters for creating step runs in specific states."""
+
+        running = factory.Trait(
+            status=RunStatus.RUNNING.value,
+            started_at=factory.LazyFunction(datetime.utcnow),
+        )
+        passed = factory.Trait(
+            status=RunStatus.PASSED.value,
+            started_at=factory.LazyFunction(datetime.utcnow),
+            completed_at=factory.LazyFunction(datetime.utcnow),
+            logs="Step completed successfully.\n",
+        )
+        failed = factory.Trait(
+            status=RunStatus.FAILED.value,
+            started_at=factory.LazyFunction(datetime.utcnow),
+            completed_at=factory.LazyFunction(datetime.utcnow),
+            error="Step failed: test error",
+            logs="Error occurred.\n",
+        )
+        with_job = factory.Trait(
+            job_id=factory.LazyFunction(generate_uuid),
+        )

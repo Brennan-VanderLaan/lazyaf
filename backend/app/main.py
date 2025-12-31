@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import init_db
-from app.routers import repos, cards, jobs, runners, agent_files
+from app.routers import repos, cards, jobs, runners, agent_files, pipelines
 from app.routers import git
 from app.services.websocket import manager
 
@@ -44,6 +44,7 @@ app.include_router(cards.router)
 app.include_router(jobs.router)
 app.include_router(runners.router)
 app.include_router(agent_files.router)
+app.include_router(pipelines.router)
 app.include_router(git.router)
 
 

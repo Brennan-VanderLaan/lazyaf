@@ -39,5 +39,18 @@ class ConnectionManager:
     async def send_runner_status(self, runner_data: dict):
         await self.broadcast("runner_status", runner_data)
 
+    # Pipeline-related broadcasts (Phase 9)
+    async def send_pipeline_updated(self, pipeline_data: dict):
+        await self.broadcast("pipeline_updated", pipeline_data)
+
+    async def send_pipeline_deleted(self, pipeline_id: str):
+        await self.broadcast("pipeline_deleted", {"id": pipeline_id})
+
+    async def send_pipeline_run_status(self, run_data: dict):
+        await self.broadcast("pipeline_run_status", run_data)
+
+    async def send_step_run_status(self, step_data: dict):
+        await self.broadcast("step_run_status", step_data)
+
 
 manager = ConnectionManager()

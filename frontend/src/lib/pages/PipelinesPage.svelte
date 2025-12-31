@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { pipelinesStore, activeRunsStore, hasActiveRuns } from '../stores/pipelines';
   import { selectedRepoId, selectedRepo } from '../stores/repos';
   import type { Pipeline, PipelineRun, RunStatus } from '../api/types';
@@ -12,6 +12,11 @@
   let editingPipeline: Pipeline | null = null;
   let viewingRun: PipelineRun | null = null;
 
+  // Load recent runs on mount
+  onMount(() => {
+    activeRunsStore.loadRecent();
+  });
+
   // Load pipelines when repo changes
   $: if ($selectedRepoId) {
     pipelinesStore.load($selectedRepoId);
@@ -23,8 +28,8 @@
   $: if ($hasActiveRuns) {
     if (!refreshInterval) {
       refreshInterval = setInterval(() => {
-        // Refresh active runs (the store handles this)
-      }, 2000);
+        activeRunsStore.loadRecent();
+      }, 3000);
     }
   } else if (refreshInterval) {
     clearInterval(refreshInterval);

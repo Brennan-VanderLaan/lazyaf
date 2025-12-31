@@ -61,10 +61,21 @@ async def cancel_job(job_id: str, db: AsyncSession = Depends(get_db)):
     return job
 
 
+class TestResults(BaseModel):
+    """Test execution results from runner."""
+    tests_run: bool = False
+    tests_passed: bool | None = None
+    pass_count: int | None = None
+    fail_count: int | None = None
+    skip_count: int | None = None
+    output: str | None = None
+
+
 class JobCallback(BaseModel):
     status: str  # "running", "completed", "failed"
     error: str | None = None
     pr_url: str | None = None
+    test_results: TestResults | None = None
 
 
 @router.post("/{job_id}/callback")
@@ -84,12 +95,25 @@ async def job_callback(job_id: str, callback: JobCallback, db: AsyncSession = De
     if callback.status in ("completed", "failed"):
         job.completed_at = datetime.utcnow()
 
+    # Update test results if provided
+    if callback.test_results:
+        job.tests_run = callback.test_results.tests_run
+        job.tests_passed = callback.test_results.tests_passed
+        job.test_pass_count = callback.test_results.pass_count
+        job.test_fail_count = callback.test_results.fail_count
+        job.test_skip_count = callback.test_results.skip_count
+        job.test_output = callback.test_results.output
+
     # Update the associated card
     result = await db.execute(select(Card).where(Card.id == job.card_id))
     card = result.scalar_one_or_none()
     if card:
         if callback.status == "completed":
-            card.status = "in_review"
+            # If tests were run and failed, mark card as failed instead of in_review
+            if callback.test_results and callback.test_results.tests_run and not callback.test_results.tests_passed:
+                card.status = "failed"
+            else:
+                card.status = "in_review"
             if callback.pr_url:
                 card.pr_url = callback.pr_url
         elif callback.status == "failed":
@@ -106,6 +130,11 @@ async def job_callback(job_id: str, callback: JobCallback, db: AsyncSession = De
         "error": job.error,
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "tests_run": job.tests_run,
+        "tests_passed": job.tests_passed,
+        "test_pass_count": job.test_pass_count,
+        "test_fail_count": job.test_fail_count,
+        "test_skip_count": job.test_skip_count,
     })
 
     # Broadcast card update via WebSocket if card was modified

@@ -51,10 +51,21 @@ class JobResponse(BaseModel):
     agent_file_ids: list[str] = []  # List of agent file IDs to mount
 
 
+class TestResultsPayload(BaseModel):
+    """Test execution results from runner."""
+    tests_run: bool = False
+    tests_passed: bool | None = None
+    pass_count: int | None = None
+    fail_count: int | None = None
+    skip_count: int | None = None
+    output: str | None = None
+
+
 class CompleteRequest(BaseModel):
     success: bool
     error: str | None = None
     pr_url: str | None = None
+    test_results: TestResultsPayload | None = None
 
 
 class LogRequest(BaseModel):
@@ -199,6 +210,15 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
         if request.error:
             job.error = request.error
 
+        # Update test results if provided
+        if request.test_results:
+            job.tests_run = request.test_results.tests_run
+            job.tests_passed = request.test_results.tests_passed
+            job.test_pass_count = request.test_results.pass_count
+            job.test_fail_count = request.test_results.fail_count
+            job.test_skip_count = request.test_results.skip_count
+            job.test_output = request.test_results.output
+
         # Sync runner logs to job
         if runner_logs:
             job.logs = "\n".join(runner_logs)
@@ -209,7 +229,11 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
         if card:
             card.completed_runner_type = runner_type  # Record which runner type completed
             if request.success:
-                card.status = "in_review"
+                # If tests were run and failed, mark card as failed instead of in_review
+                if request.test_results and request.test_results.tests_run and not request.test_results.tests_passed:
+                    card.status = "failed"
+                else:
+                    card.status = "in_review"
                 if request.pr_url:
                     card.pr_url = request.pr_url
             else:
@@ -226,6 +250,11 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
             "error": job.error,
             "started_at": job.started_at.isoformat() if job.started_at else None,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "tests_run": job.tests_run,
+            "tests_passed": job.tests_passed,
+            "test_pass_count": job.test_pass_count,
+            "test_fail_count": job.test_fail_count,
+            "test_skip_count": job.test_skip_count,
         })
 
         # Broadcast card update via WebSocket

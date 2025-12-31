@@ -437,21 +437,22 @@ src/
 
 **Deliverable**: You're using this for real work
 
-### Phase 7: MCP Interface
+### Phase 7: MCP Interface ✅
 **Goal**: Allow LLM clients (Claude Desktop, etc.) to orchestrate LazyAF via Model Context Protocol
 
 **Problem Being Solved**: Want to interact with LazyAF from chat interfaces - "create a card for adding dark mode" without opening the UI.
 
 **MVP Scope**:
-- [ ] MCP server with stdio transport (for Claude Desktop)
-- [ ] Tool: `list_repos` - returns repo names, IDs, and ingest status
-- [ ] Tool: `list_cards` - returns cards for a repo with status, branch, PR info
-- [ ] Tool: `create_card` - creates a card given repo_id, title, description
-- [ ] Tool: `get_card` - returns full card details including job logs
-- [ ] Tool: `start_card` - triggers agent work on a card
-- [ ] Tool: `get_job_logs` - fetch logs from a job run
-- [ ] Resource: repos (list of available repositories)
-- [ ] Configuration for Claude Desktop integration
+- [x] MCP server with stdio transport (for Claude Desktop)
+- [x] Tool: `list_repos` - returns repo names, IDs, and ingest status
+- [x] Tool: `list_cards` - returns cards for a repo with status, branch, PR info
+- [x] Tool: `create_card` - creates a card given repo_id, title, description
+- [x] Tool: `get_card` - returns full card details including job logs
+- [x] Tool: `start_card` - triggers agent work on a card
+- [x] Tool: `get_job_logs` - fetch logs from a job run
+- [x] Resource: repos (list of available repositories)
+- [x] Configuration for Claude Desktop integration
+- [x] Tool: `get_runner_status` - check runner pool availability (bonus)
 
 **Explicit Non-Goals (This Phase)**:
 - HTTP/SSE transport (stdio only for MVP)
@@ -474,18 +475,18 @@ backend/
 
 **Deliverable**: Can list repos, create cards, and start work from Claude Desktop
 
-### Phase 8: Test Result Capture
+### Phase 8: Test Result Capture ✅
 **Goal**: Visibility into whether agent-produced code passes tests
 
 **Problem Being Solved**: Agents complete work but may have broken tests. No visibility into test results, and manual checking is tedious. Want LazyAF to be the source of truth for test status, not GHA.
 
 **MVP Scope**:
-- [ ] Runner detects test framework (package.json scripts, pytest.ini, etc.)
-- [ ] Runner runs tests after Claude Code completes
-- [ ] Test results stored on Job model (pass_count, fail_count, output)
-- [ ] Test summary displayed in CardModal when viewing completed cards
-- [ ] Cards with failing tests get "failed" status with test output visible
-- [ ] Test output included in job logs
+- [x] Runner detects test framework (package.json scripts, pytest.ini, etc.)
+- [x] Runner runs tests after Claude Code completes (similar to docker entrypoint script)
+- [x] Test results stored on Job model (pass_count, fail_count, output)
+- [x] Test summary displayed in CardModal when viewing completed cards
+- [x] Cards with failing tests get "failed" status with test output visible
+- [x] Test output included in job logs
 
 **Explicit Non-Goals (This Phase)**:
 - Separate test dashboard (use existing UI)
@@ -515,6 +516,295 @@ backend/
 - Test timeout: 5 minutes default, configurable per repo
 
 **Deliverable**: After agent work, see "Tests: 42 passed, 3 failed" in card modal. Failed tests = failed card.
+
+---
+
+## CI/CD Pipeline System (Phases 8.5 - 11)
+
+> **Vision**: Replace GitHub Actions with a local-first, controllable CI/CD system that seamlessly integrates AI agents as just another step type. Fast, testable locally, no YAML maze.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            PIPELINE SYSTEM                                   │
+│                                                                              │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │
+│  │   TRIGGER   │───▶│  PIPELINE   │───▶│    STEPS    │───▶│   RESULTS   │  │
+│  │             │    │             │    │             │    │             │  │
+│  │ • Manual    │    │ • Ordered   │    │ • Agent     │    │ • Pass/Fail │  │
+│  │ • Webhook   │    │ • Branching │    │ • Script    │    │ • Logs      │  │
+│  │ • Git Push  │    │ • Parallel  │    │ • Docker    │    │ • Artifacts │  │
+│  │ • Schedule  │    │   (future)  │    │             │    │             │  │
+│  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘  │
+│                                                                              │
+│  Step Types:                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  AGENT          │  SCRIPT           │  DOCKER                        │   │
+│  │  Claude/Gemini  │  Shell commands   │  Command in specified image    │   │
+│  │  implements     │  lint, test,      │  isolated builds, custom       │   │
+│  │  features       │  coverage, build  │  environments                  │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### New Data Models
+
+```python
+class StepType(Enum):
+    AGENT = "agent"      # Current Claude/Gemini behavior
+    SCRIPT = "script"    # Shell command execution
+    DOCKER = "docker"    # Command in specified container image
+
+class Pipeline:
+    id: UUID
+    repo_id: UUID
+    name: str
+    description: str | None
+    steps: list[PipelineStep]  # JSON - ordered steps
+    is_template: bool          # Can be reused across repos
+    created_at: datetime
+    updated_at: datetime
+
+class PipelineStep:
+    name: str
+    type: StepType
+    config: dict               # Type-specific config (see below)
+    on_success: str            # "next" | "stop" | "trigger:{card_id}" | "merge:{branch}"
+    on_failure: str            # "next" | "stop" | "trigger:{card_id}"
+    timeout: int               # Seconds, default 300
+
+# Step config by type:
+# AGENT:  {card_id, runner_type}
+# SCRIPT: {command, working_dir?}
+# DOCKER: {image, command, env?, volumes?}
+
+class PipelineRun:
+    id: UUID
+    pipeline_id: UUID
+    status: RunStatus          # pending/running/passed/failed/cancelled
+    trigger_type: str          # "manual" | "webhook" | "card" | "push" | "schedule"
+    trigger_ref: str | None    # webhook_id, card_id, branch, etc.
+    current_step: int
+    steps_completed: int
+    steps_total: int
+    started_at: datetime
+    completed_at: datetime | None
+
+class StepRun:
+    id: UUID
+    pipeline_run_id: UUID
+    step_index: int
+    status: RunStatus
+    logs: str
+    error: str | None
+    started_at: datetime
+    completed_at: datetime | None
+
+class Webhook:
+    id: UUID
+    pipeline_id: UUID
+    name: str
+    token: str                 # Secret for authentication
+    type: str                  # "generic" | "git_push"
+    last_triggered: datetime | None
+    created_at: datetime
+```
+
+### Phase 8.5: CI/CD Foundation (Non-AI Steps)
+**Goal**: Runners can execute scripts and docker commands, not just AI agents
+
+**Problem Being Solved**: Currently all "work" must go through an AI agent. Want deterministic CI steps (lint, test, build) that run reliably every time.
+
+**MVP Scope**:
+- [ ] Add `step_type` enum: `agent | script | docker`
+- [ ] Extend Job model with step type and config fields
+- [ ] Update runner entrypoint to handle all three step types
+- [ ] Script steps: run shell command, capture output
+- [ ] Docker steps: run command in specified image, capture output
+- [ ] UI: Cards can specify step type (default: agent)
+- [ ] MCP: `create_card` accepts `step_type` parameter
+
+**Step Type Implementations**:
+```python
+# AGENT (existing behavior)
+job.step_type = "agent"
+job.config = {"runner_type": "claude-code"}
+# Runner invokes Claude Code CLI
+
+# SCRIPT (new)
+job.step_type = "script"
+job.config = {"command": "npm run lint && npm test"}
+# Runner executes command directly, captures stdout/stderr
+
+# DOCKER (new)
+job.step_type = "docker"
+job.config = {"image": "node:20", "command": "npm run build"}
+# Runner pulls image, runs command in container, captures output
+```
+
+**Explicit Non-Goals (This Phase)**:
+- Pipeline orchestration (just individual steps)
+- Webhooks
+- Step chaining
+
+**Deliverable**: Can create a card that runs `npm test` directly without AI
+
+### Phase 9: Pipelines
+**Goal**: Chain steps with conditional logic into reusable workflows
+
+**Problem Being Solved**: Want multi-step workflows: lint → test → build, with AI fixes on failure
+
+**MVP Scope**:
+- [ ] Pipeline entity with ordered steps
+- [ ] Steps can be inline (script/docker) or reference cards (agent)
+- [ ] Success/failure branching per step:
+  - `next` - continue to next step
+  - `stop` - halt pipeline (success or failure based on step result)
+  - `trigger:{card_id}` - spawn AI agent card to fix issues
+  - `merge:{branch}` - auto-merge on success
+- [ ] Pipeline execution engine (runs steps sequentially)
+- [ ] Pipeline run tracking (status, current step, logs per step)
+- [ ] UI: Pipeline builder/editor
+- [ ] UI: Pipeline runs viewer with step-by-step status
+- [ ] MCP tools: `create_pipeline`, `run_pipeline`, `get_pipeline_run`
+
+**Example Pipeline**:
+```json
+{
+  "name": "PR Validation",
+  "steps": [
+    {"name": "Lint", "type": "script", "config": {"command": "npm run lint"}, "on_failure": "trigger:ai-fix-lint"},
+    {"name": "Test", "type": "script", "config": {"command": "npm test"}, "on_failure": "trigger:ai-fix-tests"},
+    {"name": "Build", "type": "docker", "config": {"image": "node:20", "command": "npm run build"}, "on_failure": "stop"}
+  ]
+}
+```
+
+**Explicit Non-Goals (This Phase)**:
+- Parallel step execution
+- Webhook triggers
+- Scheduled runs
+
+**Deliverable**: Can define and run multi-step pipelines with AI fallback on failures
+
+### Phase 9.5: Webhooks
+**Goal**: External systems can trigger pipelines
+
+**Problem Being Solved**: Want to trigger CI pipelines from git push, external services, or other automation
+
+**MVP Scope**:
+- [ ] Webhook entity (token-authenticated URLs)
+- [ ] Generic webhook: `POST /api/webhooks/{token}/trigger`
+- [ ] Git push webhook: `POST /api/webhooks/{token}/git-push` (parses branch/commit)
+- [ ] Webhook payload available to pipeline as env vars
+- [ ] UI: Webhook management (create, view URL, regenerate token, delete)
+- [ ] MCP tools: `create_webhook`, `list_webhooks`, `delete_webhook`
+
+**Webhook Endpoints**:
+```
+POST /api/webhooks/{token}/trigger
+  Body: {params: {key: value}}
+  → Triggers associated pipeline with params as env vars
+
+POST /api/webhooks/{token}/git-push
+  Body: {ref: "refs/heads/main", commits: [...], repository: {...}}
+  → Parses git push payload, triggers pipeline with GIT_BRANCH, GIT_COMMIT, etc.
+```
+
+**Explicit Non-Goals (This Phase)**:
+- GitHub/GitLab specific integrations (use generic git-push format)
+- Webhook signature verification (token auth only for MVP)
+
+**Deliverable**: Can get a webhook URL, configure Gitea/GitHub to POST to it, pipeline runs automatically
+
+### Phase 10: Events & Triggers
+**Goal**: Pipelines trigger automatically from various events
+
+**Problem Being Solved**: Don't want to manually trigger or set up external webhooks for common cases
+
+**MVP Scope**:
+- [ ] Internal git server emits push events
+- [ ] Pipeline trigger config: on_push (branch filter), on_card_complete, on_schedule
+- [ ] Card completion can trigger downstream pipelines
+- [ ] Cron-style scheduling for periodic runs
+- [ ] UI: Trigger configuration in pipeline editor
+- [ ] MCP: Trigger config in pipeline CRUD tools
+
+**Trigger Types**:
+```python
+class PipelineTrigger:
+    type: str  # "manual" | "webhook" | "push" | "card_complete" | "schedule"
+    config: dict
+
+# Examples:
+{"type": "push", "config": {"branches": ["main", "dev"]}}
+{"type": "card_complete", "config": {"card_status": "in_review"}}
+{"type": "schedule", "config": {"cron": "0 0 * * *"}}  # Daily at midnight
+```
+
+**Explicit Non-Goals (This Phase)**:
+- Complex event filtering
+- Event replay/history
+
+**Deliverable**: Push to internal git → pipeline automatically runs → AI fixes failures → auto-merge
+
+### Phase 11: Reporting & Artifacts (Future)
+**Goal**: Visibility into CI health over time, build artifact storage
+
+**Problem Being Solved**: Want test trends, coverage reports, and a place to store build outputs
+
+**Scope** (rough):
+- [ ] Test result aggregation per repo over time
+- [ ] Coverage trend tracking
+- [ ] Artifact storage (build outputs, test reports)
+- [ ] Pipeline run history with filtering
+- [ ] Dashboard with CI health metrics
+- [ ] MCP tools: `get_test_trends`, `get_coverage`, `list_artifacts`
+
+**Explicit Non-Goals (This Phase)**:
+- External artifact storage (S3, etc.) - local storage only
+- Complex analytics
+
+**Deliverable**: Dashboard showing test pass rates over time, coverage trends, downloadable build artifacts
+
+---
+
+### MCP Integration (CI/CD)
+
+All CI/CD features exposed via MCP for Claude Desktop orchestration:
+
+```python
+# Pipeline Management
+list_pipelines(repo_id?) -> list[Pipeline]
+create_pipeline(repo_id, name, steps[]) -> Pipeline
+get_pipeline(pipeline_id) -> Pipeline
+update_pipeline(pipeline_id, steps[]) -> Pipeline
+delete_pipeline(pipeline_id) -> bool
+
+# Pipeline Execution
+run_pipeline(pipeline_id, params?) -> PipelineRun
+get_pipeline_run(run_id) -> PipelineRun
+list_pipeline_runs(pipeline_id?, status?) -> list[PipelineRun]
+cancel_pipeline_run(run_id) -> bool
+get_step_logs(run_id, step_index) -> str
+
+# Webhooks
+create_webhook(pipeline_id, name, type) -> Webhook  # Returns URL + token
+list_webhooks(repo_id?) -> list[Webhook]
+delete_webhook(webhook_id) -> bool
+
+# Resources
+pipelines://list
+pipelines://{id}/runs
+webhooks://list
+```
+
+**Example Claude Desktop interactions**:
+- "Create a pipeline for this repo that lints, tests, and builds"
+- "Show me the last 5 pipeline runs for lazyaf"
+- "Give me a webhook URL to trigger CI from Gitea"
+- "Add an AI fix step to the test pipeline that triggers on failure"
 
 ---
 
@@ -597,9 +887,9 @@ lazyaf/
 
 ## Current Status
 
-**Completed**: Phases 1-5
-**Current**: Phase 6 (Polish) - in progress
-**Next**: Phase 7 (MCP Interface), Phase 8 (Test Result Capture)
+**Completed**: Phases 1-5, Phase 7 (MCP Interface), Phase 8 (Test Result Capture)
+**Current**: Phase 8.5 (CI/CD Foundation) - starting
+**Next**: Phase 9 (Pipelines), Phase 9.5 (Webhooks)
 
 The core workflow is functional:
 1. Ingest repos via CLI
@@ -609,6 +899,11 @@ The core workflow is functional:
 5. Approve/Reject to complete cycle
 
 **Roadmap**:
-- Phase 6: Polish - quality of life improvements for daily use
-- Phase 7: MCP Interface - orchestrate LazyAF from Claude Desktop
-- Phase 8: Test Result Capture - visibility into test pass/fail, replace GHA dependency
+- Phase 6: Polish - in progress (quality of life improvements)
+- Phase 7: MCP Interface - ✅ COMPLETE
+- Phase 8: Test Result Capture - ✅ COMPLETE
+- Phase 8.5: CI/CD Foundation - **STARTING** (non-AI runner steps)
+- Phase 9: Pipelines - planned (multi-step workflows)
+- Phase 9.5: Webhooks - planned (external triggers)
+- Phase 10: Events & Triggers - planned (push, schedule, card completion)
+- Phase 11: Reporting & Artifacts - future (test trends, coverage, build artifacts)

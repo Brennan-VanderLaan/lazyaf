@@ -205,13 +205,14 @@
                   <div class="step-config">
                     {#if step.type === 'script'}
                       <div class="form-group">
-                        <label>Command</label>
-                        <input
-                          type="text"
-                          placeholder="npm test"
+                        <label>Script</label>
+                        <textarea
+                          class="script-input"
+                          placeholder={'npm install\nnpm test'}
+                          rows="3"
                           value={step.config.command || ''}
                           on:input={(e) => updateStep(index, { ...step, config: { ...step.config, command: e.currentTarget.value }})}
-                        />
+                        ></textarea>
                       </div>
                     {:else if step.type === 'docker'}
                       <div class="form-group">
@@ -225,12 +226,13 @@
                       </div>
                       <div class="form-group">
                         <label>Command</label>
-                        <input
-                          type="text"
-                          placeholder="npm run build"
+                        <textarea
+                          class="script-input"
+                          placeholder={'npm install\nnpm run build'}
+                          rows="2"
                           value={step.config.command || ''}
                           on:input={(e) => updateStep(index, { ...step, config: { ...step.config, command: e.currentTarget.value }})}
-                        />
+                        ></textarea>
                       </div>
                     {:else if step.type === 'agent'}
                       <div class="form-group">
@@ -633,5 +635,14 @@
   .btn-delete:hover {
     background: var(--error-color);
     color: white;
+  }
+
+  /* Script/command textarea styling */
+  .script-input {
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    resize: vertical;
+    min-height: 50px;
   }
 </style>

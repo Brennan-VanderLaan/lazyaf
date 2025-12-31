@@ -656,18 +656,20 @@ job.config = {"image": "node:20", "command": "npm run build"}
 **Problem Being Solved**: Want multi-step workflows: lint → test → build, with AI fixes on failure
 
 **MVP Scope**:
-- [ ] Pipeline entity with ordered steps
-- [ ] Steps can be inline (script/docker) or reference cards (agent)
-- [ ] Success/failure branching per step:
+- [x] Pipeline entity with ordered steps
+- [x] Steps can be inline (script/docker) or reference cards (agent)
+- [x] Success/failure branching per step:
   - `next` - continue to next step
   - `stop` - halt pipeline (success or failure based on step result)
   - `trigger:{card_id}` - spawn AI agent card to fix issues
+  - `trigger:pipeline:{pipeline_id}` - Run target pipeline
   - `merge:{branch}` - auto-merge on success
-- [ ] Pipeline execution engine (runs steps sequentially)
-- [ ] Pipeline run tracking (status, current step, logs per step)
-- [ ] UI: Pipeline builder/editor
-- [ ] UI: Pipeline runs viewer with step-by-step status
-- [ ] MCP tools: `create_pipeline`, `run_pipeline`, `get_pipeline_run`
+- [x] Extend Script step to allow for multi-line bash scripts
+- [x] Pipeline execution engine (runs steps sequentially)
+- [x] Pipeline run tracking (status, current step, logs per step)
+- [x] UI: Pipeline builder/editor
+- [x] UI: Pipeline runs viewer with step-by-step status
+- [x] MCP tools: `create_pipeline`, `run_pipeline`, `get_pipeline_run`
 
 **Example Pipeline**:
 ```json

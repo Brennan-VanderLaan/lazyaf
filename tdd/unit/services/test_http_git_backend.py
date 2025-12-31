@@ -152,10 +152,10 @@ class TestGetInfoRefsUploadPack:
         # Empty repo should have zero SHA
         assert zero_sha in content
 
-    def test_upload_pack_capabilities_include_multi_ack(self, git_backend, created_repo):
-        """Upload-pack advertises multi_ack capability."""
+    def test_upload_pack_capabilities_include_no_done(self, git_backend, created_repo):
+        """Upload-pack advertises no-done capability (simpler than multi_ack)."""
         content, _ = git_backend.get_info_refs(created_repo, "git-upload-pack")
-        assert b"multi_ack" in content
+        assert b"no-done" in content
 
     def test_upload_pack_capabilities_include_thin_pack(self, git_backend, created_repo):
         """Upload-pack advertises thin-pack capability."""

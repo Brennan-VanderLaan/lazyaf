@@ -25,10 +25,12 @@
     stopLogPolling();
   });
 
+  let selectedRunnerType: string = 'claude-code';
+
   async function openDockerModal() {
     showDockerModal = true;
     try {
-      dockerCommand = await runnersApi.dockerCommand(false);
+      dockerCommand = await runnersApi.dockerCommand(selectedRunnerType, false);
     } catch (e) {
       console.error('Failed to get docker command:', e);
     }
@@ -38,7 +40,7 @@
     if (!dockerCommand) return;
     try {
       if (withSecrets) {
-        dockerCommand = await runnersApi.dockerCommand(true);
+        dockerCommand = await runnersApi.dockerCommand(selectedRunnerType, true);
       }
       const cmd = withSecrets ? dockerCommand.command_with_secrets : dockerCommand.command;
       await navigator.clipboard.writeText(cmd);
@@ -46,6 +48,15 @@
       setTimeout(() => copyFeedback = '', 2000);
     } catch (e) {
       console.error('Failed to copy:', e);
+    }
+  }
+
+  async function changeRunnerType(runnerType: string) {
+    selectedRunnerType = runnerType;
+    try {
+      dockerCommand = await runnersApi.dockerCommand(runnerType, false);
+    } catch (e) {
+      console.error('Failed to get docker command:', e);
     }
   }
 
@@ -187,6 +198,26 @@
           Run this command to start a runner that will connect to the backend and wait for jobs.
         </p>
 
+        <div class="runner-type-selector">
+          <label>Runner Type:</label>
+          <div class="runner-type-buttons">
+            <button
+              class="runner-type-btn"
+              class:selected={selectedRunnerType === 'claude-code'}
+              on:click={() => changeRunnerType('claude-code')}
+            >
+              Claude Code
+            </button>
+            <button
+              class="runner-type-btn"
+              class:selected={selectedRunnerType === 'gemini'}
+              on:click={() => changeRunnerType('gemini')}
+            >
+              Gemini CLI
+            </button>
+          </div>
+        </div>
+
         {#if dockerCommand}
           <div class="command-box">
             <code>{dockerCommand.command}</code>
@@ -209,7 +240,11 @@
             <h4>Environment Variables</h4>
             <ul>
               <li><code>BACKEND_URL</code> - Backend API URL (default: http://host.docker.internal:8000)</li>
-              <li><code>ANTHROPIC_API_KEY</code> - Your Anthropic API key (required for jobs)</li>
+              {#if selectedRunnerType === 'claude-code'}
+                <li><code>ANTHROPIC_API_KEY</code> - Your Anthropic API key (required)</li>
+              {:else}
+                <li><code>GEMINI_API_KEY</code> - Your Gemini API key (required)</li>
+              {/if}
               <li><code>GITHUB_TOKEN</code> - GitHub token for creating PRs (optional)</li>
               <li><code>RUNNER_NAME</code> - Custom name for the runner (optional)</li>
             </ul>
@@ -608,5 +643,42 @@
     padding: 0.1rem 0.3rem;
     border-radius: 3px;
     font-size: 0.8rem;
+  }
+
+  .runner-type-selector {
+    margin-bottom: 1rem;
+  }
+
+  .runner-type-selector label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-size: 0.9rem;
+    color: var(--text-color, #cdd6f4);
+  }
+
+  .runner-type-buttons {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .runner-type-btn {
+    flex: 1;
+    padding: 0.6rem 1rem;
+    background: var(--surface-alt, #181825);
+    border: 2px solid var(--border-color, #45475a);
+    border-radius: 6px;
+    color: var(--text-color, #cdd6f4);
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+
+  .runner-type-btn:hover {
+    border-color: var(--primary-color, #89b4fa);
+  }
+
+  .runner-type-btn.selected {
+    border-color: var(--primary-color, #89b4fa);
+    background: rgba(137, 180, 250, 0.1);
   }
 </style>

@@ -134,22 +134,13 @@ async def clean_job_queue():
 
     # Clear before
     job_queue._pending = {}
-    # Drain the asyncio queue
-    while True:
-        try:
-            job_queue._queue.get_nowait()
-        except Exception:
-            break
+    job_queue._jobs = []
 
     yield job_queue
 
     # Clear after
     job_queue._pending = {}
-    while True:
-        try:
-            job_queue._queue.get_nowait()
-        except Exception:
-            break
+    job_queue._jobs = []
 
 
 # -----------------------------------------------------------------------------
@@ -191,6 +182,58 @@ def cleanup_git_repos_after_session():
     git_repos_dir = Path(__file__).parent.parent / "backend" / "git_repos"
     if git_repos_dir.exists():
         shutil.rmtree(git_repos_dir)
+
+
+# -----------------------------------------------------------------------------
+# Repo Fixtures
+# -----------------------------------------------------------------------------
+
+@pytest_asyncio.fixture
+async def repo(client):
+    """Create a test repository for tests that need one."""
+    from shared.factories import repo_create_payload
+
+    response = await client.post(
+        "/api/repos",
+        json=repo_create_payload(name="test-repo"),
+    )
+    assert response.status_code == 201, f"Failed to create repo: {response.text}"
+    return response.json()
+
+
+@pytest_asyncio.fixture
+async def ingested_repo(client, clean_git_repos):
+    """Create and ingest a test repository."""
+    import tempfile
+    import subprocess
+    from pathlib import Path
+
+    # Create a temporary git repo
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_path = Path(tmpdir) / "test-repo"
+        repo_path.mkdir()
+
+        # Initialize git repo
+        subprocess.run(["git", "init"], cwd=repo_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_path, check=True, capture_output=True)
+
+        # Create a file and commit
+        (repo_path / "README.md").write_text("# Test Repo")
+        subprocess.run(["git", "add", "."], cwd=repo_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo_path, check=True, capture_output=True)
+
+        # Ingest it
+        response = await client.post(
+            "/api/repos/ingest",
+            json={"path": str(repo_path), "name": "ingested-test-repo"},
+        )
+        assert response.status_code == 201, f"Failed to ingest repo: {response.text}"
+        ingest_data = response.json()
+
+        # Get the full repo
+        repo_response = await client.get(f"/api/repos/{ingest_data['id']}")
+        return repo_response.json()
 
 
 # -----------------------------------------------------------------------------

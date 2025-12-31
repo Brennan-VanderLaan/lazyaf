@@ -17,12 +17,21 @@ def assert_status_code(response: Response, expected: int) -> None:
     )
 
 
-def assert_json_contains(response: Response, expected: dict[str, Any]) -> None:
+def assert_json_contains(response: Response, expected: dict[str, Any] = None, **kwargs) -> None:
     """Assert response JSON contains all expected key-value pairs.
 
     This allows for partial matching - the response can contain additional
     fields not specified in expected.
+
+    Can be called as:
+        assert_json_contains(response, {"name": "value"})
+        assert_json_contains(response, name="value")
     """
+    if expected is None:
+        expected = kwargs
+    else:
+        expected = {**expected, **kwargs}
+
     actual = response.json()
     for key, value in expected.items():
         assert key in actual, f"Expected key '{key}' not found in response: {actual}"
@@ -78,25 +87,37 @@ def assert_error_response(response: Response, status_code: int, detail: str) -> 
     )
 
 
-def assert_created_response(response: Response, expected: dict[str, Any]) -> dict[str, Any]:
+def assert_created_response(response: Response, expected: dict[str, Any] = None, **kwargs) -> dict[str, Any]:
     """Assert response is a successful creation (201) with expected fields.
 
     Returns the full response JSON for further assertions.
+
+    Can be called as:
+        assert_created_response(response, {"name": "value"})
+        assert_created_response(response, name="value")
+        assert_created_response(response)  # Just check 201 and has id
     """
     assert_status_code(response, 201)
-    assert_json_contains(response, expected)
+    if expected is not None or kwargs:
+        assert_json_contains(response, expected, **kwargs)
     actual = response.json()
     assert "id" in actual, "Created response should include 'id'"
     return actual
 
 
-def assert_updated_response(response: Response, expected: dict[str, Any]) -> dict[str, Any]:
+def assert_updated_response(response: Response, expected: dict[str, Any] = None, **kwargs) -> dict[str, Any]:
     """Assert response is a successful update (200) with expected fields.
 
     Returns the full response JSON for further assertions.
+
+    Can be called as:
+        assert_updated_response(response, {"name": "value"})
+        assert_updated_response(response, name="value")
+        assert_updated_response(response)  # Just check 200
     """
     assert_status_code(response, 200)
-    assert_json_contains(response, expected)
+    if expected is not None or kwargs:
+        assert_json_contains(response, expected, **kwargs)
     return response.json()
 
 
@@ -105,9 +126,25 @@ def assert_deleted_response(response: Response) -> None:
     assert_status_code(response, 204)
 
 
-def assert_not_found(response: Response, resource_type: str = "Resource") -> None:
-    """Assert response is a 404 Not Found error."""
-    assert_error_response(response, 404, f"{resource_type} not found")
+def assert_not_found(response: Response, resource_type: str = None) -> None:
+    """Assert response is a 404 Not Found error.
+
+    If resource_type is provided, checks for "{resource_type} not found".
+    Otherwise, just checks for 404 status and any "not found" message.
+    """
+    assert_status_code(response, 404)
+    actual = response.json()
+    assert "detail" in actual, f"Expected 'detail' in error response: {actual}"
+
+    if resource_type:
+        expected_detail = f"{resource_type} not found"
+        assert actual["detail"] == expected_detail, (
+            f"Expected detail '{expected_detail}', got '{actual['detail']}'"
+        )
+    else:
+        assert "not found" in actual["detail"].lower(), (
+            f"Expected 'not found' in detail, got '{actual['detail']}'"
+        )
 
 
 def assert_validation_error(response: Response) -> dict[str, Any]:

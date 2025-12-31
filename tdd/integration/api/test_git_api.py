@@ -146,8 +146,9 @@ class TestInfoRefsUploadPack:
             f"/git/{created_git_repo}.git/info/refs",
             params={"service": "git-upload-pack"}
         )
-        # Should have at least multi_ack capability
-        assert b"multi_ack" in response.content
+        # Should have essential capabilities (no multi_ack - we use simpler no-done protocol)
+        assert b"side-band" in response.content
+        assert b"thin-pack" in response.content
 
     async def test_response_ends_with_flush(self, client, created_git_repo):
         """Response ends with flush packet (0000)."""

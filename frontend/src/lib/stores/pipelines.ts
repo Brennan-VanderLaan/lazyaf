@@ -108,6 +108,26 @@ function createActiveRunsStore() {
     loading: { subscribe: loading.subscribe },
     error: { subscribe: error.subscribe },
 
+    async loadRecent(limit: number = 20) {
+      loading.set(true);
+      error.set(null);
+      try {
+        const runs = await runsApi.list({ limit });
+        update(map => {
+          for (const run of runs) {
+            map.set(run.id, run);
+          }
+          return new Map(map);
+        });
+        return runs;
+      } catch (e) {
+        error.set(e instanceof Error ? e.message : 'Failed to load pipeline runs');
+        throw e;
+      } finally {
+        loading.set(false);
+      }
+    },
+
     async loadForPipeline(pipelineId: string, limit: number = 10) {
       loading.set(true);
       error.set(null);

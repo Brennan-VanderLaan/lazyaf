@@ -9,6 +9,9 @@ from app.routers import repos, cards, jobs, runners, agent_files, pipelines
 from app.routers import git
 from app.services.websocket import manager
 
+# Import models to ensure they're registered with Base before init_db
+import app.models  # noqa: F401
+
 settings = get_settings()
 
 

@@ -13,12 +13,22 @@
     deleted: void;
   }>();
 
+  // Track original values to detect changes
+  const originalName = pipeline?.name || '';
+  const originalDescription = pipeline?.description || '';
+  const originalSteps = JSON.stringify(pipeline?.steps || []);
+
   let name = pipeline?.name || '';
   let description = pipeline?.description || '';
   let steps: PipelineStepConfig[] = pipeline?.steps || [];
   let submitting = false;
 
   $: isEdit = pipeline !== null;
+
+  // Check if there are unsaved changes
+  $: hasChanges = name !== originalName ||
+                  description !== originalDescription ||
+                  JSON.stringify(steps) !== originalSteps;
 
   function createDefaultStep(): PipelineStepConfig {
     return {
@@ -102,12 +112,23 @@
     }
   }
 
+  function confirmClose(): boolean {
+    if (!hasChanges) return true;
+    return confirm('You have unsaved changes. Are you sure you want to close?');
+  }
+
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') dispatch('close');
+    if (e.key === 'Escape') {
+      if (confirmClose()) dispatch('close');
+    }
   }
 
   function handleBackdropClick() {
-    dispatch('close');
+    if (confirmClose()) dispatch('close');
+  }
+
+  function handleCloseButton() {
+    if (confirmClose()) dispatch('close');
   }
 </script>
 
@@ -120,7 +141,7 @@
     <form on:submit|preventDefault={handleSubmit}>
       <header class="modal-header">
         <h2>{isEdit ? 'Edit Pipeline' : 'New Pipeline'}</h2>
-        <button type="button" class="close-btn" on:click={() => dispatch('close')}>✕</button>
+        <button type="button" class="close-btn" on:click={handleCloseButton}>✕</button>
       </header>
 
       <div class="modal-body">
@@ -311,7 +332,7 @@
           </div>
         {/if}
         <div class="action-group-right">
-          <button type="button" class="btn-secondary" on:click={() => dispatch('close')}>
+          <button type="button" class="btn-secondary" on:click={handleCloseButton}>
             Cancel
           </button>
           <button type="submit" class="btn-primary" disabled={submitting || !name.trim() || steps.length === 0}>
@@ -345,6 +366,13 @@
     display: flex;
     flex-direction: column;
     box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+  }
+
+  .modal form {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    height: 100%;
   }
 
   .modal-header {

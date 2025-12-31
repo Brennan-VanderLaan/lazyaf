@@ -325,6 +325,8 @@ def build_agents_json(agent_files: list[dict]) -> str | None:
 
 def execute_script_step(job: dict):
     """Execute a script step (run shell command directly)."""
+    import tempfile
+
     job_id = job['id']
     step_config = job.get('step_config', {}) or {}
     command = step_config.get('command', '')
@@ -334,7 +336,12 @@ def execute_script_step(job: dict):
         complete_job(success=False, error="No command specified in step_config")
         return
 
-    log(f"Executing script step: {command}")
+    # Normalize line endings (Windows -> Unix) and handle escaped newlines from JSON
+    command = command.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\r\n', '\n').replace('\r', '\n')
+
+    # Log script preview (first 200 chars)
+    preview = command[:200] + ('...' if len(command) > 200 else '')
+    log(f"Executing script step:\n{preview}")
 
     # Start heartbeat
     heartbeat_thread = start_heartbeat_thread()
@@ -366,12 +373,28 @@ def execute_script_step(job: dict):
         else:
             working_dir = step_config.get('working_dir', '/workspace')
 
-        # Execute the command
-        log(f"Running command in {working_dir}...")
+        # Write script to temp file for reliable multi-line execution
+        script_path = Path(working_dir) / ".lazyaf_script.sh"
+        with open(script_path, 'w') as f:
+            f.write("#!/bin/bash\nset -e\n")  # Exit on first error
+            f.write(command)
+            f.write("\n")
+
+        # Make executable
+        run_command(["chmod", "+x", str(script_path)])
+
+        # Execute the script file
+        log(f"Running script in {working_dir}...")
         exit_code, stdout, stderr = run_command_streaming(
-            ["bash", "-c", command],
+            ["bash", str(script_path)],
             cwd=working_dir,
         )
+
+        # Clean up script file
+        try:
+            script_path.unlink()
+        except:
+            pass
 
         if exit_code == 0:
             log("Script completed successfully")
@@ -406,7 +429,12 @@ def execute_docker_step(job: dict):
         complete_job(success=False, error="No command specified in step_config")
         return
 
-    log(f"Executing docker step: {image} -> {command}")
+    # Normalize line endings (Windows -> Unix) and handle escaped newlines from JSON
+    command = command.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\r\n', '\n').replace('\r', '\n')
+
+    # Log script preview (first 200 chars)
+    preview = command[:200] + ('...' if len(command) > 200 else '')
+    log(f"Executing docker step: {image}\n{preview}")
 
     # Start heartbeat
     heartbeat_thread = start_heartbeat_thread()
@@ -434,6 +462,16 @@ def execute_docker_step(job: dict):
             if exit_code != 0:
                 raise Exception("Failed to clone repository")
 
+        # Write script to temp file for reliable multi-line execution
+        script_path = workspace / ".lazyaf_script.sh"
+        with open(script_path, 'w') as f:
+            f.write("#!/bin/bash\nset -e\n")  # Exit on first error
+            f.write(command)
+            f.write("\n")
+
+        # Make executable
+        run_command(["chmod", "+x", str(script_path)])
+
         # Build docker run command
         env_vars = step_config.get('env', {})
         volumes = step_config.get('volumes', [])
@@ -453,10 +491,16 @@ def execute_docker_step(job: dict):
             docker_cmd.extend(["-v", vol])
 
         docker_cmd.append(image)
-        docker_cmd.extend(["bash", "-c", command])
+        docker_cmd.extend(["bash", "/workspace/.lazyaf_script.sh"])
 
         log(f"Running: docker run {image} ...")
         exit_code, stdout, stderr = run_command_streaming(docker_cmd, cwd=str(workspace))
+
+        # Clean up script file
+        try:
+            script_path.unlink()
+        except:
+            pass
 
         if exit_code == 0:
             log("Docker step completed successfully")

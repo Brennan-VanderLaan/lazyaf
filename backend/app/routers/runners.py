@@ -282,6 +282,11 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
                 "updated_at": card.updated_at.isoformat() if card.updated_at else None,
             })
 
+        # Notify pipeline executor if this job is part of a pipeline
+        if job.step_run_id:
+            from app.services.pipeline_executor import pipeline_executor
+            await pipeline_executor.on_step_complete(db, job.step_run_id, job)
+
     return {"status": "ok"}
 
 

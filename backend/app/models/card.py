@@ -40,6 +40,8 @@ class Card(Base):
     # Step type and config (Phase 8.5)
     step_type: Mapped[str] = mapped_column(String(50), default=StepType.AGENT.value)
     step_config: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON config for script/docker steps
+    prompt_template: Mapped[str | None] = mapped_column(Text, nullable=True)  # Custom prompt for AI agents
+    agent_file_ids: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON array of agent file IDs
     branch_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     pr_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

@@ -25,6 +25,7 @@ class QueuedJob:
     repo_path: str | None = None  # Deprecated, not used with internal git
     use_internal_git: bool = False  # When True, runner clones from internal git server
     agent_file_ids: list[str] = field(default_factory=list)  # List of agent file IDs to mount
+    prompt_template: str | None = None  # Custom prompt template (overrides default)
     # Step type and config (Phase 8.5)
     step_type: str = "agent"  # agent, script, docker
     step_config: dict | None = None  # Config for the step (command, image, etc.)

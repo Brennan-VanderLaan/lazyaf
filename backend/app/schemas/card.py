@@ -15,6 +15,8 @@ class CardCreate(CardBase):
     runner_type: RunnerType = RunnerType.ANY
     step_type: StepType = StepType.AGENT
     step_config: dict[str, Any] | None = None  # {command: str} for script, {image: str, command: str} for docker
+    prompt_template: str | None = None  # Custom prompt for AI agents (overrides global default)
+    agent_file_ids: list[str] | None = None  # Agent files to make available
 
 
 class CardUpdate(BaseModel):
@@ -24,6 +26,8 @@ class CardUpdate(BaseModel):
     runner_type: RunnerType | None = None
     step_type: StepType | None = None
     step_config: dict[str, Any] | None = None
+    prompt_template: str | None = None
+    agent_file_ids: list[str] | None = None
 
 
 class CardRead(CardBase):
@@ -33,6 +37,8 @@ class CardRead(CardBase):
     runner_type: RunnerType = RunnerType.ANY
     step_type: StepType = StepType.AGENT
     step_config: dict[str, Any] | None = None
+    prompt_template: str | None = None
+    agent_file_ids: list[str] | None = None
     branch_name: str | None = None
     pr_url: str | None = None
     job_id: str | None = None
@@ -44,6 +50,17 @@ class CardRead(CardBase):
     @classmethod
     def parse_step_config(cls, v):
         """Parse step_config from JSON string if needed."""
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return v
+
+    @field_validator("agent_file_ids", mode="before")
+    @classmethod
+    def parse_agent_file_ids(cls, v):
+        """Parse agent_file_ids from JSON string if needed."""
         if isinstance(v, str):
             try:
                 return json.loads(v)

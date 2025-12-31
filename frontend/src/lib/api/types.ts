@@ -62,6 +62,8 @@ export interface Card {
   runner_type: RunnerType;
   step_type: StepType;
   step_config: StepConfig | null;
+  prompt_template: string | null;
+  agent_file_ids: string[] | null;
   branch_name: string | null;
   pr_url: string | null;
   job_id: string | null;
@@ -76,6 +78,8 @@ export interface CardCreate {
   runner_type?: RunnerType;
   step_type?: StepType;
   step_config?: StepConfig | null;
+  prompt_template?: string | null;
+  agent_file_ids?: string[] | null;
 }
 
 export interface CardUpdate {
@@ -85,6 +89,8 @@ export interface CardUpdate {
   runner_type?: RunnerType;
   step_type?: StepType;
   step_config?: StepConfig | null;
+  prompt_template?: string | null;
+  agent_file_ids?: string[] | null;
 }
 
 export interface Job {

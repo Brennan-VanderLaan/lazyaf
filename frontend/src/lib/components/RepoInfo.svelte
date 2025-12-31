@@ -15,6 +15,21 @@
   let copied = false;
   let selectedBranch: string | null = null;
 
+  // Collapsible state - persisted to localStorage
+  let isCollapsed = false;
+
+  onMount(() => {
+    const saved = localStorage.getItem('repoinfo-collapsed');
+    if (saved !== null) {
+      isCollapsed = saved === 'true';
+    }
+  });
+
+  function toggleCollapsed() {
+    isCollapsed = !isCollapsed;
+    localStorage.setItem('repoinfo-collapsed', String(isCollapsed));
+  }
+
   $: if ($selectedRepo) {
     loadRepoDetails();
   }
@@ -93,15 +108,18 @@
 </script>
 
 {#if $selectedRepo}
-  <div class="repo-info-panel">
-    <div class="info-header">
-      <h3>{$selectedRepo.name}</h3>
+  <div class="repo-info-panel" class:collapsed={isCollapsed}>
+    <button class="info-header" on:click={toggleCollapsed} type="button">
+      <div class="header-left">
+        <span class="collapse-icon">{isCollapsed ? '▶' : '▼'}</span>
+        <h3>Repository Details</h3>
+      </div>
       <span class="status-badge" class:ingested={$selectedRepo.is_ingested}>
         {$selectedRepo.is_ingested ? 'Ready' : 'Not Ingested'}
       </span>
-    </div>
+    </button>
 
-    {#if $selectedRepo.is_ingested}
+    {#if !isCollapsed && $selectedRepo.is_ingested}
       <div class="info-section">
         <label>Internal Git URL</label>
         <div class="url-box">
@@ -113,51 +131,6 @@
           >
             {copied ? 'Copied!' : 'Copy'}
           </button>
-        </div>
-      </div>
-
-      <div class="info-section">
-        <label>Push Updates</label>
-        <div class="instructions">
-          <code>git remote add lazyaf {cloneUrl}</code>
-          <code>git push lazyaf {$selectedRepo.default_branch}</code>
-        </div>
-      </div>
-
-      <div class="info-section">
-        <label>Pull Agent Work</label>
-        <div class="instructions">
-          <p class="instruction-note">Fetch and merge agent changes to your local repo:</p>
-          <div class="cmd-group">
-            <code>git fetch lazyaf</code>
-            <button class="btn-copy-sm" on:click={() => copyToClipboard('git fetch lazyaf')} title="Copy">
-              {copied ? '!' : '+'}
-            </button>
-          </div>
-          {#if selectedBranch}
-            <div class="cmd-group">
-              <code>git merge lazyaf/{selectedBranch}</code>
-              <button class="btn-copy-sm" on:click={() => copyToClipboard(`git merge lazyaf/${selectedBranch}`)} title="Copy">
-                {copied ? '!' : '+'}
-              </button>
-            </div>
-          {/if}
-          <p class="instruction-note">Or checkout the branch directly:</p>
-          {#if selectedBranch}
-            <div class="cmd-group">
-              <code>git checkout -b {selectedBranch} lazyaf/{selectedBranch}</code>
-              <button class="btn-copy-sm" on:click={() => copyToClipboard(`git checkout -b ${selectedBranch} lazyaf/${selectedBranch}`)} title="Copy">
-                {copied ? '!' : '+'}
-              </button>
-            </div>
-          {/if}
-          <p class="instruction-note">Then push to GitHub:</p>
-          <div class="cmd-group">
-            <code>git push origin {selectedBranch || $selectedRepo.default_branch}</code>
-            <button class="btn-copy-sm" on:click={() => copyToClipboard(`git push origin ${selectedBranch || $selectedRepo.default_branch}`)} title="Copy">
-              {copied ? '!' : '+'}
-            </button>
-          </div>
         </div>
       </div>
 
@@ -230,7 +203,62 @@
           <p class="muted">No branches yet. Push your repo to get started.</p>
         </div>
       {/if}
-    {:else}
+
+      <div class="info-section">
+        <label>Push Updates</label>
+        <div class="instructions">
+          <div class="cmd-group">
+            <code>git remote add lazyaf {cloneUrl}</code>
+            <button class="btn-copy-sm" on:click={() => copyToClipboard(`git remote add lazyaf ${cloneUrl}`)} title="Copy">
+              Copy
+            </button>
+          </div>
+          <div class="cmd-group">
+            <code>git push lazyaf {$selectedRepo.default_branch}</code>
+            <button class="btn-copy-sm" on:click={() => copyToClipboard(`git push lazyaf ${$selectedRepo.default_branch}`)} title="Copy">
+              Copy
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="info-section">
+        <label>Pull Agent Work</label>
+        <div class="instructions">
+          <p class="instruction-note">Fetch and merge agent changes to your local repo:</p>
+          <div class="cmd-group">
+            <code>git fetch lazyaf</code>
+            <button class="btn-copy-sm" on:click={() => copyToClipboard('git fetch lazyaf')} title="Copy">
+              Copy
+            </button>
+          </div>
+          {#if selectedBranch}
+            <div class="cmd-group">
+              <code>git merge lazyaf/{selectedBranch}</code>
+              <button class="btn-copy-sm" on:click={() => copyToClipboard(`git merge lazyaf/${selectedBranch}`)} title="Copy">
+                Copy
+              </button>
+            </div>
+          {/if}
+          <p class="instruction-note">Or checkout the branch directly:</p>
+          {#if selectedBranch}
+            <div class="cmd-group">
+              <code>git checkout -b {selectedBranch} lazyaf/{selectedBranch}</code>
+              <button class="btn-copy-sm" on:click={() => copyToClipboard(`git checkout -b ${selectedBranch} lazyaf/${selectedBranch}`)} title="Copy">
+                Copy
+              </button>
+            </div>
+          {/if}
+          <p class="instruction-note">Then push to GitHub:</p>
+          <div class="cmd-group">
+            <code>git push origin {selectedBranch || $selectedRepo.default_branch}</code>
+            <button class="btn-copy-sm" on:click={() => copyToClipboard(`git push origin ${selectedBranch || $selectedRepo.default_branch}`)} title="Copy">
+              Copy
+            </button>
+          </div>
+        </div>
+      </div>
+    {:else if !isCollapsed}
       <div class="info-section warning">
         <p>This repo needs to be ingested before agents can work on it.</p>
         <div class="instructions">
@@ -241,7 +269,7 @@
       </div>
     {/if}
 
-    {#if $selectedRepo.remote_url}
+    {#if !isCollapsed && $selectedRepo.remote_url}
       <div class="info-section">
         <label>Remote Origin</label>
         <code class="remote-url">{$selectedRepo.remote_url}</code>
@@ -265,7 +293,11 @@
     background: var(--surface-color, #1e1e2e);
     border-radius: 8px;
     padding: 1rem;
-    margin-top: 1rem;
+    margin-top: 0.75rem;
+  }
+
+  .repo-info-panel.collapsed {
+    padding-bottom: 0.5rem;
   }
 
   .info-header {
@@ -275,6 +307,35 @@
     margin-bottom: 1rem;
     padding-bottom: 0.75rem;
     border-bottom: 1px solid var(--border-color, #45475a);
+    width: 100%;
+    background: none;
+    border-top: none;
+    border-left: none;
+    border-right: none;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .repo-info-panel.collapsed .info-header {
+    margin-bottom: 0;
+    padding-bottom: 0;
+    border-bottom: none;
+  }
+
+  .info-header:hover {
+    opacity: 0.8;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .collapse-icon {
+    font-size: 0.7rem;
+    color: var(--text-muted, #6c7086);
+    width: 1rem;
   }
 
   .info-header h3 {
@@ -327,20 +388,19 @@
 
   .btn-manage {
     font-size: 0.7rem;
-    padding: 0.25rem 0.5rem;
-    background: var(--surface-alt, #181825);
-    color: var(--text-muted, #6c7086);
-    border: 1px solid var(--border-color, #45475a);
+    padding: 0.25rem 0.6rem;
+    background: #cba6f7;
+    color: #1e1e2e;
+    border: none;
     border-radius: 4px;
     cursor: pointer;
     text-transform: uppercase;
     letter-spacing: 0.3px;
+    font-weight: 500;
   }
 
   .btn-manage:hover {
-    background: var(--primary-color, #89b4fa);
-    color: #1e1e2e;
-    border-color: var(--primary-color, #89b4fa);
+    opacity: 0.9;
   }
 
   .info-section.warning {
@@ -401,9 +461,10 @@
     padding: 0.4rem 0.6rem;
     background: var(--surface-alt, #181825);
     border-radius: 4px;
-    font-size: 0.75rem;
+    font-size: 0.72rem;
     color: var(--text-color, #cdd6f4);
     font-family: monospace;
+    word-break: break-all;
   }
 
   .instructions p {
@@ -424,29 +485,31 @@
   .cmd-group {
     display: flex;
     align-items: center;
-    gap: 0.25rem;
+    gap: 0.5rem;
   }
 
   .cmd-group code {
     flex: 1;
+    min-height: 1.8rem;
+    display: flex;
+    align-items: center;
   }
 
   .btn-copy-sm {
-    padding: 0.25rem 0.4rem;
-    background: var(--surface-color, #1e1e2e);
-    color: var(--text-muted, #6c7086);
-    border: 1px solid var(--border-color, #45475a);
+    padding: 0.2rem 0.4rem;
+    background: var(--primary-color, #89b4fa);
+    color: var(--primary-text, #1e1e2e);
+    border: none;
     border-radius: 3px;
     cursor: pointer;
-    font-size: 0.7rem;
-    font-weight: 600;
-    line-height: 1;
+    font-size: 0.65rem;
+    font-weight: 500;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .btn-copy-sm:hover {
-    background: var(--primary-color, #89b4fa);
-    color: var(--primary-text, #1e1e2e);
-    border-color: var(--primary-color, #89b4fa);
+    opacity: 0.9;
   }
 
   .branch-list {

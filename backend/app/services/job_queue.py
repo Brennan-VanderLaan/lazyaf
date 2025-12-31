@@ -29,6 +29,11 @@ class QueuedJob:
     # Step type and config (Phase 8.5)
     step_type: str = "agent"  # agent, script, docker
     step_config: dict | None = None  # Config for the step (command, image, etc.)
+    # Pipeline context (Phase 9.1)
+    continue_in_context: bool = False  # If true, runner preserves workspace for next step
+    is_continuation: bool = False  # If true, runner skips cleanup at start (continues from previous step)
+    previous_step_logs: str | None = None  # Logs from previous step (for agent context)
+    pipeline_run_id: str | None = None  # Pipeline run ID for context tracking
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 

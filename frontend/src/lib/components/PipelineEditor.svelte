@@ -318,6 +318,20 @@
                       </select>
                     </div>
                   </div>
+
+                  {#if index < steps.length - 1}
+                    <div class="step-context-option">
+                      <label class="checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={step.continue_in_context || false}
+                          on:change={(e) => updateStep(index, { ...step, continue_in_context: e.currentTarget.checked })}
+                        />
+                        <span class="checkbox-text">Continue in same context</span>
+                        <span class="checkbox-hint">Next step shares workspace & sees this step's output</span>
+                      </label>
+                    </div>
+                  {/if}
                 </div>
               {/each}
             </div>
@@ -672,5 +686,39 @@
     line-height: 1.4;
     resize: vertical;
     min-height: 50px;
+  }
+
+  /* Context continuation checkbox */
+  .step-context-option {
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--border-color);
+  }
+
+  .checkbox-label {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    cursor: pointer;
+  }
+
+  .checkbox-label input[type="checkbox"] {
+    margin-top: 0.15rem;
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+  }
+
+  .checkbox-text {
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-color);
+  }
+
+  .checkbox-hint {
+    display: block;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.15rem;
   }
 </style>

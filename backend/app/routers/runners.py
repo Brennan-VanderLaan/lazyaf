@@ -53,6 +53,10 @@ class JobResponse(BaseModel):
     # Step type and config (Phase 8.5)
     step_type: str = "agent"  # agent, script, docker
     step_config: dict | None = None  # Config for the step
+    # Pipeline context (Phase 9.1)
+    continue_in_context: bool = False  # If true, runner preserves workspace for next step
+    is_continuation: bool = False  # If true, runner skips cleanup at start (continues from previous step)
+    previous_step_logs: str | None = None  # Logs from previous step (for agent context)
 
 
 class TestResultsPayload(BaseModel):
@@ -185,6 +189,9 @@ async def get_runner_job(runner_id: str, db: AsyncSession = Depends(get_db)):
             prompt_template=job.prompt_template,
             step_type=job.step_type,
             step_config=job.step_config,
+            continue_in_context=job.continue_in_context,
+            is_continuation=job.is_continuation,
+            previous_step_logs=job.previous_step_logs,
         )
     }
 

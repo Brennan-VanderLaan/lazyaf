@@ -331,6 +331,10 @@ def execute_script_step(job: dict):
     step_config = job.get('step_config', {}) or {}
     command = step_config.get('command', '')
 
+    # Pipeline context flags
+    is_continuation = job.get("is_continuation", False)
+    continue_in_context = job.get("continue_in_context", False)
+
     if not command:
         log("ERROR: No command specified in step_config")
         complete_job(success=False, error="No command specified in step_config")
@@ -355,7 +359,11 @@ def execute_script_step(job: dict):
         use_internal_git = job.get("use_internal_git", False)
         workspace = Path("/workspace/repo")
 
-        if use_internal_git and repo_id:
+        # Skip cloning if this is a continuation from a previous step
+        if is_continuation and workspace.exists():
+            log("Continuing from previous step - using existing workspace")
+            working_dir = str(workspace)
+        elif use_internal_git and repo_id:
             repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
             log(f"Cloning from internal git: {repo_url}")
 
@@ -409,7 +417,11 @@ def execute_script_step(job: dict):
 
     finally:
         stop_heartbeat_thread()
-        cleanup_workspace()
+        # Clean up workspace unless next step continues in context
+        if continue_in_context:
+            log("Preserving workspace for next pipeline step (continue_in_context=True)")
+        else:
+            cleanup_workspace()
 
 
 def execute_docker_step(job: dict):
@@ -418,6 +430,10 @@ def execute_docker_step(job: dict):
     step_config = job.get('step_config', {}) or {}
     image = step_config.get('image', '')
     command = step_config.get('command', '')
+
+    # Pipeline context flags
+    is_continuation = job.get("is_continuation", False)
+    continue_in_context = job.get("continue_in_context", False)
 
     if not image:
         log("ERROR: No image specified in step_config")
@@ -448,7 +464,10 @@ def execute_docker_step(job: dict):
         use_internal_git = job.get("use_internal_git", False)
         workspace = Path("/workspace/repo")
 
-        if use_internal_git and repo_id:
+        # Skip cloning if this is a continuation from a previous step
+        if is_continuation and workspace.exists():
+            log("Continuing from previous step - using existing workspace")
+        elif use_internal_git and repo_id:
             repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
             log(f"Cloning from internal git: {repo_url}")
 
@@ -515,7 +534,11 @@ def execute_docker_step(job: dict):
 
     finally:
         stop_heartbeat_thread()
-        cleanup_workspace()
+        # Clean up workspace unless next step continues in context
+        if continue_in_context:
+            log("Preserving workspace for next pipeline step (continue_in_context=True)")
+        else:
+            cleanup_workspace()
 
 
 def execute_agent_step(job: dict):
@@ -523,8 +546,16 @@ def execute_agent_step(job: dict):
     job_id = job['id']
     log(f"Starting agent job {job_id}: {job['card_title']}")
 
-    # Clean up workspace from any previous job
-    cleanup_workspace()
+    # Pipeline context flags
+    is_continuation = job.get("is_continuation", False)
+    continue_in_context = job.get("continue_in_context", False)
+    previous_step_logs = job.get("previous_step_logs", None)
+
+    # Clean up workspace unless this is a continuation from a previous step
+    if is_continuation:
+        log("Skipping workspace cleanup - continuing from previous pipeline step")
+    else:
+        cleanup_workspace()
 
     # Start background heartbeat thread to keep runner alive during long operations
     heartbeat_thread = start_heartbeat_thread()
@@ -566,7 +597,9 @@ def execute_agent_step(job: dict):
         run_command(["git", "config", "--global", "init.defaultBranch", "main"])
 
         # Clone or use local repo
-        if repo_url:
+        if is_continuation and workspace.exists():
+            log("Continuing from previous step - using existing workspace")
+        elif repo_url:
             log(f"Cloning {repo_url}...")
             if workspace.exists():
                 run_command(["sudo", "rm", "-rf", str(workspace)])
@@ -645,6 +678,20 @@ def execute_agent_step(job: dict):
         else:
             prompt = build_prompt(card_title, card_description, workspace)
             log("Using default prompt template")
+
+        # Append previous step logs if available (pipeline context)
+        if previous_step_logs:
+            prompt += f"""
+
+## Previous Step Output
+The previous pipeline step produced the following output:
+```
+{previous_step_logs}
+```
+
+Use this context when completing the current task.
+"""
+            log("Added previous step logs to prompt")
 
         # Build Claude command
         claude_cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
@@ -760,8 +807,11 @@ def execute_agent_step(job: dict):
         stop_heartbeat_thread()
         log("Stopped background heartbeat thread")
 
-        # Clean up workspace after job completion
-        cleanup_workspace()
+        # Clean up workspace unless next step continues in context
+        if continue_in_context:
+            log("Preserving workspace for next pipeline step (continue_in_context=True)")
+        else:
+            cleanup_workspace()
 
 
 def execute_job(job: dict):

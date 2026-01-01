@@ -13,6 +13,19 @@
     deleted: void;
   }>();
 
+  // Normalize step to ensure all fields have defaults
+  function normalizeStep(step: Partial<PipelineStepConfig>): PipelineStepConfig {
+    return {
+      name: step.name || 'Unnamed Step',
+      type: step.type || 'script',
+      config: step.config || {},
+      on_success: step.on_success || 'next',
+      on_failure: step.on_failure || 'stop',
+      timeout: step.timeout || 300,
+      continue_in_context: step.continue_in_context ?? false,
+    };
+  }
+
   // Track original values to detect changes
   const originalName = pipeline?.name || '';
   const originalDescription = pipeline?.description || '';
@@ -20,7 +33,7 @@
 
   let name = pipeline?.name || '';
   let description = pipeline?.description || '';
-  let steps: PipelineStepConfig[] = pipeline?.steps || [];
+  let steps: PipelineStepConfig[] = (pipeline?.steps || []).map(normalizeStep);
   let submitting = false;
 
   $: isEdit = pipeline !== null;
@@ -38,6 +51,7 @@
       on_success: 'next',
       on_failure: 'stop',
       timeout: 300,
+      continue_in_context: false,
     };
   }
 

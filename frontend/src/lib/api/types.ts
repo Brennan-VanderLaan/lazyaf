@@ -68,6 +68,9 @@ export interface Card {
   pr_url: string | null;
   job_id: string | null;
   completed_runner_type: string | null;
+  // Pipeline association
+  pipeline_run_id: string | null;
+  pipeline_step_index: number | null;
   created_at: string;
   updated_at: string;
 }

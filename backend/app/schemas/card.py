@@ -43,6 +43,9 @@ class CardRead(CardBase):
     pr_url: str | None = None
     job_id: str | None = None
     completed_runner_type: str | None = None
+    # Pipeline association
+    pipeline_run_id: str | None = None
+    pipeline_step_index: int | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline } from './types';
 
 const BASE_URL = '/api';
 
@@ -203,6 +203,26 @@ export const pipelineRuns = {
   cancel: (runId: string) => request<PipelineRun>(`/pipeline-runs/${runId}/cancel`, { method: 'POST' }),
   stepLogs: (runId: string, stepIndex: number) =>
     request<StepLogsResponse>(`/pipeline-runs/${runId}/steps/${stepIndex}/logs`),
+};
+
+// Repo-defined LazyAF files (Phase 9.1b)
+export const lazyafFiles = {
+  listAgents: (repoId: string, branch?: string) => {
+    const params = branch ? `?branch=${encodeURIComponent(branch)}` : '';
+    return request<RepoAgent[]>(`/repos/${repoId}/lazyaf/agents${params}`);
+  },
+  getAgent: (repoId: string, agentName: string, branch?: string) => {
+    const params = branch ? `?branch=${encodeURIComponent(branch)}` : '';
+    return request<RepoAgent>(`/repos/${repoId}/lazyaf/agents/${encodeURIComponent(agentName)}${params}`);
+  },
+  listPipelines: (repoId: string, branch?: string) => {
+    const params = branch ? `?branch=${encodeURIComponent(branch)}` : '';
+    return request<RepoPipeline[]>(`/repos/${repoId}/lazyaf/pipelines${params}`);
+  },
+  getPipeline: (repoId: string, pipelineName: string, branch?: string) => {
+    const params = branch ? `?branch=${encodeURIComponent(branch)}` : '';
+    return request<RepoPipeline>(`/repos/${repoId}/lazyaf/pipelines/${encodeURIComponent(pipelineName)}${params}`);
+  },
 };
 
 // Health

@@ -152,6 +152,11 @@ class PipelineExecutor:
         step_config = step.get("config", {})
         timeout = step.get("timeout", 300)
         continue_in_context = step.get("continue_in_context", False)
+        step_id = step.get("id")  # Optional step ID for context directory naming
+
+        # Extract agent-specific fields from step config (Phase 9.1c)
+        agent_file_ids = step_config.get("agent_file_ids", []) if step_type == "agent" else []
+        prompt_template = step_config.get("prompt_template") if step_type == "agent" else None
 
         # Check if this step is a continuation from the previous step
         is_continuation = False
@@ -211,6 +216,9 @@ class PipelineExecutor:
             runner_type=step_config.get("runner_type", "any"),
             step_type=step_type,
             step_config=json.dumps(step_config) if step_config else None,
+            # Agent-specific fields (Phase 9.1c)
+            agent_file_ids=json.dumps(agent_file_ids) if agent_file_ids else None,
+            prompt_template=prompt_template,
             pipeline_run_id=pipeline_run.id,
             pipeline_step_index=step_index,
         )
@@ -248,11 +256,18 @@ class PipelineExecutor:
             use_internal_git=True,
             step_type=step_type,
             step_config=step_config,
+            # Agent-specific fields (Phase 9.1c)
+            agent_file_ids=agent_file_ids,
+            prompt_template=prompt_template,
             # Pipeline context
             continue_in_context=continue_in_context,
             is_continuation=is_continuation,
             previous_step_logs=previous_step_logs,
             pipeline_run_id=pipeline_run.id,
+            # Step metadata for context directory (Phase 9.1d)
+            step_id=step_id,
+            step_index=step_index,
+            step_name=step_name,
         )
         await job_queue.enqueue(queued_job)
 
@@ -623,6 +638,18 @@ class PipelineExecutor:
 
         if merge_result["success"]:
             logger.info(f"Merge successful: {merge_result}")
+
+            # Clean up .lazyaf-context directory from merged branch (Phase 9.1d)
+            cleanup_result = git_repo_manager.delete_directory_from_branch(
+                repo_id=repo.id,
+                branch=target_branch,
+                directory=".lazyaf-context",
+            )
+            if cleanup_result["success"]:
+                logger.info(f"Context cleanup: {cleanup_result.get('message', 'done')}")
+            else:
+                logger.warning(f"Context cleanup failed: {cleanup_result.get('error', 'unknown')}")
+
             # Continue to next step or complete
             if current_step + 1 < len(steps):
                 await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)

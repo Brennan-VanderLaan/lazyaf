@@ -34,6 +34,10 @@ class QueuedJob:
     is_continuation: bool = False  # If true, runner skips cleanup at start (continues from previous step)
     previous_step_logs: str | None = None  # Logs from previous step (for agent context)
     pipeline_run_id: str | None = None  # Pipeline run ID for context tracking
+    # Step metadata for context directory (Phase 9.1d)
+    step_id: str | None = None  # Optional step ID from pipeline definition
+    step_index: int = 0  # Step index in the pipeline
+    step_name: str = "unnamed"  # Step name for logging
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 

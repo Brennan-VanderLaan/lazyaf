@@ -1,9 +1,75 @@
 <script lang="ts">
-  import { createEventDispatcher, tick } from 'svelte';
-  import type { Pipeline, PipelineStepConfig, StepType, RunnerType } from '../api/types';
+  import { createEventDispatcher, tick, onMount } from 'svelte';
+  import type { Pipeline, PipelineStepConfig, StepType, RunnerType, RepoAgent, MergedAgent } from '../api/types';
   import { pipelinesStore } from '../stores/pipelines';
+  import { agentFilesStore } from '../stores/agentFiles';
+  import { selectedRepo } from '../stores/repos';
+  import { lazyafFiles } from '../api/client';
 
   export let repoId: string;
+
+  // Agent files - merge platform and repo agents
+  let repoAgents: RepoAgent[] = [];
+
+  // Load repo agents when repo changes
+  async function loadRepoAgents() {
+    if ($selectedRepo?.is_ingested && repoId) {
+      try {
+        repoAgents = await lazyafFiles.listAgents(repoId);
+      } catch {
+        repoAgents = [];
+      }
+    } else {
+      repoAgents = [];
+    }
+  }
+
+  // Merge platform + repo agents (repo overrides platform by name)
+  $: mergedAgents = (() => {
+    const agentsByName = new Map<string, MergedAgent>();
+
+    // Platform agents first
+    for (const agent of $agentFilesStore) {
+      agentsByName.set(agent.name, {
+        id: agent.id,
+        name: agent.name,
+        description: agent.description ?? null,
+        content: agent.content,
+        source: 'platform',
+      });
+    }
+
+    // Repo agents override platform
+    for (const agent of repoAgents) {
+      agentsByName.set(agent.name, {
+        name: agent.name,
+        description: agent.description,
+        prompt_template: agent.prompt_template,
+        source: 'repo',
+      });
+    }
+
+    return Array.from(agentsByName.values());
+  })();
+
+  // Load agent files on mount
+  onMount(() => {
+    agentFilesStore.load();
+    loadRepoAgents();
+  });
+
+  // Normalize agent name to CLI-safe format (same as CardModal)
+  function normalizeAgentName(input: string): string {
+    return input
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+  }
+
+  // Track which steps have prompt template visible
+  let showPromptTemplateForStep: Record<number, boolean> = {};
   export let pipeline: Pipeline | null = null;
 
   const dispatch = createEventDispatcher<{
@@ -288,6 +354,75 @@
                           on:input={(e) => updateStep(index, { ...step, config: { ...step.config, description: e.currentTarget.value }})}
                         ></textarea>
                       </div>
+
+                      <!-- Agent file selector -->
+                      {#if mergedAgents.length > 0}
+                        <div class="form-group">
+                          <label>Available Agents</label>
+                          <div class="agent-file-selector">
+                            {#each mergedAgents as agent}
+                              {@const cliName = normalizeAgentName(agent.name) || agent.name}
+                              {#if agent.source === 'platform' && agent.id}
+                                {@const isSelected = (step.config.agent_file_ids || []).includes(agent.id)}
+                                <label class="agent-checkbox">
+                                  <input
+                                    type="checkbox"
+                                    checked={isSelected}
+                                    on:change={(e) => {
+                                      const currentIds = step.config.agent_file_ids || [];
+                                      const newIds = e.currentTarget.checked
+                                        ? [...currentIds, agent.id]
+                                        : currentIds.filter(id => id !== agent.id);
+                                      updateStep(index, { ...step, config: { ...step.config, agent_file_ids: newIds }});
+                                    }}
+                                  />
+                                  <span class="agent-name">@{cliName}</span>
+                                  {#if agent.description}
+                                    <span class="agent-desc">{agent.description}</span>
+                                  {/if}
+                                </label>
+                              {:else}
+                                <div class="agent-checkbox repo-agent">
+                                  <span class="agent-name">@{cliName}</span>
+                                  <span class="agent-source-badge">from repo</span>
+                                  {#if agent.description}
+                                    <span class="agent-desc">{agent.description}</span>
+                                  {/if}
+                                </div>
+                              {/if}
+                            {/each}
+                          </div>
+                          <p class="form-hint">
+                            Platform agents can be selected. Repo agents are available via <code>@agent-name</code> syntax.
+                          </p>
+                        </div>
+                      {/if}
+
+                      <!-- Custom prompt template toggle -->
+                      <div class="form-group">
+                        <button
+                          type="button"
+                          class="btn-toggle-advanced"
+                          on:click={() => showPromptTemplateForStep[index] = !showPromptTemplateForStep[index]}
+                        >
+                          {showPromptTemplateForStep[index] ? '- Hide' : '+ Show'} Custom Prompt
+                        </button>
+                      </div>
+                      {#if showPromptTemplateForStep[index]}
+                        <div class="form-group">
+                          <label>Custom Prompt Template</label>
+                          <textarea
+                            class="script-input"
+                            placeholder="Custom prompt template. Use {{title}} and {{description}} as placeholders."
+                            rows="4"
+                            value={step.config.prompt_template || ''}
+                            on:input={(e) => updateStep(index, { ...step, config: { ...step.config, prompt_template: e.currentTarget.value }})}
+                          ></textarea>
+                          <p class="form-hint">
+                            Leave empty to use default prompt. Supports <code>{`{{title}}`}</code> and <code>{`{{description}}`}</code> placeholders.
+                          </p>
+                        </div>
+                      {/if}
                     {/if}
                   </div>
 
@@ -342,8 +477,16 @@
                           on:change={(e) => updateStep(index, { ...step, continue_in_context: e.currentTarget.checked })}
                         />
                         <span class="checkbox-text">Continue in same context</span>
-                        <span class="checkbox-hint">Next step shares workspace & sees this step's output</span>
                       </label>
+                      <div class="context-hint-details">
+                        <p>When enabled:</p>
+                        <ul>
+                          <li>Workspace directory preserved for next step</li>
+                          <li>Git changes from this step are kept</li>
+                          <li>Agent steps receive this step's output as context</li>
+                        </ul>
+                        <p class="context-example">Example: install deps &rarr; test &rarr; fix failures</p>
+                      </div>
                     </div>
                   {/if}
                 </div>
@@ -734,5 +877,124 @@
     font-size: 0.75rem;
     color: var(--text-muted);
     margin-top: 0.15rem;
+  }
+
+  .context-hint-details {
+    margin-top: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--surface-color);
+    border-radius: 4px;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+
+  .context-hint-details p {
+    margin: 0 0 0.25rem 0;
+  }
+
+  .context-hint-details ul {
+    margin: 0 0 0.5rem 0;
+    padding-left: 1.25rem;
+  }
+
+  .context-hint-details li {
+    margin-bottom: 0.15rem;
+  }
+
+  .context-hint-details .context-example {
+    font-style: italic;
+    margin-bottom: 0;
+    padding-top: 0.25rem;
+    border-top: 1px dashed var(--border-color);
+  }
+
+  /* Agent file selector styles */
+  .agent-file-selector {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background: var(--surface-color);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.75rem;
+    max-height: 150px;
+    overflow-y: auto;
+  }
+
+  .agent-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    padding: 0.4rem;
+    border-radius: 4px;
+    transition: background 0.15s;
+  }
+
+  .agent-checkbox:hover {
+    background: var(--hover-color);
+  }
+
+  .agent-checkbox input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+  }
+
+  .agent-name {
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
+    font-size: 0.85rem;
+    color: var(--primary-color);
+  }
+
+  .agent-desc {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-left: auto;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .agent-checkbox.repo-agent {
+    cursor: default;
+    opacity: 0.8;
+  }
+
+  .agent-source-badge {
+    font-size: 0.65rem;
+    padding: 0.1rem 0.4rem;
+    background: var(--success-color, #a6e3a1);
+    color: var(--surface-color, #1e1e2e);
+    border-radius: 4px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+
+  .form-hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+  }
+
+  .form-hint code {
+    background: var(--surface-alt);
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+    font-size: 0.8em;
+  }
+
+  .btn-toggle-advanced {
+    background: none;
+    border: none;
+    color: var(--primary-color);
+    cursor: pointer;
+    padding: 0.25rem 0;
+    font-size: 0.85rem;
+    text-decoration: underline;
+  }
+
+  .btn-toggle-advanced:hover {
+    color: var(--text-color);
   }
 </style>

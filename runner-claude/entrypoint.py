@@ -323,6 +323,174 @@ def build_agents_json(agent_files: list[dict]) -> str | None:
     return json.dumps(agents_dict)
 
 
+# Context directory helpers (Phase 9.1d)
+CONTEXT_DIR = ".lazyaf-context"
+
+
+def init_context_directory(workspace: Path, pipeline_run_id: str) -> Path:
+    """Initialize context directory for a pipeline run."""
+    import json
+    from datetime import datetime
+
+    context_path = workspace / CONTEXT_DIR
+    context_path.mkdir(exist_ok=True)
+
+    # Create metadata.json
+    metadata = {
+        "pipeline_run_id": pipeline_run_id,
+        "steps_completed": [],
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    metadata_file = context_path / "metadata.json"
+    metadata_file.write_text(json.dumps(metadata, indent=2))
+
+    log(f"Initialized context directory: {context_path}")
+    return context_path
+
+
+def write_step_log(workspace: Path, step_index: int, step_id: str | None, step_name: str, logs: str) -> str:
+    """Write step log to context directory."""
+    context_path = workspace / CONTEXT_DIR
+
+    # Naming: id_stepid_index.log or step_index_name.log
+    if step_id:
+        filename = f"id_{step_id}_{step_index:03d}.log"
+    else:
+        # Sanitize step name for filename
+        safe_name = step_name.lower().replace(' ', '_')[:20]
+        safe_name = ''.join(c for c in safe_name if c.isalnum() or c == '_')
+        filename = f"step_{step_index:03d}_{safe_name}.log"
+
+    log_path = context_path / filename
+    log_path.write_text(logs)
+
+    log(f"Wrote step log: {filename}")
+    return filename
+
+
+def update_context_metadata(workspace: Path, step_index: int, step_name: str):
+    """Update metadata.json with completed step info."""
+    import json
+    from datetime import datetime
+
+    metadata_path = workspace / CONTEXT_DIR / "metadata.json"
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text())
+            metadata["steps_completed"].append({
+                "index": step_index,
+                "name": step_name,
+                "completed_at": datetime.utcnow().isoformat(),
+            })
+            metadata_path.write_text(json.dumps(metadata, indent=2))
+        except Exception as e:
+            log(f"Error updating context metadata: {e}")
+
+
+def commit_context_changes(workspace: Path, step_name: str) -> bool:
+    """Commit context directory changes after step completion."""
+    try:
+        # Add context directory
+        returncode, stdout, stderr = run_command(
+            ["git", "add", CONTEXT_DIR],
+            cwd=str(workspace)
+        )
+        if returncode != 0:
+            log(f"git add context failed: {stderr}")
+            return False
+
+        # Check if there are changes to commit
+        returncode, stdout, stderr = run_command(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=str(workspace)
+        )
+        if returncode == 0:
+            log("No context changes to commit")
+            return True
+
+        # Commit
+        commit_msg = f"[lazyaf] Context: {step_name} completed"
+        returncode, stdout, stderr = run_command(
+            ["git", "commit", "-m", commit_msg],
+            cwd=str(workspace)
+        )
+        if returncode != 0:
+            log(f"git commit context failed: {stderr}")
+            return False
+
+        log(f"Committed context changes: {commit_msg}")
+        return True
+
+    except Exception as e:
+        log(f"Error committing context changes: {e}")
+        return False
+
+
+def cleanup_context_directory(workspace: Path) -> bool:
+    """Remove context directory (called on merge action)."""
+    import shutil
+
+    context_path = workspace / CONTEXT_DIR
+    if not context_path.exists():
+        return True
+
+    try:
+        shutil.rmtree(context_path)
+
+        # Stage and commit the removal
+        run_command(["git", "add", "-A"], cwd=str(workspace))
+        run_command(
+            ["git", "commit", "-m", "[lazyaf] Cleanup: remove .lazyaf-context"],
+            cwd=str(workspace)
+        )
+
+        log("Cleaned up context directory")
+        return True
+
+    except Exception as e:
+        log(f"Error cleaning up context directory: {e}")
+        return False
+
+
+def handle_context_directory_start(job: dict, workspace: Path):
+    """Initialize context directory at start of pipeline step if needed."""
+    pipeline_run_id = job.get("pipeline_run_id")
+    step_index = job.get("step_index", 0)
+
+    if not pipeline_run_id:
+        return  # Not a pipeline step
+
+    if step_index == 0:
+        # First step - initialize context directory
+        init_context_directory(workspace, pipeline_run_id)
+
+
+def handle_context_directory_end(job: dict, workspace: Path, step_logs: str):
+    """Write step logs and commit context after step completion."""
+    pipeline_run_id = job.get("pipeline_run_id")
+
+    if not pipeline_run_id:
+        return  # Not a pipeline step
+
+    step_id = job.get("step_id")
+    step_index = job.get("step_index", 0)
+    step_name = job.get("step_name", "unnamed")
+
+    # Ensure context directory exists (in case first step failed to create it)
+    context_path = workspace / CONTEXT_DIR
+    if not context_path.exists():
+        init_context_directory(workspace, pipeline_run_id)
+
+    # Write step log
+    write_step_log(workspace, step_index, step_id, step_name, step_logs)
+
+    # Update metadata
+    update_context_metadata(workspace, step_index, step_name)
+
+    # Commit context changes
+    commit_context_changes(workspace, step_name)
+
+
 def execute_script_step(job: dict):
     """Execute a script step (run shell command directly)."""
     import tempfile
@@ -334,6 +502,25 @@ def execute_script_step(job: dict):
     # Pipeline context flags
     is_continuation = job.get("is_continuation", False)
     continue_in_context = job.get("continue_in_context", False)
+    pipeline_run_id = job.get("pipeline_run_id")
+    step_name = job.get("step_name", "unnamed")
+
+    # Log context information
+    log("=" * 50)
+    log("CONTEXT INFO:")
+    if pipeline_run_id:
+        log(f"  - Pipeline run: {pipeline_run_id[:8]}")
+        log(f"  - Step: {job.get('step_index', 0)} ({step_name})")
+    if is_continuation:
+        log("  - Continuing from previous step (workspace preserved)")
+    else:
+        log("  - Fresh execution (no previous step context)")
+    if continue_in_context:
+        log("  - Will preserve workspace for next step")
+    log("=" * 50)
+
+    # Collect logs for context directory
+    step_logs = []
 
     if not command:
         log("ERROR: No command specified in step_config")
@@ -377,6 +564,9 @@ def execute_script_step(job: dict):
             if exit_code != 0:
                 raise Exception("Failed to clone repository")
 
+            # Initialize context directory for pipeline steps
+            handle_context_directory_start(job, workspace)
+
             working_dir = str(workspace)
         else:
             working_dir = step_config.get('working_dir', '/workspace')
@@ -404,11 +594,20 @@ def execute_script_step(job: dict):
         except:
             pass
 
+        # Collect logs for context directory
+        step_output = f"Exit code: {exit_code}\n\n--- STDOUT ---\n{stdout}\n\n--- STDERR ---\n{stderr}"
+
         if exit_code == 0:
             log("Script completed successfully")
+            # Write context before completing job
+            if pipeline_run_id:
+                handle_context_directory_end(job, workspace, step_output)
             complete_job(success=True)
         else:
             log(f"Script failed with exit code {exit_code}")
+            # Still write context even on failure
+            if pipeline_run_id:
+                handle_context_directory_end(job, workspace, step_output)
             complete_job(success=False, error=f"Command failed with exit code {exit_code}")
 
     except Exception as e:
@@ -434,6 +633,22 @@ def execute_docker_step(job: dict):
     # Pipeline context flags
     is_continuation = job.get("is_continuation", False)
     continue_in_context = job.get("continue_in_context", False)
+    pipeline_run_id = job.get("pipeline_run_id")
+    step_name = job.get("step_name", "unnamed")
+
+    # Log context information
+    log("=" * 50)
+    log("CONTEXT INFO:")
+    if pipeline_run_id:
+        log(f"  - Pipeline run: {pipeline_run_id[:8]}")
+        log(f"  - Step: {job.get('step_index', 0)} ({step_name})")
+    if is_continuation:
+        log("  - Continuing from previous step (workspace preserved)")
+    else:
+        log("  - Fresh execution (no previous step context)")
+    if continue_in_context:
+        log("  - Will preserve workspace for next step")
+    log("=" * 50)
 
     if not image:
         log("ERROR: No image specified in step_config")
@@ -481,6 +696,9 @@ def execute_docker_step(job: dict):
             if exit_code != 0:
                 raise Exception("Failed to clone repository")
 
+            # Initialize context directory for pipeline steps
+            handle_context_directory_start(job, workspace)
+
         # Write script to temp file for reliable multi-line execution
         script_path = workspace / ".lazyaf_script.sh"
         with open(script_path, 'w') as f:
@@ -521,11 +739,20 @@ def execute_docker_step(job: dict):
         except:
             pass
 
+        # Collect logs for context directory
+        step_output = f"Image: {image}\nExit code: {exit_code}\n\n--- STDOUT ---\n{stdout}\n\n--- STDERR ---\n{stderr}"
+
         if exit_code == 0:
             log("Docker step completed successfully")
+            # Write context before completing job
+            if pipeline_run_id:
+                handle_context_directory_end(job, workspace, step_output)
             complete_job(success=True)
         else:
             log(f"Docker step failed with exit code {exit_code}")
+            # Still write context even on failure
+            if pipeline_run_id:
+                handle_context_directory_end(job, workspace, step_output)
             complete_job(success=False, error=f"Docker command failed with exit code {exit_code}")
 
     except Exception as e:
@@ -550,6 +777,27 @@ def execute_agent_step(job: dict):
     is_continuation = job.get("is_continuation", False)
     continue_in_context = job.get("continue_in_context", False)
     previous_step_logs = job.get("previous_step_logs", None)
+    pipeline_run_id = job.get("pipeline_run_id")
+    step_name = job.get("step_name", "unnamed")
+
+    # Log context information
+    log("=" * 50)
+    log("CONTEXT INFO:")
+    if pipeline_run_id:
+        log(f"  - Pipeline run: {pipeline_run_id[:8]}")
+        log(f"  - Step: {job.get('step_index', 0)} ({step_name})")
+    if is_continuation:
+        log("  - Continuing from previous step (workspace preserved)")
+    else:
+        log("  - Fresh execution (no previous step context)")
+    if continue_in_context:
+        log("  - Will preserve workspace for next step")
+    if previous_step_logs:
+        log(f"  - Previous step logs available ({len(previous_step_logs)} chars)")
+    log("=" * 50)
+
+    # Collect logs for context directory
+    agent_output_log = []
 
     # Clean up workspace unless this is a continuation from a previous step
     if is_continuation:
@@ -606,6 +854,9 @@ def execute_agent_step(job: dict):
             exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
             if exit_code != 0:
                 raise Exception("Failed to clone repository")
+
+            # Initialize context directory for pipeline steps
+            handle_context_directory_start(job, workspace)
         elif workspace.exists():
             log("Using mounted repository")
         else:
@@ -784,6 +1035,21 @@ Use this context when completing the current task.
             job_success = False
             log("Job marked as failed due to test failures")
 
+        # Write context before completing job (for pipeline steps)
+        if pipeline_run_id:
+            # Build step output log
+            step_output = f"Card: {card_title}\nBranch: {branch_name}\n"
+            if pr_url:
+                step_output += f"PR: {pr_url}\n"
+            if test_results:
+                step_output += f"\nTest Results:\n"
+                step_output += f"  Passed: {test_results.get('pass_count', 'N/A')}\n"
+                step_output += f"  Failed: {test_results.get('fail_count', 'N/A')}\n"
+                step_output += f"  Skipped: {test_results.get('skip_count', 'N/A')}\n"
+                if test_results.get('output'):
+                    step_output += f"\nTest Output:\n{test_results['output'][:5000]}\n"
+            handle_context_directory_end(job, workspace, step_output)
+
         log("Reporting job completion...")
         try:
             complete_job(success=job_success, pr_url=pr_url, test_results=test_results)
@@ -797,6 +1063,12 @@ Use this context when completing the current task.
 
     except Exception as e:
         log(f"ERROR: {e}")
+        # Still try to write context on failure
+        if pipeline_run_id:
+            try:
+                handle_context_directory_end(job, workspace, f"ERROR: {e}")
+            except Exception:
+                pass
         try:
             complete_job(success=False, error=str(e))
         except Exception as ce:

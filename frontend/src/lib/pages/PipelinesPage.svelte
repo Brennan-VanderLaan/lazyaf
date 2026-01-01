@@ -226,14 +226,19 @@
                     </td>
                     <td>
                       <div class="progress-cell">
-                        <div class="progress-bar-mini">
-                          <div
-                            class="progress-fill-mini"
-                            style="width: {(run.steps_completed / run.steps_total) * 100}%"
-                            class:running={run.status === 'running'}
-                            class:passed={run.status === 'passed'}
-                            class:failed={run.status === 'failed'}
-                          ></div>
+                        <div class="step-badges">
+                          {#each run.step_runs || [] as stepRun, i}
+                            <span
+                              class="step-badge"
+                              style="background: {getStatusColor(stepRun.status as RunStatus)}"
+                              title="{stepRun.step_name}: {stepRun.status}"
+                            ></span>
+                          {/each}
+                          {#if !run.step_runs || run.step_runs.length === 0}
+                            {#each Array(run.steps_total) as _, i}
+                              <span class="step-badge pending"></span>
+                            {/each}
+                          {/if}
                         </div>
                         <span class="progress-text-mini">{run.steps_completed}/{run.steps_total}</span>
                       </div>
@@ -569,6 +574,24 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
+  }
+
+  .step-badges {
+    display: flex;
+    gap: 3px;
+    align-items: center;
+  }
+
+  .step-badge {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+
+  .step-badge.pending {
+    background: var(--text-muted);
+    opacity: 0.3;
   }
 
   .progress-bar-mini {

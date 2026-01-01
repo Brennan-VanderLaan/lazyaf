@@ -75,12 +75,20 @@ def card_to_ws_dict(card: Card) -> dict:
 
 
 @router.get("/api/repos/{repo_id}/cards", response_model=list[CardRead])
-async def list_cards(repo_id: str, db: AsyncSession = Depends(get_db)):
+async def list_cards(
+    repo_id: str,
+    include_pipeline_cards: bool = Query(False, description="Include cards created by pipelines"),
+    db: AsyncSession = Depends(get_db)
+):
     result = await db.execute(select(Repo).where(Repo.id == repo_id))
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Repo not found")
 
-    result = await db.execute(select(Card).where(Card.repo_id == repo_id))
+    query = select(Card).where(Card.repo_id == repo_id)
+    if not include_pipeline_cards:
+        query = query.where(Card.pipeline_run_id == None)  # noqa: E711
+
+    result = await db.execute(query)
     return result.scalars().all()
 
 

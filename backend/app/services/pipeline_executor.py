@@ -211,6 +211,8 @@ class PipelineExecutor:
             runner_type=step_config.get("runner_type", "any"),
             step_type=step_type,
             step_config=json.dumps(step_config) if step_config else None,
+            pipeline_run_id=pipeline_run.id,
+            pipeline_step_index=step_index,
         )
         db.add(card)
 

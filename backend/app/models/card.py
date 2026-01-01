@@ -46,6 +46,9 @@ class Card(Base):
     pr_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     completed_runner_type: Mapped[str | None] = mapped_column(String(50), nullable=True)  # Type of runner that completed the job
+    # Pipeline association (Phase 9.1)
+    pipeline_run_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("pipeline_runs.id"), nullable=True)
+    pipeline_step_index: Mapped[int | None] = mapped_column(nullable=True)  # Step index in the pipeline
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

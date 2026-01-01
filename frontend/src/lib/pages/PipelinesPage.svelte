@@ -2,7 +2,8 @@
   import { onMount, onDestroy } from 'svelte';
   import { pipelinesStore, activeRunsStore, hasActiveRuns } from '../stores/pipelines';
   import { selectedRepoId, selectedRepo } from '../stores/repos';
-  import type { Pipeline, PipelineRun, RunStatus } from '../api/types';
+  import type { Pipeline, PipelineRun, RunStatus, RepoPipeline } from '../api/types';
+  import { lazyafFiles } from '../api/client';
   import PipelineEditor from '../components/PipelineEditor.svelte';
   import PipelineRunViewer from '../components/PipelineRunViewer.svelte';
 
@@ -11,6 +12,8 @@
   let showEditor = false;
   let editingPipeline: Pipeline | null = null;
   let viewingRun: PipelineRun | null = null;
+  let repoPipelines: RepoPipeline[] = [];
+  let repoPipelinesLoading = false;
 
   // Load recent runs on mount
   onMount(() => {
@@ -20,6 +23,34 @@
   // Load pipelines when repo changes
   $: if ($selectedRepoId) {
     pipelinesStore.load($selectedRepoId);
+    loadRepoPipelines($selectedRepoId);
+  }
+
+  async function loadRepoPipelines(repoId: string) {
+    repoPipelinesLoading = true;
+    try {
+      repoPipelines = await lazyafFiles.listPipelines(repoId);
+    } catch (e) {
+      console.error('Failed to load repo pipelines:', e);
+      repoPipelines = [];
+    } finally {
+      repoPipelinesLoading = false;
+    }
+  }
+
+  async function handleRunRepoPipeline(pipeline: RepoPipeline) {
+    if (!$selectedRepoId || !pipeline.filename) return;
+    try {
+      // Extract pipeline name from filename (remove .yaml/.yml extension)
+      const pipelineName = pipeline.filename.replace(/\.(yaml|yml)$/, '');
+      const result = await lazyafFiles.runPipeline($selectedRepoId, pipelineName);
+      // Refresh runs and switch to runs tab
+      activeRunsStore.loadRecent();
+      activeTab = 'runs';
+    } catch (e) {
+      console.error('Failed to run repo pipeline:', e);
+      alert(`Failed to run pipeline: ${e instanceof Error ? e.message : 'Unknown error'}`);
+    }
   }
 
   // Refresh runs periodically when there are active runs
@@ -150,12 +181,68 @@
 
     <div class="tab-content">
       {#if activeTab === 'pipelines'}
-        {#if $pipelinesStore.length === 0}
+        <!-- Repo-defined pipelines -->
+        {#if repoPipelines.length > 0}
+          <div class="section-header">
+            <h2>From Repository</h2>
+            <span class="section-hint">.lazyaf/pipelines/</span>
+          </div>
+          <div class="pipelines-grid">
+            {#each repoPipelines as pipeline}
+              <div class="pipeline-card repo-card">
+                <div class="card-header">
+                  <h3>
+                    {pipeline.name}
+                    <span class="repo-source-badge">repo</span>
+                  </h3>
+                  <div class="card-actions">
+                    <span class="read-only-hint" title="Edit in .lazyaf/pipelines/{pipeline.filename}">📁</span>
+                    <button class="btn-run" title="Run" on:click={() => handleRunRepoPipeline(pipeline)}>
+                      Run
+                    </button>
+                  </div>
+                </div>
+                {#if pipeline.description}
+                  <p class="card-description">{pipeline.description}</p>
+                {/if}
+                <div class="card-meta">
+                  <span class="step-count">{pipeline.steps.length} steps</span>
+                  <div class="step-types">
+                    {#each [...new Set(pipeline.steps.map(s => s.type))] as type}
+                      <span class="step-type-badge">{type}</span>
+                    {/each}
+                  </div>
+                </div>
+                <div class="step-preview">
+                  {#each pipeline.steps.slice(0, 4) as step, i}
+                    <span class="step-chip" title={step.name}>
+                      {i + 1}. {step.name}
+                    </span>
+                  {/each}
+                  {#if pipeline.steps.length > 4}
+                    <span class="step-chip more">+{pipeline.steps.length - 4} more</span>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        <!-- Platform pipelines -->
+        {#if $pipelinesStore.length > 0 || repoPipelines.length > 0}
+          <div class="section-header">
+            <h2>Platform Pipelines</h2>
+          </div>
+        {/if}
+
+        {#if $pipelinesStore.length === 0 && repoPipelines.length === 0}
           <div class="empty-state">
             <span class="empty-icon">📋</span>
             <p>No pipelines yet</p>
             <button class="btn-primary" on:click={handleCreate}>Create your first pipeline</button>
           </div>
+        {:else if $pipelinesStore.length === 0}
+          <p class="empty-section">No platform pipelines. <button class="btn-link" on:click={handleCreate}>Create one</button></p>
         {:else}
           <div class="pipelines-grid">
             {#each $pipelinesStore as pipeline}
@@ -316,6 +403,73 @@
     border-radius: 20px;
     font-size: 0.85rem;
     font-weight: 500;
+  }
+
+  .section-header {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    margin-top: 1.5rem;
+  }
+
+  .section-header:first-child {
+    margin-top: 0;
+  }
+
+  .section-header h2 {
+    margin: 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text-color);
+  }
+
+  .section-hint {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-family: monospace;
+  }
+
+  .repo-card {
+    border-left: 3px solid var(--primary-color);
+  }
+
+  .repo-source-badge {
+    font-size: 0.65rem;
+    padding: 0.15rem 0.4rem;
+    background: var(--primary-color);
+    color: var(--primary-text);
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+  }
+
+  .read-only-hint {
+    opacity: 0.6;
+    cursor: help;
+    font-size: 1.1rem;
+  }
+
+  .empty-section {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    margin: 0.5rem 0 1.5rem;
+  }
+
+  .btn-link {
+    background: none;
+    border: none;
+    color: var(--primary-color);
+    cursor: pointer;
+    text-decoration: underline;
+    font-size: inherit;
+    padding: 0;
+  }
+
+  .btn-link:hover {
+    opacity: 0.8;
   }
 
   .btn-primary {

@@ -889,9 +889,9 @@ lazyaf/
 
 ## Current Status
 
-**Completed**: Phases 1-5, Phase 7 (MCP Interface), Phase 8 (Test Result Capture), Phase 8.5 (CI/CD Foundation)
-**Current**: Phase 9 (Pipelines) - planning
-**Next**: Phase 9.5 (Webhooks), Phase 10 (Events & Triggers)
+**Completed**: Phases 1-5, Phase 7 (MCP Interface), Phase 8 (Test Result Capture), Phase 8.5 (CI/CD Foundation), Phase 9 (Pipelines - core)
+**Current**: Phase 9.1 (Pipeline Polish) - context sharing, file persistence
+**Next**: Phase 10 (Events & Triggers) - card completion triggers, auto-merge flow
 
 The core workflow is functional:
 1. Ingest repos via CLI
@@ -900,12 +900,301 @@ The core workflow is functional:
 4. Review diffs in card modal (for agent steps)
 5. Approve/Reject to complete cycle
 
+**Target Workflow (Card → Test → Merge)**:
+```
+Card created → Agent implements → Card approved → Pipeline triggers → Tests pass → Auto-merge
+```
+
+---
+
+## Phase 9.1: Pipeline Polish (Current Priority)
+**Goal**: Make pipelines production-ready for the target workflow
+
+### 9.1a: Context Sharing Clarity ✅
+- [x] `continue_in_context` flag on steps (workspace preserved)
+- [x] `is_continuation` flag (skip clone on subsequent steps)
+- [x] `previous_step_logs` passed to agent steps
+- [ ] Document workspace behavior in UI (tooltip on checkbox)
+- [ ] Log clearly what context each step receives
+
+### 9.1b: Pipeline & Agent File Persistence
+**Goal**: Store pipelines AND agents in repo as `.lazyaf/` directory
+
+This allows repos to bring custom agents along, version-controlled with the repo.
+
+- [ ] Define YAML schema for pipeline definitions
+- [ ] Define YAML schema for agent definitions
+- [ ] API endpoint to read `.lazyaf/` from git tree (branch-aware)
+- [ ] UI: Repo-defined agents tagged as "from repo" (vs platform agents)
+- [ ] Agents referenced by name, repo overrides platform on lookup
+- [ ] Pipelines read from working branch (matches the code being worked on)
+
+**Critical: Git-Native Behavior**
+The `.lazyaf/` directory is **live from the repo**, not a one-time import:
+- [ ] UI reads `.lazyaf/` from HEAD of selected branch (via git server)
+- [ ] Pipelines/agents update automatically when branch HEAD changes
+- [ ] External commits (manual edits, other tools) reflected in UI immediately
+- [ ] No CLI export/import commands - just edit files in repo directly
+- [ ] Repo IS the source of truth (no DB copies of repo-defined items)
+
+**Lookup Precedence**:
+When resolving agent references (e.g., `agent: "test-fixer"`):
+1. Check `.lazyaf/agents/test-fixer.yaml` in repo (working branch)
+2. Fall back to platform-defined agent if not found in repo
+
+This means:
+- Switch branches → see that branch's pipelines/agents
+- Push a commit adding `.lazyaf/agents/new-agent.yaml` → UI shows it immediately
+- Different branches can have different pipeline/agent definitions
+
+**Directory Structure**:
+```
+.lazyaf/
+├── pipelines/
+│   ├── test-suite.yaml       # One pipeline per file
+│   ├── deploy.yaml
+│   └── nightly-build.yaml
+└── agents/
+    ├── test-fixer.yaml       # One agent per file
+    ├── code-reviewer.yaml
+    └── unity-specialist.yaml
+```
+
+Benefits:
+- Each pipeline/agent is a separate file (cleaner git diffs)
+- Filename = identifier (no name collisions within a file)
+- Easier to copy/share individual pipelines or agents
+- Can delete/add without editing a monolithic file
+
+**Pipeline Schema** (`.lazyaf/pipelines/test-suite.yaml`):
+```yaml
+# Filename is the identifier: "test-suite"
+name: "Test Suite"                    # Display name
+description: "Run tests on feature branches"
+steps:
+  - id: "tests"                       # Optional: stable ID for context file references
+    name: "Install & Test"
+    type: script
+    config:
+      command: |
+        pip install -e ".[test]"
+        pytest -v
+    continue_in_context: true
+  - id: "fix"
+    name: "Fix Failures"
+    type: agent
+    config:
+      title: "Fix Test Failures"
+      description: "Review test output and fix failing tests"
+      agent: "test-fixer"             # References agent by filename
+    on_failure: stop
+```
+
+**Agent Schema** (`.lazyaf/agents/test-fixer.yaml`):
+```yaml
+# Filename is the identifier: "test-fixer"
+name: "Test Fixer"                    # Display name
+description: "Specialized agent for fixing test failures"
+prompt_template: |
+  You are a test specialist. Review the failing tests and fix them.
+
+  Focus on:
+  - Understanding why the test failed
+  - Fixing the code, not the test (unless the test is wrong)
+  - Maintaining existing test coverage
+
+  ## Task
+  {{description}}
+```
+
+**Another Agent** (`.lazyaf/agents/unity-specialist.yaml`):
+```yaml
+name: "Unity Specialist"
+description: "Agent specialized in Unity C# development"
+prompt_template: |
+  You are a Unity game development specialist.
+
+  ## Guidelines
+  - Follow Unity best practices
+  - Use proper component architecture
+  - Consider performance for mobile builds
+
+  ## Task
+  {{description}}
+```
+
+**Variable Substitution**:
+Prompt templates use `{{variable}}` syntax (consistent with existing entrypoint code):
+- `{{description}}` - Card/step description
+- `{{title}}` - Card/step title
+- `{{branch_name}}` - Current branch name
+
+---
+
+### 9.1d: Pipeline Context Directory
+**Goal**: Enable chain-of-thought across pipeline steps via committed context
+
+This is experimental - if agents benefit from reading/writing shared context files, this enables multi-step reasoning where agents build on each other's work.
+
+- [ ] Pipeline executor creates `.lazyaf-context/` on first step
+- [ ] Step logs written with naming based on step ID (if set) or index
+- [ ] Metadata written to `.lazyaf-context/metadata.json`
+- [ ] Context directory committed after each step
+- [ ] Merge action adds cleanup commit (removes `.lazyaf-context/`)
+- [ ] Users can squash-merge to keep upstream history clean
+
+**Step IDs for Stable References**:
+Steps can have an optional `id` field for stable log file references:
+```yaml
+steps:
+  - id: "tests"              # Optional stable identifier
+    name: "Run Tests"
+    type: script
+    # ...
+  - name: "Quick Lint"       # No ID - uses index-based naming
+    type: script
+    # ...
+```
+
+**Log File Naming**:
+- With ID: `.lazyaf-context/id_<id>_NNN.log` (e.g., `id_tests_001.log`)
+- Without ID: `.lazyaf-context/step_NNN_<name>.log` (e.g., `step_002_quick_lint.log`)
+
+IDs enable stable references in agent prompts even if steps are reordered:
+```yaml
+prompt_template: |
+  Review the test output in `.lazyaf-context/id_tests_*.log` and fix failures.
+```
+
+**Directory Structure** (committed to feature branch):
+```
+.lazyaf-context/
+├── id_tests_001.log               # Step with id="tests" (stable reference)
+├── step_002_quick_lint.log        # Step without ID (index-based)
+├── id_analyze_003.log             # Step with id="analyze"
+├── id_analyze_003.md              # Agent's notes (optional, agent-written)
+├── test_results.json              # Structured test data (if available)
+├── decisions.md                   # Accumulated decisions/learnings (agents can append)
+└── metadata.json                  # {pipeline_run_id, steps_completed, step_id_map, ...}
+```
+
+**Key Behaviors**:
+- Agents can READ from context (previous step logs, notes from earlier agents)
+- Agents can WRITE to context (leave notes, analysis, decisions for future steps)
+- Context accumulates across commits on the feature branch
+- **On merge**: pipeline adds a final commit that removes `.lazyaf-context/`
+- **User choice**: squash-merge to collapse all commits (including cleanup) into one clean commit
+
+**Example Flow**:
+```yaml
+steps:
+  - id: "tests"
+    name: "Run Tests"
+    type: script
+    config:
+      command: pytest -v  # Output → .lazyaf-context/id_tests_001.log
+    continue_in_context: true
+
+  - id: "fix"
+    name: "Analyze & Fix"
+    type: agent
+    config:
+      agent: "test-fixer"  # Reads id_tests_*.log, writes id_fix_002.md notes
+    continue_in_context: true
+
+  - name: "Generate Changelog"  # No ID - uses step_003_generate_changelog.log
+    type: agent
+    config:
+      agent: "changelog-writer"  # Reads accumulated context, writes CHANGELOG entry
+    on_success: "merge:main"  # Adds cleanup commit, then merges
+```
+
+**Merge Behavior**:
+```yaml
+# Default: add cleanup commit then merge (user can squash-merge)
+on_success: "merge:main"
+
+# Keep context (skip cleanup commit) - make sure to warn user to make sure they know what they are doing
+on_success: "merge:main:keep-context"
+
+# Process context before merge
+- name: "Archive Context"
+  type: script
+  config:
+    command: |
+      # Do something creative with accumulated context
+      cat .lazyaf-context/decisions.md >> docs/AI_DECISIONS.md
+  on_success: "merge:main"  # Cleanup commit still added after this step
+```
+
+**Why Committed (not workspace-only)**:
+- Context persists if pipeline is interrupted/resumed
+- Git history shows agent reasoning evolution
+- Can inspect context at any commit via git
+- Agents can reference earlier context across multiple runs on same branch
+
+**Concurrent Runs**:
+Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isolated per branch. Conflicts are unlikely since branches diverge before pipelines run.
+
+**Explicit Non-Goals (This Phase)**:
+- Default/golden-path agents that auto-use context (let patterns emerge first)
+- Platform-level context templates
+- Cross-pipeline context sharing
+
+### 9.1c: Pipeline/Card Agent Parity
+**Goal**: Pipeline agent steps should have same capabilities as cards
+
+- [ ] Add `agent_file_ids` to pipeline step config (select agents)
+- [ ] Add `prompt_template` to pipeline step config
+- [ ] Update PipelineEditor to show agent selector for agent steps
+- [ ] Update pipeline executor to pass agent files to job
+
+---
+
+## Phase 10: Events & Triggers (Next Priority)
+**Goal**: Enable the Card → Pipeline → Merge workflow
+
+### 10a: Card Completion Trigger
+- [ ] Add `on_card_complete` trigger type to pipelines
+- [ ] Config: `{status: "done", repo_id?, card_id?}`
+- [ ] When card status → done/in_review, check for matching pipelines
+- [ ] Auto-trigger pipeline with card context (branch, commit)
+- [ ] UI: Configure trigger in pipeline editor
+
+### 10b: Auto-Merge Action
+- [ ] Test existing `on_success: "merge:branch"` behavior
+- [ ] Merge uses internal git (merge branch to default)
+- [ ] Conflict handling: fail step with clear error
+- [ ] Optional: create "merge commit" message
+
+### 10c: Push Triggers (Lower Priority)
+- [ ] Internal git server emits push events
+- [ ] Pipeline trigger: `{type: "push", branches: ["main", "dev"]}`
+- [ ] Push to branch → matching pipelines trigger
+
+---
+
+## Tech Debt (After Core Workflow Works)
+
+### TD1: Entrypoint Refactor
+**Trigger**: If entrypoint becomes hard to modify during Phase 10
+- [ ] Extract test detection → `test_runner.py`
+- [ ] Extract git operations → `git_helpers.py`
+- [ ] Keep entrypoint as orchestrator
+
+### TD2: Feature Consistency
+- [ ] Cards and pipeline steps use same agent configuration UI
+- [ ] Unified step config schema across cards and pipelines
+
+---
+
 **Roadmap**:
-- Phase 6: Polish - in progress (quality of life improvements)
+- Phase 6: Polish - ongoing (quality of life)
 - Phase 7: MCP Interface - ✅ COMPLETE
 - Phase 8: Test Result Capture - ✅ COMPLETE
-- Phase 8.5: CI/CD Foundation - ✅ COMPLETE (non-AI runner steps: script, docker)
-- Phase 9: Pipelines - **NEXT** (multi-step workflows with branching)
-- Phase 9.5: Webhooks - planned (external triggers)
-- Phase 10: Events & Triggers - planned (push, schedule, card completion)
-- Phase 11: Reporting & Artifacts - future (test trends, coverage, build artifacts)
+- Phase 8.5: CI/CD Foundation - ✅ COMPLETE
+- Phase 9: Pipelines - ✅ CORE COMPLETE
+- **Phase 9.1: Pipeline Polish - IN PROGRESS** ← You are here
+- **Phase 10: Events & Triggers - NEXT** ← Enables target workflow
+- Phase 9.5: Webhooks - deferred (external triggers)
+- Phase 11: Reporting & Artifacts - future

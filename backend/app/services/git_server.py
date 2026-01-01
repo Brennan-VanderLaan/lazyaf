@@ -1323,6 +1323,178 @@ class GitRepoManager:
             traceback.print_exc()
             return {"error": str(e), "files": []}
 
+    def get_file_content(self, repo_id: str, branch: str, path: str) -> bytes | None:
+        """
+        Get file content from a specific branch.
+
+        Public API for reading files from git tree (used for .lazyaf/ directory).
+
+        Args:
+            repo_id: Repository ID
+            branch: Branch name to read from
+            path: File path (e.g., ".lazyaf/agents/test-fixer.yaml")
+
+        Returns:
+            File content as bytes, or None if not found
+        """
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return None
+
+        branch_sha = self.get_branch_commit(repo_id, branch)
+        if not branch_sha:
+            return None
+
+        try:
+            commit = repo.object_store[branch_sha.encode('ascii')]
+            return self._get_blob_at_path(repo, commit.tree, path)
+        except (KeyError, Exception):
+            return None
+
+    def list_directory(self, repo_id: str, branch: str, path: str) -> list[str] | None:
+        """
+        List files in a directory from a specific branch.
+
+        Public API for reading directory contents from git tree.
+
+        Args:
+            repo_id: Repository ID
+            branch: Branch name
+            path: Directory path (e.g., ".lazyaf/agents")
+
+        Returns:
+            List of filenames (not full paths), or None if directory not found
+        """
+        from dulwich.objects import Tree
+
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return None
+
+        branch_sha = self.get_branch_commit(repo_id, branch)
+        if not branch_sha:
+            return None
+
+        try:
+            commit = repo.object_store[branch_sha.encode('ascii')]
+
+            # Navigate to the target directory
+            parts = path.strip('/').split('/') if path else []
+            current_sha = commit.tree
+
+            for part in parts:
+                if not part:
+                    continue
+                obj = repo.object_store[current_sha]
+                if not isinstance(obj, Tree):
+                    return None
+
+                part_bytes = part.encode('utf-8')
+                found = False
+                for entry in obj.items():
+                    if entry.path == part_bytes:
+                        current_sha = entry.sha
+                        found = True
+                        break
+
+                if not found:
+                    return None
+
+            # current_sha should now point to the target directory
+            obj = repo.object_store[current_sha]
+            if not isinstance(obj, Tree):
+                return None
+
+            # Return list of filenames
+            return [entry.path.decode('utf-8', errors='replace') for entry in obj.items()]
+
+        except (KeyError, Exception):
+            return None
+
+    def delete_directory_from_branch(self, repo_id: str, branch: str, directory: str,
+                                      author: str = "LazyAF <lazyaf@localhost>") -> dict:
+        """
+        Delete a directory from a branch and create a cleanup commit.
+
+        Used for cleaning up .lazyaf-context after pipeline merge.
+
+        Args:
+            repo_id: Repository ID
+            branch: Branch to modify
+            directory: Directory path to delete (e.g., ".lazyaf-context")
+            author: Author string for the commit
+
+        Returns:
+            dict with success, new_sha, message, error
+        """
+        from dulwich.objects import Commit, Tree
+        import time
+        import stat
+
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return {"success": False, "error": "Repo not found", "new_sha": None}
+
+        branch_sha = self.get_branch_commit(repo_id, branch)
+        if not branch_sha:
+            return {"success": False, "error": f"Branch '{branch}' not found", "new_sha": None}
+
+        try:
+            commit = repo.object_store[branch_sha.encode('ascii')]
+            tree = repo.object_store[commit.tree]
+
+            # Check if directory exists in tree
+            dir_parts = directory.split('/')
+            dir_name = dir_parts[0].encode('utf-8')
+            dir_found = False
+            for entry in tree.items():
+                if entry.path == dir_name and stat.S_ISDIR(entry.mode):
+                    dir_found = True
+                    break
+
+            if not dir_found:
+                # Directory doesn't exist, nothing to do
+                return {"success": True, "new_sha": branch_sha, "message": "Directory not found, nothing to delete"}
+
+            # Create new tree without the directory
+            new_tree = Tree()
+            for entry in tree.items():
+                if entry.path != dir_name:
+                    new_tree.add(entry.path, entry.mode, entry.sha)
+
+            repo.object_store.add_object(new_tree)
+
+            # Create cleanup commit
+            new_commit = Commit()
+            new_commit.tree = new_tree.id
+            new_commit.parents = [branch_sha.encode('ascii')]
+            new_commit.author = author.encode('utf-8')
+            new_commit.committer = author.encode('utf-8')
+            new_commit.commit_time = new_commit.author_time = int(time.time())
+            new_commit.commit_timezone = new_commit.author_timezone = 0
+            new_commit.encoding = b'UTF-8'
+            new_commit.message = f"[lazyaf] Cleanup: remove {directory}\n".encode('utf-8')
+
+            repo.object_store.add_object(new_commit)
+
+            # Update branch ref
+            branch_ref = f"refs/heads/{branch}".encode()
+            repo.refs[branch_ref] = new_commit.id
+
+            new_sha = new_commit.id.decode('ascii')
+            print(f"[git_server] cleanup commit created: {new_sha[:8]}")
+            return {
+                "success": True,
+                "new_sha": new_sha,
+                "message": f"Removed {directory} from {branch}"
+            }
+
+        except Exception as e:
+            import traceback
+            print(f"[git_server] delete_directory_from_branch error: {e}")
+            traceback.print_exc()
+            return {"success": False, "error": str(e), "new_sha": None}
+
 
 class HTTPGitBackend:
     """HTTP smart protocol handler for git operations."""

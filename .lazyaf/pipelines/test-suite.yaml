@@ -1,0 +1,40 @@
+name: "Test Suite"
+description: "Install dependencies with uv and run the test suite"
+steps:
+  - id: "install-uv"
+    name: "Install uv"
+    type: script
+    config:
+      command: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.local/bin:$PATH"
+        uv --version
+    continue_in_context: true
+    on_success: next
+    on_failure: stop
+    timeout: 120
+
+  - id: "sync-deps"
+    name: "Sync Dependencies"
+    type: script
+    config:
+      command: |
+        export PATH="$HOME/.local/bin:$PATH"
+        cd backend
+        uv sync --all-extras
+    continue_in_context: true
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  - id: "run-tests"
+    name: "Run Tests"
+    type: script
+    config:
+      command: |
+        export PATH="$HOME/.local/bin:$PATH"
+        cd backend
+        uv run pytest ../tdd -v --tb=short
+    on_success: next
+    on_failure: stop
+    timeout: 600

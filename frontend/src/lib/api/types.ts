@@ -250,9 +250,18 @@ export interface AgentFileUpdate {
 export type RunStatus = 'pending' | 'running' | 'passed' | 'failed' | 'cancelled';
 
 export interface PipelineStepConfig {
+  id?: string;  // Optional step ID for context directory references
   name: string;
   type: StepType;
-  config: StepConfig & { runner_type?: RunnerType; title?: string; description?: string };
+  config: StepConfig & {
+    runner_type?: RunnerType;
+    title?: string;
+    description?: string;
+    // Agent step fields (Phase 9.1c)
+    agent_file_ids?: string[];    // Platform agent file IDs to use
+    prompt_template?: string;     // Custom prompt template
+    agent?: string;               // Repo-defined agent reference (e.g., "test-fixer")
+  };
   on_success: string;  // "next" | "stop" | "trigger:{card_id}" | "merge:{branch}"
   on_failure: string;  // "next" | "stop" | "trigger:{card_id}"
   timeout: number;
@@ -324,4 +333,33 @@ export interface StepLogsResponse {
   logs: string;
   error: string | null;
   status: RunStatus;
+}
+
+// Repo-defined agents and pipelines (Phase 9.1b)
+export interface RepoAgent {
+  name: string;
+  description: string | null;
+  prompt_template: string;
+  source: 'repo' | 'platform';
+  branch?: string;
+  filename?: string;
+}
+
+export interface RepoPipeline {
+  name: string;
+  description: string | null;
+  steps: PipelineStepConfig[];
+  source: 'repo' | 'platform';
+  branch?: string;
+  filename?: string;
+}
+
+// Merged agent for UI (combines platform AgentFile with RepoAgent)
+export interface MergedAgent {
+  id?: string;  // Only for platform agents
+  name: string;
+  description: string | null;
+  content?: string;  // Platform agent content
+  prompt_template?: string;  // Repo agent template
+  source: 'repo' | 'platform';
 }

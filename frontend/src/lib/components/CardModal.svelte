@@ -1,10 +1,10 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, tick } from 'svelte';
-  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType, StepType, StepConfig, AgentFile } from '../api/types';
+  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType, StepType, StepConfig, AgentFile, RepoAgent, MergedAgent } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
   import { agentFilesStore } from '../stores/agentFiles';
-  import { repos } from '../api/client';
+  import { repos, lazyafFiles } from '../api/client';
   import JobStatus from './JobStatus.svelte';
   import DiffViewer from './DiffViewer.svelte';
   import ConflictResolver from './ConflictResolver.svelte';
@@ -43,8 +43,49 @@
   let showPromptTemplate = false;  // Toggle for advanced options
   let submitting = false;
 
-  // Agent files from store
-  $: agentFiles = $agentFilesStore;
+  // Agent files - merge platform and repo agents
+  let repoAgents: RepoAgent[] = [];
+
+  // Load repo agents when repo changes
+  async function loadRepoAgents() {
+    if ($selectedRepo?.is_ingested) {
+      try {
+        repoAgents = await lazyafFiles.listAgents($selectedRepo.id);
+      } catch {
+        repoAgents = [];
+      }
+    } else {
+      repoAgents = [];
+    }
+  }
+
+  // Merge platform + repo agents (repo overrides platform by name)
+  $: mergedAgents = (() => {
+    const agentsByName = new Map<string, MergedAgent>();
+
+    // Platform agents first
+    for (const agent of $agentFilesStore) {
+      agentsByName.set(agent.name, {
+        id: agent.id,
+        name: agent.name,
+        description: agent.description ?? null,
+        content: agent.content,
+        source: 'platform',
+      });
+    }
+
+    // Repo agents override platform
+    for (const agent of repoAgents) {
+      agentsByName.set(agent.name, {
+        name: agent.name,
+        description: agent.description,
+        prompt_template: agent.prompt_template,
+        source: 'repo',
+      });
+    }
+
+    return Array.from(agentsByName.values());
+  })();
 
   // Normalize agent name to CLI-safe format (same as AgentFileModal)
   function normalizeAgentName(input: string): string {
@@ -93,6 +134,8 @@
     }
     // Load agent files for multi-select
     agentFilesStore.load();
+    // Load repo-defined agents
+    loadRepoAgents();
   });
 
   async function loadBranches() {
@@ -368,27 +411,37 @@
             </p>
           </div>
 
-          {#if agentFiles.length > 0}
+          {#if mergedAgents.length > 0}
             <div class="form-group">
               <label>Available Agents</label>
               <div class="agent-file-selector">
-                {#each agentFiles as agent}
+                {#each mergedAgents as agent}
                   {@const cliName = normalizeAgentName(agent.name) || agent.name}
-                  <label class="agent-checkbox">
-                    <input
-                      type="checkbox"
-                      bind:group={selectedAgentFileIds}
-                      value={agent.id}
-                    />
-                    <span class="agent-name">@{cliName}</span>
-                    {#if agent.description}
-                      <span class="agent-desc">{agent.description}</span>
-                    {/if}
-                  </label>
+                  {#if agent.source === 'platform' && agent.id}
+                    <label class="agent-checkbox">
+                      <input
+                        type="checkbox"
+                        bind:group={selectedAgentFileIds}
+                        value={agent.id}
+                      />
+                      <span class="agent-name">@{cliName}</span>
+                      {#if agent.description}
+                        <span class="agent-desc">{agent.description}</span>
+                      {/if}
+                    </label>
+                  {:else}
+                    <div class="agent-checkbox repo-agent">
+                      <span class="agent-name">@{cliName}</span>
+                      <span class="agent-source-badge">from repo</span>
+                      {#if agent.description}
+                        <span class="agent-desc">{agent.description}</span>
+                      {/if}
+                    </div>
+                  {/if}
                 {/each}
               </div>
               <p class="form-hint">
-                Selected agents will be available via <code>@agent-name</code> syntax.
+                Platform agents can be selected. Repo agents are available via <code>@agent-name</code> syntax.
               </p>
             </div>
           {/if}
@@ -1196,6 +1249,21 @@
     font-weight: 500;
     color: var(--primary-color, #89b4fa);
     font-size: 0.9rem;
+  }
+
+  .agent-checkbox.repo-agent {
+    cursor: default;
+    opacity: 0.8;
+  }
+
+  .agent-source-badge {
+    font-size: 0.65rem;
+    padding: 0.1rem 0.4rem;
+    background: var(--success-color, #a6e3a1);
+    color: var(--surface-color, #1e1e2e);
+    border-radius: 4px;
+    font-weight: 600;
+    text-transform: uppercase;
   }
 
   .agent-desc {

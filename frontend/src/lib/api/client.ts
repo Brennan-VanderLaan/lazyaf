@@ -223,6 +223,13 @@ export const lazyafFiles = {
     const params = branch ? `?branch=${encodeURIComponent(branch)}` : '';
     return request<RepoPipeline>(`/repos/${repoId}/lazyaf/pipelines/${encodeURIComponent(pipelineName)}${params}`);
   },
+  runPipeline: (repoId: string, pipelineName: string, branch?: string) => {
+    const params = branch ? `?branch=${encodeURIComponent(branch)}` : '';
+    return request<{ pipeline_id: string; run_id: string; status: string; message: string }>(
+      `/repos/${repoId}/lazyaf/pipelines/${encodeURIComponent(pipelineName)}/run${params}`,
+      { method: 'POST' }
+    );
+  },
 };
 
 // Health

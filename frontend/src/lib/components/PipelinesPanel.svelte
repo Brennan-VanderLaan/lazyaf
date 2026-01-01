@@ -2,7 +2,8 @@
   import { onMount, onDestroy } from 'svelte';
   import { pipelinesStore, activeRunsStore, hasActiveRuns } from '../stores/pipelines';
   import { selectedRepoId } from '../stores/repos';
-  import type { Pipeline, PipelineRun, RunStatus } from '../api/types';
+  import type { Pipeline, PipelineRun, RunStatus, RepoPipeline } from '../api/types';
+  import { lazyafFiles } from '../api/client';
   import PipelineEditor from './PipelineEditor.svelte';
   import PipelineRunViewer from './PipelineRunViewer.svelte';
 
@@ -10,6 +11,8 @@
   let showEditor = false;
   let editingPipeline: Pipeline | null = null;
   let viewingRun: PipelineRun | null = null;
+  let repoPipelines: RepoPipeline[] = [];
+  let repoPipelinesError: string | null = null;
 
   // Load recent runs on mount (regardless of selected repo)
   onMount(() => {
@@ -19,6 +22,20 @@
   // Load pipelines when repo changes
   $: if ($selectedRepoId) {
     pipelinesStore.load($selectedRepoId);
+    loadRepoPipelines($selectedRepoId);
+  }
+
+  async function loadRepoPipelines(repoId: string) {
+    console.log('[PipelinesPanel] Loading repo pipelines for:', repoId);
+    repoPipelinesError = null;
+    try {
+      repoPipelines = await lazyafFiles.listPipelines(repoId);
+      console.log('[PipelinesPanel] Loaded repo pipelines:', repoPipelines);
+    } catch (e) {
+      console.error('[PipelinesPanel] Failed to load repo pipelines:', e);
+      repoPipelinesError = e instanceof Error ? e.message : 'Failed to load repo pipelines';
+      repoPipelines = [];
+    }
   }
 
   // Refresh runs periodically when there are active runs
@@ -106,14 +123,44 @@
       {#if !$selectedRepoId}
         <p class="no-repo">Select a repo to manage pipelines</p>
       {:else}
+        <!-- Repo-defined pipelines -->
+        {#if repoPipelines.length > 0}
+          <div class="section">
+            <div class="section-header">
+              <span>From Repository</span>
+            </div>
+            <div class="pipeline-list">
+              {#each repoPipelines as pipeline}
+                <div class="pipeline-item repo-pipeline">
+                  <div class="pipeline-info">
+                    <span class="pipeline-name">
+                      {pipeline.name}
+                      <span class="repo-badge">repo</span>
+                    </span>
+                    <span class="pipeline-steps">{pipeline.steps.length} steps</span>
+                  </div>
+                  <div class="pipeline-actions">
+                    <span class="pipeline-hint" title="Repo pipelines are read-only. Edit in .lazyaf/pipelines/">📁</span>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
+        {#if repoPipelinesError}
+          <p class="error-text">{repoPipelinesError}</p>
+        {/if}
+
+        <!-- Platform pipelines -->
         <div class="section">
           <div class="section-header">
-            <span>Pipelines</span>
+            <span>Platform Pipelines</span>
             <button class="btn-small" on:click={handleCreate}>+ New</button>
           </div>
 
           {#if $pipelinesStore.length === 0}
-            <p class="empty">No pipelines yet</p>
+            <p class="empty">No platform pipelines yet</p>
           {:else}
             <div class="pipeline-list">
               {#each $pipelinesStore as pipeline}
@@ -281,11 +328,39 @@
   .pipeline-name {
     font-size: 0.9rem;
     font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
   }
 
   .pipeline-steps {
     font-size: 0.75rem;
     color: var(--text-muted);
+  }
+
+  .repo-badge {
+    font-size: 0.65rem;
+    padding: 0.1rem 0.3rem;
+    background: var(--primary-color);
+    color: var(--primary-text);
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .repo-pipeline {
+    border-left: 2px solid var(--primary-color);
+  }
+
+  .pipeline-hint {
+    opacity: 0.6;
+    cursor: help;
+  }
+
+  .error-text {
+    color: var(--error-color);
+    font-size: 0.8rem;
+    margin: 0.5rem 0;
   }
 
   .pipeline-actions {

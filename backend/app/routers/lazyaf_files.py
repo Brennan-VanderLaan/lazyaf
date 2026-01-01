@@ -6,14 +6,16 @@ Reads pipelines and agents from the repository's .lazyaf/ directory:
 - .lazyaf/agents/*.yaml - Agent definitions
 """
 
+import json
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Repo
+from app.models import Repo, Pipeline, PipelineRun
 from app.services.git_server import git_repo_manager
+from app.services.pipeline_executor import pipeline_executor
 from app.schemas.lazyaf_yaml import (
     AgentYaml,
     PipelineYaml,
@@ -221,3 +223,88 @@ async def get_repo_pipeline(
                 raise HTTPException(status_code=500, detail=f"Error parsing pipeline file: {e}")
 
     raise HTTPException(status_code=404, detail="Pipeline not found")
+
+
+@router.post("/pipelines/{pipeline_name}/run")
+async def run_repo_pipeline(
+    repo_id: str,
+    pipeline_name: str,
+    branch: str = Query(None, description="Branch to read from (defaults to repo default)"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Run a repo-defined pipeline.
+
+    Creates or updates a platform pipeline from the repo definition, then runs it.
+    """
+    repo = await get_repo_or_404(db, repo_id)
+    target_branch = branch or repo.default_branch
+
+    if not target_branch:
+        raise HTTPException(status_code=400, detail="No branch specified and repo has no default branch")
+
+    # Find and parse the pipeline
+    pipeline_data = None
+    for ext in ['.yaml', '.yml']:
+        filename = f"{pipeline_name}{ext}"
+        content = git_repo_manager.get_file_content(
+            repo_id, target_branch, f".lazyaf/pipelines/{filename}"
+        )
+        if content:
+            try:
+                data = yaml.safe_load(content.decode('utf-8'))
+                pipeline_data = PipelineYaml(**data)
+                break
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error parsing pipeline file: {e}")
+
+    if not pipeline_data:
+        raise HTTPException(status_code=404, detail="Pipeline not found in repo")
+
+    # Check if a platform pipeline with same name exists for this repo
+    result = await db.execute(
+        select(Pipeline)
+        .where(Pipeline.repo_id == repo_id)
+        .where(Pipeline.name == f"[repo] {pipeline_data.name}")
+    )
+    platform_pipeline = result.scalar_one_or_none()
+
+    # Convert steps to the format expected by Pipeline model
+    steps = [step.model_dump() for step in pipeline_data.steps]
+
+    if platform_pipeline:
+        # Update existing pipeline with latest definition
+        platform_pipeline.description = pipeline_data.description
+        platform_pipeline.steps = json.dumps(steps)
+    else:
+        # Create new platform pipeline from repo definition
+        import uuid
+        platform_pipeline = Pipeline(
+            id=str(uuid.uuid4()),
+            repo_id=repo_id,
+            name=f"[repo] {pipeline_data.name}",
+            description=pipeline_data.description,
+            steps=json.dumps(steps),
+            is_template=False,
+        )
+        db.add(platform_pipeline)
+
+    await db.commit()
+    await db.refresh(platform_pipeline)
+
+    # Run the pipeline
+    try:
+        run = await pipeline_executor.start_run(
+            db=db,
+            pipeline=platform_pipeline,
+            trigger_type="manual",
+            trigger_ref=f"repo:{target_branch}",
+        )
+        return {
+            "pipeline_id": platform_pipeline.id,
+            "run_id": run.id,
+            "status": run.status,
+            "message": f"Started pipeline run for '{pipeline_data.name}'"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start pipeline: {e}")

@@ -6,8 +6,22 @@ from app.database import get_db
 from app.models import Repo
 from app.schemas import RepoCreate, RepoRead, RepoUpdate, RepoIngest
 from app.services.git_server import git_repo_manager
+from app.services.websocket import manager
 
 router = APIRouter(prefix="/api/repos", tags=["repos"])
+
+
+def repo_to_dict(repo: Repo) -> dict:
+    """Convert Repo model to dictionary for WebSocket broadcast."""
+    return {
+        "id": repo.id,
+        "name": repo.name,
+        "remote_url": repo.remote_url,
+        "default_branch": repo.default_branch,
+        "is_ingested": repo.is_ingested,
+        "internal_git_url": repo.internal_git_url,
+        "created_at": repo.created_at.isoformat(),
+    }
 
 
 @router.get("", response_model=list[RepoRead])
@@ -22,6 +36,10 @@ async def create_repo(repo: RepoCreate, db: AsyncSession = Depends(get_db)):
     db.add(db_repo)
     await db.commit()
     await db.refresh(db_repo)
+
+    # Broadcast repo creation
+    await manager.send_repo_created(repo_to_dict(db_repo))
+
     return db_repo
 
 
@@ -55,6 +73,9 @@ async def ingest_repo(repo: RepoCreate, request: Request, db: AsyncSession = Dep
     # Build full clone URL
     base_url = str(request.base_url).rstrip("/")
     clone_url = f"{base_url}/git/{db_repo.id}.git"
+
+    # Broadcast repo creation
+    await manager.send_repo_created(repo_to_dict(db_repo))
 
     return RepoIngest(
         id=db_repo.id,
@@ -101,6 +122,10 @@ async def update_repo(repo_id: str, update: RepoUpdate, db: AsyncSession = Depen
 
     await db.commit()
     await db.refresh(repo)
+
+    # Broadcast repo update
+    await manager.send_repo_updated(repo_to_dict(repo))
+
     return repo
 
 
@@ -116,6 +141,9 @@ async def delete_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
 
     await db.delete(repo)
     await db.commit()
+
+    # Broadcast repo deletion
+    await manager.send_repo_deleted(repo_id)
 
 
 @router.get("/{repo_id}/branches")

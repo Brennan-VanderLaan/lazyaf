@@ -52,5 +52,15 @@ class ConnectionManager:
     async def send_step_run_status(self, step_data: dict):
         await self.broadcast("step_run_status", step_data)
 
+    # Repo-related broadcasts
+    async def send_repo_created(self, repo_data: dict):
+        await self.broadcast("repo_created", repo_data)
+
+    async def send_repo_updated(self, repo_data: dict):
+        await self.broadcast("repo_updated", repo_data)
+
+    async def send_repo_deleted(self, repo_id: str):
+        await self.broadcast("repo_deleted", {"id": repo_id})
+
 
 manager = ConnectionManager()

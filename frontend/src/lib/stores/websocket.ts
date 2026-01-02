@@ -1,13 +1,14 @@
 import { writable } from 'svelte/store';
-import type { Card, Pipeline, PipelineRun, StepRun } from '../api/types';
+import type { Card, Pipeline, PipelineRun, StepRun, Repo } from '../api/types';
 import { cardsStore } from './cards';
 import { jobsStore, type JobStatusUpdate } from './jobs';
 import { pipelinesStore, activeRunsStore } from './pipelines';
+import { reposStore } from './repos';
 
 export type WebSocketStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
 interface WebSocketMessage {
-  type: 'card_updated' | 'card_deleted' | 'job_status' | 'runner_status' | 'pipeline_updated' | 'pipeline_deleted' | 'pipeline_run_status' | 'step_run_status';
+  type: 'card_updated' | 'card_deleted' | 'job_status' | 'runner_status' | 'pipeline_updated' | 'pipeline_deleted' | 'pipeline_run_status' | 'step_run_status' | 'repo_created' | 'repo_updated' | 'repo_deleted';
   payload: unknown;
 }
 
@@ -81,6 +82,13 @@ function createWebSocketStore() {
       case 'step_run_status':
         // Step status updates are included in pipeline_run_status
         // This is for more granular updates if needed
+        break;
+      case 'repo_created':
+      case 'repo_updated':
+        reposStore.updateLocal(message.payload as Repo);
+        break;
+      case 'repo_deleted':
+        reposStore.deleteLocal((message.payload as { id: string }).id);
         break;
     }
   }

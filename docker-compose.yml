@@ -7,7 +7,7 @@ services:
       - ./backend/app:/app/app
       - lazyaf-data:/app/data
     environment:
-      - DATABASE_URL=sqlite+aiosqlite:///./data/lazyaf.db
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/lazyaf.db
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     restart: unless-stopped
@@ -28,6 +28,8 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+    deploy:
+      replicas: ${CLAUDE_RUNNERS:-1}
 
   runner-gemini:
     build: ./runner-gemini
@@ -37,6 +39,8 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+    deploy:
+      replicas: ${GEMINI_RUNNERS:-1}
 
 volumes:
   lazyaf-data:

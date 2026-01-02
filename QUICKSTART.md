@@ -50,6 +50,8 @@ git cherry-pick <commit-sha>
 
 **Pipelines** - Automate multi-step workflows
 
-**Just one runner** - `docker compose up -d backend frontend runner-claude`
+**Scale runners** - Set `CLAUDE_RUNNERS=3` or `GEMINI_RUNNERS=2` in `.env`
+
+**Just one runner type** - `docker compose up -d backend frontend runner-claude`
 
 See `PLAN.md` for architecture details.

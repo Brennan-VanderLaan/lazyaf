@@ -20,6 +20,7 @@ class Settings(BaseModel):
 @lru_cache
 def get_settings() -> Settings:
     return Settings(
+        database_url=os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./lazyaf.db"),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
         gemini_api_key=os.getenv("GEMINI_API_KEY"),
         docker_host=os.getenv("DOCKER_HOST"),

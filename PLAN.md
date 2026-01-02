@@ -1492,6 +1492,11 @@ interface PlaygroundState {
 - [ ] Cards and pipeline steps use same agent configuration UI
 - [ ] Unified step config schema across cards and pipelines
 
+### TD3: Pipeline Workspace Cleanup
+- [ ] Clean up old pipeline workspace directories (`/workspace/{pipeline_run_id[:8]}/`)
+- [ ] Add runner housekeeping to purge stale workspaces after pipeline completion
+- [ ] Consider disk space monitoring and automatic cleanup thresholds
+
 ---
 
 **Roadmap**:

@@ -620,48 +620,50 @@
                       </p>
                     {/if}
 
-                    <!-- Actions on pipeline completion -->
-                    <div class="trigger-actions">
-                      <div class="form-group">
-                        <label>On Pipeline Pass:</label>
-                        <div class="action-selector">
+                    <!-- Actions on pipeline completion (only for card triggers) -->
+                    {#if trigger.type === 'card_complete'}
+                      <div class="trigger-actions">
+                        <div class="form-group">
+                          <label>On Pipeline Pass:</label>
+                          <div class="action-selector">
+                            <select
+                              value={trigger.on_pass?.startsWith('merge:') ? 'merge' : (trigger.on_pass || 'nothing')}
+                              on:change={(e) => {
+                                const val = e.currentTarget.value;
+                                if (val === 'merge') {
+                                  updateTrigger(index, { ...trigger, on_pass: 'merge' });
+                                } else {
+                                  updateTrigger(index, { ...trigger, on_pass: val });
+                                }
+                              }}
+                            >
+                              <option value="nothing">Do nothing</option>
+                              <option value="merge">Merge card to default branch</option>
+                            </select>
+                            {#if trigger.on_pass?.startsWith('merge:')}
+                              <input
+                                type="text"
+                                class="branch-input"
+                                placeholder="branch name"
+                                value={trigger.on_pass.slice(6)}
+                                on:input={(e) => updateTrigger(index, { ...trigger, on_pass: `merge:${e.currentTarget.value}` })}
+                              />
+                            {/if}
+                          </div>
+                        </div>
+                        <div class="form-group">
+                          <label>On Pipeline Fail:</label>
                           <select
-                            value={trigger.on_pass?.startsWith('merge:') ? 'merge' : (trigger.on_pass || 'nothing')}
-                            on:change={(e) => {
-                              const val = e.currentTarget.value;
-                              if (val === 'merge') {
-                                updateTrigger(index, { ...trigger, on_pass: 'merge' });
-                              } else {
-                                updateTrigger(index, { ...trigger, on_pass: val });
-                              }
-                            }}
+                            value={trigger.on_fail || 'nothing'}
+                            on:change={(e) => updateTrigger(index, { ...trigger, on_fail: e.currentTarget.value })}
                           >
                             <option value="nothing">Do nothing</option>
-                            <option value="merge">Merge card to default branch</option>
+                            <option value="fail">Mark card as failed</option>
+                            <option value="reject">Reject card (back to todo)</option>
                           </select>
-                          {#if trigger.on_pass?.startsWith('merge:')}
-                            <input
-                              type="text"
-                              class="branch-input"
-                              placeholder="branch name"
-                              value={trigger.on_pass.slice(6)}
-                              on:input={(e) => updateTrigger(index, { ...trigger, on_pass: `merge:${e.currentTarget.value}` })}
-                            />
-                          {/if}
                         </div>
                       </div>
-                      <div class="form-group">
-                        <label>On Pipeline Fail:</label>
-                        <select
-                          value={trigger.on_fail || 'nothing'}
-                          on:change={(e) => updateTrigger(index, { ...trigger, on_fail: e.currentTarget.value })}
-                        >
-                          <option value="nothing">Do nothing</option>
-                          <option value="fail">Mark card as failed</option>
-                          <option value="reject">Reject card (back to todo)</option>
-                        </select>
-                      </div>
-                    </div>
+                    {/if}
                   </div>
                 </div>
               {/each}

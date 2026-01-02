@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult } from './types';
 
 const BASE_URL = '/api';
 
@@ -235,4 +235,47 @@ export const lazyafFiles = {
 // Health
 export const health = {
   check: () => request<{ status: string; app: string }>('/health'),
+};
+
+// Playground (Phase 11)
+export const playground = {
+  start: (repoId: string, data: PlaygroundTestRequest) =>
+    request<PlaygroundTestResponse>(`/repos/${repoId}/playground/test`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  status: (sessionId: string) =>
+    request<{ session_id: string; status: string; started_at: string | null; completed_at: string | null }>(
+      `/playground/${sessionId}/status`
+    ),
+
+  cancel: (sessionId: string) =>
+    request<{ status: string; session_id: string }>(`/playground/${sessionId}/cancel`, {
+      method: 'POST',
+    }),
+
+  result: (sessionId: string) => request<PlaygroundResult>(`/playground/${sessionId}/result`),
+
+  // SSE stream URL (used directly with EventSource, not through request())
+  streamUrl: (sessionId: string) => `${BASE_URL}/playground/${sessionId}/stream`,
+};
+
+// Models API
+export interface ModelInfo {
+  id: string;
+  name: string;
+  provider: 'anthropic' | 'google';
+  description: string;
+}
+
+export interface ModelsListResponse {
+  models: ModelInfo[];
+  anthropic: ModelInfo[];
+  google: ModelInfo[];
+}
+
+export const models = {
+  list: (refresh: boolean = false) =>
+    request<ModelsListResponse>(`/models${refresh ? '?refresh=true' : ''}`),
 };

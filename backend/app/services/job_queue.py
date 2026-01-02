@@ -22,6 +22,7 @@ class QueuedJob:
     card_title: str
     card_description: str
     runner_type: str = "any"  # Requested runner type (any, claude-code, gemini)
+    model: str | None = None  # Specific model (claude-sonnet-4-20250514, claude-opus-4-20250514, gemini-2.5-pro, etc.)
     repo_path: str | None = None  # Deprecated, not used with internal git
     use_internal_git: bool = False  # When True, runner clones from internal git server
     agent_file_ids: list[str] = field(default_factory=list)  # List of agent file IDs to mount
@@ -39,6 +40,10 @@ class QueuedJob:
     step_index: int = 0  # Step index in the pipeline
     step_name: str = "unnamed"  # Step name for logging
     created_at: datetime = field(default_factory=datetime.utcnow)
+    # Playground fields (Phase 11)
+    is_playground: bool = False  # True = ephemeral run, no card updates
+    playground_session_id: str | None = None  # Links to SSE stream
+    playground_save_branch: str | None = None  # If set, push changes to this branch
 
 
 class JobQueue:

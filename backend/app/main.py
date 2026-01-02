@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.database import init_db
 from app.routers import repos, cards, jobs, runners, agent_files, pipelines, lazyaf_files
-from app.routers import git
+from app.routers import git, playground, models
 from app.services.websocket import manager
 
 # Import models to ensure they're registered with Base before init_db
@@ -19,10 +19,13 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     from app.database import engine
     from app.services.runner_pool import runner_pool
+    from app.services.playground_service import playground_service
 
     await init_db()
     await runner_pool.start()
+    await playground_service.start()
     yield
+    await playground_service.stop()
     await runner_pool.stop()
     await engine.dispose()
 
@@ -50,6 +53,9 @@ app.include_router(agent_files.router)
 app.include_router(pipelines.router)
 app.include_router(lazyaf_files.router)
 app.include_router(git.router)
+app.include_router(playground.router)
+app.include_router(playground.session_router)
+app.include_router(models.router)
 
 
 @app.get("/health")

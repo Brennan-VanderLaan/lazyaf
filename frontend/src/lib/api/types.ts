@@ -391,3 +391,44 @@ export interface MergedAgent {
   prompt_template?: string;  // Repo agent template
   source: 'repo' | 'platform';
 }
+
+// Playground types (Phase 11)
+export type PlaygroundStatus = 'idle' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+// Model options for each runner type
+export type ClaudeModel = 'claude-sonnet-4-5-20250929' | 'claude-opus-4-5-20250929' | 'claude-sonnet-4-20250514' | 'claude-haiku-4-5-20251001';
+export type GeminiModel = 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
+export type AgentModel = ClaudeModel | GeminiModel;
+
+export interface PlaygroundTestRequest {
+  agent_id?: string | null;
+  repo_agent_name?: string | null;
+  runner_type: 'claude-code' | 'gemini';
+  model?: AgentModel | null;  // Specific model to use
+  branch: string;
+  task_override?: string | null;
+  save_to_branch?: string | null;
+}
+
+export interface PlaygroundTestResponse {
+  session_id: string;
+  status: string;
+  message: string;
+}
+
+export interface PlaygroundResult {
+  session_id: string;
+  status: string;
+  diff: string | null;
+  files_changed: string[];
+  branch_saved: string | null;
+  error: string | null;
+  logs: string;
+  duration_seconds: number | null;
+}
+
+export interface PlaygroundLogEvent {
+  type: 'log' | 'tool' | 'status' | 'complete' | 'error' | 'ping';
+  data: string;
+  timestamp: string;
+}

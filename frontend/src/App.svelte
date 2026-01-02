@@ -6,13 +6,16 @@
   import AgentPanel from './lib/components/AgentPanel.svelte';
   import BoardPage from './lib/pages/BoardPage.svelte';
   import PipelinesPage from './lib/pages/PipelinesPage.svelte';
+  import PlaygroundPage from './lib/pages/PlaygroundPage.svelte';
   import { websocketStore } from './lib/stores/websocket';
   import { hasRunningJobs } from './lib/stores/jobs';
   import { hasActiveRuns } from './lib/stores/pipelines';
+  import { isRunning as playgroundRunning } from './lib/stores/playground';
 
   const routes = {
     '/': BoardPage,
     '/pipelines': PipelinesPage,
+    '/playground': PlaygroundPage,
   };
 
   onMount(() => {
@@ -40,6 +43,13 @@
         <span class="nav-icon">{$hasActiveRuns ? '⚙️' : '🔄'}</span>
         <span class="nav-label">Pipelines</span>
         {#if $hasActiveRuns}
+          <span class="nav-badge"></span>
+        {/if}
+      </a>
+      <a href="/playground" use:link class="nav-item" class:active={$location === '/playground'}>
+        <span class="nav-icon">{$playgroundRunning ? '⚙️' : '🧪'}</span>
+        <span class="nav-label">Playground</span>
+        {#if $playgroundRunning}
           <span class="nav-badge"></span>
         {/if}
       </a>

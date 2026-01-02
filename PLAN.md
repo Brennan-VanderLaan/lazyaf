@@ -650,7 +650,7 @@ job.config = {"image": "node:20", "command": "npm run build"}
 
 **Deliverable**: Can create a card with step_type=script or docker that runs commands directly without AI. UI has step type selector with config inputs. MCP create_card supports all step types.
 
-### Phase 9: Pipelines
+### Phase 9: Pipelines ✅
 **Goal**: Chain steps with conditional logic into reusable workflows
 
 **Problem Being Solved**: Want multi-step workflows: lint → test → build, with AI fixes on failure
@@ -889,8 +889,7 @@ lazyaf/
 
 ## Current Status
 
-**Completed**: Phases 1-5, Phase 7 (MCP Interface), Phase 8 (Test Result Capture), Phase 8.5 (CI/CD Foundation), Phase 9 (Pipelines - core)
-**Current**: Phase 9.1 (Pipeline Polish) - context sharing, file persistence
+**Completed**: Phases 1-9.1 (all core pipeline functionality including file persistence and context directory)
 **Next**: Phase 10 (Events & Triggers) - card completion triggers, auto-merge flow
 
 The core workflow is functional:
@@ -907,35 +906,35 @@ Card created → Agent implements → Card approved → Pipeline triggers → Te
 
 ---
 
-## Phase 9.1: Pipeline Polish (Current Priority)
+## Phase 9.1: Pipeline Polish ✅
 **Goal**: Make pipelines production-ready for the target workflow
 
 ### 9.1a: Context Sharing Clarity ✅
 - [x] `continue_in_context` flag on steps (workspace preserved)
 - [x] `is_continuation` flag (skip clone on subsequent steps)
 - [x] `previous_step_logs` passed to agent steps
-- [ ] Document workspace behavior in UI (tooltip on checkbox)
-- [ ] Log clearly what context each step receives
+- [x] Document workspace behavior in UI (tooltip on checkbox) - `PipelineEditor.svelte:481-489`
+- [x] Log clearly what context each step receives - `entrypoint.py:508-517`
 
-### 9.1b: Pipeline & Agent File Persistence
+### 9.1b: Pipeline & Agent File Persistence ✅
 **Goal**: Store pipelines AND agents in repo as `.lazyaf/` directory
 
 This allows repos to bring custom agents along, version-controlled with the repo.
 
-- [ ] Define YAML schema for pipeline definitions
-- [ ] Define YAML schema for agent definitions
-- [ ] API endpoint to read `.lazyaf/` from git tree (branch-aware)
-- [ ] UI: Repo-defined agents tagged as "from repo" (vs platform agents)
-- [ ] Agents referenced by name, repo overrides platform on lookup
-- [ ] Pipelines read from working branch (matches the code being worked on)
+- [x] Define YAML schema for pipeline definitions - `backend/app/schemas/lazyaf_yaml.py`
+- [x] Define YAML schema for agent definitions - `backend/app/schemas/lazyaf_yaml.py`
+- [x] API endpoint to read `.lazyaf/` from git tree (branch-aware) - `backend/app/routers/lazyaf_files.py`
+- [x] UI: Repo-defined agents tagged as "from repo" (vs platform agents) - `PipelineEditor.svelte:385-391`
+- [x] Agents referenced by name, repo overrides platform on lookup - `backend/app/services/agent_resolver.py`
+- [x] Pipelines read from working branch (matches the code being worked on)
 
-**Critical: Git-Native Behavior**
+**Critical: Git-Native Behavior** ✅
 The `.lazyaf/` directory is **live from the repo**, not a one-time import:
-- [ ] UI reads `.lazyaf/` from HEAD of selected branch (via git server)
-- [ ] Pipelines/agents update automatically when branch HEAD changes
-- [ ] External commits (manual edits, other tools) reflected in UI immediately
-- [ ] No CLI export/import commands - just edit files in repo directly
-- [ ] Repo IS the source of truth (no DB copies of repo-defined items)
+- [x] UI reads `.lazyaf/` from HEAD of selected branch (via git server)
+- [x] Pipelines/agents update automatically when branch HEAD changes
+- [x] External commits (manual edits, other tools) reflected in UI immediately
+- [x] No CLI export/import commands - just edit files in repo directly
+- [x] Repo IS the source of truth (no DB copies of repo-defined items)
 
 **Lookup Precedence**:
 When resolving agent references (e.g., `agent: "test-fixer"`):
@@ -1031,17 +1030,17 @@ Prompt templates use `{{variable}}` syntax (consistent with existing entrypoint 
 
 ---
 
-### 9.1d: Pipeline Context Directory
+### 9.1d: Pipeline Context Directory ✅
 **Goal**: Enable chain-of-thought across pipeline steps via committed context
 
 This is experimental - if agents benefit from reading/writing shared context files, this enables multi-step reasoning where agents build on each other's work.
 
-- [ ] Pipeline executor creates `.lazyaf-context/` on first step
-- [ ] Step logs written with naming based on step ID (if set) or index
-- [ ] Metadata written to `.lazyaf-context/metadata.json`
-- [ ] Context directory committed after each step
-- [ ] Merge action adds cleanup commit (removes `.lazyaf-context/`)
-- [ ] Users can squash-merge to keep upstream history clean
+- [x] Pipeline executor creates `.lazyaf-context/` on first step - `entrypoint.py:330-348`
+- [x] Step logs written with naming based on step ID (if set) or index - `entrypoint.py:351-368`
+- [x] Metadata written to `.lazyaf-context/metadata.json` - `entrypoint.py:371-388`
+- [x] Context directory committed after each step - `entrypoint.py:390-426`
+- [x] Merge action adds cleanup commit (removes `.lazyaf-context/`) - `pipeline_executor.py:642-651`
+- [x] Users can squash-merge to keep upstream history clean (user behavior, not code)
 
 **Step IDs for Stable References**:
 Steps can have an optional `id` field for stable log file references:
@@ -1141,17 +1140,17 @@ Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isol
 - Platform-level context templates
 - Cross-pipeline context sharing
 
-### 9.1c: Pipeline/Card Agent Parity
+### 9.1c: Pipeline/Card Agent Parity ✅
 **Goal**: Pipeline agent steps should have same capabilities as cards
 
-- [ ] Add `agent_file_ids` to pipeline step config (select agents)
-- [ ] Add `prompt_template` to pipeline step config
-- [ ] Update PipelineEditor to show agent selector for agent steps
-- [ ] Update pipeline executor to pass agent files to job
+- [x] Add `agent_file_ids` to pipeline step config (select agents)
+- [x] Add `prompt_template` to pipeline step config
+- [x] Update PipelineEditor to show agent selector for agent steps
+- [x] Update pipeline executor to pass agent files to job
 
 ---
 
-## Phase 10: Events & Triggers (Next Priority)
+## Phase 10: Events & Triggers (Current Priority)
 **Goal**: Enable the Card → Pipeline → Merge workflow
 
 ### 10a: Card Completion Trigger
@@ -1193,8 +1192,12 @@ Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isol
 - Phase 7: MCP Interface - ✅ COMPLETE
 - Phase 8: Test Result Capture - ✅ COMPLETE
 - Phase 8.5: CI/CD Foundation - ✅ COMPLETE
-- Phase 9: Pipelines - ✅ CORE COMPLETE
-- **Phase 9.1: Pipeline Polish - IN PROGRESS** ← You are here
+- Phase 9: Pipelines - ✅ COMPLETE
+- Phase 9.1: Pipeline Polish - ✅ COMPLETE
+  - 9.1a: Context Sharing - ✅ COMPLETE
+  - 9.1b: File Persistence - ✅ COMPLETE
+  - 9.1c: Agent Parity - ✅ COMPLETE
+  - 9.1d: Context Directory - ✅ COMPLETE
 - **Phase 10: Events & Triggers - NEXT** ← Enables target workflow
 - Phase 9.5: Webhooks - deferred (external triggers)
 - Phase 11: Reporting & Artifacts - future

@@ -22,6 +22,7 @@ steps:
         export PATH="$HOME/.local/bin:$PATH"
         cd backend
         uv sync --all-extras
+        uv sync --extra test
     continue_in_context: true
     on_success: next
     on_failure: stop

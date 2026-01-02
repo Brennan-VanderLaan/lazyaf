@@ -198,6 +198,7 @@ class RunnerPool:
                 "runner_type": r.runner_type,
                 "status": r.status,
                 "current_job_id": r.current_job.id if r.current_job else None,
+                "current_job_title": r.current_job.card_title if r.current_job else None,
                 "last_heartbeat": r.last_heartbeat.isoformat(),
                 "registered_at": r.registered_at.isoformat(),
                 "log_count": len(r.logs),

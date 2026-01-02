@@ -155,7 +155,7 @@
     }
   }
 
-  async function handleSubmit() {
+  async function handleSubmit(andStart: boolean = false) {
     if (!title.trim()) return;
     submitting = true;
 
@@ -186,6 +186,15 @@
           prompt_template: agentPrompt,
           agent_file_ids: agentFiles,
         });
+        // If andStart is true, immediately start the card
+        if (andStart) {
+          try {
+            await cardsStore.start(created.id);
+          } catch (startError) {
+            // Show error but card was still created
+            alert(startError instanceof Error ? startError.message : 'Card created but failed to start');
+          }
+        }
         // Wait for Svelte to apply all pending state changes before dispatching
         // This prevents race conditions with WebSocket updates that might interfere with modal closure
         await tick();
@@ -746,6 +755,9 @@
             </button>
             <button type="submit" class="btn-primary" disabled={submitting}>
               {submitting ? 'Creating...' : 'Create Card'}
+            </button>
+            <button type="button" class="btn-action btn-start" on:click={() => handleSubmit(true)} disabled={submitting}>
+              {submitting ? 'Creating...' : '🚀 Create & Submit'}
             </button>
           </div>
         {/if}

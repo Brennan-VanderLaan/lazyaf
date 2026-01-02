@@ -42,7 +42,16 @@
     const { cardId, status } = e.detail;
     const card = $cardsStore.find(c => c.id === cardId);
     if (card && card.status !== status) {
-      await cardsStore.update(cardId, { status });
+      // If dragging from 'todo' to 'in_progress', start the card instead of just updating status
+      if (card.status === 'todo' && status === 'in_progress') {
+        try {
+          await cardsStore.start(cardId);
+        } catch (error) {
+          alert(error instanceof Error ? error.message : 'Failed to start card');
+        }
+      } else {
+        await cardsStore.update(cardId, { status });
+      }
     }
   }
 

@@ -79,29 +79,29 @@ def _get_client() -> httpx.Client:
 
 
 @mcp.tool()
-def list_repos() -> list[dict]:
+def list_repos() -> dict:
     """
     List all repositories in LazyAF.
 
-    Returns a list of repos with their ID, name, ingest status, and default branch.
+    Returns repos in {"repos": [...]} format with ID, name, ingest status, and default branch.
     Only ingested repos can have cards started on them.
     """
     with _get_client() as client:
         response = client.get("/api/repos")
         if response.status_code != 200:
             return {"error": f"Failed to list repos: {response.text}"}
-        return response.json()
+        return {"repos": response.json()}
 
 
 @mcp.tool()
-def list_cards(repo_id: str) -> list[dict]:
+def list_cards(repo_id: str) -> dict:
     """
     List all cards for a repository.
 
     Args:
         repo_id: The repository ID (UUID string)
 
-    Returns cards with status, branch, and job info.
+    Returns cards in {"cards": [...]} format with status, branch, and job info.
     """
     with _get_client() as client:
         response = client.get(f"/api/repos/{repo_id}/cards")
@@ -109,7 +109,7 @@ def list_cards(repo_id: str) -> list[dict]:
             return {"error": f"Repo {repo_id} not found"}
         if response.status_code != 200:
             return {"error": f"Failed to list cards: {response.text}"}
-        return response.json()
+        return {"cards": response.json()}
 
 
 @mcp.tool()
@@ -385,14 +385,14 @@ def get_runner_status() -> dict:
 # =============================================================================
 
 @mcp.tool()
-def list_pipelines(repo_id: str = "") -> list[dict]:
+def list_pipelines(repo_id: str = "") -> dict:
     """
     List pipelines, optionally filtered by repository.
 
     Args:
         repo_id: Optional repository ID to filter by. If empty, lists all pipelines.
 
-    Returns list of pipelines with their steps and configuration.
+    Returns list of pipelines in {"pipelines": [...]} format.
     """
     with _get_client() as client:
         if repo_id:
@@ -404,7 +404,7 @@ def list_pipelines(repo_id: str = "") -> list[dict]:
             return {"error": f"Repo {repo_id} not found"}
         if response.status_code != 200:
             return {"error": f"Failed to list pipelines: {response.text}"}
-        return response.json()
+        return {"pipelines": response.json()}
 
 
 @mcp.tool()
@@ -657,7 +657,7 @@ def list_pipeline_runs(
     pipeline_id: str = "",
     status: str = "",
     limit: int = 20
-) -> list[dict]:
+) -> dict:
     """
     List pipeline runs with optional filters.
 
@@ -666,7 +666,7 @@ def list_pipeline_runs(
         status: Filter by status: pending, running, passed, failed, cancelled (optional)
         limit: Maximum results (default 20)
 
-    Returns list of pipeline runs.
+    Returns list of pipeline runs in {"runs": [...]} format.
     """
     with _get_client() as client:
         params = {"limit": limit}
@@ -678,7 +678,7 @@ def list_pipeline_runs(
         response = client.get("/api/pipeline-runs", params=params)
         if response.status_code != 200:
             return {"error": f"Failed to list runs: {response.text}"}
-        return response.json()
+        return {"runs": response.json()}
 
 
 @mcp.tool()
@@ -909,20 +909,20 @@ def delete_card(card_id: str) -> dict:
 # =============================================================================
 
 @mcp.tool()
-def list_agent_files() -> list[dict]:
+def list_agent_files() -> dict:
     """
     List all platform agent files.
 
     Agent files contain reusable prompt templates that can be
     attached to cards or pipeline steps.
 
-    Returns list of agent files with their names and descriptions.
+    Returns list of agent files in {"agent_files": [...]} format.
     """
     with _get_client() as client:
         response = client.get("/api/agent-files")
         if response.status_code != 200:
             return {"error": f"Failed to list agent files: {response.text}"}
-        return response.json()
+        return {"agent_files": response.json()}
 
 
 @mcp.tool()
@@ -1105,7 +1105,7 @@ def get_diff(
 # =============================================================================
 
 @mcp.tool()
-def list_repo_agents(repo_id: str, branch: str = "") -> list[dict]:
+def list_repo_agents(repo_id: str, branch: str = "") -> dict:
     """
     List agents defined in a repository's .lazyaf/agents/ directory.
 
@@ -1116,7 +1116,7 @@ def list_repo_agents(repo_id: str, branch: str = "") -> list[dict]:
         repo_id: The repository ID
         branch: Branch to read from (default: repo's default branch)
 
-    Returns list of repo-defined agents with their templates.
+    Returns list of repo-defined agents in {"agents": [...]} format.
     """
     with _get_client() as client:
         params = {}
@@ -1128,11 +1128,11 @@ def list_repo_agents(repo_id: str, branch: str = "") -> list[dict]:
             return {"error": f"Repo {repo_id} not found or not ingested"}
         if response.status_code != 200:
             return {"error": f"Failed to list repo agents: {response.text}"}
-        return response.json()
+        return {"agents": response.json()}
 
 
 @mcp.tool()
-def list_repo_pipelines(repo_id: str, branch: str = "") -> list[dict]:
+def list_repo_pipelines(repo_id: str, branch: str = "") -> dict:
     """
     List pipelines defined in a repository's .lazyaf/pipelines/ directory.
 
@@ -1142,7 +1142,7 @@ def list_repo_pipelines(repo_id: str, branch: str = "") -> list[dict]:
         repo_id: The repository ID
         branch: Branch to read from (default: repo's default branch)
 
-    Returns list of repo-defined pipelines with their step configurations.
+    Returns list of repo-defined pipelines in {"pipelines": [...]} format.
     """
     with _get_client() as client:
         params = {}
@@ -1154,4 +1154,4 @@ def list_repo_pipelines(repo_id: str, branch: str = "") -> list[dict]:
             return {"error": f"Repo {repo_id} not found or not ingested"}
         if response.status_code != 200:
             return {"error": f"Failed to list repo pipelines: {response.text}"}
-        return response.json()
+        return {"pipelines": response.json()}

@@ -10,8 +10,8 @@ from io import BytesIO
 from dulwich.repo import Repo as DulwichRepo
 
 
-# Storage directory for bare repos
-GIT_REPOS_DIR = Path(__file__).parent.parent.parent / "git_repos"
+# Storage directory for bare repos - configurable via env, defaults to data volume
+GIT_REPOS_DIR = Path(os.getenv("GIT_REPOS_DIR", "/app/data/git_repos"))
 
 
 class GitRepoManager:

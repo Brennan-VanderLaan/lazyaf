@@ -61,6 +61,26 @@ function createReposStore() {
         throw e;
       }
     },
+
+    // WebSocket updates - optimistic updates from other clients
+    updateLocal(repo: Repo) {
+      update(repos => {
+        const index = repos.findIndex(r => r.id === repo.id);
+        if (index >= 0) {
+          // Update existing repo
+          const updated = [...repos];
+          updated[index] = repo;
+          return updated;
+        } else {
+          // Add new repo
+          return [...repos, repo];
+        }
+      });
+    },
+
+    deleteLocal(id: string) {
+      update(repos => repos.filter(r => r.id !== id));
+    },
   };
 }
 

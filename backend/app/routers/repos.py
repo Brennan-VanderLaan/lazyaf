@@ -48,12 +48,16 @@ async def ingest_repo(repo: RepoCreate, request: Request, db: AsyncSession = Dep
     """
     Create a repo and initialize its internal git storage.
 
-    After calling this endpoint, push your local repo to the returned clone_url:
+    If `path` is provided, files from that local git repo will be pushed
+    to the internal git server automatically.
+
+    Otherwise, push your local repo to the returned clone_url:
         git remote add lazyaf <clone_url>
         git push lazyaf --all
     """
-    # Create the repo record
-    db_repo = Repo(**repo.model_dump())
+    # Create the repo record (exclude path from model_dump as it's not in the DB model)
+    repo_data = repo.model_dump(exclude={"path"})
+    db_repo = Repo(**repo_data)
     db.add(db_repo)
     await db.commit()
     await db.refresh(db_repo)
@@ -61,11 +65,29 @@ async def ingest_repo(repo: RepoCreate, request: Request, db: AsyncSession = Dep
     # Initialize bare repo for git storage
     try:
         git_repo_manager.create_bare_repo(db_repo.id)
+
+        # If path provided, push files from local repo
+        if repo.path:
+            push_result = git_repo_manager.push_from_local(db_repo.id, repo.path)
+            if not push_result["success"]:
+                # Clean up and fail
+                git_repo_manager.delete_repo(db_repo.id)
+                await db.delete(db_repo)
+                await db.commit()
+                raise HTTPException(status_code=400, detail=push_result["error"])
+
+            # Use detected default branch from local repo
+            if push_result.get("default_branch"):
+                db_repo.default_branch = push_result["default_branch"]
+
         db_repo.is_ingested = True
         await db.commit()
         await db.refresh(db_repo)
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
     except Exception as e:
         # Rollback repo creation if git init fails
+        git_repo_manager.delete_repo(db_repo.id)
         await db.delete(db_repo)
         await db.commit()
         raise HTTPException(status_code=500, detail=f"Failed to initialize git repo: {e}")

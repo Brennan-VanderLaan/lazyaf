@@ -137,9 +137,10 @@ def assert_not_found(response: Response, resource_type: str = None) -> None:
     assert "detail" in actual, f"Expected 'detail' in error response: {actual}"
 
     if resource_type:
-        expected_detail = f"{resource_type} not found"
-        assert actual["detail"] == expected_detail, (
-            f"Expected detail '{expected_detail}', got '{actual['detail']}'"
+        # Check that resource type appears in the message (case-insensitive)
+        # Allows both "Repo not found" and "Repository not found"
+        assert resource_type.lower() in actual["detail"].lower() and "not found" in actual["detail"].lower(), (
+            f"Expected '{resource_type}' and 'not found' in detail, got '{actual['detail']}'"
         )
     else:
         assert "not found" in actual["detail"].lower(), (

@@ -147,27 +147,41 @@ async def clean_job_queue():
 # Git Server Fixtures
 # -----------------------------------------------------------------------------
 
+@pytest.fixture
+def temp_git_repos_dir(tmp_path):
+    """Create a temporary git repos directory for tests."""
+    git_dir = tmp_path / "git_repos"
+    git_dir.mkdir()
+    return git_dir
+
+
 @pytest_asyncio.fixture
-async def clean_git_repos():
+async def clean_git_repos(temp_git_repos_dir):
     """Clean git repos directory before and after each test.
 
     This fixture ensures tests have a fresh git storage state and
     cleans up any repos created during tests.
+
+    Uses a temp directory to avoid path issues on Windows.
     """
     import shutil
     from app.services.git_server import git_repo_manager
 
-    # Clear before - remove all repos
-    if git_repo_manager.repos_dir.exists():
-        shutil.rmtree(git_repo_manager.repos_dir)
-    git_repo_manager.repos_dir.mkdir(parents=True, exist_ok=True)
+    # Store original repos_dir
+    original_repos_dir = git_repo_manager.repos_dir
+    original_initialized = git_repo_manager._initialized
+
+    # Override with temp directory
+    git_repo_manager.repos_dir = temp_git_repos_dir
+    git_repo_manager._initialized = True
 
     yield git_repo_manager
 
-    # Clear after
-    if git_repo_manager.repos_dir.exists():
-        shutil.rmtree(git_repo_manager.repos_dir)
-    git_repo_manager.repos_dir.mkdir(parents=True, exist_ok=True)
+    # Restore original settings
+    git_repo_manager.repos_dir = original_repos_dir
+    git_repo_manager._initialized = original_initialized
+
+    # Clean up temp dir (handled by pytest tmp_path fixture)
 
 
 @pytest.fixture(scope="session", autouse=True)

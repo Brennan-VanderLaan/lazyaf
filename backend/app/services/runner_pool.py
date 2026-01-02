@@ -140,9 +140,9 @@ class RunnerPool:
         if runner.status != "idle":
             return None
 
-        # Pass runner type to get a matching job
+        # Pass runner type AND runner_id to get a matching job (for affinity)
         logger.debug(f"Runner {runner_id} (type={runner.runner_type!r}) requesting job")
-        job = await job_queue.dequeue(runner_type=runner.runner_type)
+        job = await job_queue.dequeue(runner_type=runner.runner_type, runner_id=runner_id)
         if job:
             # Verify the match (should always be true if dequeue works correctly)
             job_type = str(job.runner_type) if job.runner_type else "any"

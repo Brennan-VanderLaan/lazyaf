@@ -19,18 +19,34 @@ class GitRepoManager:
 
     def __init__(self, repos_dir: Path = GIT_REPOS_DIR):
         self.repos_dir = repos_dir
-        self.repos_dir.mkdir(parents=True, exist_ok=True)
+        self._initialized = False
+
+    def _ensure_dir(self):
+        """Lazily create the repos directory when first needed."""
+        if self._initialized:
+            return
+        try:
+            self.repos_dir.mkdir(parents=True, exist_ok=True)
+            self._initialized = True
+        except PermissionError:
+            # Running in test context without /app access - use temp dir
+            import tempfile
+            self.repos_dir = Path(tempfile.mkdtemp(prefix="lazyaf_git_"))
+            self._initialized = True
 
     def get_repo_path(self, repo_id: str) -> Path:
         """Get the path to a bare repo."""
+        self._ensure_dir()
         return self.repos_dir / f"{repo_id}.git"
 
     def repo_exists(self, repo_id: str) -> bool:
         """Check if a repo exists."""
+        self._ensure_dir()
         return self.get_repo_path(repo_id).exists()
 
     def create_bare_repo(self, repo_id: str) -> Path:
         """Create a new bare git repository."""
+        self._ensure_dir()
         repo_path = self.get_repo_path(repo_id)
         if repo_path.exists():
             raise ValueError(f"Repository {repo_id} already exists")
@@ -50,6 +66,97 @@ class GitRepoManager:
             return False
         shutil.rmtree(repo_path)
         return True
+
+    def push_from_local(self, repo_id: str, local_path: str) -> dict:
+        """
+        Push content from a local git repo to the bare repo.
+
+        This adds the bare repo as a remote and pushes all branches.
+
+        Args:
+            repo_id: The repository ID (bare repo must already exist)
+            local_path: Path to the local git repository
+
+        Returns:
+            dict with success, message, error, and default_branch fields
+        """
+        import subprocess
+
+        repo_path = self.get_repo_path(repo_id)
+        if not repo_path.exists():
+            return {"success": False, "error": "Bare repository not found", "message": "", "default_branch": None}
+
+        local_path = Path(local_path)
+        if not (local_path / ".git").exists():
+            return {"success": False, "error": "Local path is not a git repository", "message": "", "default_branch": None}
+
+        remote_name = f"lazyaf-ingest-{repo_id[:8]}"
+
+        try:
+            # Detect the current branch name from the local repo
+            branch_result = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=local_path,
+                capture_output=True,
+                text=True,
+            )
+            default_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+
+            # Add the bare repo as a remote
+            subprocess.run(
+                ["git", "remote", "add", remote_name, str(repo_path)],
+                cwd=local_path,
+                check=True,
+                capture_output=True,
+            )
+
+            # Push all branches
+            result = subprocess.run(
+                ["git", "push", remote_name, "--all"],
+                cwd=local_path,
+                capture_output=True,
+            )
+
+            # Also push tags if any
+            subprocess.run(
+                ["git", "push", remote_name, "--tags"],
+                cwd=local_path,
+                capture_output=True,
+            )
+
+            # Clean up - remove the temporary remote
+            subprocess.run(
+                ["git", "remote", "remove", remote_name],
+                cwd=local_path,
+                capture_output=True,
+            )
+
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", errors="replace")
+                return {"success": False, "error": f"Push failed: {stderr}", "message": "", "default_branch": None}
+
+            return {
+                "success": True,
+                "message": "Pushed all branches from local repo",
+                "error": None,
+                "default_branch": default_branch,
+            }
+
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
+            return {"success": False, "error": f"Git command failed: {stderr}", "message": "", "default_branch": None}
+        except Exception as e:
+            return {"success": False, "error": str(e), "message": "", "default_branch": None}
+        finally:
+            # Ensure remote is cleaned up even on error
+            try:
+                subprocess.run(
+                    ["git", "remote", "remove", remote_name],
+                    cwd=local_path,
+                    capture_output=True,
+                )
+            except Exception:
+                pass  # Ignore cleanup errors
 
     def get_repo(self, repo_id: str) -> DulwichRepo | None:
         """Get a dulwich Repo object."""

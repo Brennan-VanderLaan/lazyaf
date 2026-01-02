@@ -328,9 +328,11 @@ class TestInitialization:
     """Tests for GitRepoManager initialization."""
 
     def test_creates_repos_dir_if_not_exists(self, temp_repos_dir):
-        """Creates repos directory if it does not exist."""
+        """Creates repos directory when first needed (lazy init)."""
         non_existent = temp_repos_dir / "nested" / "repos"
         manager = GitRepoManager(repos_dir=non_existent)
+        # Directory is created lazily when first used
+        manager._ensure_dir()
         assert non_existent.exists()
 
     def test_uses_existing_repos_dir(self, temp_repos_dir):

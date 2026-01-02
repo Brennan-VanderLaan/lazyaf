@@ -26,18 +26,32 @@ Use these tools to:
 - Start work on cards (AI agent or script/docker execution)
 - Monitor job progress and logs
 - Check runner availability
+- Manage agent files (reusable prompt templates)
+- View branches and diffs
 
 Card Types (step_type):
 - "agent": AI implements a feature using Claude Code or Gemini CLI
 - "script": Run a shell command directly in the cloned repo
 - "docker": Run a command inside a Docker container
 
+Card Lifecycle:
+- todo -> in_progress (when started) -> in_review (when job completes)
+- in_review: approve_card() to merge, reject_card() to reset to todo
+- failed: retry_card() to try again, reject_card() to reset
+
 Pipeline Features:
 - Chain multiple steps (script, docker, agent) into reusable workflows
 - Conditional branching: on_success and on_failure actions
 - Actions: "next" (continue), "stop" (end), "trigger:{card_id}" (spawn AI fix), "merge:{branch}"
+- Automatic triggers: card_complete (when card reaches status), push (on git push)
+- Trigger actions: on_pass (merge card), on_fail (mark failed or reject)
 
-Typical workflow:
+Agent Files:
+- Platform agent files: reusable prompt templates stored in LazyAF
+- Repo agent files: defined in .lazyaf/agents/ directory (use list_repo_agents)
+- Use {{title}} and {{description}} placeholders in templates
+
+Typical card workflow:
 1. list_repos() to see available repositories
 2. list_cards(repo_id) to see existing work items
 3. get_runner_status() to check available runners
@@ -47,11 +61,14 @@ Typical workflow:
    - For containerized CI: step_type="docker", image="node:20", command="npm test"
 5. start_card(card_id) to trigger execution
 6. get_job_logs(job_id) to monitor progress
+7. When in_review: approve_card(card_id) to merge or reject_card(card_id) to reset
 
 Pipeline workflow:
-1. create_pipeline(repo_id, name, steps) to define a multi-step workflow
-2. run_pipeline(pipeline_id) to start execution
+1. create_pipeline(repo_id, name, steps, triggers) to define a multi-step workflow
+   - Add triggers to auto-run on card completion or git push
+2. run_pipeline(pipeline_id) to start execution manually
 3. get_pipeline_run(run_id) to monitor progress
+4. Pipelines with triggers run automatically when conditions are met
 """
 )
 
@@ -395,7 +412,8 @@ def create_pipeline(
     repo_id: str,
     name: str,
     steps: list[dict],
-    description: str = ""
+    description: str = "",
+    triggers: list[dict] = None
 ) -> dict:
     """
     Create a new pipeline for a repository.
@@ -414,12 +432,25 @@ def create_pipeline(
             - on_failure: "next" | "stop" | "trigger:{card_id}" (default: "stop")
             - timeout: Seconds (default: 300)
         description: Optional description
+        triggers: Optional list of automatic triggers. Each trigger has:
+            - type: "card_complete" or "push"
+            - config: Type-specific config:
+                - card_complete: {"status": "in_review" | "done"}
+                - push: {"branches": ["main", "dev"]}
+            - enabled: true/false (default: true)
+            - on_pass: Action on pipeline success - "nothing", "merge", "merge:{branch}"
+            - on_fail: Action on pipeline failure - "nothing", "fail", "reject"
 
     Example steps:
     [
         {"name": "Lint", "type": "script", "config": {"command": "npm run lint"}},
         {"name": "Test", "type": "script", "config": {"command": "npm test"}, "on_failure": "stop"},
         {"name": "Build", "type": "docker", "config": {"image": "node:20", "command": "npm build"}}
+    ]
+
+    Example triggers:
+    [
+        {"type": "card_complete", "config": {"status": "in_review"}, "on_pass": "merge", "on_fail": "fail"}
     ]
 
     Returns the created pipeline.
@@ -447,12 +478,32 @@ def create_pipeline(
         }
         normalized_steps.append(normalized_step)
 
+    # Normalize triggers with defaults
+    normalized_triggers = []
+    if triggers:
+        for trigger in triggers:
+            if not trigger.get("type"):
+                return {"error": "Each trigger must have a 'type' (card_complete or push)"}
+            if trigger["type"] not in ["card_complete", "push"]:
+                return {"error": f"Invalid trigger type '{trigger['type']}'"}
+
+            normalized_trigger = {
+                "type": trigger["type"],
+                "config": trigger.get("config", {}),
+                "enabled": trigger.get("enabled", True),
+                "on_pass": trigger.get("on_pass", "nothing"),
+                "on_fail": trigger.get("on_fail", "nothing"),
+            }
+            normalized_triggers.append(normalized_trigger)
+
     with _get_client() as client:
         payload = {
             "name": name,
             "description": description,
             "steps": normalized_steps,
         }
+        if normalized_triggers:
+            payload["triggers"] = normalized_triggers
 
         response = client.post(f"/api/repos/{repo_id}/pipelines", json=payload)
         if response.status_code == 404:
@@ -461,7 +512,8 @@ def create_pipeline(
             return {"error": f"Failed to create pipeline: {response.text}"}
 
         pipeline = response.json()
-        pipeline["message"] = f"Pipeline '{name}' created with {len(normalized_steps)} steps"
+        trigger_msg = f" with {len(normalized_triggers)} trigger(s)" if normalized_triggers else ""
+        pipeline["message"] = f"Pipeline '{name}' created with {len(normalized_steps)} steps{trigger_msg}"
         return pipeline
 
 
@@ -489,7 +541,8 @@ def update_pipeline(
     pipeline_id: str,
     name: str = "",
     steps: list[dict] = None,
-    description: str = None
+    description: str = None,
+    triggers: list[dict] = None
 ) -> dict:
     """
     Update an existing pipeline.
@@ -499,6 +552,12 @@ def update_pipeline(
         name: New name (optional)
         steps: New steps list (optional, replaces existing)
         description: New description (optional)
+        triggers: New triggers list (optional, replaces existing). Each trigger has:
+            - type: "card_complete" or "push"
+            - config: {"status": "in_review"} or {"branches": ["main"]}
+            - enabled: true/false
+            - on_pass: "nothing" | "merge" | "merge:{branch}"
+            - on_fail: "nothing" | "fail" | "reject"
 
     Returns updated pipeline.
     """
@@ -509,6 +568,8 @@ def update_pipeline(
         payload["steps"] = steps
     if description is not None:
         payload["description"] = description
+    if triggers is not None:
+        payload["triggers"] = triggers
 
     if not payload:
         return {"error": "No fields to update"}
@@ -662,4 +723,435 @@ def get_step_logs(run_id: str, step_index: int) -> dict:
             return {"error": f"Step not found (run_id={run_id}, step={step_index})"}
         if response.status_code != 200:
             return {"error": f"Failed to get step logs: {response.text}"}
+        return response.json()
+
+
+# =============================================================================
+# Card Action Tools
+# =============================================================================
+
+@mcp.tool()
+def approve_card(card_id: str, target_branch: str = "") -> dict:
+    """
+    Approve a card and merge its branch to the target branch.
+
+    The card must be in 'in_review' status with a branch.
+    This merges the card's changes and marks it as 'done'.
+
+    Args:
+        card_id: The card ID to approve
+        target_branch: Branch to merge into (default: repo's default branch)
+
+    Returns the updated card and merge result.
+    """
+    with _get_client() as client:
+        params = {}
+        if target_branch:
+            params["target_branch"] = target_branch
+
+        response = client.post(f"/api/cards/{card_id}/approve", params=params)
+        if response.status_code == 404:
+            return {"error": f"Card {card_id} not found"}
+        if response.status_code == 400:
+            error_detail = response.json().get("detail", "Bad request")
+            return {"error": error_detail}
+        if response.status_code != 200:
+            return {"error": f"Failed to approve card: {response.text}"}
+
+        result = response.json()
+        result["message"] = "Card approved and merged"
+        return result
+
+
+@mcp.tool()
+def reject_card(card_id: str) -> dict:
+    """
+    Reject a card back to todo status.
+
+    Clears the card's branch and resets it for re-work.
+    The card must be in 'in_review' or 'failed' status.
+
+    Args:
+        card_id: The card ID to reject
+
+    Returns the updated card.
+    """
+    with _get_client() as client:
+        response = client.post(f"/api/cards/{card_id}/reject")
+        if response.status_code == 404:
+            return {"error": f"Card {card_id} not found"}
+        if response.status_code == 400:
+            error_detail = response.json().get("detail", "Bad request")
+            return {"error": error_detail}
+        if response.status_code != 200:
+            return {"error": f"Failed to reject card: {response.text}"}
+
+        card = response.json()
+        card["message"] = "Card rejected back to todo"
+        return card
+
+
+@mcp.tool()
+def retry_card(card_id: str) -> dict:
+    """
+    Retry a failed card.
+
+    Requeues the card for another attempt by a runner.
+    The card must be in 'failed' status.
+
+    Args:
+        card_id: The card ID to retry
+
+    Returns the updated card with new job info.
+    """
+    with _get_client() as client:
+        response = client.post(f"/api/cards/{card_id}/retry")
+        if response.status_code == 404:
+            return {"error": f"Card {card_id} not found"}
+        if response.status_code == 400:
+            error_detail = response.json().get("detail", "Bad request")
+            return {"error": error_detail}
+        if response.status_code != 200:
+            return {"error": f"Failed to retry card: {response.text}"}
+
+        card = response.json()
+        card["message"] = "Card retried, new job queued"
+        return card
+
+
+@mcp.tool()
+def update_card(
+    card_id: str,
+    title: str = "",
+    description: str = "",
+    runner_type: str = "",
+    step_type: str = "",
+    command: str = "",
+    image: str = ""
+) -> dict:
+    """
+    Update an existing card's details.
+
+    Only provided fields are updated. Card must be in 'todo' status
+    to change step_type or runner_type.
+
+    Args:
+        card_id: The card ID to update
+        title: New title (optional)
+        description: New description (optional)
+        runner_type: New runner type (optional)
+        step_type: New step type (optional)
+        command: New command for script/docker steps (optional)
+        image: New docker image (optional)
+
+    Returns the updated card.
+    """
+    payload = {}
+    if title:
+        payload["title"] = title
+    if description:
+        payload["description"] = description
+    if runner_type:
+        payload["runner_type"] = runner_type
+    if step_type:
+        payload["step_type"] = step_type
+
+    # Build step_config if command or image provided
+    if command or image:
+        step_config = {}
+        if command:
+            step_config["command"] = command
+        if image:
+            step_config["image"] = image
+        payload["step_config"] = step_config
+
+    if not payload:
+        return {"error": "No fields to update"}
+
+    with _get_client() as client:
+        response = client.patch(f"/api/cards/{card_id}", json=payload)
+        if response.status_code == 404:
+            return {"error": f"Card {card_id} not found"}
+        if response.status_code == 400:
+            error_detail = response.json().get("detail", "Bad request")
+            return {"error": error_detail}
+        if response.status_code != 200:
+            return {"error": f"Failed to update card: {response.text}"}
+
+        card = response.json()
+        card["message"] = "Card updated successfully"
+        return card
+
+
+@mcp.tool()
+def delete_card(card_id: str) -> dict:
+    """
+    Delete a card.
+
+    The card and any associated jobs will be removed.
+
+    Args:
+        card_id: The card ID to delete
+
+    Returns success status.
+    """
+    with _get_client() as client:
+        response = client.delete(f"/api/cards/{card_id}")
+        if response.status_code == 404:
+            return {"error": f"Card {card_id} not found"}
+        if response.status_code not in (200, 204):
+            return {"error": f"Failed to delete card: {response.text}"}
+        return {"success": True, "message": "Card deleted"}
+
+
+# =============================================================================
+# Agent Files Tools
+# =============================================================================
+
+@mcp.tool()
+def list_agent_files() -> list[dict]:
+    """
+    List all platform agent files.
+
+    Agent files contain reusable prompt templates that can be
+    attached to cards or pipeline steps.
+
+    Returns list of agent files with their names and descriptions.
+    """
+    with _get_client() as client:
+        response = client.get("/api/agent-files")
+        if response.status_code != 200:
+            return {"error": f"Failed to list agent files: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def get_agent_file(agent_file_id: str) -> dict:
+    """
+    Get an agent file's full content.
+
+    Args:
+        agent_file_id: The agent file ID
+
+    Returns the agent file with name, description, and content.
+    """
+    with _get_client() as client:
+        response = client.get(f"/api/agent-files/{agent_file_id}")
+        if response.status_code == 404:
+            return {"error": f"Agent file {agent_file_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to get agent file: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def create_agent_file(
+    name: str,
+    content: str,
+    description: str = ""
+) -> dict:
+    """
+    Create a new platform agent file.
+
+    Agent files are reusable prompt templates. Use {{title}} and {{description}}
+    placeholders which will be replaced with card/step values.
+
+    Args:
+        name: Agent name (e.g., "test-fixer", "code-reviewer")
+        content: The prompt template content
+        description: Optional description of what this agent does
+
+    Returns the created agent file.
+    """
+    if not name:
+        return {"error": "name is required"}
+    if not content:
+        return {"error": "content is required"}
+
+    with _get_client() as client:
+        payload = {
+            "name": name,
+            "content": content,
+        }
+        if description:
+            payload["description"] = description
+
+        response = client.post("/api/agent-files", json=payload)
+        if response.status_code not in (200, 201):
+            return {"error": f"Failed to create agent file: {response.text}"}
+
+        agent_file = response.json()
+        agent_file["message"] = f"Agent file '{name}' created"
+        return agent_file
+
+
+@mcp.tool()
+def update_agent_file(
+    agent_file_id: str,
+    name: str = "",
+    content: str = "",
+    description: str = None
+) -> dict:
+    """
+    Update an existing agent file.
+
+    Args:
+        agent_file_id: The agent file ID to update
+        name: New name (optional)
+        content: New content (optional)
+        description: New description (optional, use empty string to clear)
+
+    Returns the updated agent file.
+    """
+    payload = {}
+    if name:
+        payload["name"] = name
+    if content:
+        payload["content"] = content
+    if description is not None:
+        payload["description"] = description
+
+    if not payload:
+        return {"error": "No fields to update"}
+
+    with _get_client() as client:
+        response = client.patch(f"/api/agent-files/{agent_file_id}", json=payload)
+        if response.status_code == 404:
+            return {"error": f"Agent file {agent_file_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to update agent file: {response.text}"}
+
+        agent_file = response.json()
+        agent_file["message"] = "Agent file updated"
+        return agent_file
+
+
+@mcp.tool()
+def delete_agent_file(agent_file_id: str) -> dict:
+    """
+    Delete an agent file.
+
+    Args:
+        agent_file_id: The agent file ID to delete
+
+    Returns success status.
+    """
+    with _get_client() as client:
+        response = client.delete(f"/api/agent-files/{agent_file_id}")
+        if response.status_code == 404:
+            return {"error": f"Agent file {agent_file_id} not found"}
+        if response.status_code not in (200, 204):
+            return {"error": f"Failed to delete agent file: {response.text}"}
+        return {"success": True, "message": "Agent file deleted"}
+
+
+# =============================================================================
+# Git/Branch Tools
+# =============================================================================
+
+@mcp.tool()
+def list_branches(repo_id: str) -> dict:
+    """
+    List all branches in a repository.
+
+    Args:
+        repo_id: The repository ID
+
+    Returns list of branches with their commit info and status.
+    """
+    with _get_client() as client:
+        response = client.get(f"/api/repos/{repo_id}/branches")
+        if response.status_code == 404:
+            return {"error": f"Repo {repo_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to list branches: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def get_diff(
+    repo_id: str,
+    head_branch: str,
+    base_branch: str = ""
+) -> dict:
+    """
+    Get the diff between two branches.
+
+    Args:
+        repo_id: The repository ID
+        head_branch: The branch with changes
+        base_branch: The branch to compare against (default: repo's default branch)
+
+    Returns file diffs with additions, deletions, and patch content.
+    """
+    with _get_client() as client:
+        params = {"head_branch": head_branch}
+        if base_branch:
+            params["base_branch"] = base_branch
+
+        response = client.get(f"/api/repos/{repo_id}/diff", params=params)
+        if response.status_code == 404:
+            return {"error": f"Repo or branch not found"}
+        if response.status_code == 400:
+            error_detail = response.json().get("detail", "Bad request")
+            return {"error": error_detail}
+        if response.status_code != 200:
+            return {"error": f"Failed to get diff: {response.text}"}
+        return response.json()
+
+
+# =============================================================================
+# Repo-Defined Assets (.lazyaf) Tools
+# =============================================================================
+
+@mcp.tool()
+def list_repo_agents(repo_id: str, branch: str = "") -> list[dict]:
+    """
+    List agents defined in a repository's .lazyaf/agents/ directory.
+
+    These are repo-specific prompt templates that can be referenced
+    in cards and pipeline steps.
+
+    Args:
+        repo_id: The repository ID
+        branch: Branch to read from (default: repo's default branch)
+
+    Returns list of repo-defined agents with their templates.
+    """
+    with _get_client() as client:
+        params = {}
+        if branch:
+            params["branch"] = branch
+
+        response = client.get(f"/api/repos/{repo_id}/lazyaf/agents", params=params)
+        if response.status_code == 404:
+            return {"error": f"Repo {repo_id} not found or not ingested"}
+        if response.status_code != 200:
+            return {"error": f"Failed to list repo agents: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def list_repo_pipelines(repo_id: str, branch: str = "") -> list[dict]:
+    """
+    List pipelines defined in a repository's .lazyaf/pipelines/ directory.
+
+    These are repo-specific pipeline definitions in YAML format.
+
+    Args:
+        repo_id: The repository ID
+        branch: Branch to read from (default: repo's default branch)
+
+    Returns list of repo-defined pipelines with their step configurations.
+    """
+    with _get_client() as client:
+        params = {}
+        if branch:
+            params["branch"] = branch
+
+        response = client.get(f"/api/repos/{repo_id}/lazyaf/pipelines", params=params)
+        if response.status_code == 404:
+            return {"error": f"Repo {repo_id} not found or not ingested"}
+        if response.status_code != 200:
+            return {"error": f"Failed to list repo pipelines: {response.text}"}
         return response.json()

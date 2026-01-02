@@ -76,12 +76,13 @@ function createPipelinesStore() {
 
     updateLocal(pipeline: Pipeline) {
       update(pipelines => {
+        // Only update existing pipelines, never add new ones
+        // Adding is handled by create() to avoid race conditions with WebSocket
         const existing = pipelines.find(p => p.id === pipeline.id);
         if (existing) {
           return pipelines.map(p => p.id === pipeline.id ? pipeline : p);
-        } else {
-          return [...pipelines, pipeline];
         }
+        return pipelines;
       });
     },
 

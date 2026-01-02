@@ -20,5 +20,23 @@ services:
       - backend
     restart: unless-stopped
 
+  runner-claude:
+    build: ./runner-claude
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  runner-gemini:
+    build: ./runner-gemini
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
 volumes:
   lazyaf-data:

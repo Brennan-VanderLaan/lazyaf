@@ -289,6 +289,13 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
                 "updated_at": card.updated_at.isoformat() if card.updated_at else None,
             })
 
+            # Check for pipeline triggers on card status change (only for non-pipeline cards)
+            if not job.step_run_id:
+                from app.services.trigger_service import trigger_service
+                await trigger_service.on_card_status_change(
+                    db, card, "in_progress", card.status
+                )
+
         # Notify pipeline executor if this job is part of a pipeline
         if job.step_run_id:
             from app.services.pipeline_executor import pipeline_executor

@@ -24,6 +24,7 @@ class Pipeline(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     steps: Mapped[str] = mapped_column(Text, nullable=False, default="[]")  # JSON array of PipelineStep
+    triggers: Mapped[str] = mapped_column(Text, nullable=False, default="[]")  # JSON array of TriggerConfig
     is_template: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -40,6 +41,7 @@ class PipelineRun(Base):
     status: Mapped[str] = mapped_column(String(50), default=RunStatus.PENDING.value)
     trigger_type: Mapped[str] = mapped_column(String(50), default="manual")  # manual, webhook, card, push, schedule
     trigger_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    trigger_context: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON with branch, sha, card_id
     current_step: Mapped[int] = mapped_column(Integer, default=0)
     steps_completed: Mapped[int] = mapped_column(Integer, default=0)
     steps_total: Mapped[int] = mapped_column(Integer, default=0)

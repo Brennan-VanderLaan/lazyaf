@@ -155,6 +155,14 @@ async def job_callback(job_id: str, callback: JobCallback, db: AsyncSession = De
             "updated_at": card.updated_at.isoformat() if card.updated_at else None,
         })
 
+        # Check for pipeline triggers on card status change (only for non-pipeline cards)
+        # Pipeline step cards shouldn't trigger additional pipelines
+        if not job.step_run_id:
+            from app.services.trigger_service import trigger_service
+            await trigger_service.on_card_status_change(
+                db, card, "in_progress", card.status
+            )
+
     # Mark runner as idle
     if callback.status in ("completed", "failed"):
         runner_pool.mark_runner_idle(job_id)

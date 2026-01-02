@@ -248,6 +248,20 @@ export interface AgentFileUpdate {
 
 // Pipeline types (Phase 9)
 export type RunStatus = 'pending' | 'running' | 'passed' | 'failed' | 'cancelled';
+export type TriggerType = 'card_complete' | 'push';
+
+export type TriggerAction = 'nothing' | 'merge' | 'reject';
+
+export interface TriggerConfig {
+  type: TriggerType;
+  config: {
+    status?: 'done' | 'in_review';  // For card_complete triggers
+    branches?: string[];  // For push triggers
+  };
+  enabled: boolean;
+  on_pass: string;  // "nothing" | "merge" | "merge:{branch}"
+  on_fail: string;  // "nothing" | "fail" | "reject"
+}
 
 export interface PipelineStepConfig {
   id?: string;  // Optional step ID for context directory references
@@ -274,6 +288,7 @@ export interface Pipeline {
   name: string;
   description: string | null;
   steps: PipelineStepConfig[];
+  triggers: TriggerConfig[];
   is_template: boolean;
   created_at: string;
   updated_at: string;
@@ -283,6 +298,7 @@ export interface PipelineCreate {
   name: string;
   description?: string;
   steps: PipelineStepConfig[];
+  triggers?: TriggerConfig[];
   is_template?: boolean;
 }
 
@@ -290,6 +306,7 @@ export interface PipelineUpdate {
   name?: string;
   description?: string;
   steps?: PipelineStepConfig[];
+  triggers?: TriggerConfig[];
   is_template?: boolean;
 }
 
@@ -306,12 +323,22 @@ export interface StepRun {
   completed_at: string | null;
 }
 
+export interface TriggerContext {
+  branch?: string;
+  commit_sha?: string;
+  card_id?: string;
+  card_title?: string;
+  old_sha?: string;
+  push_ref?: string;
+}
+
 export interface PipelineRun {
   id: string;
   pipeline_id: string;
   status: RunStatus;
   trigger_type: string;
   trigger_ref: string | null;
+  trigger_context: TriggerContext | null;
   current_step: number;
   steps_completed: number;
   steps_total: number;
@@ -324,6 +351,7 @@ export interface PipelineRun {
 export interface PipelineRunCreate {
   trigger_type?: string;
   trigger_ref?: string;
+  trigger_context?: TriggerContext;
   params?: Record<string, unknown>;
 }
 

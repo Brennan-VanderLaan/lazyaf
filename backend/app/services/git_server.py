@@ -1907,7 +1907,7 @@ class HTTPGitBackend:
                 output = BytesIO()
                 output.write(pkt_line(f"unpack error: {pack_import_error or 'unknown error'}\n".encode()))
                 output.write(b"0000")
-                return output.getvalue()
+                return {"output": output.getvalue(), "pushed_refs": []}
 
             # Apply ref updates
             first_branch_pushed = None
@@ -1957,7 +1957,22 @@ class HTTPGitBackend:
                 output.write(pkt_line(f"{line}\n".encode()))
             output.write(b"0000")  # Flush packet
 
-            return output.getvalue()
+            # Build list of successfully pushed refs for trigger service
+            pushed_refs = []
+            for old_sha, new_sha, ref_name in ref_updates:
+                if ref_name.startswith(b'refs/heads/'):
+                    branch_name = ref_name[11:].decode()
+                    new_sha_str = new_sha.decode() if isinstance(new_sha, bytes) else new_sha
+                    old_sha_str = old_sha.decode() if isinstance(old_sha, bytes) else old_sha
+                    # Only include non-delete updates
+                    if new_sha_str != '0' * 40:
+                        pushed_refs.append({
+                            "branch": branch_name,
+                            "new_sha": new_sha_str,
+                            "old_sha": old_sha_str,
+                        })
+
+            return {"output": output.getvalue(), "pushed_refs": pushed_refs}
 
         except Exception as e:
             import traceback

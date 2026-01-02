@@ -72,6 +72,152 @@ def step_run_to_ws_dict(step_run: StepRun) -> dict:
 class PipelineExecutor:
     """Orchestrates pipeline execution."""
 
+    async def _complete_pipeline(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        success: bool,
+    ) -> None:
+        """
+        Complete a pipeline run and execute trigger actions.
+
+        This handles:
+        1. Setting the final status (passed/failed)
+        2. Executing on_pass/on_fail actions from trigger_context
+        3. Broadcasting the status update
+        """
+        pipeline_run.status = RunStatus.PASSED.value if success else RunStatus.FAILED.value
+        pipeline_run.completed_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(pipeline_run)
+
+        # Execute trigger actions if present in trigger_context
+        if pipeline_run.trigger_context:
+            try:
+                context = json.loads(pipeline_run.trigger_context)
+                action = context.get("on_pass") if success else context.get("on_fail")
+
+                if action and action != "nothing":
+                    await self._execute_trigger_action(db, pipeline_run, context, action, success)
+            except Exception as e:
+                logger.error(f"Failed to execute trigger action: {e}")
+
+        await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+        logger.info(f"Pipeline run {pipeline_run.id[:8]} completed with status {pipeline_run.status}")
+
+    async def _execute_trigger_action(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        context: dict,
+        action: str,
+        success: bool,
+    ) -> None:
+        """
+        Execute a trigger action after pipeline completion.
+
+        Actions:
+        - "merge" or "merge:{branch}": Approve and merge the card
+        - "reject": Reject the card back to todo
+        """
+        card_id = context.get("card_id")
+        if not card_id:
+            logger.warning(f"No card_id in trigger context, cannot execute action '{action}'")
+            return
+
+        # Fetch the card
+        result = await db.execute(select(Card).where(Card.id == card_id))
+        card = result.scalar_one_or_none()
+        if not card:
+            logger.warning(f"Card {card_id} not found, cannot execute action '{action}'")
+            return
+
+        # Fetch the repo for merge operations
+        result = await db.execute(select(Repo).where(Repo.id == card.repo_id))
+        repo = result.scalar_one_or_none()
+
+        logger.info(f"Executing trigger action '{action}' for card {card_id[:8]}")
+
+        if action == "merge" or action.startswith("merge:"):
+            # Determine target branch
+            if action.startswith("merge:"):
+                target_branch = action[6:]  # Remove "merge:" prefix
+            else:
+                target_branch = repo.default_branch if repo else "main"
+
+            # Only merge if card has a branch and is in a mergeable state
+            if card.branch_name and card.status in ("in_review", "in_progress"):
+                merge_result = git_repo_manager.merge_branch(
+                    repo_id=card.repo_id,
+                    source_branch=card.branch_name,
+                    target_branch=target_branch,
+                )
+
+                if merge_result.get("success"):
+                    card.status = "done"
+                    await db.commit()
+                    await db.refresh(card)
+                    logger.info(f"Card {card_id[:8]} merged to {target_branch} and marked done")
+
+                    # Broadcast card update
+                    await manager.send_card_updated({
+                        "id": card.id,
+                        "repo_id": card.repo_id,
+                        "title": card.title,
+                        "status": card.status,
+                        "branch_name": card.branch_name,
+                    })
+                else:
+                    logger.error(f"Merge failed for card {card_id[:8]}: {merge_result.get('error')}")
+            else:
+                logger.warning(
+                    f"Cannot merge card {card_id[:8]}: "
+                    f"branch={card.branch_name}, status={card.status}"
+                )
+
+        elif action == "reject":
+            # Reject card back to todo
+            if card.status in ("in_review", "failed", "in_progress"):
+                card.status = "todo"
+                card.branch_name = None
+                card.pr_url = None
+                await db.commit()
+                await db.refresh(card)
+                logger.info(f"Card {card_id[:8]} rejected back to todo")
+
+                # Broadcast card update
+                await manager.send_card_updated({
+                    "id": card.id,
+                    "repo_id": card.repo_id,
+                    "title": card.title,
+                    "status": card.status,
+                    "branch_name": card.branch_name,
+                })
+            else:
+                logger.warning(f"Cannot reject card {card_id[:8]}: status={card.status}")
+
+        elif action == "fail":
+            # Mark card as failed (user can retry)
+            if card.status in ("in_review", "in_progress"):
+                card.status = "failed"
+                await db.commit()
+                await db.refresh(card)
+                logger.info(f"Card {card_id[:8]} marked as failed")
+
+                # Broadcast card update
+                await manager.send_card_updated({
+                    "id": card.id,
+                    "repo_id": card.repo_id,
+                    "title": card.title,
+                    "status": card.status,
+                    "branch_name": card.branch_name,
+                })
+            else:
+                logger.warning(f"Cannot fail card {card_id[:8]}: status={card.status}")
+
+        else:
+            logger.warning(f"Unknown trigger action: {action}")
+
     async def start_pipeline(
         self,
         db: AsyncSession,
@@ -79,12 +225,18 @@ class PipelineExecutor:
         repo: Repo,
         trigger_type: str = "manual",
         trigger_ref: str | None = None,
+        trigger_context: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ) -> PipelineRun:
         """
         Start a new pipeline run.
 
         Creates PipelineRun, then starts executing the first step.
+
+        trigger_context can contain:
+        - branch: The branch to work on
+        - commit_sha: The specific commit
+        - card_id: The card that triggered the pipeline (for card_complete triggers)
         """
         steps = parse_steps(pipeline.steps)
 
@@ -95,6 +247,7 @@ class PipelineExecutor:
             status=RunStatus.RUNNING.value,
             trigger_type=trigger_type,
             trigger_ref=trigger_ref,
+            trigger_context=json.dumps(trigger_context) if trigger_context else None,
             current_step=0,
             steps_completed=0,
             steps_total=len(steps),
@@ -114,11 +267,7 @@ class PipelineExecutor:
             await self._execute_step(db, pipeline_run, repo, steps, 0, params)
         else:
             # No steps, mark as passed
-            pipeline_run.status = RunStatus.PASSED.value
-            pipeline_run.completed_at = datetime.utcnow()
-            await db.commit()
-            await db.refresh(pipeline_run)
-            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+            await self._complete_pipeline(db, pipeline_run, success=True)
 
         return pipeline_run
 
@@ -138,12 +287,7 @@ class PipelineExecutor:
         """
         if step_index >= len(steps):
             # All steps completed
-            pipeline_run.status = RunStatus.PASSED.value
-            pipeline_run.completed_at = datetime.utcnow()
-            await db.commit()
-            await db.refresh(pipeline_run)
-            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
-            logger.info(f"Pipeline run {pipeline_run.id[:8]} completed successfully")
+            await self._complete_pipeline(db, pipeline_run, success=True)
             return
 
         step = steps[step_index]
@@ -399,12 +543,7 @@ class PipelineExecutor:
 
         elif action == "stop":
             # Complete the pipeline
-            pipeline_run.status = RunStatus.PASSED.value if step_success else RunStatus.FAILED.value
-            pipeline_run.completed_at = datetime.utcnow()
-            await db.commit()
-            await db.refresh(pipeline_run)
-            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
-            logger.info(f"Pipeline run {pipeline_run.id[:8]} stopped with status {pipeline_run.status}")
+            await self._complete_pipeline(db, pipeline_run, success=step_success)
 
         elif action.startswith("trigger:pipeline:"):
             # Start another pipeline
@@ -423,11 +562,7 @@ class PipelineExecutor:
 
         else:
             logger.warning(f"Unknown action '{action}', treating as 'stop'")
-            pipeline_run.status = RunStatus.PASSED.value if step_success else RunStatus.FAILED.value
-            pipeline_run.completed_at = datetime.utcnow()
-            await db.commit()
-            await db.refresh(pipeline_run)
-            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+            await self._complete_pipeline(db, pipeline_run, success=step_success)
 
     async def _trigger_card(
         self,
@@ -654,19 +789,10 @@ class PipelineExecutor:
             if current_step + 1 < len(steps):
                 await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
             else:
-                pipeline_run.status = RunStatus.PASSED.value
-                pipeline_run.completed_at = datetime.utcnow()
-                await db.commit()
-                await db.refresh(pipeline_run)
-                await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+                await self._complete_pipeline(db, pipeline_run, success=True)
         else:
             logger.error(f"Merge failed: {merge_result}")
-            # Mark pipeline as failed
-            pipeline_run.status = RunStatus.FAILED.value
-            pipeline_run.completed_at = datetime.utcnow()
-            await db.commit()
-            await db.refresh(pipeline_run)
-            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+            await self._complete_pipeline(db, pipeline_run, success=False)
 
     async def cancel_run(self, db: AsyncSession, pipeline_run: PipelineRun) -> PipelineRun:
         """

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, tick, onMount } from 'svelte';
-  import type { Pipeline, PipelineStepConfig, StepType, RunnerType, RepoAgent, MergedAgent } from '../api/types';
+  import type { Pipeline, PipelineStepConfig, StepType, RunnerType, RepoAgent, MergedAgent, TriggerConfig, TriggerType } from '../api/types';
   import { pipelinesStore } from '../stores/pipelines';
   import { agentFilesStore } from '../stores/agentFiles';
   import { selectedRepo } from '../stores/repos';
@@ -92,14 +92,27 @@
     };
   }
 
+  // Normalize trigger to ensure all fields have defaults
+  function normalizeTrigger(trigger: Partial<TriggerConfig>): TriggerConfig {
+    return {
+      type: trigger.type || 'card_complete',
+      config: trigger.config || {},
+      enabled: trigger.enabled ?? true,
+      on_pass: trigger.on_pass || 'nothing',
+      on_fail: trigger.on_fail || 'nothing',
+    };
+  }
+
   // Track original values to detect changes
   const originalName = pipeline?.name || '';
   const originalDescription = pipeline?.description || '';
   const originalSteps = JSON.stringify(pipeline?.steps || []);
+  const originalTriggers = JSON.stringify(pipeline?.triggers || []);
 
   let name = pipeline?.name || '';
   let description = pipeline?.description || '';
   let steps: PipelineStepConfig[] = (pipeline?.steps || []).map(normalizeStep);
+  let triggers: TriggerConfig[] = (pipeline?.triggers || []).map(normalizeTrigger);
   let submitting = false;
 
   $: isEdit = pipeline !== null;
@@ -107,7 +120,8 @@
   // Check if there are unsaved changes
   $: hasChanges = name !== originalName ||
                   description !== originalDescription ||
-                  JSON.stringify(steps) !== originalSteps;
+                  JSON.stringify(steps) !== originalSteps ||
+                  JSON.stringify(triggers) !== originalTriggers;
 
   function createDefaultStep(): PipelineStepConfig {
     return {
@@ -155,6 +169,40 @@
     updateStep(index, step);
   }
 
+  // Trigger management functions
+  function createDefaultTrigger(): TriggerConfig {
+    return {
+      type: 'card_complete',
+      config: { status: 'in_review' },
+      enabled: true,
+      on_pass: 'merge',
+      on_fail: 'fail',
+    };
+  }
+
+  function addTrigger() {
+    triggers = [...triggers, createDefaultTrigger()];
+  }
+
+  function removeTrigger(index: number) {
+    triggers = triggers.filter((_, i) => i !== index);
+  }
+
+  function updateTrigger(index: number, trigger: TriggerConfig) {
+    triggers = triggers.map((t, i) => i === index ? trigger : t);
+  }
+
+  function updateTriggerType(index: number, type: TriggerType) {
+    const trigger = { ...triggers[index], type };
+    // Reset config based on type
+    if (type === 'card_complete') {
+      trigger.config = { status: 'in_review' };
+    } else if (type === 'push') {
+      trigger.config = { branches: [] };
+    }
+    updateTrigger(index, trigger);
+  }
+
   async function handleSubmit() {
     if (!name.trim() || steps.length === 0) return;
     submitting = true;
@@ -164,6 +212,7 @@
         name: name.trim(),
         description: description.trim() || undefined,
         steps,
+        triggers,
       };
 
       if (isEdit && pipeline) {
@@ -489,6 +538,131 @@
                       </div>
                     </div>
                   {/if}
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        <!-- Triggers Section -->
+        <div class="triggers-section">
+          <div class="triggers-header">
+            <label>Triggers ({triggers.length})</label>
+            <button type="button" class="btn-add-trigger" on:click={addTrigger}>+ Add Trigger</button>
+          </div>
+
+          {#if triggers.length === 0}
+            <p class="no-triggers">No automatic triggers. Pipeline runs manually only.</p>
+          {:else}
+            <div class="triggers-list">
+              {#each triggers as trigger, index}
+                <div class="trigger-card">
+                  <div class="trigger-header">
+                    <select
+                      class="trigger-type-select"
+                      value={trigger.type}
+                      on:change={(e) => updateTriggerType(index, e.currentTarget.value as TriggerType)}
+                    >
+                      <option value="card_complete">Card Complete</option>
+                      <option value="push">Git Push</option>
+                    </select>
+
+                    <label class="trigger-enabled">
+                      <input
+                        type="checkbox"
+                        checked={trigger.enabled}
+                        on:change={(e) => updateTrigger(index, { ...trigger, enabled: e.currentTarget.checked })}
+                      />
+                      <span>Enabled</span>
+                    </label>
+
+                    <button
+                      type="button"
+                      class="btn-icon btn-delete"
+                      title="Remove trigger"
+                      on:click={() => removeTrigger(index)}
+                    >✕</button>
+                  </div>
+
+                  <div class="trigger-config">
+                    {#if trigger.type === 'card_complete'}
+                      <div class="form-group">
+                        <label>When card reaches status:</label>
+                        <select
+                          value={trigger.config.status || 'in_review'}
+                          on:change={(e) => updateTrigger(index, { ...trigger, config: { ...trigger.config, status: e.currentTarget.value as 'done' | 'in_review' }})}
+                        >
+                          <option value="in_review">In Review (job completed)</option>
+                          <option value="done">Done (approved & merged)</option>
+                        </select>
+                      </div>
+                      <p class="trigger-hint">
+                        Pipeline runs when any card in this repo reaches the selected status.
+                      </p>
+                    {:else if trigger.type === 'push'}
+                      <div class="form-group">
+                        <label>Branch filter (comma-separated, empty = all):</label>
+                        <input
+                          type="text"
+                          placeholder="main, dev, feature/*"
+                          value={(trigger.config.branches || []).join(', ')}
+                          on:input={(e) => {
+                            const branches = e.currentTarget.value
+                              .split(',')
+                              .map(b => b.trim())
+                              .filter(b => b.length > 0);
+                            updateTrigger(index, { ...trigger, config: { ...trigger.config, branches }});
+                          }}
+                        />
+                      </div>
+                      <p class="trigger-hint">
+                        Pipeline runs when code is pushed to matching branches. Supports glob patterns.
+                      </p>
+                    {/if}
+
+                    <!-- Actions on pipeline completion -->
+                    <div class="trigger-actions">
+                      <div class="form-group">
+                        <label>On Pipeline Pass:</label>
+                        <div class="action-selector">
+                          <select
+                            value={trigger.on_pass?.startsWith('merge:') ? 'merge' : (trigger.on_pass || 'nothing')}
+                            on:change={(e) => {
+                              const val = e.currentTarget.value;
+                              if (val === 'merge') {
+                                updateTrigger(index, { ...trigger, on_pass: 'merge' });
+                              } else {
+                                updateTrigger(index, { ...trigger, on_pass: val });
+                              }
+                            }}
+                          >
+                            <option value="nothing">Do nothing</option>
+                            <option value="merge">Merge card to default branch</option>
+                          </select>
+                          {#if trigger.on_pass?.startsWith('merge:')}
+                            <input
+                              type="text"
+                              class="branch-input"
+                              placeholder="branch name"
+                              value={trigger.on_pass.slice(6)}
+                              on:input={(e) => updateTrigger(index, { ...trigger, on_pass: `merge:${e.currentTarget.value}` })}
+                            />
+                          {/if}
+                        </div>
+                      </div>
+                      <div class="form-group">
+                        <label>On Pipeline Fail:</label>
+                        <select
+                          value={trigger.on_fail || 'nothing'}
+                          on:change={(e) => updateTrigger(index, { ...trigger, on_fail: e.currentTarget.value })}
+                        >
+                          <option value="nothing">Do nothing</option>
+                          <option value="fail">Mark card as failed</option>
+                          <option value="reject">Reject card (back to todo)</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               {/each}
             </div>
@@ -996,5 +1170,127 @@
 
   .btn-toggle-advanced:hover {
     color: var(--text-color);
+  }
+
+  /* Triggers section styles */
+  .triggers-section {
+    margin-top: 1.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border-color);
+  }
+
+  .triggers-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+
+  .triggers-header label {
+    font-weight: 600;
+    color: var(--text-color);
+  }
+
+  .btn-add-trigger {
+    padding: 0.4rem 0.75rem;
+    background: var(--surface-alt);
+    color: var(--text-color);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  .btn-add-trigger:hover {
+    background: var(--hover-color);
+  }
+
+  .no-triggers {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    text-align: center;
+    padding: 1.5rem;
+    background: var(--surface-alt);
+    border-radius: 8px;
+    border: 1px dashed var(--border-color);
+  }
+
+  .triggers-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .trigger-card {
+    background: var(--surface-alt);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 0.75rem;
+  }
+
+  .trigger-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .trigger-type-select {
+    flex: 1;
+    max-width: 180px;
+  }
+
+  .trigger-enabled {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .trigger-enabled input {
+    width: auto;
+    margin: 0;
+  }
+
+  .trigger-config {
+    padding-top: 0.5rem;
+  }
+
+  .trigger-config .form-group {
+    margin-bottom: 0.5rem;
+  }
+
+  .trigger-hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin: 0.25rem 0 0;
+    font-style: italic;
+  }
+
+  .trigger-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--border-color);
+  }
+
+  .trigger-actions .form-group {
+    margin-bottom: 0;
+  }
+
+  .trigger-actions .action-selector {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .trigger-actions .branch-input {
+    padding: 0.5rem 0.75rem !important;
+    font-size: 0.85rem !important;
+    font-family: monospace;
   }
 </style>

@@ -333,12 +333,17 @@ async def approve_card(
             )
 
     # Update card status to done only if merge succeeded
+    old_status = card.status
     card.status = "done"
     await db.commit()
     await db.refresh(card)
 
     # Broadcast card update via WebSocket
     await manager.send_card_updated(card_to_ws_dict(card))
+
+    # Check for pipeline triggers on card completion
+    from app.services.trigger_service import trigger_service
+    await trigger_service.on_card_status_change(db, card, old_status, "done")
 
     return {
         "card": CardRead.model_validate(card),

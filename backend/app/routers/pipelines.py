@@ -38,6 +38,23 @@ def serialize_steps(steps: list | None) -> str:
     return json.dumps([s.model_dump() if hasattr(s, 'model_dump') else s for s in steps])
 
 
+def parse_triggers(triggers_str: str | None) -> list:
+    """Parse triggers from JSON string to list."""
+    if not triggers_str:
+        return []
+    try:
+        return json.loads(triggers_str)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def serialize_triggers(triggers: list | None) -> str:
+    """Serialize triggers from list to JSON string."""
+    if not triggers:
+        return "[]"
+    return json.dumps([t.model_dump() if hasattr(t, 'model_dump') else t for t in triggers])
+
+
 def pipeline_to_ws_dict(pipeline: Pipeline) -> dict:
     """Convert a Pipeline model to a dict for websocket broadcast."""
     return {
@@ -46,10 +63,21 @@ def pipeline_to_ws_dict(pipeline: Pipeline) -> dict:
         "name": pipeline.name,
         "description": pipeline.description,
         "steps": parse_steps(pipeline.steps),
+        "triggers": parse_triggers(pipeline.triggers),
         "is_template": pipeline.is_template,
         "created_at": pipeline.created_at.isoformat() if pipeline.created_at else None,
         "updated_at": pipeline.updated_at.isoformat() if pipeline.updated_at else None,
     }
+
+
+def parse_trigger_context(context_str: str | None) -> dict | None:
+    """Parse trigger_context from JSON string to dict."""
+    if not context_str:
+        return None
+    try:
+        return json.loads(context_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 def pipeline_run_to_ws_dict(run: PipelineRun) -> dict:
@@ -60,6 +88,7 @@ def pipeline_run_to_ws_dict(run: PipelineRun) -> dict:
         "status": run.status,
         "trigger_type": run.trigger_type,
         "trigger_ref": run.trigger_ref,
+        "trigger_context": parse_trigger_context(run.trigger_context),
         "current_step": run.current_step,
         "steps_completed": run.steps_completed,
         "steps_total": run.steps_total,
@@ -120,14 +149,16 @@ async def create_pipeline(repo_id: str, pipeline: PipelineCreate, db: AsyncSessi
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Repo not found")
 
-    # Serialize steps to JSON
+    # Serialize steps and triggers to JSON
     steps_json = serialize_steps(pipeline.steps)
+    triggers_json = serialize_triggers(pipeline.triggers)
 
     db_pipeline = Pipeline(
         repo_id=repo_id,
         name=pipeline.name,
         description=pipeline.description,
         steps=steps_json,
+        triggers=triggers_json,
         is_template=pipeline.is_template,
     )
     db.add(db_pipeline)
@@ -162,6 +193,8 @@ async def update_pipeline(pipeline_id: str, update: PipelineUpdate, db: AsyncSes
     for key, value in update_data.items():
         if key == "steps" and value is not None:
             value = serialize_steps(value)
+        elif key == "triggers" and value is not None:
+            value = serialize_triggers(value)
         setattr(pipeline, key, value)
 
     await db.commit()
@@ -234,6 +267,7 @@ async def run_pipeline(
         repo=repo,
         trigger_type=request.trigger_type,
         trigger_ref=request.trigger_ref,
+        trigger_context=request.trigger_context,
         params=request.params,
     )
 

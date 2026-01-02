@@ -20,6 +20,7 @@ dependencies = [
     "python-dotenv>=1.2.1",
     "pyyaml>=6.0.0",
     "sqlalchemy>=2.0.45",
+    "sse-starlette>=3.1.1",
     "uvicorn>=0.40.0",
     "websockets>=15.0.1",
 ]

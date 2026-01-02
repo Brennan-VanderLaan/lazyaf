@@ -170,6 +170,76 @@ def complete_job(success: bool, error: str = None, pr_url: str = None, test_resu
         log(f"Failed to complete job: {e}")
 
 
+# ============================================================================
+# Playground Functions (Phase 11)
+# ============================================================================
+
+
+def playground_log(session_id: str, msg: str):
+    """Log a message to playground session via backend."""
+    print(f"[playground] {msg}", flush=True)
+    try:
+        session.post(
+            f"{BACKEND_URL}/api/playground/{session_id}/internal/log",
+            json={"lines": [msg]},
+            timeout=5,
+        )
+    except Exception:
+        pass  # Don't fail if log sending fails
+
+
+def playground_status(session_id: str, status: str, error: str = None):
+    """Update playground session status."""
+    try:
+        session.post(
+            f"{BACKEND_URL}/api/playground/{session_id}/internal/status",
+            json={"status": status, "error": error},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[playground] Failed to update status: {e}", flush=True)
+
+
+def playground_result(
+    session_id: str,
+    status: str,
+    diff: str = None,
+    files_changed: list = None,
+    branch_saved: str = None,
+    error: str = None,
+):
+    """Report playground test result to backend."""
+    try:
+        session.post(
+            f"{BACKEND_URL}/api/playground/{session_id}/internal/result",
+            json={
+                "status": status,
+                "diff": diff,
+                "files_changed": files_changed or [],
+                "branch_saved": branch_saved,
+                "error": error,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[playground] Failed to report result: {e}", flush=True)
+
+
+def playground_is_cancelled(session_id: str) -> bool:
+    """Check if a playground session has been cancelled."""
+    try:
+        response = session.get(
+            f"{BACKEND_URL}/api/playground/{session_id}/status",
+            timeout=5,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("status") == "cancelled"
+    except Exception:
+        pass
+    return False
+
+
 def cleanup_workspace():
     """Clean up the workspace directory between jobs."""
     workspace = Path("/workspace/repo")
@@ -947,6 +1017,12 @@ Use this context when completing the current task.
         # Build Claude command
         claude_cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
 
+        # Use specified model if provided
+        model = job.get("model")
+        if model:
+            claude_cmd.extend(["--model", model])
+            log(f"Using model: {model}")
+
         # Add --agents flag if we have agent files
         if agents_json:
             claude_cmd.extend(["--agents", agents_json])
@@ -1086,12 +1162,287 @@ Use this context when completing the current task.
             cleanup_workspace()
 
 
+def execute_playground_job(job: dict):
+    """
+    Execute a playground job (ephemeral agent test).
+
+    Key differences from regular agent jobs:
+    1. No card status updates
+    2. Stream logs to playground session endpoint
+    3. Capture diff after completion
+    4. Optionally save to branch
+    """
+    job_id = job['id']
+    session_id = job.get('playground_session_id', '')
+    save_branch = job.get('playground_save_branch')
+
+    playground_log(session_id, f"Starting playground job {job_id[:8]}")
+
+    # Start heartbeat
+    heartbeat_thread = start_heartbeat_thread()
+
+    # Report running status to playground service
+    playground_status(session_id, "running")
+
+    workspace = Path("/workspace/repo")
+
+    try:
+        # Clean up workspace
+        cleanup_workspace()
+
+        # Configure git
+        run_command(["git", "config", "--global", "user.email", "lazyaf@localhost"])
+        run_command(["git", "config", "--global", "user.name", "LazyAF Playground"])
+
+        # Clone repo from internal git
+        repo_id = job.get("repo_id", "")
+        base_branch = job.get("base_branch", "main")
+        repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
+
+        playground_log(session_id, f"Cloning from internal git: {repo_url}")
+        if workspace.exists():
+            run_command(["sudo", "rm", "-rf", str(workspace)])
+
+        exit_code, _, stderr = run_command(["git", "clone", repo_url, str(workspace)])
+        if exit_code != 0:
+            raise Exception(f"Failed to clone repository: {stderr}")
+
+        # Checkout the test branch
+        playground_log(session_id, f"Checking out branch: {base_branch}")
+        exit_code, _, stderr = run_command(["git", "checkout", base_branch], cwd=str(workspace))
+        if exit_code != 0:
+            # Try origin/branch
+            exit_code, _, stderr = run_command(
+                ["git", "checkout", "-b", base_branch, f"origin/{base_branch}"],
+                cwd=str(workspace)
+            )
+            if exit_code != 0:
+                playground_log(session_id, f"Warning: Could not checkout {base_branch}, using default")
+
+        # Capture base commit before running agent (for diff later)
+        exit_code, base_commit_out, _ = run_command(["git", "rev-parse", "HEAD"], cwd=str(workspace))
+        base_commit = base_commit_out.strip() if exit_code == 0 else None
+        playground_log(session_id, f"Base commit: {base_commit[:8] if base_commit else 'unknown'}")
+
+        # Build prompt
+        prompt_template = job.get("prompt_template", "")
+        card_description = job.get("card_description", "")
+        card_title = job.get("card_title", "Playground Test")
+
+        if prompt_template:
+            # Substitute placeholders in the template (same as execute_agent_step)
+            prompt = prompt_template.replace("{{title}}", card_title).replace("{{description}}", card_description)
+
+            # If the template didn't have {{description}} placeholder and we have a task, append it
+            if "{{description}}" not in prompt_template and card_description and card_description != "Test agent behavior on this branch":
+                prompt = f"""{prompt}
+
+## Current Task
+{card_description}
+"""
+                playground_log(session_id, f"Using agent prompt template with appended task")
+            else:
+                playground_log(session_id, f"Using agent prompt template")
+        else:
+            prompt = f"""You are testing agent behavior.
+
+## Task
+{card_description}
+
+## Instructions
+1. Make the requested changes following existing code patterns
+2. Keep changes minimal and focused
+"""
+            playground_log(session_id, f"Using default prompt with task: {card_description[:100]}...")
+
+        # Fetch and setup agents if specified
+        agent_file_ids = job.get("agent_file_ids", [])
+        agents_json = None
+        if agent_file_ids:
+            agent_files = fetch_agent_files(agent_file_ids)
+            agents_json = build_agents_json(agent_files)
+            if agents_json:
+                playground_log(session_id, f"Built agents JSON for {len(agent_files)} agent(s)")
+
+        # Build Claude Code command
+        cmd = ["claude", "-p", prompt, "--dangerously-skip-permissions"]
+
+        # Use specified model if provided
+        model = job.get("model")
+        if model:
+            cmd.extend(["--model", model])
+            playground_log(session_id, f"Using model: {model}")
+
+        if agents_json:
+            cmd.extend(["--agents", agents_json])
+
+        # Invoke Claude Code with streaming
+        playground_log(session_id, "Invoking Claude Code (playground mode)...")
+        playground_log(session_id, "=" * 50)
+
+        # Run command and stream output to playground
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(workspace),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        # Stream output line by line
+        for line in iter(process.stdout.readline, ''):
+            line = line.rstrip('\n')
+            if line:
+                playground_log(session_id, line)
+
+        process.wait()
+        exit_code = process.returncode
+
+        playground_log(session_id, "=" * 50)
+
+        if exit_code != 0:
+            raise Exception(f"Claude Code failed with exit code {exit_code}")
+
+        # Capture diff against base commit (includes committed changes)
+        playground_log(session_id, "Capturing diff...")
+
+        full_diff = ""
+        files_changed = []
+
+        # First, stage all changes so new files appear in diff
+        run_command(["git", "add", "-A"], cwd=str(workspace))
+
+        if base_commit:
+            # Diff from base commit to current HEAD (shows committed changes)
+            exit_code, committed_diff, _ = run_command(
+                ["git", "diff", f"{base_commit}..HEAD"],
+                cwd=str(workspace),
+            )
+            if committed_diff and committed_diff.strip():
+                full_diff = committed_diff
+
+            # Get list of changed files between base and HEAD
+            exit_code, diff_stat, _ = run_command(
+                ["git", "diff", "--name-only", f"{base_commit}..HEAD"],
+                cwd=str(workspace),
+            )
+            files_changed = [f.strip() for f in diff_stat.strip().split("\n") if f.strip()]
+
+        # Check for staged changes (includes new files now that we've staged them)
+        exit_code, staged_diff, _ = run_command(
+            ["git", "diff", "--staged"],
+            cwd=str(workspace),
+        )
+        if staged_diff and staged_diff.strip():
+            if full_diff:
+                full_diff += "\n\n--- Uncommitted Changes ---\n" + staged_diff
+            else:
+                full_diff = staged_diff
+
+        # Get list of staged files
+        exit_code, staged_files_output, _ = run_command(
+            ["git", "diff", "--staged", "--name-only"],
+            cwd=str(workspace),
+        )
+        staged_files = [f.strip() for f in staged_files_output.strip().split("\n") if f.strip()]
+        for f in staged_files:
+            if f not in files_changed:
+                files_changed.append(f)
+
+        # Reset staging area (don't leave files staged)
+        run_command(["git", "reset", "HEAD"], cwd=str(workspace))
+
+        playground_log(session_id, f"Files changed: {len(files_changed)}")
+        for f in files_changed:
+            playground_log(session_id, f"  - {f}")
+
+        # Optionally save to branch
+        branch_saved = None
+        if save_branch and (full_diff.strip() or files_changed):
+            playground_log(session_id, f"Saving changes to branch: {save_branch}")
+
+            # Create new branch from current HEAD (which includes agent's commits)
+            exit_code, _, stderr = run_command(
+                ["git", "checkout", "-b", save_branch],
+                cwd=str(workspace)
+            )
+            if exit_code != 0:
+                # Branch might already exist, try to switch to it
+                playground_log(session_id, f"Branch exists, switching to it")
+                run_command(["git", "checkout", save_branch], cwd=str(workspace))
+
+            # Check if there are uncommitted changes to commit
+            exit_code, status_out, _ = run_command(
+                ["git", "status", "--porcelain"],
+                cwd=str(workspace)
+            )
+            if status_out.strip():
+                # Stage and commit uncommitted changes
+                playground_log(session_id, "Committing uncommitted changes...")
+                run_command(["git", "add", "-A"], cwd=str(workspace))
+                run_command(
+                    ["git", "commit", "-m", "Playground test changes"],
+                    cwd=str(workspace),
+                )
+
+            # Push the branch (includes any commits made by the agent)
+            exit_code, _, stderr = run_command(
+                ["git", "push", "-u", "origin", save_branch, "--force"],
+                cwd=str(workspace),
+            )
+            if exit_code == 0:
+                branch_saved = save_branch
+                playground_log(session_id, f"Changes saved to branch: {save_branch}")
+            else:
+                playground_log(session_id, f"Warning: Failed to push branch: {stderr}")
+
+        # Check if cancelled before reporting result
+        if playground_is_cancelled(session_id):
+            playground_log(session_id, "Session was cancelled, skipping result report")
+            complete_job(success=False, error="Cancelled by user")
+        else:
+            # Report result to playground service
+            playground_result(
+                session_id=session_id,
+                status="completed",
+                diff=full_diff,
+                files_changed=files_changed,
+                branch_saved=branch_saved,
+            )
+            playground_log(session_id, "Playground job completed successfully!")
+            # Release runner back to idle
+            complete_job(success=True)
+
+    except Exception as e:
+        playground_log(session_id, f"ERROR: {e}")
+        # Only report failure if not cancelled
+        if not playground_is_cancelled(session_id):
+            playground_result(
+                session_id=session_id,
+                status="failed",
+                error=str(e),
+            )
+        # Release runner back to idle
+        complete_job(success=False, error=str(e))
+
+    finally:
+        stop_heartbeat_thread()
+        cleanup_workspace()
+
+
 def execute_job(job: dict):
     """Execute a job based on its step type."""
     step_type = job.get('step_type', 'agent')
     job_id = job.get('id', 'unknown')
+    is_playground = job.get('is_playground', False)
 
-    log(f"Job {job_id[:8]}: step_type={step_type}")
+    log(f"Job {job_id[:8]}: step_type={step_type}, is_playground={is_playground}")
+
+    # Playground jobs have their own execution path
+    if is_playground:
+        execute_playground_job(job)
+        return
 
     if step_type == 'script':
         execute_script_step(job)

@@ -48,6 +48,7 @@ class JobResponse(BaseModel):
     card_title: str
     card_description: str
     use_internal_git: bool = False  # When True, runner clones from internal git server
+    model: str | None = None  # Specific model to use (claude-sonnet-4-20250514, etc.)
     agent_file_ids: list[str] = []  # List of agent file IDs to make available
     prompt_template: str | None = None  # Custom prompt template (overrides default)
     # Step type and config (Phase 8.5)
@@ -57,6 +58,10 @@ class JobResponse(BaseModel):
     continue_in_context: bool = False  # If true, runner preserves workspace for next step
     is_continuation: bool = False  # If true, runner skips cleanup at start (continues from previous step)
     previous_step_logs: str | None = None  # Logs from previous step (for agent context)
+    # Playground fields (Phase 11)
+    is_playground: bool = False  # True = ephemeral run, no card updates
+    playground_session_id: str | None = None  # Links to SSE stream
+    playground_save_branch: str | None = None  # If set, push changes to this branch
 
 
 class TestResultsPayload(BaseModel):
@@ -185,6 +190,7 @@ async def get_runner_job(runner_id: str, db: AsyncSession = Depends(get_db)):
             card_title=job.card_title,
             card_description=job.card_description,
             use_internal_git=job.use_internal_git,
+            model=job.model,
             agent_file_ids=job.agent_file_ids,
             prompt_template=job.prompt_template,
             step_type=job.step_type,
@@ -192,6 +198,10 @@ async def get_runner_job(runner_id: str, db: AsyncSession = Depends(get_db)):
             continue_in_context=job.continue_in_context,
             is_continuation=job.is_continuation,
             previous_step_logs=job.previous_step_logs,
+            # Playground fields
+            is_playground=job.is_playground,
+            playground_session_id=job.playground_session_id,
+            playground_save_branch=job.playground_save_branch,
         )
     }
 

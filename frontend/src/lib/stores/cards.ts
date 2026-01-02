@@ -147,12 +147,13 @@ function createCardsStore() {
 
     updateLocal(card: Card) {
       update(cards => {
+        // Only update existing cards, never add new ones
+        // Adding is handled by create() to avoid race conditions with WebSocket
         const existing = cards.find(c => c.id === card.id);
         if (existing) {
           return cards.map(c => c.id === card.id ? card : c);
-        } else {
-          return [...cards, card];
         }
+        return cards;
       });
     },
 

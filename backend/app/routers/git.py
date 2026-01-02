@@ -6,11 +6,21 @@ Implements the server side of git clone/fetch/push over HTTP.
 
 import gzip
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database import get_db
 from app.services.git_server import git_backend, git_repo_manager
 
 router = APIRouter(prefix="/git", tags=["git"])
+
+
+class PushEventRequest(BaseModel):
+    """Request body for internal push event notification."""
+    branch: str
+    new_sha: str
+    old_sha: str = ""
 
 
 async def get_request_body(request: Request) -> bytes:
@@ -95,11 +105,14 @@ async def git_upload_pack(repo_id: str, request: Request):
 
 
 @router.post("/{repo_id}.git/git-receive-pack")
-async def git_receive_pack(repo_id: str, request: Request):
+async def git_receive_pack(repo_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     """
     Handle git push pack reception.
 
     POST /git/{repo_id}.git/git-receive-pack
+
+    After successfully processing the push, this triggers any matching
+    push-based pipeline triggers for the pushed branches.
     """
     if not git_repo_manager.repo_exists(repo_id):
         raise HTTPException(status_code=404, detail="Repository not found")
@@ -108,8 +121,27 @@ async def git_receive_pack(repo_id: str, request: Request):
 
     try:
         result = git_backend.handle_receive_pack(repo_id, body)
+        output = result["output"]
+        pushed_refs = result.get("pushed_refs", [])
+
+        # Trigger pipelines for each pushed branch
+        if pushed_refs:
+            from app.services.trigger_service import trigger_service
+            for ref in pushed_refs:
+                try:
+                    await trigger_service.on_push(
+                        db=db,
+                        repo_id=repo_id,
+                        branch=ref["branch"],
+                        commit_sha=ref["new_sha"],
+                        old_sha=ref["old_sha"],
+                    )
+                except Exception as e:
+                    # Don't fail the push if trigger fails
+                    print(f"[git] Warning: Push trigger failed: {e}")
+
         return Response(
-            content=result,
+            content=output,
             media_type="application/x-git-receive-pack-result",
             headers={
                 "Cache-Control": "no-cache",
@@ -141,3 +173,34 @@ async def get_head(repo_id: str):
             "Cache-Control": "no-cache",
         },
     )
+
+
+@router.post("/{repo_id}.git/_internal/push-event")
+async def handle_push_event(
+    repo_id: str,
+    event: PushEventRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Internal endpoint called after git push to trigger pipelines.
+
+    This endpoint is called by the git server after successfully processing
+    a git push. It checks for matching push triggers and starts pipelines.
+    """
+    if not git_repo_manager.repo_exists(repo_id):
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    from app.services.trigger_service import trigger_service
+
+    runs = await trigger_service.on_push(
+        db=db,
+        repo_id=repo_id,
+        branch=event.branch,
+        commit_sha=event.new_sha,
+        old_sha=event.old_sha,
+    )
+
+    return {
+        "triggered_runs": len(runs),
+        "run_ids": [r.id for r in runs],
+    }

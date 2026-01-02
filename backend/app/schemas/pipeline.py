@@ -7,6 +7,28 @@ from app.models.card import StepType
 from app.models.pipeline import RunStatus
 
 
+class TriggerConfig(BaseModel):
+    """Configuration for automatic pipeline triggers."""
+    type: str  # "card_complete" | "push"
+    config: dict[str, Any] = {}  # Type-specific config
+    enabled: bool = True
+    on_pass: str = "nothing"  # "nothing" | "merge" | "merge:{branch}"
+    on_fail: str = "nothing"  # "nothing" | "fail" | "reject"
+
+    # card_complete config: {status: "done" | "in_review"}
+    # push config: {branches: ["main", "dev"]}
+    #
+    # on_pass actions:
+    #   "nothing" - leave card as-is
+    #   "merge" - approve and merge the card to default branch
+    #   "merge:{branch}" - approve and merge the card to specified branch
+    #
+    # on_fail actions:
+    #   "nothing" - leave card as-is
+    #   "fail" - mark card as failed (user can retry)
+    #   "reject" - reject card back to todo
+
+
 class PipelineStepConfig(BaseModel):
     """Configuration for a pipeline step (stored in Pipeline.steps JSON array)."""
     name: str
@@ -25,6 +47,7 @@ class PipelineBase(BaseModel):
 
 class PipelineCreate(PipelineBase):
     steps: list[PipelineStepConfig] = []
+    triggers: list[TriggerConfig] = []
     is_template: bool = False
 
 
@@ -32,6 +55,7 @@ class PipelineUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     steps: list[PipelineStepConfig] | None = None
+    triggers: list[TriggerConfig] | None = None
     is_template: bool | None = None
 
 
@@ -39,6 +63,7 @@ class PipelineRead(PipelineBase):
     id: str
     repo_id: str
     steps: list[PipelineStepConfig] = []
+    triggers: list[TriggerConfig] = []
     is_template: bool
     created_at: datetime
     updated_at: datetime
@@ -53,6 +78,17 @@ class PipelineRead(PipelineBase):
             except (json.JSONDecodeError, TypeError):
                 return []
         return v
+
+    @field_validator("triggers", mode="before")
+    @classmethod
+    def parse_triggers(cls, v):
+        """Parse triggers from JSON string if needed."""
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return v if v else []
 
     class Config:
         from_attributes = True
@@ -80,6 +116,7 @@ class PipelineRunRead(BaseModel):
     status: RunStatus
     trigger_type: str
     trigger_ref: str | None = None
+    trigger_context: dict[str, Any] | None = None  # {branch, commit_sha, card_id, etc.}
     current_step: int
     steps_completed: int
     steps_total: int
@@ -87,6 +124,17 @@ class PipelineRunRead(BaseModel):
     completed_at: datetime | None = None
     created_at: datetime
     step_runs: list[StepRunRead] = []
+
+    @field_validator("trigger_context", mode="before")
+    @classmethod
+    def parse_trigger_context(cls, v):
+        """Parse trigger_context from JSON string if needed."""
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return v
 
     class Config:
         from_attributes = True
@@ -96,4 +144,5 @@ class PipelineRunCreate(BaseModel):
     """Parameters for starting a pipeline run."""
     trigger_type: str = "manual"
     trigger_ref: str | None = None
+    trigger_context: dict[str, Any] | None = None  # {branch, commit_sha, card_id, etc.}
     params: dict[str, Any] | None = None  # Optional parameters passed to steps as env vars

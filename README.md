@@ -115,7 +115,7 @@ cli/              # lazyaf CLI (ingest, land, list)
 
 ## MCP Server
 
-LazyAF exposes an MCP (Model Context Protocol) server so AI agents like Claude can interact with it directly.
+LazyAF exposes an MCP server so AI agents like Claude can manage repos, cards, and pipelines directly.
 
 **Claude Desktop config** (`claude_desktop_config.json`):
 ```json
@@ -129,18 +129,9 @@ LazyAF exposes an MCP (Model Context Protocol) server so AI agents like Claude c
 }
 ```
 
-**Available tools:**
-- `list_repos` - List all repositories
-- `list_cards` - List cards for a repo
-- `create_card` - Create a new task for an agent
-- `start_card` - Start agent work on a card
-- `get_card` - Get card status and details
-- `approve_card` - Merge completed work
-- `list_pipelines` - List pipelines
-- `run_pipeline` - Execute a pipeline
-- `get_branches` - List repo branches
+**Tools:** `list_repos`, `list_cards`, `create_card`, `start_card`, `get_card`, `approve_card`, `reject_card`, `retry_card`, `list_pipelines`, `create_pipeline`, `run_pipeline`, `get_pipeline_run`, `list_agent_files`, `list_branches`, `get_diff`, `list_repo_agents`, `list_repo_pipelines`, and more.
 
-Set `LAZYAF_URL` env var if backend isn't at `http://localhost:8000`.
+Set `LAZYAF_BACKEND_URL` env var if backend isn't at `http://localhost:8000`.
 
 ## API
 

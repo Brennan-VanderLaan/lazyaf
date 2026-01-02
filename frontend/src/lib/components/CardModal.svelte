@@ -204,9 +204,13 @@
     submitting = true;
     try {
       await cardsStore.delete(card.id);
-      dispatch('deleted');
-    } finally {
       submitting = false;
+      // Wait for Svelte to apply state changes before dispatching
+      await tick();
+      dispatch('deleted');
+    } catch (e) {
+      submitting = false;
+      alert(e instanceof Error ? e.message : 'Failed to delete card');
     }
   }
 
@@ -215,9 +219,13 @@
     submitting = true;
     try {
       const updated = await cardsStore.start(card.id);
-      dispatch('updated', updated);
-    } finally {
       submitting = false;
+      // Wait for Svelte to apply state changes before dispatching
+      await tick();
+      dispatch('updated', updated);
+    } catch (e) {
+      submitting = false;
+      alert(e instanceof Error ? e.message : 'Failed to start card');
     }
   }
 
@@ -246,9 +254,13 @@
     submitting = true;
     try {
       const updated = await cardsStore.reject(card.id);
-      dispatch('updated', updated);
-    } finally {
       submitting = false;
+      // Wait for Svelte to apply state changes before dispatching
+      await tick();
+      dispatch('updated', updated);
+    } catch (e) {
+      submitting = false;
+      alert(e instanceof Error ? e.message : 'Failed to reject card');
     }
   }
 
@@ -257,9 +269,13 @@
     submitting = true;
     try {
       const updated = await cardsStore.retry(card.id);
-      dispatch('updated', updated);
-    } finally {
       submitting = false;
+      // Wait for Svelte to apply state changes before dispatching
+      await tick();
+      dispatch('updated', updated);
+    } catch (e) {
+      submitting = false;
+      alert(e instanceof Error ? e.message : 'Failed to retry card');
     }
   }
 

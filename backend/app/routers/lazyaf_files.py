@@ -294,9 +294,10 @@ async def run_repo_pipeline(
 
     # Run the pipeline
     try:
-        run = await pipeline_executor.start_run(
+        run = await pipeline_executor.start_pipeline(
             db=db,
             pipeline=platform_pipeline,
+            repo=repo,
             trigger_type="manual",
             trigger_ref=f"repo:{target_branch}",
         )

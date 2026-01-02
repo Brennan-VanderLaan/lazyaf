@@ -442,17 +442,52 @@ src/
 
 **Problem Being Solved**: Want to interact with LazyAF from chat interfaces - "create a card for adding dark mode" without opening the UI.
 
-**MVP Scope**:
-- [x] MCP server with stdio transport (for Claude Desktop)
-- [x] Tool: `list_repos` - returns repo names, IDs, and ingest status
-- [x] Tool: `list_cards` - returns cards for a repo with status, branch, PR info
-- [x] Tool: `create_card` - creates a card given repo_id, title, description
-- [x] Tool: `get_card` - returns full card details including job logs
-- [x] Tool: `start_card` - triggers agent work on a card
-- [x] Tool: `get_job_logs` - fetch logs from a job run
-- [x] Resource: repos (list of available repositories)
-- [x] Configuration for Claude Desktop integration
-- [x] Tool: `get_runner_status` - check runner pool availability (bonus)
+**MVP Scope** (31 tools total):
+
+**Core Tools**:
+- [x] `list_repos` - returns repo names, IDs, and ingest status
+- [x] `list_cards` - returns cards for a repo with status, branch, PR info
+- [x] `create_card` - creates a card given repo_id, title, description
+- [x] `get_card` - returns full card details including job logs
+- [x] `start_card` - triggers agent work on a card
+- [x] `get_job_logs` - fetch logs from a job run
+- [x] `get_runner_status` - check runner pool availability
+
+**Card Actions**:
+- [x] `approve_card` - approve and merge a card
+- [x] `reject_card` - reject card back to todo
+- [x] `retry_card` - retry a failed card
+- [x] `update_card` - update card details
+- [x] `delete_card` - delete a card
+
+**Pipeline Tools** (with trigger support):
+- [x] `list_pipelines` - list pipelines for a repo
+- [x] `create_pipeline` - create pipeline with steps and triggers
+- [x] `get_pipeline` - get pipeline details
+- [x] `update_pipeline` - update pipeline including triggers
+- [x] `delete_pipeline` - delete a pipeline
+- [x] `run_pipeline` - trigger a pipeline run
+- [x] `get_pipeline_run` - get run status with step details
+- [x] `list_pipeline_runs` - list runs with filters
+- [x] `cancel_pipeline_run` - cancel a running pipeline
+- [x] `get_step_logs` - get logs for a specific step
+
+**Agent Files**:
+- [x] `list_agent_files` - list platform agent files
+- [x] `get_agent_file` - get agent file content
+- [x] `create_agent_file` - create new agent file
+- [x] `update_agent_file` - update agent file
+- [x] `delete_agent_file` - delete agent file
+
+**Git/Branch Tools**:
+- [x] `list_branches` - list repo branches
+- [x] `get_diff` - get diff between branches
+
+**Repo-Defined Assets**:
+- [x] `list_repo_agents` - list .lazyaf/agents/
+- [x] `list_repo_pipelines` - list .lazyaf/pipelines/
+
+**Resource**: `repos://list` - formatted repo list
 
 **Explicit Non-Goals (This Phase)**:
 - HTTP/SSE transport (stdio only for MVP)
@@ -464,16 +499,16 @@ src/
 backend/
 ├── mcp/
 │   ├── __init__.py
-│   ├── server.py         # MCP server implementation
-│   └── tools.py          # Tool definitions wrapping existing API
+│   ├── __main__.py       # Entry point for stdio transport
+│   └── server.py         # MCP server implementation (all tools)
 ```
 
 **Tech Stack**:
-- `mcp` Python package for server implementation
+- `mcp` Python package with FastMCP for server implementation
 - stdio transport for Claude Desktop compatibility
 - Thin wrapper around existing FastAPI services
 
-**Deliverable**: Can list repos, create cards, and start work from Claude Desktop
+**Deliverable**: Full LazyAF orchestration from Claude Desktop - create cards, manage pipelines, configure triggers, review and approve work
 
 ### Phase 8: Test Result Capture ✅
 **Goal**: Visibility into whether agent-produced code passes tests
@@ -889,20 +924,28 @@ lazyaf/
 
 ## Current Status
 
-**Completed**: Phases 1-9.1 (all core pipeline functionality including file persistence and context directory)
-**Next**: Phase 10 (Events & Triggers) - card completion triggers, auto-merge flow
+**Completed**: Phases 1-10 (full pipeline and trigger system)
+**Next**: Phase 9.5 (Webhooks) or Phase 11 (Reporting & Artifacts)
 
-The core workflow is functional:
+The target workflow is now fully functional:
 1. Ingest repos via CLI
 2. Create cards describing features (or CI steps: script/docker)
 3. Start work → runner clones repo, executes step (AI agent, shell script, or docker command)
-4. Review diffs in card modal (for agent steps)
-5. Approve/Reject to complete cycle
+4. Card completes → reaches "in_review" status
+5. **Pipeline triggers automatically** (if configured with card_complete trigger)
+6. Pipeline runs tests/validation steps
+7. **On pass**: Card auto-merged and marked done
+8. **On fail**: Card marked failed (user can retry)
 
-**Target Workflow (Card → Test → Merge)**:
+**Target Workflow (Card → Test → Merge)** - ✅ COMPLETE:
 ```
-Card created → Agent implements → Card approved → Pipeline triggers → Tests pass → Auto-merge
+Card created → Agent implements → Card in_review → Pipeline triggers → Tests pass → Auto-merge to main
 ```
+
+**Also Supported**:
+- Push triggers: Pipeline runs when code pushed to matching branches
+- Manual pipeline runs: Run any pipeline on-demand
+- Trigger actions: Configure what happens on pass/fail per trigger
 
 ---
 
@@ -1150,26 +1193,33 @@ Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isol
 
 ---
 
-## Phase 10: Events & Triggers (Current Priority)
+## Phase 10: Events & Triggers ✅
 **Goal**: Enable the Card → Pipeline → Merge workflow
 
-### 10a: Card Completion Trigger
-- [ ] Add `on_card_complete` trigger type to pipelines
-- [ ] Config: `{status: "done", repo_id?, card_id?}`
-- [ ] When card status → done/in_review, check for matching pipelines
-- [ ] Auto-trigger pipeline with card context (branch, commit)
-- [ ] UI: Configure trigger in pipeline editor
+### 10a: Card Completion Trigger ✅
+- [x] Add `triggers` field to Pipeline model (JSON array of TriggerConfig)
+- [x] Add `trigger_context` field to PipelineRun model
+- [x] TriggerConfig schema: `{type, config, enabled, on_pass, on_fail}`
+- [x] When card status → done/in_review, check for matching pipelines
+- [x] Auto-trigger pipeline with card context (branch, commit, card_id)
+- [x] UI: Configure triggers in pipeline editor (type, status filter, actions)
+- [x] Trigger actions: on_pass (merge/nothing), on_fail (fail/reject/nothing)
 
-### 10b: Auto-Merge Action
-- [ ] Test existing `on_success: "merge:branch"` behavior
-- [ ] Merge uses internal git (merge branch to default)
-- [ ] Conflict handling: fail step with clear error
-- [ ] Optional: create "merge commit" message
+### 10b: Auto-Merge Action ✅
+- [x] Pipeline completion executes trigger actions from context
+- [x] `on_pass: "merge"` - merge card branch to default branch, mark card done
+- [x] `on_pass: "merge:{branch}"` - merge to specific branch
+- [x] `on_fail: "fail"` - mark card as failed (user can retry)
+- [x] `on_fail: "reject"` - reject card back to todo
+- [x] Merge uses internal git server
+- [x] Conflict handling: fail with clear error
 
-### 10c: Push Triggers (Lower Priority)
-- [ ] Internal git server emits push events
-- [ ] Pipeline trigger: `{type: "push", branches: ["main", "dev"]}`
-- [ ] Push to branch → matching pipelines trigger
+### 10c: Push Triggers ✅
+- [x] Internal git server captures pushed refs after receive-pack
+- [x] Push event fires trigger_service.on_push()
+- [x] Pipeline trigger: `{type: "push", config: {branches: ["main", "dev"]}}`
+- [x] Branch pattern matching with fnmatch (supports wildcards)
+- [x] Push triggers don't show on_pass/on_fail UI (no card to act on)
 
 ---
 
@@ -1189,7 +1239,7 @@ Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isol
 
 **Roadmap**:
 - Phase 6: Polish - ongoing (quality of life)
-- Phase 7: MCP Interface - ✅ COMPLETE
+- Phase 7: MCP Interface - ✅ COMPLETE (31 tools)
 - Phase 8: Test Result Capture - ✅ COMPLETE
 - Phase 8.5: CI/CD Foundation - ✅ COMPLETE
 - Phase 9: Pipelines - ✅ COMPLETE
@@ -1198,6 +1248,6 @@ Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isol
   - 9.1b: File Persistence - ✅ COMPLETE
   - 9.1c: Agent Parity - ✅ COMPLETE
   - 9.1d: Context Directory - ✅ COMPLETE
-- **Phase 10: Events & Triggers - NEXT** ← Enables target workflow
-- Phase 9.5: Webhooks - deferred (external triggers)
+- Phase 10: Events & Triggers - ✅ COMPLETE (card triggers, push triggers, auto-merge)
+- **Phase 9.5: Webhooks - NEXT** (external triggers from GitHub/Gitea)
 - Phase 11: Reporting & Artifacts - future

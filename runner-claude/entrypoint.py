@@ -604,9 +604,6 @@ def execute_script_step(job: dict):
     preview = command[:200] + ('...' if len(command) > 200 else '')
     log(f"Executing script step:\n{preview}")
 
-    # Start heartbeat
-    heartbeat_thread = start_heartbeat_thread()
-
     # Report running status
     report_job_status(job_id, "running")
 
@@ -685,7 +682,6 @@ def execute_script_step(job: dict):
         complete_job(success=False, error=str(e))
 
     finally:
-        stop_heartbeat_thread()
         # Clean up workspace unless next step continues in context
         if continue_in_context:
             log("Preserving workspace for next pipeline step (continue_in_context=True)")
@@ -736,9 +732,6 @@ def execute_docker_step(job: dict):
     # Log script preview (first 200 chars)
     preview = command[:200] + ('...' if len(command) > 200 else '')
     log(f"Executing docker step: {image}\n{preview}")
-
-    # Start heartbeat
-    heartbeat_thread = start_heartbeat_thread()
 
     # Report running status
     report_job_status(job_id, "running")
@@ -830,7 +823,6 @@ def execute_docker_step(job: dict):
         complete_job(success=False, error=str(e))
 
     finally:
-        stop_heartbeat_thread()
         # Clean up workspace unless next step continues in context
         if continue_in_context:
             log("Preserving workspace for next pipeline step (continue_in_context=True)")
@@ -874,10 +866,6 @@ def execute_agent_step(job: dict):
         log("Skipping workspace cleanup - continuing from previous pipeline step")
     else:
         cleanup_workspace()
-
-    # Start background heartbeat thread to keep runner alive during long operations
-    heartbeat_thread = start_heartbeat_thread()
-    log("Started background heartbeat thread")
 
     # Report running status immediately
     report_job_status(job_id, "running")
@@ -1151,10 +1139,6 @@ Use this context when completing the current task.
             log(f"WARNING: Failed to report failure: {ce}")
 
     finally:
-        # Always stop the heartbeat thread
-        stop_heartbeat_thread()
-        log("Stopped background heartbeat thread")
-
         # Clean up workspace unless next step continues in context
         if continue_in_context:
             log("Preserving workspace for next pipeline step (continue_in_context=True)")
@@ -1177,9 +1161,6 @@ def execute_playground_job(job: dict):
     save_branch = job.get('playground_save_branch')
 
     playground_log(session_id, f"Starting playground job {job_id[:8]}")
-
-    # Start heartbeat
-    heartbeat_thread = start_heartbeat_thread()
 
     # Report running status to playground service
     playground_status(session_id, "running")
@@ -1427,7 +1408,6 @@ def execute_playground_job(job: dict):
         complete_job(success=False, error=str(e))
 
     finally:
-        stop_heartbeat_thread()
         cleanup_workspace()
 
 
@@ -1753,6 +1733,10 @@ def main():
             if not runner_id:
                 continue  # Restart the loop if registration failed
 
+            # Start persistent heartbeat thread after successful registration
+            heartbeat_thread = start_heartbeat_thread()
+            log("Started persistent heartbeat thread")
+
             log("Waiting for jobs...")
 
             # Job polling loop
@@ -1772,11 +1756,16 @@ def main():
 
             # If we get here, we need to re-register
             log("Connection lost - will reconnect...")
+            # Stop the persistent heartbeat thread before re-registering
+            stop_heartbeat_thread()
+            log("Stopped persistent heartbeat thread")
             runner_id = None
             time.sleep(RECONNECT_INTERVAL)
 
     except KeyboardInterrupt:
         log("Shutting down...")
+        # Ensure heartbeat thread is stopped on shutdown
+        stop_heartbeat_thread()
 
 
 if __name__ == "__main__":

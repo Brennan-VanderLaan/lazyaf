@@ -1,86 +1,55 @@
 # LazyAF Quick Start
 
-## Prerequisites
-- Docker & Docker Compose
-- Anthropic API key
-
-## 1. Start the Stack
+## 1. Start everything
 
 ```bash
-# Set your API key
-echo "ANTHROPIC_API_KEY=your_key_here" > .env
+cp .env.example .env
+# Edit .env with your API keys (Anthropic and/or Gemini)
 
-# Start backend + frontend
 docker compose up -d
-
-# Verify
-curl http://localhost:8000/health
 ```
 
-Frontend: http://localhost:80
-Backend: http://localhost:8000
+Open http://localhost:5173
 
-## 2. Start a Runner
-
-```bash
-# Build runner image
-docker build -t lazyaf-runner -f backend/runner/Dockerfile backend/runner
-
-# Start runner (connects to backend)
-docker run --rm \
-  -e BACKEND_URL=http://host.docker.internal:8000 \
-  -e ANTHROPIC_API_KEY=your_key_here \
-  --add-host=host.docker.internal:host-gateway \
-  lazyaf-runner
-```
-
-## 3. Install CLI
+## 2. Import a repo
 
 ```bash
-cd cli
-pip install -e .
-```
-
-## 4. Ingest a Repo
-
-```bash
-# Basic ingest
+pip install -e cli/
 lazyaf ingest /path/to/your/repo --name my-project
-
-# Ingest specific branch
-lazyaf ingest /path/to/your/repo --name my-project --branch main
-
-# Ingest all branches
-lazyaf ingest /path/to/your/repo --name my-project --all-branches
 ```
 
-## 5. Use the UI
+## 3. Create and run a card
 
-1. Open http://localhost:80
-2. Create a card with your feature request
-3. Click "Start" - runner picks it up
-4. Watch real-time progress
-5. Review the branch when complete
-6. Use `lazyaf land` to push to your real remote
+1. Select your repo in the UI
+2. Click "New Card"
+3. Title: "Document the project"
+4. Description: "Create a file called rocks-that-think.txt explaining what this project does"
+5. Click "Create", then "Start"
+6. Watch the agent work in real-time
+7. Review the diff when done, then Approve or Reject
 
-## Troubleshooting
+## 4. Sync changes
 
-**Runner can't connect to backend:**
+The CLI adds `lazyaf` as a git remote. Use standard git commands:
+
 ```bash
-# Check backend is running
-docker compose ps
+# Push local changes to lazyaf
+git push lazyaf main
 
-# Check runner logs
-docker logs <runner-container-id>
+# Pull agent changes back to local
+git fetch lazyaf
+git merge lazyaf/card-123-feature-name
+
+# Or cherry-pick specific commits
+git cherry-pick <commit-sha>
 ```
 
-**CLI can't connect:**
-```bash
-# Verify backend is up
-curl http://localhost:8000/api/repos
+## Extras
 
-# Set custom server
-export LAZYAF_SERVER=http://localhost:8000
-```
+**Playground** - Test prompts without creating cards
+
+**Pipelines** - Automate multi-step workflows
+
+**Just one runner** - `docker compose up -d backend frontend runner-claude`
 
 See `PLAN.md` for architecture details.

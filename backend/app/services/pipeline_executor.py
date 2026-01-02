@@ -279,11 +279,15 @@ class PipelineExecutor:
         steps: list[dict],
         step_index: int,
         params: dict[str, Any] | None = None,
+        previous_runner_id: str | None = None,
     ) -> None:
         """
         Execute a single step in the pipeline.
 
         Creates a StepRun, creates a temporary Card + Job, and enqueues the job.
+
+        Args:
+            previous_runner_id: The runner that executed the previous step (for continuation affinity)
         """
         if step_index >= len(steps):
             # All steps completed
@@ -388,6 +392,10 @@ class PipelineExecutor:
         await db.commit()
 
         # Queue the job for a runner
+        # If this is a continuation, require the same runner for affinity
+        required_runner_id = previous_runner_id if is_continuation else None
+        logger.info(f"Step {step_index}: is_continuation={is_continuation}, previous_runner_id={previous_runner_id[:8] if previous_runner_id else None}, required_runner_id={required_runner_id[:8] if required_runner_id else None}")
+
         queued_job = QueuedJob(
             id=job_id,
             card_id=card.id,
@@ -412,6 +420,8 @@ class PipelineExecutor:
             step_id=step_id,
             step_index=step_index,
             step_name=step_name,
+            # Runner affinity for continuations
+            required_runner_id=required_runner_id,
         )
         await job_queue.enqueue(queued_job)
 
@@ -432,12 +442,16 @@ class PipelineExecutor:
         db: AsyncSession,
         step_run_id: str,
         job: Job,
+        runner_id: str | None = None,
     ) -> None:
         """
         Handle step completion.
 
         Called from job_callback when a job with step_run_id completes.
         Evaluates on_success/on_failure and proceeds accordingly.
+
+        Args:
+            runner_id: The runner that executed this step (for continuation affinity)
         """
         # Get the step run
         result = await db.execute(
@@ -512,8 +526,8 @@ class PipelineExecutor:
         step = steps[step_run.step_index]
         action = step.get("on_success" if step_success else "on_failure", "stop" if not step_success else "next")
 
-        # Handle the action
-        await self._handle_action(db, pipeline_run, repo, steps, step_run.step_index, action, step_success)
+        # Handle the action, passing runner_id for continuation affinity
+        await self._handle_action(db, pipeline_run, repo, steps, step_run.step_index, action, step_success, runner_id=runner_id)
 
     async def _handle_action(
         self,
@@ -524,6 +538,7 @@ class PipelineExecutor:
         current_step: int,
         action: str,
         step_success: bool,
+        runner_id: str | None = None,
     ) -> None:
         """
         Handle on_success/on_failure action.
@@ -534,12 +549,15 @@ class PipelineExecutor:
         - "trigger:{card_id}": Clone card as template and run it
         - "trigger:pipeline:{pipeline_id}": Start another pipeline
         - "merge:{branch}": Merge current branch to target
+
+        Args:
+            runner_id: The runner that completed the previous step (for continuation affinity)
         """
         logger.info(f"Handling action '{action}' after step {current_step} (success={step_success})")
 
         if action == "next":
-            # Execute next step
-            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
+            # Execute next step, passing runner_id for affinity
+            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1, previous_runner_id=runner_id)
 
         elif action == "stop":
             # Complete the pipeline

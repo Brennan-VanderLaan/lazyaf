@@ -309,7 +309,7 @@ async def complete_job(runner_id: str, request: CompleteRequest, db: AsyncSessio
         # Notify pipeline executor if this job is part of a pipeline
         if job.step_run_id:
             from app.services.pipeline_executor import pipeline_executor
-            await pipeline_executor.on_step_complete(db, job.step_run_id, job)
+            await pipeline_executor.on_step_complete(db, job.step_run_id, job, runner_id=runner_id)
 
     return {"status": "ok"}
 

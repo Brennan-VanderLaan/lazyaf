@@ -227,7 +227,7 @@ class TestPipelineExecutorActionHandlers:
             )
 
             mock_execute.assert_called_once_with(
-                mock_db, mock_pipeline_run, mock_repo, steps, 1
+                mock_db, mock_pipeline_run, mock_repo, steps, 1, previous_runner_id=None
             )
 
     @pytest.mark.asyncio

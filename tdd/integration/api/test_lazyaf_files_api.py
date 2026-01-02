@@ -99,8 +99,7 @@ async def repo_with_agent_definition(client, clean_git_repos):
         # Create a test agent
         agent_yaml = """name: test-agent
 description: Test agent for fixing bugs
-runner_type: claude-code
-prompt: |
+prompt_template: |
   Fix the bug: {{description}}
 """
         (agents_dir / "test-agent.yaml").write_text(agent_yaml)
@@ -156,8 +155,8 @@ class TestGetRepoAgent:
         assert_status_code(response, 200)
         agent = response.json()
         assert agent["name"] == "test-agent"
-        assert agent["runner_type"] == "claude-code"
-        assert "Fix the bug" in agent["prompt"]
+        assert agent["source"] == "repo"
+        assert "Fix the bug" in agent["prompt_template"]
 
     async def test_get_agent_not_found(self, client, ingested_repo):
         """Returns 404 for non-existent agent."""
@@ -316,9 +315,9 @@ class TestRunRepoPipeline:
         )
         assert_not_found(response, "Repo")
 
-    async def test_run_repo_pipeline_no_default_branch(self, client, clean_git_repos, clean_job_queue):
-        """Returns 400 when repo has no default branch and none specified."""
-        # Create a repo without ingesting (no default branch)
+    async def test_run_repo_pipeline_not_ingested(self, client, clean_git_repos, clean_job_queue):
+        """Returns 404 when repo is not ingested (no git storage)."""
+        # Create a repo without ingesting (no git storage)
         response = await client.post(
             "/api/repos",
             json={"name": "no-branch-repo"},
@@ -328,8 +327,8 @@ class TestRunRepoPipeline:
         response = await client.post(
             f"/api/repos/{repo['id']}/lazyaf/pipelines/test/run",
         )
-        assert_status_code(response, 400)
-        assert "no branch" in response.json()["detail"].lower()
+        # Pipeline can't be found because there's no git storage
+        assert_status_code(response, 404)
 
 
 class TestRepoPipelineAndPlatformPipelineDrift:

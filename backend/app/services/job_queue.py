@@ -40,6 +40,8 @@ class QueuedJob:
     step_index: int = 0  # Step index in the pipeline
     step_name: str = "unnamed"  # Step name for logging
     created_at: datetime = field(default_factory=datetime.utcnow)
+    # Runner affinity (for pipeline continuations)
+    required_runner_id: str | None = None  # If set, only this runner can pick up the job
     # Playground fields (Phase 11)
     is_playground: bool = False  # True = ephemeral run, no card updates
     playground_session_id: str | None = None  # Links to SSE stream
@@ -61,29 +63,38 @@ class JobQueue:
             logger.info(f"Enqueued job {job.id[:8]} (type={job.runner_type!r}) for card {job.card_id[:8]}")
         return job.id
 
-    async def dequeue(self, runner_type: str | None = None) -> QueuedJob | None:
+    async def dequeue(self, runner_type: str | None = None, runner_id: str | None = None) -> QueuedJob | None:
         """
-        Get the next job from the queue that matches the runner type.
+        Get the next job from the queue that matches the runner type and affinity.
 
         Matching logic:
+        - If job has required_runner_id, only that runner can pick it up
         - If runner_type is None, only return jobs with runner_type="any"
         - If runner_type is specified (e.g., "claude-code"), return jobs that:
           - Have runner_type="any" (any runner can take them), OR
           - Have runner_type matching the runner's type
         """
         async with self._lock:
-            logger.debug(f"Dequeue called with runner_type={runner_type!r}, queue has {len(self._jobs)} jobs")
+            runner_short = runner_id[:8] if runner_id else None
+            logger.info(f"Dequeue: runner_type={runner_type!r}, runner_id={runner_short}, queue_size={len(self._jobs)}")
             for i, job in enumerate(self._jobs):
-                matches = self._job_matches_runner(job, runner_type)
-                logger.debug(f"  Job {job.id[:8]} (type={job.runner_type!r}) matches runner {runner_type!r}: {matches}")
+                req_runner = job.required_runner_id[:8] if job.required_runner_id else None
+                matches = self._job_matches_runner(job, runner_type, runner_id)
+                logger.info(f"  Job {job.id[:8]}: type={job.runner_type!r}, required_runner={req_runner}, is_continuation={job.is_continuation}, matches={matches}")
                 if matches:
                     self._jobs.pop(i)
-                    logger.info(f"Dequeued job {job.id[:8]} (type={job.runner_type!r}) for runner type {runner_type!r}")
+                    logger.info(f"  -> Assigned to runner {runner_short}")
                     return job
             return None
 
-    def _job_matches_runner(self, job: QueuedJob, runner_type: str | None) -> bool:
-        """Check if a job can be picked up by a runner of the given type."""
+    def _job_matches_runner(self, job: QueuedJob, runner_type: str | None, runner_id: str | None = None) -> bool:
+        """Check if a job can be picked up by a runner of the given type and ID."""
+        # Check runner affinity first (for pipeline continuations)
+        if job.required_runner_id:
+            if runner_id != job.required_runner_id:
+                return False
+            # If runner matches, still need to check type
+
         # Normalize to strings to ensure comparison works
         job_type = str(job.runner_type) if job.runner_type else "any"
         runner_type_str = str(runner_type) if runner_type else None

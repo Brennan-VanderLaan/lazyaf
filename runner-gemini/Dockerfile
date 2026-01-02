@@ -28,6 +28,9 @@ RUN useradd -m -s /bin/bash runner \
 # Create workspace directory and give ownership to runner
 RUN mkdir -p /workspace && chown -R runner:runner /workspace
 
+# Create /app/data for tests that import backend code (git_server expects this)
+RUN mkdir -p /app/data && chown -R runner:runner /app/data
+
 # Copy entrypoint script
 COPY entrypoint.py /entrypoint.py
 RUN chown runner:runner /entrypoint.py

@@ -170,6 +170,7 @@ async def job_callback(job_id: str, callback: JobCallback, db: AsyncSession = De
     # Notify pipeline executor if this job is part of a pipeline (Phase 9)
     if callback.status in ("completed", "failed") and job.step_run_id:
         from app.services.pipeline_executor import pipeline_executor
-        await pipeline_executor.on_step_complete(db, job.step_run_id, job)
+        # Note: runner_id not available in legacy callback, affinity won't work
+        await pipeline_executor.on_step_complete(db, job.step_run_id, job, runner_id=None)
 
     return {"status": "ok"}

@@ -9,8 +9,12 @@ class RepoBase(BaseModel):
 
 
 class RepoCreate(RepoBase):
-    """Create a new repo - will be ingested via CLI."""
-    pass
+    """Create a new repo - will be ingested via CLI.
+
+    If path is provided, files from that local path will be pushed
+    to the internal git server automatically.
+    """
+    path: str | None = None  # Optional local path to push from
 
 
 class RepoUpdate(BaseModel):

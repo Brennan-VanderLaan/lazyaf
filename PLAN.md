@@ -1223,6 +1223,263 @@ Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isol
 
 ---
 
+## Phase 11: Agent Playground
+
+**Goal**: Rapid experimentation with agent prompts without going through full card/job development loops
+
+**Problem Being Solved**: When developing or refining agent prompts, you need to iterate quickly. Currently, testing an agent requires creating a card, starting it, waiting for completion, reviewing the diff - a slow loop. The Agent Playground provides immediate feedback on agent behavior.
+
+### Key Architecture Decision
+
+**Use Existing Runner Infrastructure**: Direct Claude/Gemini API calls cannot modify files - they only return text. Real agent behavior (file changes, diffs) requires the existing Docker runner infrastructure (Claude Code CLI, aider, etc.). The Playground reuses `job_queue` with a special `is_playground=True` flag.
+
+### MVP Scope (Phase 11a-11c)
+
+- **Test Once mode only** (defer Test Continuous to later)
+- **Branch input mode only** (test against real branch, like card execution)
+- **Real-time streaming** (agent reasoning + tool calls via `--output-format stream-json`)
+- **Branch creation opt-in** (run against source branch, save to new branch only if user wants)
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      AGENT PLAYGROUND TAB                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────────────┐  ┌──────────────────────────────────────┐│
+│  │   AGENT CONFIG       │  │      STREAMING AGENT OUTPUT          ││
+│  │                      │  │                                      ││
+│  │  Repo: [dropdown]    │  │  I'll analyze the code structure     ││
+│  │  Agent: [dropdown]   │  │  and make the requested changes.     ││
+│  │  Runner: Claude/Gem  │  │                                      ││
+│  │                      │  │  [Tool: Read] src/utils.ts           ││
+│  │  Branch: [dropdown]  │  │  [Tool: Edit] src/utils.ts:42        ││
+│  │                      │  │                                      ││
+│  │  ┌────────────────┐  │  │  The function now handles edge       ││
+│  │  │ Task Override  │  │  │  cases for empty input...█           ││
+│  │  │ (optional)     │  │  │                                      ││
+│  │  └────────────────┘  │  └──────────────────────────────────────┘│
+│  │                      │                                          │
+│  │  [▶ Test Once]       │  ┌──────────────────────────────────────┐│
+│  │  [■ Cancel]          │  │         DIFF PREVIEW                 ││
+│  │                      │  │                                      ││
+│  │  ☐ Save to branch    │  │  src/utils.ts                        ││
+│  │  agent-test/...      │  │  - const old = "foo";                ││
+│  │                      │  │  + const new = "bar";                ││
+│  └──────────────────────┘  └──────────────────────────────────────┘│
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### How It Works
+
+1. User selects repo, branch, agent, runner type
+2. Optionally overrides task description
+3. Clicks "Test Once"
+4. Backend creates a playground job (ephemeral, no DB card)
+5. Runner picks up job, executes agent with **streaming output**:
+   ```bash
+   claude -p --output-format stream-json --include-partial-messages "..."
+   ```
+6. Runner reads stdout line-by-line, forwards JSON events to backend
+7. Backend relays events to frontend via SSE (tokens, tool calls, reasoning)
+8. On completion, backend captures diff from runner
+9. Diff displayed in UI
+10. If "Save to branch" checked, changes pushed to `agent-test/<name>-NNN`
+
+### Streaming Architecture
+
+Claude Code CLI supports `--output-format stream-json` which emits real-time JSON events:
+- `content_block_delta` - streaming text tokens
+- `tool_use` - tool calls (Edit, Bash, etc.)
+- `message_stop` - completion
+
+The runner captures these and forwards to the playground session, giving users visibility into agent reasoning as it happens.
+
+### Backend Implementation
+
+**Extend QueuedJob** in `job_queue.py`:
+```python
+@dataclass
+class QueuedJob:
+    # ... existing fields ...
+    is_playground: bool = False  # True = ephemeral run, no card updates
+    playground_session_id: str | None = None  # Links to SSE stream
+    playground_save_branch: str | None = None  # If set, push changes here
+```
+
+**New Service**: `app/services/playground_service.py`
+```python
+class PlaygroundService:
+    """
+    Manages playground test runs using existing runner infrastructure.
+    """
+
+    # In-memory tracking (no DB persistence)
+    active_runs: dict[str, PlaygroundRun]  # session_id -> run state
+
+    async def start_test(
+        self,
+        repo_id: str,
+        agent_id: str,
+        runner_type: str,
+        branch: str,
+        task_override: str | None = None,
+        save_branch: str | None = None,  # If set, save changes here
+    ) -> str:
+        """
+        1. Load agent config
+        2. Create QueuedJob with is_playground=True
+        3. Enqueue job
+        4. Return session_id for SSE streaming
+        """
+
+    async def stream_logs(self, session_id: str) -> AsyncGenerator:
+        """SSE generator yielding runner logs as they arrive"""
+
+    async def cancel_test(self, session_id: str) -> bool:
+        """Cancel running playground job"""
+
+    async def get_result(self, session_id: str) -> PlaygroundResult:
+        """Get diff and status after completion"""
+```
+
+**New Router**: `app/routers/playground.py`
+```python
+@router.post("/repos/{repo_id}/playground/test")
+async def start_test(repo_id: str, request: TestRequest) -> TestResponse:
+    """Start a playground test, returns session_id"""
+
+@router.get("/playground/{session_id}/stream")
+async def stream_logs(session_id: str) -> EventSourceResponse:
+    """SSE endpoint streaming runner logs"""
+
+@router.post("/playground/{session_id}/cancel")
+async def cancel_test(session_id: str) -> dict:
+    """Cancel a running test"""
+
+@router.get("/playground/{session_id}/result")
+async def get_result(session_id: str) -> ResultResponse:
+    """Get diff and completion status"""
+```
+
+**Runner Awareness**: Runners check `is_playground` flag:
+- If `True`: Skip card status updates, stream logs to playground session
+- If `playground_save_branch` set: Push changes to that branch
+- Otherwise: Discard changes after capturing diff
+
+### Frontend Implementation
+
+**New Page**: `src/routes/PlaygroundPage.svelte`
+- Route: `/playground`
+- Tab alongside Board, Pipelines
+
+**New Store**: `src/lib/stores/playground.ts`
+```typescript
+interface PlaygroundState {
+  // Configuration
+  repoId: string | null;
+  agentId: string | null;
+  runnerType: 'claude-code' | 'gemini';
+  branch: string | null;
+  taskOverride: string;
+  saveToBranch: boolean;
+  saveBranchName: string;
+
+  // Execution state
+  status: 'idle' | 'running' | 'cancelling' | 'complete' | 'error';
+  sessionId: string | null;
+  logs: string[];
+  diff: string | null;
+  filesChanged: string[];
+  error: string | null;
+}
+```
+
+**New Component**: `src/lib/components/Playground.svelte`
+- Repo selector (existing component)
+- Branch selector (existing component)
+- Agent selector dropdown
+- Runner type selector
+- Task override textarea (optional)
+- "Save to branch" checkbox + branch name input
+- "Test Once" button
+- Cancel button
+- Log stream display (scrolling, like job logs)
+- Diff preview panel
+
+### Implementation Phases
+
+#### Phase 11a: Foundation (MVP)
+- [ ] Add `is_playground`, `playground_session_id`, `playground_save_branch` to QueuedJob
+- [ ] Create `PlaygroundService` with `start_test()`, `stream_logs()`, `get_result()`
+- [ ] Create `/playground/*` REST endpoints
+- [ ] SSE streaming for runner logs
+- [ ] Runner checks `is_playground` flag, skips card updates if true
+
+#### Phase 11b: Frontend - Test Once Mode
+- [ ] Add Playground tab to navigation
+- [ ] Create `PlaygroundPage.svelte`
+- [ ] Create `playground` store
+- [ ] Repo/branch/agent/runner selectors
+- [ ] Task override textarea
+- [ ] "Test Once" button
+- [ ] Log stream display (reuse LogViewer patterns)
+- [ ] Connect to SSE endpoint
+
+#### Phase 11c: Diff & Save
+- [ ] Backend captures diff after runner completes
+- [ ] Diff preview panel in frontend
+- [ ] "Save to branch" checkbox
+- [ ] Branch name input with auto-generate (`agent-test/<agent>-NNN`)
+- [ ] Push changes to save branch on completion
+
+#### Phase 11d: Cancellation
+- [ ] Backend: `cancel_test()` kills runner process
+- [ ] Frontend: Cancel button
+- [ ] Graceful cleanup
+- [ ] Status indicators
+
+#### Phase 11e: Polish
+- [ ] Keyboard shortcuts (Ctrl+Enter for Test Once)
+- [ ] Log auto-scroll with pause on hover
+- [ ] Copy diff to clipboard
+- [ ] Branch cleanup UI (list/delete `agent-test/*` branches)
+- [ ] Error handling and retry
+
+### Future Enhancements (Not MVP)
+
+- **Test Continuous mode**: Auto-run after typing stops (2.5s debounce)
+- **Sample text input**: Quick prompt validation without full branch
+- **File-specific input**: Test against single file
+- **Side-by-side comparison**: Claude vs Gemini results
+- **Run history**: Persist playground runs for comparison
+
+### Files to Create
+
+| File | Purpose |
+|------|---------|
+| `backend/app/services/playground_service.py` | Core service |
+| `backend/app/routers/playground.py` | REST + SSE endpoints |
+| `backend/app/schemas/playground.py` | Request/response models |
+| `frontend/src/routes/PlaygroundPage.svelte` | Page component |
+| `frontend/src/lib/stores/playground.ts` | State management |
+| `frontend/src/lib/components/Playground.svelte` | Main UI |
+
+### Files to Modify
+
+| File | Changes |
+|------|---------|
+| `backend/app/services/job_queue.py` | Add playground fields to QueuedJob |
+| `backend/app/main.py` | Mount playground router |
+| `frontend/src/App.svelte` | Add Playground tab to nav |
+| `frontend/src/lib/api/client.ts` | Add playground API methods |
+| `frontend/src/lib/api/types.ts` | Add playground types |
+| Runner code | Check `is_playground` flag, handle accordingly |
+
+---
+
 ## Tech Debt (After Core Workflow Works)
 
 ### TD1: Entrypoint Refactor
@@ -1249,5 +1506,12 @@ Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isol
   - 9.1c: Agent Parity - ✅ COMPLETE
   - 9.1d: Context Directory - ✅ COMPLETE
 - Phase 10: Events & Triggers - ✅ COMPLETE (card triggers, push triggers, auto-merge)
-- **Phase 9.5: Webhooks - NEXT** (external triggers from GitHub/Gitea)
-- Phase 11: Reporting & Artifacts - future
+- **Phase 11: Agent Playground - NEXT** (rapid agent experimentation)
+  - 11a: Foundation (backend service, SSE streaming, runner integration)
+  - 11b: Frontend - Test Once mode
+  - 11c: Diff capture & Save to branch
+  - 11d: Cancellation support
+  - 11e: Polish
+  - Future: Test Continuous mode, sample text input, file-specific input
+- Phase 9.5: Webhooks - deferred (external triggers from GitHub/Gitea)
+- Phase 12: Reporting & Artifacts - future

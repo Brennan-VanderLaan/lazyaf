@@ -520,7 +520,13 @@ def execute_script_step(job: dict):
         # Clone repo for context (script may need repo files)
         repo_id = job.get("repo_id", "")
         use_internal_git = job.get("use_internal_git", False)
-        workspace = Path("/workspace/repo")
+
+        # Use separate workspace directories per pipeline to avoid conflicts
+        # When multiple pipelines run on the same runner, they won't interfere
+        if pipeline_run_id:
+            workspace = Path(f"/workspace/{pipeline_run_id[:8]}/repo")
+        else:
+            workspace = Path("/workspace/repo")
 
         # Skip cloning if this is a continuation from a previous step
         if is_continuation and workspace.exists():
@@ -536,6 +542,7 @@ def execute_script_step(job: dict):
 
             if workspace.exists():
                 run_command(["sudo", "rm", "-rf", str(workspace)])
+            workspace.parent.mkdir(parents=True, exist_ok=True)
             exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
             if exit_code != 0:
                 raise Exception("Failed to clone repository")
@@ -649,7 +656,12 @@ def execute_docker_step(job: dict):
         # Clone repo first (so we can mount it into the container)
         repo_id = job.get("repo_id", "")
         use_internal_git = job.get("use_internal_git", False)
-        workspace = Path("/workspace/repo")
+
+        # Use separate workspace directories per pipeline to avoid conflicts
+        if pipeline_run_id:
+            workspace = Path(f"/workspace/{pipeline_run_id[:8]}/repo")
+        else:
+            workspace = Path("/workspace/repo")
 
         # Skip cloning if this is a continuation from a previous step
         if is_continuation and workspace.exists():
@@ -664,6 +676,7 @@ def execute_docker_step(job: dict):
 
             if workspace.exists():
                 run_command(["sudo", "rm", "-rf", str(workspace)])
+            workspace.parent.mkdir(parents=True, exist_ok=True)
             exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
             if exit_code != 0:
                 raise Exception("Failed to clone repository")
@@ -797,7 +810,11 @@ def execute_agent_step(job: dict):
         repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
         log(f"Using internal git server: {repo_url}")
 
-    workspace = Path("/workspace/repo")
+    # Use separate workspace directories per pipeline to avoid conflicts
+    if pipeline_run_id:
+        workspace = Path(f"/workspace/{pipeline_run_id[:8]}/repo")
+    else:
+        workspace = Path("/workspace/repo")
 
     try:
         # Configure git
@@ -812,6 +829,7 @@ def execute_agent_step(job: dict):
             log(f"Cloning {repo_url}...")
             if workspace.exists():
                 run_command(["sudo", "rm", "-rf", str(workspace)])
+            workspace.parent.mkdir(parents=True, exist_ok=True)
             exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
             if exit_code != 0:
                 raise Exception("Failed to clone repository")

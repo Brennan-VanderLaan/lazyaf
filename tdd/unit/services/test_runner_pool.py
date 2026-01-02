@@ -468,8 +468,10 @@ class TestGetRunners:
         runner = result[0]
         assert "id" in runner
         assert "name" in runner
+        assert "runner_type" in runner
         assert "status" in runner
         assert "current_job_id" in runner
+        assert "current_job_title" in runner
         assert "last_heartbeat" in runner
         assert "registered_at" in runner
         assert "log_count" in runner
@@ -485,6 +487,20 @@ class TestGetRunners:
 
         assert runner_data["status"] == "busy"
         assert runner_data["current_job_id"] == "job-999"
+        assert runner_data["current_job_title"] == "Test Job"
+
+    def test_get_runners_no_job_title_when_idle(self, pool):
+        """Runner info has None for job title when idle."""
+        runner = pool.register()
+        runner.status = "idle"
+        runner.current_job = None
+
+        result = pool.get_runners()
+        runner_data = result[0]
+
+        assert runner_data["status"] == "idle"
+        assert runner_data["current_job_id"] is None
+        assert runner_data["current_job_title"] is None
 
 
 # -----------------------------------------------------------------------------

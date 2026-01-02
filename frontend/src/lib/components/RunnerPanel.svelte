@@ -14,6 +14,18 @@
   let logsLoading = false;
   let logPollInterval: ReturnType<typeof setInterval> | null = null;
 
+  // Group runners by type
+  $: groupedRunners = $runnersStore.reduce((acc, runner) => {
+    const type = runner.runner_type || 'unknown';
+    if (!acc[type]) {
+      acc[type] = [];
+    }
+    acc[type].push(runner);
+    return acc;
+  }, {} as Record<string, Runner[]>);
+
+  $: runnerTypes = Object.keys(groupedRunners).sort();
+
   onMount(() => {
     poolStatus.startPolling(2000);
     runnersStore.startPolling(2000);
@@ -149,30 +161,47 @@
 
   {#if showRunners}
     <div class="runner-list">
-      {#each $runnersStore as runner (runner.id)}
-        <button
-          class="runner-item"
-          on:click={() => openLogsModal(runner)}
-        >
-          <span
-            class="status-dot"
-            style="background: {getStatusColor(runner.status)}"
-          ></span>
-          <span class="runner-name">{runner.name}</span>
-          <span class="runner-status">{runner.status}</span>
-          {#if runner.current_job_id}
-            <span class="job-badge">working</span>
-          {/if}
-          {#if runner.log_count > 0}
-            <span class="log-count">{runner.log_count} lines</span>
-          {/if}
-        </button>
-      {:else}
+      {#if $runnersStore.length === 0}
         <div class="no-runners">
           <p>No runners connected</p>
           <p class="hint">Click 🐳 to get the Docker command</p>
         </div>
-      {/each}
+      {:else}
+        {#each runnerTypes as runnerType (runnerType)}
+          <div class="runner-group">
+            <div class="runner-group-header">
+              <span class="runner-type-label">{runnerType}</span>
+              <span class="runner-count">{groupedRunners[runnerType].length}</span>
+            </div>
+            {#each groupedRunners[runnerType] as runner (runner.id)}
+              <button
+                class="runner-item"
+                on:click={() => openLogsModal(runner)}
+              >
+                <span
+                  class="status-dot"
+                  style="background: {getStatusColor(runner.status)}"
+                ></span>
+                <div class="runner-info">
+                  <div class="runner-main">
+                    <span class="runner-name">{runner.name}</span>
+                    <span class="runner-status">{runner.status}</span>
+                  </div>
+                  {#if runner.current_job_title}
+                    <div class="runner-job">
+                      <span class="job-icon">⚡</span>
+                      <span class="job-title">{runner.current_job_title}</span>
+                    </div>
+                  {/if}
+                </div>
+                {#if runner.log_count > 0}
+                  <span class="log-count">{runner.log_count} lines</span>
+                {/if}
+              </button>
+            {/each}
+          </div>
+        {/each}
+      {/if}
     </div>
   {/if}
 </div>
@@ -380,8 +409,42 @@
 
   .runner-list {
     margin-top: 0.5rem;
-    max-height: 300px;
+    max-height: 400px;
     overflow-y: auto;
+  }
+
+  .runner-group {
+    margin-bottom: 0.75rem;
+  }
+
+  .runner-group:last-child {
+    margin-bottom: 0;
+  }
+
+  .runner-group-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.4rem 0.5rem;
+    margin-bottom: 0.25rem;
+    background: var(--surface-alt, #181825);
+    border-radius: 4px;
+  }
+
+  .runner-type-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--primary-color, #89b4fa);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .runner-count {
+    font-size: 0.7rem;
+    color: var(--text-muted, #6c7086);
+    background: var(--surface-color, #1e1e2e);
+    padding: 0.1rem 0.4rem;
+    border-radius: 10px;
   }
 
   .runner-item {
@@ -408,31 +471,63 @@
     height: 8px;
     border-radius: 50%;
     flex-shrink: 0;
+    margin-top: 0.2rem;
+    align-self: flex-start;
+  }
+
+  .runner-info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-width: 0;
+  }
+
+  .runner-main {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
   }
 
   .runner-name {
     font-family: monospace;
     color: var(--text-color, #cdd6f4);
+    font-size: 0.8rem;
   }
 
   .runner-status {
     color: var(--text-muted, #6c7086);
     text-transform: capitalize;
+    font-size: 0.75rem;
   }
 
-  .job-badge {
-    background: var(--warning-color, #f9e2af);
-    color: var(--primary-text, #1e1e2e);
-    padding: 0.1rem 0.4rem;
+  .runner-job {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.15rem 0.4rem;
+    background: rgba(137, 180, 250, 0.1);
     border-radius: 3px;
+    border-left: 2px solid var(--primary-color, #89b4fa);
+  }
+
+  .job-icon {
     font-size: 0.7rem;
-    font-weight: 500;
+  }
+
+  .job-title {
+    font-size: 0.75rem;
+    color: var(--text-color, #cdd6f4);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .log-count {
     margin-left: auto;
     font-size: 0.7rem;
     color: var(--text-muted, #6c7086);
+    flex-shrink: 0;
   }
 
   .no-runners {

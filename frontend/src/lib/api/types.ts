@@ -125,6 +125,7 @@ export interface Runner {
   runner_type: string;
   status: RunnerStatus;
   current_job_id: string | null;
+  current_job_title: string | null;
   last_heartbeat: string;
   registered_at: string;
   log_count: number;

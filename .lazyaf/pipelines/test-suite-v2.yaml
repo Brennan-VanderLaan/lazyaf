@@ -1,0 +1,28 @@
+name: "Test Suite v2 (Pre-built Image)"
+description: "Run tests using pre-built lazyaf-test-runner image"
+steps:
+  - id: "sync-deps"
+    name: "Sync Dependencies"
+    type: docker
+    config:
+      image: "lazyaf-test-runner:latest"
+      command: |
+        cd backend
+        uv sync --all-extras
+        uv sync --extra test
+    continue_in_context: true
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  - id: "run-tests"
+    name: "Run Tests"
+    type: docker
+    config:
+      image: "lazyaf-test-runner:latest"
+      command: |
+        cd backend
+        uv run pytest ../tdd -v --tb=short
+    on_success: next
+    on_failure: stop
+    timeout: 600

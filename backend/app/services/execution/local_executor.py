@@ -329,9 +329,19 @@ class LocalExecutor:
         # Build container config
         container_name = f"lazyaf-step-{key.step_index}-{str(uuid4())[:8]}"
 
-        volumes = {
-            config.workspace_path: {"bind": config.working_dir, "mode": "rw"},
-        }
+        # Determine if workspace_path is a Docker volume name or host path
+        # Docker volume names start with alphanumeric, host paths start with /
+        is_volume = not config.workspace_path.startswith("/") and not config.workspace_path.startswith("\\")
+
+        if is_volume:
+            # Named Docker volume - use list format for volumes
+            # Format: ["volume_name:/container/path:mode"]
+            volumes = [f"{config.workspace_path}:{config.working_dir}:rw"]
+        else:
+            # Bind mount from host path
+            volumes = {
+                config.workspace_path: {"bind": config.working_dir, "mode": "rw"},
+            }
 
         # Environment variables
         env = dict(config.environment)

@@ -4,15 +4,17 @@ Pipeline execution service.
 Orchestrates multi-step pipeline workflows by:
 1. Creating pipeline runs and step runs
 2. Creating workspace for pipeline (Docker volume)
-3. Enqueuing steps as jobs (via temporary cards for tracking)
+3. Routing steps to LocalExecutor (Phase 12.4) or job queue (legacy/agent)
 4. Handling step completion callbacks
 5. Evaluating on_success/on_failure branching logic
 6. Broadcasting status via WebSocket
 7. Cleaning up workspace on completion
 """
 
+import asyncio
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -26,6 +28,12 @@ from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
 from app.services.workspace_service import get_workspace_service, WorkspaceError
+
+# Phase 12.4: LocalExecutor integration
+from app.services.execution.router import ExecutionRouter, ExecutorType
+from app.services.execution.config_builder import build_execution_config
+from app.services.execution.local_executor import get_local_executor, ExecutionResult
+from app.services.execution.idempotency import ExecutionKey
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +82,18 @@ def step_run_to_ws_dict(step_run: StepRun) -> dict:
 
 class PipelineExecutor:
     """Orchestrates pipeline execution."""
+
+    def __init__(self, use_local_executor: bool = True):
+        """
+        Initialize PipelineExecutor with execution router.
+
+        Args:
+            use_local_executor: If True, route script/docker steps to LocalExecutor
+                              for immediate execution. If False, always use job queue.
+                              Set to False in tests or when Docker isn't available.
+        """
+        self._router = ExecutionRouter()
+        self._use_local_executor = use_local_executor
 
     async def _complete_pipeline(
         self,
@@ -333,7 +353,8 @@ class PipelineExecutor:
         """
         Execute a single step in the pipeline.
 
-        Creates a StepRun, creates a temporary Card + Job, and enqueues the job.
+        Phase 12.4: Routes script/docker steps to LocalExecutor for instant execution.
+        Agent steps and steps with special requirements use job queue (legacy path).
 
         Args:
             previous_runner_id: The runner that executed the previous step (for continuation affinity)
@@ -350,6 +371,7 @@ class PipelineExecutor:
         timeout = step.get("timeout", 300)
         continue_in_context = step.get("continue_in_context", False)
         step_id = step.get("id")  # Optional step ID for context directory naming
+        requirements = step.get("requires", {})
 
         # Extract agent-specific fields from step config (Phase 9.1c)
         agent_file_ids = step_config.get("agent_file_ids", []) if step_type == "agent" else []
@@ -394,6 +416,201 @@ class PipelineExecutor:
         await manager.send_step_run_status(step_run_to_ws_dict(step_run))
         await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
 
+        # Phase 12.4: Route step to appropriate executor
+        # Agent steps still use job queue (until Phase 12.5)
+        # Continuation steps need affinity, so they use job queue for remote runners
+        routing_decision = self._router.route(
+            step_type=step_type,
+            step_config=step_config,
+            requirements=requirements,
+            previous_runner_id=previous_runner_id if is_continuation else None,
+        )
+
+        # Use LocalExecutor for script/docker steps without special requirements
+        # Only if local execution is enabled (disabled in tests)
+        use_local_executor = (
+            self._use_local_executor
+            and routing_decision.executor_type == ExecutorType.LOCAL
+            and step_type in ("script", "docker")
+            and not is_continuation  # Continuations need job queue for proper workspace handling
+        )
+
+        if use_local_executor:
+            # Execute locally via LocalExecutor
+            await self._execute_step_locally(
+                db=db,
+                pipeline_run=pipeline_run,
+                repo=repo,
+                steps=steps,
+                step_index=step_index,
+                step_run=step_run,
+                step_type=step_type,
+                step_config=step_config,
+                timeout=timeout,
+                continue_in_context=continue_in_context,
+            )
+            return
+
+        # Legacy path: Use job queue for agent steps and remote execution
+        await self._execute_step_via_job_queue(
+            db=db,
+            pipeline_run=pipeline_run,
+            repo=repo,
+            steps=steps,
+            step_index=step_index,
+            step_run=step_run,
+            step_name=step_name,
+            step_type=step_type,
+            step_config=step_config,
+            step_id=step_id,
+            timeout=timeout,
+            continue_in_context=continue_in_context,
+            is_continuation=is_continuation,
+            previous_step_logs=previous_step_logs,
+            previous_runner_id=previous_runner_id,
+            agent_file_ids=agent_file_ids,
+            prompt_template=prompt_template,
+        )
+
+    async def _execute_step_locally(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        repo: Repo,
+        steps: list[dict],
+        step_index: int,
+        step_run: StepRun,
+        step_type: str,
+        step_config: dict,
+        timeout: int,
+        continue_in_context: bool,
+    ) -> None:
+        """
+        Execute a step locally using LocalExecutor (Phase 12.4).
+
+        This is the fast path for script/docker steps without special requirements.
+        """
+        step_name = step_run.step_name
+        logger.info(f"Executing step {step_index} locally: {step_name}")
+
+        # Get workspace - explicitly load the workspace relationship
+        await db.refresh(pipeline_run, ["workspace"])
+        workspace = pipeline_run.workspace
+
+        # For Docker volume-based workspaces, we need to mount by volume name
+        # For local execution, the LocalExecutor handles volume mounting
+        if workspace and workspace.volume_name:
+            # Use Docker volume name - LocalExecutor will mount it
+            workspace_path = workspace.volume_name
+        else:
+            # No workspace - create a temporary directory
+            logger.warning(f"No workspace for pipeline run {pipeline_run.id[:8]}, creating temporary workspace")
+            workspace_path = f"/tmp/lazyaf-workspace-{pipeline_run.id}"
+
+        try:
+            # Build execution config
+            exec_config = build_execution_config(
+                step_type=step_type,
+                step_config=step_config,
+                workspace_path=workspace_path,
+                timeout_seconds=timeout,
+                use_control_layer=False,  # Direct execution without control layer for now
+            )
+
+            # Create execution key for idempotency
+            exec_key = ExecutionKey(
+                pipeline_run_id=pipeline_run.id,
+                step_index=step_index,
+                attempt=1,  # TODO: Track attempts for retries
+            )
+
+            # Execute via LocalExecutor
+            executor = get_local_executor()
+            logs_buffer = []
+
+            async for item in executor.execute_step(exec_key, exec_config):
+                if isinstance(item, str):
+                    logs_buffer.append(item)
+                    # Stream logs in real-time
+                    logger.debug(f"[step {step_index}] {item}")
+                elif isinstance(item, ExecutionResult):
+                    # Execution complete
+                    step_success = item.success
+
+                    # Update step run
+                    step_run.status = RunStatus.PASSED.value if step_success else RunStatus.FAILED.value
+                    step_run.completed_at = datetime.utcnow()
+                    step_run.logs = "\n".join(logs_buffer)
+                    if not step_success:
+                        step_run.error = item.error or f"Exit code: {item.exit_code}"
+
+                    if step_success:
+                        pipeline_run.steps_completed += 1
+
+                    await db.commit()
+                    await db.refresh(step_run)
+                    await db.refresh(pipeline_run)
+
+                    # Broadcast completion
+                    await manager.send_step_run_status(step_run_to_ws_dict(step_run))
+                    await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+
+                    logger.info(f"Step {step_index} ({step_name}) completed locally: {'success' if step_success else 'failed'}")
+
+                    # Get step definition for action handling
+                    step = steps[step_index]
+                    action = step.get("on_success" if step_success else "on_failure", "stop" if not step_success else "next")
+
+                    # Handle action (no runner_id for local execution)
+                    await self._handle_action(db, pipeline_run, repo, steps, step_index, action, step_success, runner_id=None)
+                    return
+
+        except Exception as e:
+            logger.error(f"Local execution failed for step {step_index}: {e}")
+
+            # Mark step as failed
+            step_run.status = RunStatus.FAILED.value
+            step_run.completed_at = datetime.utcnow()
+            step_run.error = str(e)
+
+            await db.commit()
+            await db.refresh(step_run)
+
+            # Broadcast failure
+            await manager.send_step_run_status(step_run_to_ws_dict(step_run))
+            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+
+            # Get step definition for action handling
+            step = steps[step_index]
+            action = step.get("on_failure", "stop")
+
+            await self._handle_action(db, pipeline_run, repo, steps, step_index, action, False, runner_id=None)
+
+    async def _execute_step_via_job_queue(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        repo: Repo,
+        steps: list[dict],
+        step_index: int,
+        step_run: StepRun,
+        step_name: str,
+        step_type: str,
+        step_config: dict,
+        step_id: str | None,
+        timeout: int,
+        continue_in_context: bool,
+        is_continuation: bool,
+        previous_step_logs: str | None,
+        previous_runner_id: str | None,
+        agent_file_ids: list,
+        prompt_template: str | None,
+    ) -> None:
+        """
+        Execute a step via job queue (legacy path for agent steps and remote execution).
+
+        This preserves the existing behavior for agent steps and steps with special requirements.
+        """
         # Create a temporary card for tracking this step
         # This allows reuse of the existing job/runner infrastructure
         card_title = f"[Pipeline] {step_name}"
@@ -899,4 +1116,7 @@ class PipelineExecutor:
 
 
 # Global pipeline executor instance
-pipeline_executor = PipelineExecutor()
+# Local executor is disabled by default for safety in tests
+# Set LAZYAF_USE_LOCAL_EXECUTOR=1 to enable in production
+_use_local_executor = os.environ.get("LAZYAF_USE_LOCAL_EXECUTOR", "0") == "1"
+pipeline_executor = PipelineExecutor(use_local_executor=_use_local_executor)

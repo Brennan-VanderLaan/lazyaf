@@ -78,6 +78,9 @@ class RoutingDecision:
     required_labels: Dict[str, Any] = field(default_factory=dict)
     required_runner_id: Optional[str] = None
     workspace_affinity: str = "local"  # "local" or runner_id for remote
+    # Phase 12.4: Include step info for execution config building
+    step_type: str = "script"
+    step_config: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         # Set workspace affinity based on executor type
@@ -153,6 +156,8 @@ class ExecutionRouter:
                 executor_type=ExecutorType.REMOTE,
                 reason=f"Affinity: continuing on runner {previous_runner_id}",
                 required_runner_id=previous_runner_id,
+                step_type=step_type,
+                step_config=step_config,
             )
 
         # Specific runner requested
@@ -165,6 +170,8 @@ class ExecutionRouter:
                 executor_type=ExecutorType.REMOTE,
                 reason=f"Specific runner requested: {reqs.runner_id}",
                 required_runner_id=reqs.runner_id,
+                step_type=step_type,
+                step_config=step_config,
             )
 
         # Hardware requirements (gpio, camera, cuda, etc.)
@@ -180,6 +187,8 @@ class ExecutionRouter:
                 executor_type=ExecutorType.REMOTE,
                 reason=f"Hardware requirements: {', '.join(reqs.has)}",
                 required_labels=labels,
+                step_type=step_type,
+                step_config=step_config,
             )
 
         # Architecture mismatch
@@ -192,12 +201,16 @@ class ExecutionRouter:
                 executor_type=ExecutorType.REMOTE,
                 reason=f"Architecture mismatch: need {reqs.arch}, local is {self.local_arch}",
                 required_labels={"arch": reqs.arch},
+                step_type=step_type,
+                step_config=step_config,
             )
 
         # Default: local execution
         return RoutingDecision(
             executor_type=ExecutorType.LOCAL,
             reason="No special requirements, using local executor",
+            step_type=step_type,
+            step_config=step_config,
         )
 
     async def get_executor(self, decision: RoutingDecision):

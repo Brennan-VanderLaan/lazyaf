@@ -30,7 +30,7 @@ try:
         TimeoutError as ExecutionTimeoutError,
     )
     from app.services.execution.step_state import StepState
-    from app.services.execution.idempotency import ExecutionKey
+    from app.services.execution.idempotency import ExecutionKey, IdempotencyStore, get_idempotency_store
     EXECUTION_MODULE_AVAILABLE = True
 except ImportError:
     EXECUTION_MODULE_AVAILABLE = False
@@ -42,6 +42,19 @@ except ImportError:
     ExecutionTimeoutError = Exception
     StepState = None
     ExecutionKey = None
+    IdempotencyStore = None
+    get_idempotency_store = None
+
+
+@pytest.fixture(autouse=True)
+def clear_idempotency_store():
+    """Clear the global idempotency store before each test."""
+    if get_idempotency_store is not None:
+        get_idempotency_store().clear()
+    yield
+    # Also clear after test for good measure
+    if get_idempotency_store is not None:
+        get_idempotency_store().clear()
 
 
 pytestmark = pytest.mark.skipif(

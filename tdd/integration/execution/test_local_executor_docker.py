@@ -59,6 +59,26 @@ pytestmark = [
 ]
 
 
+@pytest.fixture
+def require_image():
+    """Fixture factory to check if a Docker image is available.
+
+    Usage:
+        def test_something(self, require_image):
+            require_image("python:3.12-slim")
+            # ... test code ...
+    """
+    def _require(image_name: str):
+        try:
+            client = docker.from_env()
+            client.images.get(image_name)
+        except docker.errors.ImageNotFound:
+            pytest.skip(f"Docker image '{image_name}' not available. Run: docker pull {image_name}")
+        except Exception as e:
+            pytest.skip(f"Failed to check for image '{image_name}': {e}")
+    return _require
+
+
 class TestLocalExecutorWithDocker:
     """Integration tests using real Docker containers."""
 
@@ -296,8 +316,10 @@ class TestLocalExecutorPythonImage:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(120)
-    async def test_execute_python_script(self, executor, workspace):
+    async def test_execute_python_script(self, executor, workspace, require_image):
         """Execute a Python script in container."""
+        require_image("python:3.12-slim")
+
         # Create a Python script
         script = workspace / "hello.py"
         script.write_text("print('Hello from Python!')")
@@ -330,8 +352,10 @@ class TestLocalExecutorPythonImage:
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(120)
-    async def test_execute_python_with_error(self, executor, workspace):
+    async def test_execute_python_with_error(self, executor, workspace, require_image):
         """Python script with error returns non-zero exit code."""
+        require_image("python:3.12-slim")
+
         # Create a Python script that raises an error
         script = workspace / "error.py"
         script.write_text("raise ValueError('Test error')")

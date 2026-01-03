@@ -12,6 +12,15 @@ from app.schemas.pipeline import (
     PipelineRunCreate,
     StepRunRead,
 )
+from app.schemas.steps import (
+    StepStatus,
+    StatusUpdate,
+    LogsUpdate,
+    HeartbeatRequest,
+    StatusResponse,
+    LogsResponse,
+    HeartbeatResponse,
+)
 
 __all__ = [
     "RepoCreate",
@@ -33,4 +42,11 @@ __all__ = [
     "PipelineRunRead",
     "PipelineRunCreate",
     "StepRunRead",
+    "StepStatus",
+    "StatusUpdate",
+    "LogsUpdate",
+    "HeartbeatRequest",
+    "StatusResponse",
+    "LogsResponse",
+    "HeartbeatResponse",
 ]

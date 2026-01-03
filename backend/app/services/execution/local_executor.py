@@ -9,8 +9,10 @@ The LocalExecutor is the "fast path" for step execution:
 """
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import AsyncGenerator, Optional, Union
 from uuid import uuid4
 
@@ -50,6 +52,12 @@ class ExecutionConfig:
     network_mode: str = "bridge"            # Docker network mode
     memory_limit: Optional[str] = None      # Memory limit (e.g., "2g")
     cpu_limit: Optional[float] = None       # CPU limit (e.g., 1.0)
+    # Control layer support (Phase 12.3)
+    use_control_layer: bool = False         # If True, use control layer image
+    backend_url: Optional[str] = None       # Backend URL for control layer
+    heartbeat_interval: float = 10.0        # Heartbeat interval (seconds)
+    log_batch_size: int = 100               # Log batch size
+    log_batch_interval: float = 1.0         # Log batch interval (seconds)
 
 
 @dataclass
@@ -119,6 +127,59 @@ class LocalExecutor:
         machine = self._state_machines.get(key)
         return machine.state if machine else None
 
+    def _prepare_control_directory(
+        self,
+        key: ExecutionKey,
+        config: ExecutionConfig,
+    ) -> Optional[str]:
+        """
+        Prepare the .control directory for control layer execution.
+
+        Creates /workspace/.control/step_config.json with:
+        - Step ID and authentication token
+        - Backend URL for communication
+        - Command to execute
+        - Environment and timeout settings
+
+        Args:
+            key: Execution key
+            config: Execution configuration
+
+        Returns:
+            Step token if control layer is enabled, None otherwise
+        """
+        if not config.use_control_layer:
+            return None
+
+        from .step_token import generate_step_token
+
+        # Generate step token for authentication
+        step_id = str(key)
+        token = generate_step_token(step_id)
+
+        # Prepare control directory
+        control_dir = Path(config.workspace_path) / ".control"
+        control_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write step configuration
+        step_config = {
+            "step_id": step_id,
+            "backend_url": config.backend_url or "http://host.docker.internal:8000",
+            "token": token,
+            "command": config.command,
+            "working_dir": "/workspace/repo",
+            "environment": config.environment,
+            "timeout_seconds": config.timeout_seconds,
+            "heartbeat_interval": config.heartbeat_interval,
+            "log_batch_size": config.log_batch_size,
+            "log_batch_interval": config.log_batch_interval,
+        }
+
+        config_path = control_dir / "step_config.json"
+        config_path.write_text(json.dumps(step_config, indent=2))
+
+        return token
+
     async def execute_step(
         self,
         key: ExecutionKey,
@@ -166,6 +227,11 @@ class LocalExecutor:
                 machine.transition(StepState.PREPARING)
 
             yield f"[executor] Preparing container with image {config.image}"
+
+            # Prepare control directory if using control layer
+            if config.use_control_layer:
+                self._prepare_control_directory(key, config)
+                yield f"[executor] Control layer configured"
 
             # Create container
             docker_client = self._get_docker_client()
@@ -267,16 +333,26 @@ class LocalExecutor:
             config.workspace_path: {"bind": config.working_dir, "mode": "rw"},
         }
 
+        # Environment variables
+        env = dict(config.environment)
+        if config.use_control_layer:
+            # Set HOME to workspace/home for cache persistence
+            env["HOME"] = "/workspace/home"
+
         kwargs = {
             "image": config.image,
-            "command": config.command,
             "name": container_name,
             "volumes": volumes,
             "working_dir": config.working_dir,
-            "environment": config.environment,
+            "environment": env,
             "network_mode": config.network_mode,
             "detach": True,
         }
+
+        # Only pass command if NOT using control layer
+        # Control layer reads command from step_config.json
+        if not config.use_control_layer:
+            kwargs["command"] = config.command
 
         if config.memory_limit:
             kwargs["mem_limit"] = config.memory_limit

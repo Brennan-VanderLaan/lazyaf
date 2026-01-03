@@ -1214,7 +1214,7 @@ Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isol
 
 ---
 
-## Phase 11: Agent Playground
+## Phase 11: Agent Playground ✅ (MVP Complete)
 
 **Goal**: Rapid experimentation with agent prompts without going through full card/job development loops
 
@@ -1403,34 +1403,34 @@ interface PlaygroundState {
 ### Implementation Phases
 
 #### Phase 11a: Foundation (MVP)
-- [ ] Add `is_playground`, `playground_session_id`, `playground_save_branch` to QueuedJob
-- [ ] Create `PlaygroundService` with `start_test()`, `stream_logs()`, `get_result()`
-- [ ] Create `/playground/*` REST endpoints
-- [ ] SSE streaming for runner logs
-- [ ] Runner checks `is_playground` flag, skips card updates if true
+- [x] Add `is_playground`, `playground_session_id`, `playground_save_branch` to QueuedJob
+- [x] Create `PlaygroundService` with `start_test()`, `stream_logs()`, `get_result()`
+- [x] Create `/playground/*` REST endpoints
+- [x] SSE streaming for runner logs
+- [x] Runner checks `is_playground` flag, skips card updates if true (Claude only, Gemini TODO)
 
 #### Phase 11b: Frontend - Test Once Mode
-- [ ] Add Playground tab to navigation
-- [ ] Create `PlaygroundPage.svelte`
-- [ ] Create `playground` store
-- [ ] Repo/branch/agent/runner selectors
-- [ ] Task override textarea
-- [ ] "Test Once" button
-- [ ] Log stream display (reuse LogViewer patterns)
-- [ ] Connect to SSE endpoint
+- [x] Add Playground tab to navigation
+- [x] Create `PlaygroundPage.svelte`
+- [x] Create `playground` store
+- [x] Repo/branch/agent/runner selectors
+- [x] Task override textarea
+- [x] "Test Once" button
+- [x] Log stream display (reuse LogViewer patterns)
+- [x] Connect to SSE endpoint
 
 #### Phase 11c: Diff & Save
-- [ ] Backend captures diff after runner completes
-- [ ] Diff preview panel in frontend
-- [ ] "Save to branch" checkbox
-- [ ] Branch name input with auto-generate (`agent-test/<agent>-NNN`)
-- [ ] Push changes to save branch on completion
+- [x] Backend captures diff after runner completes
+- [x] Diff preview panel in frontend
+- [x] "Save to branch" checkbox
+- [x] Branch name input with auto-generate (`agent-test/<agent>-NNN`)
+- [x] Push changes to save branch on completion
 
 #### Phase 11d: Cancellation
-- [ ] Backend: `cancel_test()` kills runner process
-- [ ] Frontend: Cancel button
-- [ ] Graceful cleanup
-- [ ] Status indicators
+- [x] Backend: `cancel_test()` updates status (actual process kill TODO)
+- [x] Frontend: Cancel button
+- [x] Graceful cleanup
+- [x] Status indicators
 
 #### Phase 11e: Polish
 - [ ] Keyboard shortcuts (Ctrl+Enter for Test Once)
@@ -1764,6 +1764,13 @@ steps:
 This is intentional - allows heterogeneous pipelines. Caveat: architecture must match (can't build ARM binary on amd64 and run it).
 
 #### Runner Affinity
+
+> **Implementation Status** (as of Phase 11):
+> - ✅ Basic affinity: `required_runner_id` enforced in job_queue.dequeue()
+> - ✅ `continue_in_context` / `is_continuation` flags working in both runners
+> - ✅ `previous_runner_id` passed between pipeline steps
+> - ❌ `affinity_timeout` NOT implemented (jobs wait indefinitely for required runner)
+> - ❌ No tests for affinity scenarios
 
 When `continue_in_context: true`, the next step REQUIRES the same runner:
 
@@ -3622,7 +3629,12 @@ async def with_workspace_lock(workspace_id: str):
   - 9.1c: Agent Parity - ✅ COMPLETE
   - 9.1d: Context Directory - ✅ COMPLETE
 - Phase 10: Events & Triggers - ✅ COMPLETE (card triggers, push triggers, auto-merge)
-- Phase 11: Agent Playground - deferred (rapid agent experimentation)
+- Phase 11: Agent Playground - ✅ MVP COMPLETE (Phase 11e Polish remaining)
+  - 11a: Foundation - ✅ COMPLETE (Gemini is_playground TODO)
+  - 11b: Frontend Test Once - ✅ COMPLETE
+  - 11c: Diff & Save - ✅ COMPLETE
+  - 11d: Cancellation - ✅ COMPLETE (actual process kill TODO)
+  - 11e: Polish - PENDING (keyboard shortcuts, auto-scroll, etc.)
 - **Phase 12: Runner Architecture Refactor - NEXT** (multi-image pipelines, hardware runners)
   - 12.0: Unify Runner Entrypoints (2-3 days) - fix immediate pain
   - 12.1: LocalExecutor + Step State Machine (~1.5 weeks) - zero latency + idempotency

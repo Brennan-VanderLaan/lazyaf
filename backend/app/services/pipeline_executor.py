@@ -3,10 +3,12 @@ Pipeline execution service.
 
 Orchestrates multi-step pipeline workflows by:
 1. Creating pipeline runs and step runs
-2. Enqueuing steps as jobs (via temporary cards for tracking)
-3. Handling step completion callbacks
-4. Evaluating on_success/on_failure branching logic
-5. Broadcasting status via WebSocket
+2. Creating workspace for pipeline (Docker volume)
+3. Enqueuing steps as jobs (via temporary cards for tracking)
+4. Handling step completion callbacks
+5. Evaluating on_success/on_failure branching logic
+6. Broadcasting status via WebSocket
+7. Cleaning up workspace on completion
 """
 
 import json
@@ -23,6 +25,7 @@ from app.models import Pipeline, PipelineRun, StepRun, RunStatus, Job, Card, Rep
 from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
+from app.services.workspace_service import get_workspace_service, WorkspaceError
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +88,18 @@ class PipelineExecutor:
         1. Setting the final status (passed/failed)
         2. Executing on_pass/on_fail actions from trigger_context
         3. Broadcasting the status update
+        4. Cleaning up the workspace
         """
         pipeline_run.status = RunStatus.PASSED.value if success else RunStatus.FAILED.value
         pipeline_run.completed_at = datetime.utcnow()
         await db.commit()
         await db.refresh(pipeline_run)
+
+        # Cleanup workspace
+        try:
+            await self._cleanup_workspace(db, pipeline_run)
+        except Exception as e:
+            logger.error(f"Failed to cleanup workspace for pipeline run {pipeline_run.id[:8]}: {e}")
 
         # Execute trigger actions if present in trigger_context
         if pipeline_run.trigger_context:
@@ -231,7 +241,7 @@ class PipelineExecutor:
         """
         Start a new pipeline run.
 
-        Creates PipelineRun, then starts executing the first step.
+        Creates PipelineRun, workspace, then starts executing the first step.
 
         trigger_context can contain:
         - branch: The branch to work on
@@ -259,6 +269,23 @@ class PipelineExecutor:
 
         logger.info(f"Started pipeline run {pipeline_run.id[:8]} for pipeline {pipeline.name}")
 
+        # Create workspace for the pipeline run
+        try:
+            branch = trigger_context.get("branch") if trigger_context else None
+            commit_sha = trigger_context.get("commit_sha") if trigger_context else None
+            workspace_service = get_workspace_service()
+            workspace = await workspace_service.get_or_create_workspace(
+                db=db,
+                pipeline_run=pipeline_run,
+                repo=repo,
+                branch=branch,
+                commit_sha=commit_sha,
+            )
+            logger.info(f"Created workspace {workspace.id} for pipeline run {pipeline_run.id[:8]}")
+        except WorkspaceError as e:
+            logger.error(f"Failed to create workspace: {e}")
+            # Continue without workspace - jobs will create their own working directories
+
         # Broadcast pipeline run started
         await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
 
@@ -270,6 +297,28 @@ class PipelineExecutor:
             await self._complete_pipeline(db, pipeline_run, success=True)
 
         return pipeline_run
+
+    async def _cleanup_workspace(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+    ) -> None:
+        """
+        Cleanup workspace after pipeline completion.
+
+        Args:
+            db: Database session
+            pipeline_run: Completed pipeline run
+        """
+        # Refresh to get workspace relationship
+        await db.refresh(pipeline_run)
+
+        if not pipeline_run.workspace:
+            logger.debug(f"No workspace to cleanup for pipeline run {pipeline_run.id[:8]}")
+            return
+
+        workspace_service = get_workspace_service()
+        await workspace_service.cleanup_workspace(db, pipeline_run.workspace)
 
     async def _execute_step(
         self,

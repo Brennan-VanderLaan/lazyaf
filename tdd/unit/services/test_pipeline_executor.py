@@ -359,17 +359,23 @@ class TestPipelineExecutorStartPipeline:
         mock_repo = MagicMock()
         mock_repo.id = "repo-456"
 
+        # Mock workspace service
+        mock_workspace_service = MagicMock()
+        mock_workspace_service.get_or_create_workspace = AsyncMock()
+        mock_workspace_service.cleanup_workspace = AsyncMock()
+
         with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
             mock_manager.send_pipeline_run_status = AsyncMock()
 
-            result = await executor.start_pipeline(
-                db=mock_db,
-                pipeline=mock_pipeline,
-                repo=mock_repo,
-            )
+            with patch("app.services.pipeline_executor.get_workspace_service", return_value=mock_workspace_service):
+                result = await executor.start_pipeline(
+                    db=mock_db,
+                    pipeline=mock_pipeline,
+                    repo=mock_repo,
+                )
 
-            assert result.status == RunStatus.PASSED.value
-            assert result.completed_at is not None
+                assert result.status == RunStatus.PASSED.value
+                assert result.completed_at is not None
 
     @pytest.mark.asyncio
     async def test_start_pipeline_with_steps_executes_first_step(self, executor):
@@ -388,18 +394,23 @@ class TestPipelineExecutorStartPipeline:
         mock_repo = MagicMock()
         mock_repo.id = "repo-456"
 
+        # Mock workspace service
+        mock_workspace_service = MagicMock()
+        mock_workspace_service.get_or_create_workspace = AsyncMock()
+
         with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
             mock_manager.send_pipeline_run_status = AsyncMock()
 
-            with patch.object(executor, "_execute_step", new_callable=AsyncMock) as mock_execute:
-                result = await executor.start_pipeline(
-                    db=mock_db,
-                    pipeline=mock_pipeline,
-                    repo=mock_repo,
-                )
+            with patch("app.services.pipeline_executor.get_workspace_service", return_value=mock_workspace_service):
+                with patch.object(executor, "_execute_step", new_callable=AsyncMock) as mock_execute:
+                    result = await executor.start_pipeline(
+                        db=mock_db,
+                        pipeline=mock_pipeline,
+                        repo=mock_repo,
+                    )
 
-                assert result.status == RunStatus.RUNNING.value
-                mock_execute.assert_called_once()
+                    assert result.status == RunStatus.RUNNING.value
+                    mock_execute.assert_called_once()
 
 
 class TestPipelineExecutorCancelRun:

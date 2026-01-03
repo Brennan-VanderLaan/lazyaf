@@ -191,14 +191,16 @@ class LocalExecutor:
                     logs_buffer.append(log_line)
                     yield log_line
             except asyncio.TimeoutError:
-                # Kill container on timeout
+                # Kill and cleanup container on timeout
                 await self._kill_container(container)
+                await self._cleanup_container(container)
                 machine.transition(StepState.FAILED, reason="timeout", exit_code=-1)
                 self._idempotency.complete_execution(key, success=False, exit_code=-1, error="Timeout")
                 raise TimeoutError(f"Execution timed out after {config.timeout_seconds}s")
             except asyncio.CancelledError:
-                # Cancelled
+                # Cancelled - kill and cleanup
                 await self._kill_container(container)
+                await self._cleanup_container(container)
                 machine.transition(StepState.CANCELLED)
                 raise
 
@@ -242,7 +244,10 @@ class LocalExecutor:
         except (ExecutionError, TimeoutError):
             raise
         except Exception as e:
-            # Handle unexpected errors
+            # Handle unexpected errors - cleanup container if it exists
+            if 'container' in locals():
+                await self._kill_container(container)
+                await self._cleanup_container(container)
             if machine.state not in {StepState.COMPLETED, StepState.FAILED, StepState.CANCELLED}:
                 machine.transition(StepState.FAILED, reason=str(e))
             self._idempotency.complete_execution(key, success=False, exit_code=-1, error=str(e))
@@ -271,8 +276,6 @@ class LocalExecutor:
             "environment": config.environment,
             "network_mode": config.network_mode,
             "detach": True,
-            "stdout": True,
-            "stderr": True,
         }
 
         if config.memory_limit:
@@ -297,39 +300,67 @@ class LocalExecutor:
         timeout: int,
         cancel_event: asyncio.Event,
     ) -> AsyncGenerator[str, None]:
-        """Stream logs from container with timeout."""
+        """Stream logs from container with timeout.
+
+        Uses a background thread to read from the blocking Docker log stream
+        and an asyncio queue to pass lines to the async code. This allows
+        proper timeout checking even when no output is being produced.
+        """
         loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+
+        # Queue for passing log lines from reader thread to async code
+        log_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+        def read_logs_sync():
+            """Synchronous log reader running in a thread."""
+            try:
+                logs = container.logs(stream=True, follow=True, stdout=True, stderr=True)
+                for line in logs:
+                    if isinstance(line, bytes):
+                        line = line.decode("utf-8", errors="replace")
+                    # Use call_soon_threadsafe to put items on the queue
+                    loop.call_soon_threadsafe(log_queue.put_nowait, line.rstrip("\n\r"))
+            except Exception:
+                pass  # Log stream ended - container probably exited
+            finally:
+                # Signal end of stream
+                loop.call_soon_threadsafe(log_queue.put_nowait, None)
+
+        # Start reader thread
+        reader_future = loop.run_in_executor(None, read_logs_sync)
 
         try:
-            # Get log stream
-            logs = await loop.run_in_executor(
-                None,
-                lambda: container.logs(stream=True, follow=True, stdout=True, stderr=True)
-            )
-
-            deadline = asyncio.get_event_loop().time() + timeout
-
-            for line in logs:
-                # Check timeout
-                if asyncio.get_event_loop().time() > deadline:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
                     raise asyncio.TimeoutError()
 
-                # Check cancellation
                 if cancel_event.is_set():
                     raise asyncio.CancelledError()
 
-                # Decode and yield
-                if isinstance(line, bytes):
-                    line = line.decode("utf-8", errors="replace")
-                yield line.rstrip("\n\r")
+                try:
+                    # Wait for next line with short timeout to allow deadline/cancel checks
+                    line = await asyncio.wait_for(
+                        log_queue.get(),
+                        timeout=min(remaining, 0.5)
+                    )
 
-                # Small yield to allow other tasks
-                await asyncio.sleep(0)
+                    if line is None:
+                        # Reader done - container exited
+                        break
 
-        except Exception as e:
-            if isinstance(e, (asyncio.TimeoutError, asyncio.CancelledError)):
-                raise
-            # Log stream ended - container probably exited
+                    yield line
+
+                except asyncio.TimeoutError:
+                    # No output within 0.5s - check if overall deadline exceeded
+                    if loop.time() >= deadline:
+                        raise
+                    # Otherwise continue waiting for more output
+        finally:
+            # The reader thread will exit when container dies or logs close
+            # We don't need to explicitly stop it as container.kill() handles that
+            pass
 
     async def _kill_container(self, container) -> None:
         """Kill a container."""

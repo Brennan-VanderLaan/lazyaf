@@ -6,10 +6,16 @@ services:
     volumes:
       - ./backend/app:/app/app
       - lazyaf-data:/app/data
+      # Mount Docker socket for LocalExecutor to spawn containers
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DATABASE_URL=sqlite+aiosqlite:////app/data/lazyaf.db
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    # Allow container to access Docker daemon
+    group_add:
+      - docker
     restart: unless-stopped
 
   frontend:

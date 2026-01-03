@@ -9,6 +9,7 @@ from .models import (
     PipelineFactory,
     PipelineRunFactory,
     StepRunFactory,
+    StepExecutionFactory,
 )
 from .api import (
     card_create_payload,
@@ -46,6 +47,7 @@ __all__ = [
     "PipelineFactory",
     "PipelineRunFactory",
     "StepRunFactory",
+    "StepExecutionFactory",
     # API factories
     "repo_create_payload",
     "repo_update_payload",

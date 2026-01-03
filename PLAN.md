@@ -2020,19 +2020,115 @@ On backend restart:
 
 ---
 
+### Phase 12 Prerequisites: Test Infrastructure
+
+> **Goal**: Establish platform-level test hooks and fixtures BEFORE any Phase 12 implementation begins. Tests define interfaces and expected behavior - they are written FIRST, not as an afterthought.
+
+**This must exist BEFORE any Phase 12 work begins.**
+
+#### Test Fixtures (Create First)
+
+- [ ] `tdd/conftest.py` with shared pytest fixtures:
+  - `docker_client` - Connected Docker SDK client (skip tests if unavailable)
+  - `test_database` - Fresh SQLite in-memory or temp file per test
+  - `async_session` - Async SQLAlchemy session factory
+  - `mock_websocket` - Fake WebSocket for protocol testing
+  - `temp_workspace` - Creates and cleans up temp directories
+
+#### Platform-Level Test Hooks
+
+- [ ] Docker manipulation helpers (`tdd/shared/docker_helpers.py`):
+  - `spawn_test_container(image, command)` - Create container, return handle
+  - `kill_container(container_id)` - Force kill
+  - `pause_container(container_id)` - Simulate hang
+  - `disconnect_network(container_id)` - Network partition
+- [ ] Process control helpers (`tdd/shared/process_helpers.py`):
+  - `kill_process(pid)` - Simulate crash
+  - `send_signal(pid, signal)` - SIGTERM, SIGKILL, SIGSTOP
+- [ ] Time manipulation (`tdd/shared/time_helpers.py`):
+  - `freeze_time(timestamp)` - For timeout testing
+  - `advance_time(seconds)` - Fast-forward for heartbeat tests
+
+#### Mock Infrastructure
+
+- [ ] `MockDockerClient` - Fake Docker SDK for unit tests (no real Docker needed)
+- [ ] `MockWebSocket` - Fake WebSocket for protocol tests
+- [ ] `TestDatabase` - Fresh database per test with rollback
+- [ ] `MockRunner` - Simulates runner behavior for RemoteExecutor tests
+
+#### Chaos Test Infrastructure
+
+- [ ] `ChaosController` class (`tdd/shared/chaos.py`):
+  - `inject_failure(type, target, duration)` - Programmatic failure injection
+  - Failure types: network_partition, process_kill, disk_full, slow_io
+- [ ] Recovery verification helpers:
+  - `wait_for_state(entity, expected_state, timeout)`
+  - `assert_eventually(condition, timeout, interval)`
+
+**Outcome**: All Phase 12 sub-phases can write tests immediately without infrastructure blockers.
+
+---
+
 ### Phase 12.0: Unify Runner Entrypoints
 **Goal**: Fix immediate pain, unblock future phases
 
 The current entrypoints are ~1800 lines each with 95% duplication. This phase extracts common code into a shared package.
 
+#### Tests First (Define Contracts)
+
+Write these tests BEFORE implementing the shared modules:
+
+**test_git_helpers.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_clone_creates_repo_at_path` | `clone(url, path) -> None` raises on failure |
+| `test_checkout_branch_switches` | `checkout(path, branch) -> None` |
+| `test_get_current_sha_returns_string` | `get_sha(path) -> str` |
+| `test_clone_handles_auth_failure` | Returns specific exception type |
+
+**test_context_helpers.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_create_context_dir_structure` | `.lazyaf-context/` has expected subdirs |
+| `test_write_context_file_creates_json` | Files are valid JSON |
+| `test_read_context_returns_parsed` | Read matches written |
+
+**test_job_helpers.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_heartbeat_sends_to_backend` | `send_heartbeat(job_id)` hits correct endpoint |
+| `test_heartbeat_timeout_raises` | Raises after N seconds |
+| `test_status_report_formats_correctly` | Status payload structure |
+
+- [ ] Write `test_git_helpers.py` (defines interface)
+- [ ] Write `test_context_helpers.py` (defines interface)
+- [ ] Write `test_job_helpers.py` (defines interface)
+
+#### Implementation (Make Tests Pass)
+
 - [ ] Create `runner-common/` package with shared utilities
-  - `git_helpers.py` - clone, branch, push, commit operations
-  - `context_helpers.py` - `.lazyaf-context/` management
-  - `job_helpers.py` - heartbeat, logging, status reporting
+  - `git_helpers.py` - clone, branch, push, commit operations (pass tests)
+  - `context_helpers.py` - `.lazyaf-context/` management (pass tests)
+  - `job_helpers.py` - heartbeat, logging, status reporting (pass tests)
   - `test_helpers.py` - test detection and execution
 - [ ] Create unified entrypoint that dispatches by agent type
 - [ ] Reduce Claude/Gemini-specific code to ~100 lines each (just CLI invocation)
-- [ ] Verify existing pipelines still work
+
+#### Integration Validation
+
+- [ ] `test_unified_entrypoint_dispatches.py`:
+  - Claude agent type routes correctly
+  - Gemini agent type routes correctly
+  - Unknown agent type fails with clear error
+- [ ] `test_existing_pipelines_still_work.py`:
+  - Run actual pipeline with unified entrypoint
+  - Compare output to baseline
+
+#### Done Criteria
+
+- [ ] All `test_*_helpers.py` tests pass
+- [ ] Integration tests pass with both Claude and Gemini runners
+- [ ] No regression in existing pipeline behavior
 
 **Effort**: 2-3 days
 **Risk**: Low
@@ -2045,7 +2141,50 @@ The current entrypoints are ~1800 lines each with 95% duplication. This phase ex
 
 The fast path - backend spawns containers directly, with full lifecycle tracking.
 
-**Database migration (replaces in-memory job queue for steps):**
+#### Tests First (Define Contracts)
+
+**test_step_state_machine.py** - Write BEFORE implementing state machine
+| Test | Defines Contract |
+|------|------------------|
+| `test_pending_to_assigned_valid` | Transition allowed |
+| `test_pending_to_running_invalid` | Must go through assigned first |
+| `test_running_to_completed_on_exit_0` | Exit code 0 = success |
+| `test_running_to_failed_on_nonzero` | Exit code != 0 = failure |
+| `test_running_to_timeout_on_deadline` | Timeout = specific state |
+| `test_cancel_from_any_state` | Cancel always works |
+| `test_completed_is_terminal` | No transitions from completed |
+| `test_transition_records_timestamp` | State changes have timestamps |
+
+**test_idempotency_keys.py** - Write BEFORE implementing idempotency
+| Test | Defines Contract |
+|------|------------------|
+| `test_execution_key_format` | Format: `{run_id}:{step}:{attempt}` |
+| `test_same_key_returns_existing` | Duplicate request = same execution |
+| `test_different_attempt_new_execution` | Retry = new execution |
+
+**test_local_executor_contract.py** - Write BEFORE implementing LocalExecutor
+| Test | Defines Contract |
+|------|------------------|
+| `test_execute_step_returns_generator` | `execute_step() -> AsyncGenerator` |
+| `test_execute_step_idempotent` | Same key = same result |
+| `test_execute_step_spawns_container` | Container created with correct image |
+| `test_execute_step_mounts_workspace` | Volume mounted at /workspace |
+| `test_execute_step_streams_logs` | Generator yields log lines |
+| `test_timeout_kills_container` | Container killed after timeout |
+| `test_crash_detection_fails_step` | Container crash = step failed |
+
+- [ ] Write `test_step_state_machine.py` (defines state transitions)
+- [ ] Write `test_idempotency_keys.py` (defines idempotency contract)
+- [ ] Write `test_local_executor_contract.py` (defines executor interface)
+
+#### Database Migration
+
+- [ ] Write migration test first:
+  ```python
+  def test_step_executions_table_created():
+      """Migration creates table with expected columns."""
+      # Run migration, assert table exists, assert columns
+  ```
 - [ ] Create `step_executions` table with Alembic migration
   ```python
   class StepExecution(Base):
@@ -2061,23 +2200,41 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
       completed_at: datetime | None
   ```
 - [ ] Add unique index on `execution_key` for idempotency
-- [ ] Implement Step state machine (pending -> preparing -> running -> completing -> completed/failed)
 
-**LocalExecutor implementation:**
-- [ ] Create `LocalExecutor` service in `backend/app/services/execution/`
-  ```python
-  class LocalExecutor:
-      """Spawns containers directly via Docker SDK. Zero latency."""
-      async def execute_step(request: StepExecutionRequest) -> AsyncGenerator[str, StepResult]
-      # Idempotent - checks execution_key before creating new execution
-  ```
+#### Implementation (Make Tests Pass)
+
+- [ ] Implement Step state machine (make state tests pass)
+- [ ] Create `LocalExecutor` service in `backend/app/services/execution/` (make executor tests pass)
 - [ ] Add Docker SDK (`docker` package) to backend dependencies
 - [ ] Mount Docker socket to backend container in docker-compose
 - [ ] Timeout handling with automatic container kill
 - [ ] Container crash detection and proper state transition to `failed`
 - [ ] Real-time log streaming from container to pipeline executor
 - [ ] Crash recovery: on startup, find orphaned steps and re-queue or fail them
-- [ ] Test: idempotency (same request twice returns same result)
+
+#### Integration Validation
+
+- [ ] `test_local_executor_real_docker.py` (requires Docker):
+  - Actually spawns container
+  - Actually streams logs
+  - Actually detects exit codes
+- [ ] `test_local_executor_recovery.py`:
+  - Kill backend mid-execution
+  - Restart backend
+  - Verify orphaned steps are failed/reattached
+
+#### Chaos Tests
+
+- [ ] `test_container_oom_handled.py` - Container OOM = step failed
+- [ ] `test_docker_unavailable_graceful.py` - Docker down = clear error
+
+#### Done Criteria
+
+- [ ] All state machine unit tests pass
+- [ ] All idempotency tests pass
+- [ ] LocalExecutor contract tests pass
+- [ ] Integration tests pass with real Docker
+- [ ] Recovery test passes
 
 **Effort**: 1.5 weeks
 **Risk**: Medium
@@ -2088,7 +2245,58 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
 ### Phase 12.2: Workspace State Machine & Pipeline Integration
 **Goal**: Proper workspace lifecycle with locking and cleanup
 
-- [ ] Implement Workspace state machine (creating → ready ↔ in_use → cleaning → destroyed)
+#### Tests First (Define Contracts)
+
+**test_workspace_state_machine.py** - Write BEFORE implementing workspace lifecycle
+| Test | Defines Contract |
+|------|------------------|
+| `test_creating_to_ready_on_success` | Volume created = ready |
+| `test_creating_to_failed_on_error` | Volume creation fails = failed |
+| `test_ready_to_in_use_increments_count` | use_count tracks concurrent access |
+| `test_in_use_to_ready_decrements_count` | Step completes = decrement |
+| `test_cleaning_requires_zero_use_count` | Can't clean while in use |
+| `test_orphaned_detection` | Workspace with no pipeline = orphaned |
+
+**test_workspace_locking.py** - Write BEFORE implementing locking
+| Test | Defines Contract |
+|------|------------------|
+| `test_exclusive_lock_for_create` | Only one creator |
+| `test_exclusive_lock_for_cleanup` | Only one cleaner |
+| `test_shared_lock_for_execution` | Multiple steps can run |
+| `test_lock_timeout_returns_false` | Don't block forever |
+
+**test_execution_router.py** - Write BEFORE implementing router
+| Test | Defines Contract |
+|------|------------------|
+| `test_routes_to_local_when_no_requirements` | Default = LocalExecutor |
+| `test_routes_to_remote_when_hardware_required` | `requires: {has: gpio}` = remote |
+| `test_returns_executor_handle` | Caller gets async generator |
+
+**test_pipeline_state_machine.py** - Write BEFORE implementing pipeline lifecycle
+| Test | Defines Contract |
+|------|------------------|
+| `test_pending_to_preparing` | Pipeline starts |
+| `test_preparing_to_running` | Workspace ready |
+| `test_running_to_completing` | All steps done |
+| `test_completing_to_completed` | Cleanup done |
+| `test_step_failure_fails_pipeline` | One step fails = pipeline fails |
+
+**test_trigger_deduplication.py** - Write BEFORE implementing dedup
+| Test | Defines Contract |
+|------|------------------|
+| `test_same_trigger_key_within_window_ignored` | Duplicate = no new run |
+| `test_same_trigger_key_after_window_allowed` | Window expired = new run |
+| `test_trigger_key_format` | Format: `{type}:{repo}:{ref}` |
+
+- [ ] Write `test_workspace_state_machine.py` (defines workspace lifecycle)
+- [ ] Write `test_workspace_locking.py` (defines locking semantics)
+- [ ] Write `test_execution_router.py` (defines routing contract)
+- [ ] Write `test_pipeline_state_machine.py` (defines pipeline lifecycle)
+- [ ] Write `test_trigger_deduplication.py` (defines dedup contract)
+
+#### Implementation (Make Tests Pass)
+
+- [ ] Implement Workspace state machine (make workspace tests pass)
 - [ ] Create `Workspace` model with state and use_count
   ```python
   class Workspace:
@@ -2097,16 +2305,42 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
       use_count: int  # For concurrent step access
       pipeline_run_id: str
   ```
-- [ ] Workspace locking (exclusive for create/cleanup, shared for step execution)
+- [ ] Implement workspace locking (make lock tests pass)
 - [ ] Idempotent workspace creation (`get_or_create_workspace`)
-- [ ] Create `ExecutionRouter` that routes steps to appropriate executor
+- [ ] Create `ExecutionRouter` (make routing tests pass)
 - [ ] Update `pipeline_executor.py` to use ExecutionRouter instead of job queue
-- [ ] Pipeline run state machine (pending → preparing → running → completing → completed)
-- [ ] Trigger deduplication with `trigger_key` (prevents duplicate pipeline runs)
-- [ ] Exactly-once step execution (skip steps with completed `execution_key`)
+- [ ] Implement pipeline state machine (make pipeline tests pass)
+- [ ] Implement trigger deduplication (make dedup tests pass)
 - [ ] Workspace cleanup on pipeline completion
 - [ ] Orphan detection: periodic audit finds abandoned workspaces
-- [ ] Test: multi-step pipeline with different images, crash recovery
+
+#### Integration Validation
+
+- [ ] `test_multi_step_pipeline.py`:
+  - Step 1 completes, workspace persists
+  - Step 2 sees Step 1 artifacts
+  - Pipeline completes, workspace cleaned
+- [ ] `test_different_images_share_workspace.py`:
+  - Step 1 in `golang:1.21`
+  - Step 2 in `python:3.12`
+  - Workspace contains both outputs
+- [ ] `test_workspace_cleanup_on_failure.py`:
+  - Pipeline fails mid-execution
+  - Workspace still cleaned up (eventually)
+
+#### Chaos Tests
+
+- [ ] `test_concurrent_workspace_access.py` - Multiple steps, same workspace
+- [ ] `test_orphan_workspace_recovery.py` - Backend dies, workspace orphaned, recovered on restart
+
+#### Done Criteria
+
+- [ ] Workspace state machine tests pass
+- [ ] Locking tests pass (no race conditions)
+- [ ] ExecutionRouter tests pass
+- [ ] Pipeline state machine tests pass
+- [ ] Multi-step integration test passes
+- [ ] Orphan recovery test passes
 
 **Effort**: 1.5 weeks
 **Risk**: Medium
@@ -2117,25 +2351,86 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
 ### Phase 12.3: Control Layer & Step Images
 **Goal**: Proper container communication and base images
 
-- [ ] Create control layer script (`/control/run.py`)
+#### Tests First (Define Contracts)
+
+**test_control_layer_protocol.py** - Write BEFORE implementing control layer
+| Test | Defines Contract |
+|------|------------------|
+| `test_reads_config_from_control_dir` | Config at `/workspace/.control/step_config.json` |
+| `test_reports_status_on_start` | POST to `/api/steps/{id}/status` with `running` |
+| `test_reports_status_on_complete` | POST with `completed` and exit code |
+| `test_streams_logs_to_backend` | POST to `/api/steps/{id}/logs` |
+| `test_heartbeat_during_execution` | POST to `/api/steps/{id}/heartbeat` periodically |
+| `test_handles_backend_unavailable` | Retries, eventually fails gracefully |
+
+**test_step_api_endpoints.py** - Write BEFORE implementing API (backend side)
+| Test | Defines Contract |
+|------|------------------|
+| `test_post_status_updates_step` | Status endpoint updates DB |
+| `test_post_logs_appends` | Logs endpoint appends to step logs |
+| `test_post_heartbeat_updates_timestamp` | Heartbeat extends timeout |
+| `test_auth_required` | Endpoints require step token |
+
+**test_base_image_contract.py** - Write BEFORE building base image
+| Test | Defines Contract |
+|------|------------------|
+| `test_python_available` | `python3 --version` works |
+| `test_git_available` | `git --version` works |
+| `test_control_layer_at_expected_path` | `/control/run.py` exists |
+| `test_entrypoint_is_control_layer` | Default entrypoint runs control layer |
+
+**test_home_persistence.py** - Write BEFORE implementing HOME behavior
+| Test | Defines Contract |
+|------|------------------|
+| `test_home_is_workspace_home` | `$HOME` = `/workspace/home` |
+| `test_pip_cache_persists` | pip cache survives step boundary |
+| `test_local_bin_persists` | `~/.local/bin` survives step boundary |
+
+- [ ] Write `test_control_layer_protocol.py` (defines control layer contract)
+- [ ] Write `test_step_api_endpoints.py` (defines API contract)
+- [ ] Write `test_base_image_contract.py` (defines image requirements)
+- [ ] Write `test_home_persistence.py` (defines HOME behavior)
+
+#### Implementation (Make Tests Pass)
+
+- [ ] Create control layer script (`/control/run.py`) - make protocol tests pass
   - Reads step config from `/workspace/.control/step_config.json`
   - Reports status to backend (running, completed, failed)
   - Streams logs to backend
   - Heartbeat during long operations
-- [ ] Create base image (`lazyaf-base`)
-  - Python 3.12-slim + git + curl + control layer
-  - `ENTRYPOINT ["python", "/control/run.py"]`
-- [ ] Create agent images inheriting from base
-  - `lazyaf-claude`: base + Claude CLI + agent wrapper
-  - `lazyaf-gemini`: base + Gemini CLI + agent wrapper
-- [ ] Workspace HOME persistence (`HOME=/workspace/home`)
-  - pip/npm/uv caches persist across steps
-  - `~/.local/bin` for user-installed tools
-- [ ] New API endpoints for step containers
+- [ ] Create API endpoints - make endpoint tests pass
   - `POST /api/steps/{step_id}/status`
   - `POST /api/steps/{step_id}/logs`
   - `POST /api/steps/{step_id}/heartbeat`
-- [ ] Test: agent step → script step → agent step with shared HOME
+- [ ] Create base image (`lazyaf-base`) - make image contract tests pass
+  - Python 3.12-slim + git + curl + control layer
+  - `ENTRYPOINT ["python", "/control/run.py"]`
+- [ ] Configure HOME persistence - make persistence tests pass
+  - `HOME=/workspace/home`
+  - pip/npm/uv caches persist across steps
+  - `~/.local/bin` for user-installed tools
+- [ ] Create agent images inheriting from base
+  - `lazyaf-claude`: base + Claude CLI + agent wrapper
+  - `lazyaf-gemini`: base + Gemini CLI + agent wrapper
+
+#### Integration Validation
+
+- [ ] `test_agent_script_agent_pipeline.py`:
+  - Agent step installs tool via pip
+  - Script step uses that tool
+  - Agent step sees script output
+- [ ] `test_control_layer_reports_failure.py`:
+  - Command exits non-zero
+  - Control layer reports failed status
+  - Backend marks step failed
+
+#### Done Criteria
+
+- [ ] Control layer protocol tests pass
+- [ ] API endpoint tests pass
+- [ ] Base image passes contract tests
+- [ ] HOME persistence tests pass
+- [ ] Cross-step integration test passes
 
 **Effort**: 1-1.5 weeks
 **Risk**: Medium
@@ -2146,12 +2441,42 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
 ### Phase 12.4: Migrate Script/Docker Steps
 **Goal**: All non-agent steps use new architecture
 
+#### Tests First (Define Contracts)
+
+**test_step_routing_contract.py** - Write BEFORE implementing routing
+| Test | Defines Contract |
+|------|------------------|
+| `test_script_step_routes_through_orchestrator` | type=script uses new path |
+| `test_docker_step_routes_through_orchestrator` | type=docker uses new path |
+| `test_custom_image_respected` | `image: foo:bar` uses that image |
+
+**test_migration_compatibility.py** - Write BEFORE migrating
+| Test | Defines Contract |
+|------|------------------|
+| `test_existing_pipeline_yaml_works` | Old format still executes |
+| `test_new_pipeline_yaml_works` | New format with images executes |
+
+- [ ] Write `test_step_routing_contract.py` (defines routing behavior)
+- [ ] Write `test_migration_compatibility.py` (defines backward compat)
+
+#### Implementation (Make Tests Pass)
+
 - [ ] Pipeline executor routes script/docker steps through orchestrator
 - [ ] Remove `execute_script_step` and `execute_docker_step` from runner entrypoints
 - [ ] Steps can specify custom images in pipeline YAML
 - [ ] Migrate test-suite.yaml to use pre-built image
 - [ ] Create example `lazyaf-test-runner` Dockerfile with uv + deps
-- [ ] Test: existing pipelines work, new multi-image pipelines work
+
+#### Integration Validation
+
+- [ ] `test_existing_pipelines_work.py` - Run actual existing pipelines
+- [ ] `test_multi_image_pipeline.py` - Different images in same pipeline
+
+#### Done Criteria
+
+- [ ] Routing tests pass
+- [ ] Backward compatibility tests pass
+- [ ] All existing pipelines pass (regression suite)
 
 **Effort**: 1 week
 **Risk**: Medium (migration path)
@@ -2162,11 +2487,44 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
 ### Phase 12.5: Migrate Agent Steps
 **Goal**: Agent steps also use new architecture
 
+#### Tests First (Define Contracts)
+
+**test_agent_step_contract.py** - Write BEFORE implementing agent migration
+| Test | Defines Contract |
+|------|------------------|
+| `test_agent_step_spawns_container` | Agent runs in container, not runner |
+| `test_agent_wrapper_invokes_cli` | Claude CLI called correctly |
+| `test_agent_uses_correct_image` | `lazyaf-claude` image used |
+
+**test_polling_removal.py** - Write BEFORE removing polling
+| Test | Defines Contract |
+|------|------------------|
+| `test_no_runner_polling_calls` | Backend doesn't poll runners |
+| `test_runners_not_long_lived` | No persistent runner processes |
+
+- [ ] Write `test_agent_step_contract.py` (defines agent execution)
+- [ ] Write `test_polling_removal.py` (defines what's removed)
+
+#### Implementation (Make Tests Pass)
+
 - [ ] Agent steps spawn ephemeral containers via orchestrator
 - [ ] Agent wrapper script handles Claude/Gemini CLI invocation
 - [ ] Remove old runner polling infrastructure
 - [ ] Runners no longer long-lived - spawned per step
-- [ ] Test: Claude → script → Gemini pipeline works
+
+#### Integration Validation
+
+- [ ] `test_claude_script_gemini_pipeline.py`:
+  - Claude step (container)
+  - Script step (container)
+  - Gemini step (container)
+  - All share workspace
+
+#### Done Criteria
+
+- [ ] Agent step contract tests pass
+- [ ] Polling removal verified
+- [ ] Cross-agent pipeline works
 
 **Effort**: 1-1.5 weeks
 **Risk**: Higher (changes agent execution model)
@@ -2179,7 +2537,56 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
 
 Event-driven architecture - no polling, backend pushes jobs immediately.
 
-**Database migration (replaces in-memory runner_pool.py):**
+#### Tests First (Define Contracts)
+
+**test_runner_state_machine.py** - Write BEFORE implementing runner lifecycle
+| Test | Defines Contract |
+|------|------------------|
+| `test_disconnected_to_connecting` | WebSocket opens |
+| `test_connecting_to_idle_on_register` | Registration succeeds |
+| `test_idle_to_assigned_on_job` | Job pushed to runner |
+| `test_assigned_to_busy_on_ack` | Runner acknowledges |
+| `test_busy_to_dead_on_timeout` | Heartbeat missed |
+| `test_dead_to_connecting_on_reconnect` | Runner reconnects |
+
+**test_websocket_protocol.py** - Write BEFORE implementing WebSocket
+| Test | Defines Contract |
+|------|------------------|
+| `test_register_message_format` | `{"type": "register", "runner_id": ..., "labels": ...}` |
+| `test_execute_step_message_format` | `{"type": "execute_step", ...}` |
+| `test_ack_required_within_timeout` | 5s ACK timeout |
+| `test_heartbeat_interval` | Heartbeat every 10s |
+| `test_death_timeout` | 30s without heartbeat = dead |
+
+**test_remote_executor_contract.py** - Write BEFORE implementing RemoteExecutor
+| Test | Defines Contract |
+|------|------------------|
+| `test_register_runner_stores_in_db` | Runner record created |
+| `test_execute_step_pushes_via_websocket` | Job pushed immediately |
+| `test_ack_timeout_reassigns` | No ACK = try another runner |
+| `test_heartbeat_extends_deadline` | Heartbeat resets death timer |
+| `test_death_requeues_step` | Dead runner = step back to pending |
+
+**test_job_recovery.py** - Write BEFORE implementing recovery
+| Test | Defines Contract |
+|------|------------------|
+| `test_runner_dies_mid_job_requeues` | Step re-queued |
+| `test_runner_reconnects_resumes` | Same runner picks up |
+| `test_reconnect_after_reassign_aborts` | Too late = abort local work |
+
+- [ ] Write `test_runner_state_machine.py` (defines runner lifecycle)
+- [ ] Write `test_websocket_protocol.py` (defines protocol contract)
+- [ ] Write `test_remote_executor_contract.py` (defines executor interface)
+- [ ] Write `test_job_recovery.py` (defines recovery contract)
+
+#### Database Migration
+
+- [ ] Write migration test first:
+  ```python
+  def test_runners_table_created():
+      """Migration creates runners table."""
+      # Assert columns: id, name, status, labels, current_step_execution_id, ...
+  ```
 - [ ] Create `runners` table with Alembic migration
   ```python
   class Runner(Base):
@@ -2194,26 +2601,19 @@ Event-driven architecture - no polling, backend pushes jobs immediately.
       connected_at: datetime | None
       created_at: datetime
   ```
-- [ ] Remove in-memory `runner_pool.py` dict, query database instead
-- [ ] Implement Runner state machine (disconnected -> connecting -> idle -> assigned -> busy)
 
-**RemoteExecutor implementation:**
-- [ ] Create `RemoteExecutor` service in backend
-  ```python
-  class RemoteExecutor:
-      """Pushes jobs to remote runners via WebSocket."""
-      async def register_runner(runner_id, labels, websocket) -> None
-      async def execute_step(runner_id, step_config) -> AsyncGenerator[str, StepResult]
-      # Handles ACK timeout, heartbeat monitoring, death detection
-  ```
+#### Implementation (Make Tests Pass)
+
+- [ ] Implement Runner state machine (make state tests pass)
+- [ ] Remove in-memory `runner_pool.py` dict, query database instead
+- [ ] Implement WebSocket protocol (make protocol tests pass)
+- [ ] Create `RemoteExecutor` service (make executor tests pass)
 - [ ] WebSocket endpoint for runner connections (`/ws/runner`)
   - Registration with auth timeout (10s)
   - ACK required for job assignment (5s timeout)
   - Heartbeat monitoring (30s death timeout)
   - Graceful drain for shutdown
-- [ ] Job recovery on runner death
-  - If runner dies mid-job, re-queue step if still in `running` state
-  - Prevents duplicate execution if completion message was lost
+- [ ] Implement job recovery (make recovery tests pass)
 - [ ] Reconnection handling
   - Same runner_id can reconnect after death
   - Rejects duplicate connections from same runner_id
@@ -2225,7 +2625,32 @@ Event-driven architecture - no polling, backend pushes jobs immediately.
 - [ ] `NativeOrchestrator` for embedded devices
   - Runs steps directly on host (no Docker)
   - Git-based workspace sync
-- [ ] Test: runner death mid-job → step re-queued → new runner picks up
+
+#### Integration Validation
+
+- [ ] `test_remote_runner_full_flow.py`:
+  - Start runner agent
+  - Push job via backend
+  - Runner executes
+  - Runner reports completion
+- [ ] `test_runner_failover.py`:
+  - Two runners connected
+  - Kill one mid-job
+  - Other picks up
+
+#### Chaos Tests (Critical for this phase)
+
+- [ ] `test_runner_disconnect_mid_job.py` - Network partition
+- [ ] `test_all_runners_disconnect.py` - Total failure
+- [ ] `test_runner_reconnect_race.py` - Reconnect vs reassign race
+
+#### Done Criteria
+
+- [ ] Runner state machine tests pass
+- [ ] WebSocket protocol tests pass
+- [ ] RemoteExecutor contract tests pass
+- [ ] Job recovery tests pass
+- [ ] Chaos tests pass
 
 **Effort**: 2 weeks
 **Risk**: Medium-High
@@ -2256,6 +2681,45 @@ Runner -> Backend: {"type": "step_complete", "step_id": "...", "exit_code": 0}
 **Goal**: Re-run failed pipelines with breakpoints for interactive debugging
 
 The primary use case: someone points you at a failed pipeline and you need to figure out what went wrong. Debug mode lets you re-run with breakpoints, inspect state, and iterate.
+
+#### Tests First (Define Contracts)
+
+**test_debug_session_state_machine.py** - Write BEFORE implementing debug lifecycle
+| Test | Defines Contract |
+|------|------------------|
+| `test_pending_to_waiting_on_breakpoint` | Breakpoint hit = waiting |
+| `test_waiting_to_connected_on_join` | CLI connects = connected |
+| `test_connected_to_ended_on_resume` | Resume = continue |
+| `test_timeout_from_waiting` | No connect = timeout |
+| `test_timeout_from_connected` | Idle too long = timeout |
+
+**test_debug_api_contract.py** - Write BEFORE implementing API endpoints
+| Test | Defines Contract |
+|------|------------------|
+| `test_create_debug_rerun_returns_session` | POST returns session ID |
+| `test_get_debug_session_returns_info` | GET returns commit, runtime, logs |
+| `test_resume_continues_pipeline` | POST resume = pipeline continues |
+| `test_abort_cancels_pipeline` | POST abort = pipeline cancelled |
+
+**test_breakpoint_execution.py** - Write BEFORE implementing breakpoint behavior
+| Test | Defines Contract |
+|------|------------------|
+| `test_pipeline_pauses_at_breakpoint` | Execution stops |
+| `test_workspace_preserved_at_breakpoint` | Files accessible |
+| `test_multiple_breakpoints_work` | Can set many breakpoints |
+
+**test_terminal_connection.py** - Write BEFORE implementing terminal
+| Test | Defines Contract |
+|------|------------------|
+| `test_sidecar_mode_spawns_container` | Sidecar container created |
+| `test_shell_mode_execs_into_running` | Exec into step container |
+| `test_special_commands_work` | @resume, @abort, @status |
+| `test_token_required` | Auth enforced |
+
+- [ ] Write `test_debug_session_state_machine.py` (defines debug lifecycle)
+- [ ] Write `test_debug_api_contract.py` (defines API contract)
+- [ ] Write `test_breakpoint_execution.py` (defines breakpoint behavior)
+- [ ] Write `test_terminal_connection.py` (defines terminal protocol)
 
 #### Debug Re-Run Workflow
 
@@ -2448,6 +2912,24 @@ Mounts workspace volume at `/workspace`. Lightweight, starts fast.
 - [ ] `--extend` to add time to session
 - [ ] Cleanup: remove debug containers on session end
 
+#### Integration Validation
+
+- [ ] `test_e2e_debug_workflow.py`:
+  - Pipeline fails
+  - Create debug re-run with breakpoint
+  - Connect via CLI
+  - Inspect workspace
+  - Resume
+  - Pipeline completes
+
+#### Done Criteria
+
+- [ ] Debug session state machine tests pass
+- [ ] API contract tests pass
+- [ ] Breakpoint execution tests pass
+- [ ] Terminal connection tests pass
+- [ ] E2E workflow test passes
+
 **Effort**: 2-3 weeks
 **Risk**: Medium
 **Outcome**: Operators can re-run failed pipelines with breakpoints and connect via CLI to debug
@@ -2457,11 +2939,97 @@ Mounts workspace volume at `/workspace`. Lightweight, starts fast.
 ### Phase 12.8: Cleanup & Polish
 **Goal**: Remove legacy code, document new model
 
+#### Tests First (Regression Focus)
+
+**test_no_legacy_code.py** - Verify removal is complete
+| Test | Validates |
+|------|-----------|
+| `test_old_entrypoints_removed` | Files don't exist |
+| `test_runner_pool_removed` | No polling infrastructure |
+| `test_no_docker_in_docker` | No socket mounting in runners |
+
+**test_full_regression_suite.py** - Everything still works
+
+*Pipeline Execution Paths*
+| Test | Validates |
+|------|-----------|
+| `test_pipeline_with_single_step_completes` | Minimal pipeline executes end-to-end |
+| `test_pipeline_with_multiple_steps_sequential` | Steps execute in order |
+| `test_pipeline_on_success_next_continues` | `on_success: next` advances to next step |
+| `test_pipeline_on_success_stop_completes` | `on_success: stop` ends pipeline with passed status |
+| `test_pipeline_on_failure_stop_halts` | `on_failure: stop` ends pipeline with failed status |
+| `test_pipeline_on_failure_next_continues` | `on_failure: next` continues despite step failure |
+| `test_pipeline_cancel_stops_execution` | Cancel marks run cancelled, stops steps |
+
+*Step Type Variations*
+| Test | Validates |
+|------|-----------|
+| `test_script_step_executes_command` | `type: script` runs shell command |
+| `test_docker_step_uses_specified_image` | `type: docker` pulls and runs in specified image |
+| `test_agent_step_invokes_ai_runner` | `type: agent` dispatches to Claude/Gemini runner |
+| `test_step_timeout_enforced` | Step exceeding timeout is killed |
+| `test_step_config_passed_to_executor` | step_config JSON reaches executor |
+
+*Executor Modes*
+| Test | Validates |
+|------|-----------|
+| `test_local_executor_spawns_container` | LocalExecutor creates Docker container |
+| `test_remote_executor_pushes_via_websocket` | RemoteExecutor sends job over WebSocket |
+| `test_execution_router_selects_correct_executor` | Router picks Local vs Remote based on requirements |
+
+*Workspace Continuity*
+| Test | Validates |
+|------|-----------|
+| `test_continue_in_context_preserves_workspace` | `continue_in_context: true` keeps files |
+| `test_is_continuation_skips_cleanup` | Continuation step does not reset workspace |
+| `test_previous_step_logs_passed_to_next` | Agent sees previous step output |
+| `test_different_images_share_workspace` | Step 1 in golang, Step 2 in python, both see files |
+
+*Trigger Mechanisms*
+| Test | Validates |
+|------|-----------|
+| `test_card_complete_trigger_fires` | Card -> done triggers pipeline |
+| `test_push_trigger_on_branch_match` | Push to matching branch triggers |
+| `test_trigger_disabled_does_not_fire` | enabled: false suppresses trigger |
+
+*WebSocket Broadcasts*
+| Test | Validates |
+|------|-----------|
+| `test_pipeline_run_status_broadcast` | pipeline_run_status event sent |
+| `test_step_run_status_broadcast` | step_run_status event sent |
+| `test_card_updated_broadcast` | card_updated on status change |
+
+*Error Handling*
+| Test | Validates |
+|------|-----------|
+| `test_step_failure_captured_in_error_field` | Failed step has error message |
+| `test_job_failure_updates_card_status` | Failed job -> card status = failed |
+| `test_tests_failed_marks_card_failed` | tests_passed=false -> card failed |
+| `test_runner_death_requeues_step` | Runner dies -> step returns to pending |
+
+*Recovery Scenarios*
+| Test | Validates |
+|------|-----------|
+| `test_backend_restart_resumes_pipelines` | Running pipelines resume after restart |
+| `test_orphan_containers_cleaned_on_startup` | Stale containers killed |
+| `test_orphan_steps_marked_failed` | Abandoned steps get failed status |
+
+- [ ] Write `test_no_legacy_code.py` (verifies cleanup)
+- [ ] Write `test_full_regression_suite.py` (validates everything works - 30+ tests above)
+
+#### Implementation
+
 - [ ] Remove old runner entrypoints (archive for reference)
 - [ ] Update docker-compose for new architecture
 - [ ] Remove `runner_pool.py` polling infrastructure
 - [ ] Documentation: runner deployment, custom images, step requirements
 - [ ] Example Dockerfiles for common step images
+
+#### Done Criteria
+
+- [ ] Legacy removal tests pass
+- [ ] Full regression suite passes
+- [ ] Documentation reviewed
 
 **Effort**: 1 week
 **Outcome**: Clean, documented system
@@ -2471,11 +3039,30 @@ Mounts workspace volume at `/workspace`. Lightweight, starts fast.
 ### Phase 12.9: Kubernetes Orchestrator (Future)
 **Goal**: Same code works on Kubernetes
 
-- [ ] Implement `KubernetesOrchestrator`
+#### Tests First (Define Contracts)
+
+**test_k8s_orchestrator_contract.py** - Write BEFORE implementing K8s
+| Test | Defines Contract |
+|------|------------------|
+| `test_creates_k8s_job_for_step` | Job resource created |
+| `test_uses_pvc_for_workspace` | PVC mounted |
+| `test_node_selector_from_labels` | Labels -> node selector |
+| `test_job_completion_detected` | Job status watched |
+
+- [ ] Write `test_k8s_orchestrator_contract.py` (defines K8s behavior)
+
+#### Implementation (Make Tests Pass)
+
+- [ ] Implement `KubernetesOrchestrator` (make tests pass)
 - [ ] PersistentVolumeClaims for workspaces
 - [ ] K8s Jobs for step execution
 - [ ] Node selectors based on runner labels
-- [ ] Test in K8s environment
+- [ ] Integration tests in K8s environment
+
+#### Done Criteria
+
+- [ ] K8s orchestrator tests pass (mocked)
+- [ ] Integration tests pass (real K8s)
 
 **Effort**: 2-3 weeks when needed
 **Outcome**: Production-ready K8s deployment

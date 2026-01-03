@@ -5,51 +5,42 @@
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           FRONTEND                                   │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │                    Svelte App                                │   │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐           │   │
-│  │  │ To Do   │ │In Prog  │ │In Review│ │  Done   │           │   │
-│  │  │  ┌───┐  │ │  ┌───┐  │ │  ┌───┐  │ │  ┌───┐  │           │   │
-│  │  │  │   │  │ │  │   │  │ │  │   │  │ │  │   │  │           │   │
-│  │  │  └───┘  │ │  └───┘  │ │  └───┘  │ │  └───┘  │           │   │
-│  │  └─────────┘ └─────────┘ └─────────┘ └─────────┘           │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
-                              │ HTTP/WebSocket
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                           BACKEND                                    │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │                    FastAPI Server                            │   │
-│  │                                                              │   │
-│  │  • REST API (cards, repos, jobs)                            │   │
-│  │  • WebSocket (real-time status updates)                     │   │
-│  │  • Runner Pool Manager                                       │   │
-│  │  • Job Queue                                                 │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                              │                                       │
-│                              ▼                                       │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │                    SQLite Database                           │   │
-│  │  • repos, cards, jobs, runners                              │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
-                              │ Docker API
-                              ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        RUNNER POOL                                   │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐                       │
-│  │  Runner 1 │  │  Runner 2 │  │  Runner N │                       │
-│  │ ┌───────┐ │  │ ┌───────┐ │  │ ┌───────┐ │                       │
-│  │ │Docker │ │  │ │Docker │ │  │ │Docker │ │                       │
-│  │ │  +    │ │  │ │  +    │ │  │ │  +    │ │                       │
-│  │ │Claude │ │  │ │Claude │ │  │ │Claude │ │                       │
-│  │ │ Code  │ │  │ │ Code  │ │  │ │ Code  │ │                       │
-│  │ └───────┘ │  │ └───────┘ │  │ └───────┘ │                       │
-│  └───────────┘  └───────────┘  └───────────┘                       │
-└─────────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------+
+|                           FRONTEND                                     |
+|   +---------------------------------------------------------------+   |
+|   |                    Svelte App                                  |   |
+|   |   [To Do]    [In Prog]   [In Review]   [Done]                 |   |
+|   |    [card]     [card]       [card]      [card]                 |   |
+|   +---------------------------------------------------------------+   |
++-----------------------------------------------------------------------+
+                              | HTTP/WebSocket
+                              v
++-----------------------------------------------------------------------+
+|                           BACKEND                                      |
+|   +---------------------------------------------------------------+   |
+|   |                    FastAPI Server                              |   |
+|   |  - REST API (cards, repos, jobs)                              |   |
+|   |  - WebSocket (real-time status updates)                       |   |
+|   |  - Runner Pool Manager                                        |   |
+|   |  - Job Queue                                                  |   |
+|   +---------------------------------------------------------------+   |
+|                              |                                         |
+|                              v                                         |
+|   +---------------------------------------------------------------+   |
+|   |                    SQLite Database                             |   |
+|   |  - repos, cards, jobs, runners                                |   |
+|   +---------------------------------------------------------------+   |
++-----------------------------------------------------------------------+
+                              | Docker API
+                              v
++-----------------------------------------------------------------------+
+|                        RUNNER POOL                                     |
+|   +-----------+   +-----------+   +-----------+                       |
+|   | Runner 1  |   | Runner 2  |   | Runner N  |                       |
+|   | [Docker + |   | [Docker + |   | [Docker + |                       |
+|   |  Claude]  |   |  Claude]  |   |  Claude]  |                       |
+|   +-----------+   +-----------+   +-----------+                       |
++-----------------------------------------------------------------------+
 ```
 
 ## Tech Stack
@@ -257,26 +248,26 @@ Description:
 ### Svelte Structure
 ```
 src/
-├── lib/
-│   ├── components/
-│   │   ├── Board.svelte           # Kanban board container
-│   │   ├── Column.svelte          # Single column (To Do, etc.)
-│   │   ├── Card.svelte            # Draggable card
-│   │   ├── CardModal.svelte       # Create/edit card
-│   │   ├── RepoSelector.svelte    # Repo picker
-│   │   ├── JobStatus.svelte       # Job progress indicator
-│   │   └── RunnerPool.svelte      # Runner status display
-│   ├── stores/
-│   │   ├── cards.ts               # Card state
-│   │   ├── repos.ts               # Repo state
-│   │   ├── jobs.ts                # Job state
-│   │   └── websocket.ts           # WS connection
-│   └── api/
-│       └── client.ts              # API client
-├── routes/
-│   ├── +page.svelte               # Main board view
-│   └── +layout.svelte             # App layout
-└── app.html
+|-- lib/
+|   |-- components/
+|   |   |-- Board.svelte           # Kanban board container
+|   |   |-- Column.svelte          # Single column (To Do, etc.)
+|   |   |-- Card.svelte            # Draggable card
+|   |   |-- CardModal.svelte       # Create/edit card
+|   |   |-- RepoSelector.svelte    # Repo picker
+|   |   |-- JobStatus.svelte       # Job progress indicator
+|   |   +-- RunnerPool.svelte      # Runner status display
+|   |-- stores/
+|   |   |-- cards.ts               # Card state
+|   |   |-- repos.ts               # Repo state
+|   |   |-- jobs.ts                # Job state
+|   |   +-- websocket.ts           # WS connection
+|   +-- api/
+|       +-- client.ts              # API client
+|-- routes/
+|   |-- +page.svelte               # Main board view
+|   +-- +layout.svelte             # App layout
++-- app.html
 ```
 
 ## Implementation Phases
@@ -336,21 +327,21 @@ src/
 
 #### Architecture
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        INTERNAL GIT SERVER                          │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │                    HTTP Smart Protocol                       │   │
-│  │  GET  /git/{repo_id}.git/info/refs   (clone discovery)      │   │
-│  │  POST /git/{repo_id}.git/git-upload-pack   (fetch)          │   │
-│  │  POST /git/{repo_id}.git/git-receive-pack  (push)           │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                              │                                       │
-│                              ▼                                       │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │                    Bare Git Repos                            │   │
-│  │  backend/git_repos/{repo_id}.git/                           │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------+
+|                        INTERNAL GIT SERVER                             |
+|   +---------------------------------------------------------------+   |
+|   |                    HTTP Smart Protocol                         |   |
+|   |  GET  /git/{repo_id}.git/info/refs   (clone discovery)        |   |
+|   |  POST /git/{repo_id}.git/git-upload-pack   (fetch)            |   |
+|   |  POST /git/{repo_id}.git/git-receive-pack  (push)             |   |
+|   +---------------------------------------------------------------+   |
+|                              |                                         |
+|                              v                                         |
+|   +---------------------------------------------------------------+   |
+|   |                    Bare Git Repos                              |   |
+|   |  backend/git_repos/{repo_id}.git/                             |   |
+|   +---------------------------------------------------------------+   |
++-----------------------------------------------------------------------+
 ```
 
 #### Flows
@@ -497,10 +488,10 @@ src/
 **Key Files**:
 ```
 backend/
-├── mcp/
-│   ├── __init__.py
-│   ├── __main__.py       # Entry point for stdio transport
-│   └── server.py         # MCP server implementation (all tools)
++-- mcp/
+    |-- __init__.py
+    |-- __main__.py       # Entry point for stdio transport
+    +-- server.py         # MCP server implementation (all tools)
 ```
 
 **Tech Stack**:
@@ -561,26 +552,26 @@ backend/
 ### Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            PIPELINE SYSTEM                                   │
-│                                                                              │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐  │
-│  │   TRIGGER   │───▶│  PIPELINE   │───▶│    STEPS    │───▶│   RESULTS   │  │
-│  │             │    │             │    │             │    │             │  │
-│  │ • Manual    │    │ • Ordered   │    │ • Agent     │    │ • Pass/Fail │  │
-│  │ • Webhook   │    │ • Branching │    │ • Script    │    │ • Logs      │  │
-│  │ • Git Push  │    │ • Parallel  │    │ • Docker    │    │ • Artifacts │  │
-│  │ • Schedule  │    │   (future)  │    │             │    │             │  │
-│  └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘  │
-│                                                                              │
-│  Step Types:                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  AGENT          │  SCRIPT           │  DOCKER                        │   │
-│  │  Claude/Gemini  │  Shell commands   │  Command in specified image    │   │
-│  │  implements     │  lint, test,      │  isolated builds, custom       │   │
-│  │  features       │  coverage, build  │  environments                  │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------------+
+|                            PIPELINE SYSTEM                                   |
+|                                                                              |
+|  +-------------+    +-------------+    +-------------+    +-------------+   |
+|  |   TRIGGER   | -> |  PIPELINE   | -> |    STEPS    | -> |   RESULTS   |   |
+|  |             |    |             |    |             |    |             |   |
+|  | - Manual    |    | - Ordered   |    | - Agent     |    | - Pass/Fail |   |
+|  | - Webhook   |    | - Branching |    | - Script    |    | - Logs      |   |
+|  | - Git Push  |    | - Parallel  |    | - Docker    |    | - Artifacts |   |
+|  | - Schedule  |    |   (future)  |    |             |    |             |   |
+|  +-------------+    +-------------+    +-------------+    +-------------+   |
+|                                                                              |
+|  Step Types:                                                                 |
+|  +-------------------------------------------------------------------------+ |
+|  |  AGENT          |  SCRIPT           |  DOCKER                          | |
+|  |  Claude/Gemini  |  Shell commands   |  Command in specified image      | |
+|  |  implements     |  lint, test,      |  isolated builds, custom         | |
+|  |  features       |  coverage, build  |  environments                    | |
+|  +-------------------------------------------------------------------------+ |
++-----------------------------------------------------------------------------+
 ```
 
 ### New Data Models
@@ -849,58 +840,58 @@ webhooks://list
 
 ```
 lazyaf/
-├── backend/
-│   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py              # FastAPI app
-│   │   ├── config.py            # Settings
-│   │   ├── database.py          # SQLAlchemy setup
-│   │   ├── models/
-│   │   │   ├── __init__.py
-│   │   │   ├── repo.py
-│   │   │   ├── card.py
-│   │   │   ├── job.py
-│   │   │   └── runner.py
-│   │   ├── routers/
-│   │   │   ├── __init__.py
-│   │   │   ├── repos.py
-│   │   │   ├── cards.py
-│   │   │   ├── jobs.py
-│   │   │   ├── runners.py
-│   │   │   └── git.py           # Git HTTP smart protocol
-│   │   ├── services/
-│   │   │   ├── __init__.py
-│   │   │   ├── runner_pool.py
-│   │   │   ├── job_queue.py
-│   │   │   ├── websocket.py
-│   │   │   └── git_server.py    # Bare repo management
-│   │   ├── mcp/                  # MCP server (Phase 7)
-│   │   │   ├── __init__.py
-│   │   │   ├── server.py         # MCP server entry point
-│   │   │   └── tools.py          # Tool definitions
-│   │   └── schemas/
-│   │       ├── __init__.py
-│   │       └── ...              # Pydantic models
-│   ├── git_repos/               # Internal bare git repos
-│   │   └── {repo_id}.git/
-│   ├── runner/
-│   │   ├── Dockerfile
-│   │   └── entrypoint.py
-│   ├── pyproject.toml
-│   └── alembic/                 # DB migrations
-├── cli/                         # LazyAF CLI tool
-│   ├── pyproject.toml
-│   └── lazyaf/
-│       └── cli.py               # ingest, land commands
-├── frontend/
-│   ├── src/
-│   │   └── ...                  # Svelte app
-│   ├── package.json
-│   └── vite.config.ts
-├── docker-compose.yml
-├── dream.txt                    # Vision doc
-├── PLAN.md                      # This file
-└── README.md
+|-- backend/
+|   |-- app/
+|   |   |-- __init__.py
+|   |   |-- main.py              # FastAPI app
+|   |   |-- config.py            # Settings
+|   |   |-- database.py          # SQLAlchemy setup
+|   |   |-- models/
+|   |   |   |-- __init__.py
+|   |   |   |-- repo.py
+|   |   |   |-- card.py
+|   |   |   |-- job.py
+|   |   |   +-- runner.py
+|   |   |-- routers/
+|   |   |   |-- __init__.py
+|   |   |   |-- repos.py
+|   |   |   |-- cards.py
+|   |   |   |-- jobs.py
+|   |   |   |-- runners.py
+|   |   |   +-- git.py           # Git HTTP smart protocol
+|   |   |-- services/
+|   |   |   |-- __init__.py
+|   |   |   |-- runner_pool.py
+|   |   |   |-- job_queue.py
+|   |   |   |-- websocket.py
+|   |   |   +-- git_server.py    # Bare repo management
+|   |   |-- mcp/                  # MCP server (Phase 7)
+|   |   |   |-- __init__.py
+|   |   |   |-- server.py         # MCP server entry point
+|   |   |   +-- tools.py          # Tool definitions
+|   |   +-- schemas/
+|   |       |-- __init__.py
+|   |       +-- ...              # Pydantic models
+|   |-- git_repos/               # Internal bare git repos
+|   |   +-- {repo_id}.git/
+|   |-- runner/
+|   |   |-- Dockerfile
+|   |   +-- entrypoint.py
+|   |-- pyproject.toml
+|   +-- alembic/                 # DB migrations
+|-- cli/                         # LazyAF CLI tool
+|   |-- pyproject.toml
+|   +-- lazyaf/
+|       +-- cli.py               # ingest, land commands
+|-- frontend/
+|   |-- src/
+|   |   +-- ...                  # Svelte app
+|   |-- package.json
+|   +-- vite.config.ts
+|-- docker-compose.yml
+|-- dream.txt                    # Vision doc
+|-- PLAN.md                      # This file
++-- README.md
 ```
 
 ## Open Questions / Future Scope
@@ -925,7 +916,7 @@ lazyaf/
 ## Current Status
 
 **Completed**: Phases 1-10 (full pipeline and trigger system)
-**Next**: Phase 9.5 (Webhooks) or Phase 11 (Reporting & Artifacts)
+**Next**: Phase 12 (Runner Architecture Refactor) - start with 12.0 (Unify Entrypoints)
 
 The target workflow is now fully functional:
 1. Ingest repos via CLI
@@ -992,14 +983,14 @@ This means:
 **Directory Structure**:
 ```
 .lazyaf/
-├── pipelines/
-│   ├── test-suite.yaml       # One pipeline per file
-│   ├── deploy.yaml
-│   └── nightly-build.yaml
-└── agents/
-    ├── test-fixer.yaml       # One agent per file
-    ├── code-reviewer.yaml
-    └── unity-specialist.yaml
+|-- pipelines/
+|   |-- test-suite.yaml       # One pipeline per file
+|   |-- deploy.yaml
+|   +-- nightly-build.yaml
++-- agents/
+    |-- test-fixer.yaml       # One agent per file
+    |-- code-reviewer.yaml
+    +-- unity-specialist.yaml
 ```
 
 Benefits:
@@ -1111,13 +1102,13 @@ prompt_template: |
 **Directory Structure** (committed to feature branch):
 ```
 .lazyaf-context/
-├── id_tests_001.log               # Step with id="tests" (stable reference)
-├── step_002_quick_lint.log        # Step without ID (index-based)
-├── id_analyze_003.log             # Step with id="analyze"
-├── id_analyze_003.md              # Agent's notes (optional, agent-written)
-├── test_results.json              # Structured test data (if available)
-├── decisions.md                   # Accumulated decisions/learnings (agents can append)
-└── metadata.json                  # {pipeline_run_id, steps_completed, step_id_map, ...}
+|-- id_tests_001.log               # Step with id="tests" (stable reference)
+|-- step_002_quick_lint.log        # Step without ID (index-based)
+|-- id_analyze_003.log             # Step with id="analyze"
+|-- id_analyze_003.md              # Agent's notes (optional, agent-written)
+|-- test_results.json              # Structured test data (if available)
+|-- decisions.md                   # Accumulated decisions/learnings (agents can append)
++-- metadata.json                  # {pipeline_run_id, steps_completed, step_id_map, ...}
 ```
 
 **Key Behaviors**:
@@ -1243,33 +1234,33 @@ Each pipeline run works on its own feature branch, so `.lazyaf-context/` is isol
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      AGENT PLAYGROUND TAB                           │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌──────────────────────┐  ┌──────────────────────────────────────┐│
-│  │   AGENT CONFIG       │  │      STREAMING AGENT OUTPUT          ││
-│  │                      │  │                                      ││
-│  │  Repo: [dropdown]    │  │  I'll analyze the code structure     ││
-│  │  Agent: [dropdown]   │  │  and make the requested changes.     ││
-│  │  Runner: Claude/Gem  │  │                                      ││
-│  │                      │  │  [Tool: Read] src/utils.ts           ││
-│  │  Branch: [dropdown]  │  │  [Tool: Edit] src/utils.ts:42        ││
-│  │                      │  │                                      ││
-│  │  ┌────────────────┐  │  │  The function now handles edge       ││
-│  │  │ Task Override  │  │  │  cases for empty input...█           ││
-│  │  │ (optional)     │  │  │                                      ││
-│  │  └────────────────┘  │  └──────────────────────────────────────┘│
-│  │                      │                                          │
-│  │  [▶ Test Once]       │  ┌──────────────────────────────────────┐│
-│  │  [■ Cancel]          │  │         DIFF PREVIEW                 ││
-│  │                      │  │                                      ││
-│  │  ☐ Save to branch    │  │  src/utils.ts                        ││
-│  │  agent-test/...      │  │  - const old = "foo";                ││
-│  │                      │  │  + const new = "bar";                ││
-│  └──────────────────────┘  └──────────────────────────────────────┘│
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------+
+|                      AGENT PLAYGROUND TAB                              |
++-----------------------------------------------------------------------+
+|                                                                        |
+|  +----------------------+  +--------------------------------------+   |
+|  |   AGENT CONFIG       |  |      STREAMING AGENT OUTPUT          |   |
+|  |                      |  |                                      |   |
+|  |  Repo: [dropdown]    |  |  I'll analyze the code structure     |   |
+|  |  Agent: [dropdown]   |  |  and make the requested changes.     |   |
+|  |  Runner: Claude/Gem  |  |                                      |   |
+|  |                      |  |  [Tool: Read] src/utils.ts           |   |
+|  |  Branch: [dropdown]  |  |  [Tool: Edit] src/utils.ts:42        |   |
+|  |                      |  |                                      |   |
+|  |  +----------------+  |  |  The function now handles edge       |   |
+|  |  | Task Override  |  |  |  cases for empty input...           |   |
+|  |  | (optional)     |  |  |                                      |   |
+|  |  +----------------+  |  +--------------------------------------+   |
+|  |                      |                                             |
+|  |  [> Test Once]       |  +--------------------------------------+   |
+|  |  [x Cancel]          |  |         DIFF PREVIEW                 |   |
+|  |                      |  |                                      |   |
+|  |  [ ] Save to branch  |  |  src/utils.ts                        |   |
+|  |  agent-test/...      |  |  - const old = "foo";                |   |
+|  |                      |  |  + const new = "bar";                |   |
+|  +----------------------+  +--------------------------------------+   |
+|                                                                        |
++-----------------------------------------------------------------------+
 ```
 
 ### How It Works
@@ -1480,6 +1471,690 @@ interface PlaygroundState {
 
 ---
 
+## Phase 12: Runner Architecture Refactor
+
+> **Vision**: Runners become execution targets (machines with capabilities), not execution environments. Steps run in ephemeral containers with a shared workspace. Enables multi-image pipelines, hardware-specific runners, and future Kubernetes support.
+
+### Current Problems
+
+1. **Entrypoint divergence**: Claude and Gemini runners are ~1800 lines each, 95% duplicated, features diverging
+2. **Docker-in-Docker required**: For `type: docker` steps, runners need Docker socket mounted (gross)
+3. **Workspace conflicts**: Multiple pipelines on same runner can destroy each other's workspace
+4. **No image flexibility**: Steps inherit the runner's environment, can't use custom images
+5. **No hardware affinity**: Can't route steps to specific hardware (embedded devices, GPUs)
+
+### Target Architecture
+
+**Two execution modes:**
+
+```
+MODE 1: LOCAL (Backend has Docker access) - Zero latency
+
+    BACKEND
+    +----------------+     +----------------+     +----------------+
+    | Pipeline       | --> | Execution      | --> | Local          | --> Docker API
+    | Executor       |     | Router         |     | Executor       |         |
+    +----------------+     +----------------+     +----------------+         |
+                                                                             v
+                                                                    +----------------+
+                                                                    | Step Container |
+                                                                    +----------------+
+
+MODE 2: REMOTE (Hardware/distributed runners) - WebSocket push, millisecond latency
+
+    BACKEND
+    +----------------+     +----------------+     +----------------+
+    | Pipeline       | --> | Execution      | --> | Remote         | <-- WebSocket
+    | Executor       |     | Router         |     | Executor       |         |
+    +----------------+     +----------------+     +----------------+         |
+                                                                             |
+            +----------------------------------------------------------------+
+            | (push job immediately)
+            v
+    +----------------+     +----------------+     +----------------+
+    | Runner Agent   |     | Runner Agent   |     | Runner Agent   |
+    | (Docker host)  |     | (Raspberry Pi) |     | (GPU server)   |
+    |                |     |                |     |                |
+    | labels:        |     | labels:        |     | labels:        |
+    |   arch=amd64   |     |   arch=arm64   |     |   arch=amd64   |
+    |   type=docker  |     |   has=gpio     |     |   has=cuda     |
+    |                |     |   has=camera   |     |                |
+    | [Docker Orch.] |     | [Native Orch.] |     | [Docker Orch.] |
+    +----------------+     +----------------+     +----------------+
+```
+
+### Key Design Decisions
+
+**Event-driven, not polling**: Old runners polled every 5 seconds. New architecture:
+- Local: Backend spawns containers directly (instant)
+- Remote: Backend pushes jobs via WebSocket (milliseconds)
+
+**OCI containers for everything** (except embedded hardware):
+- System dependencies are container-level concerns
+- Even "local" development uses Docker containers
+- Native execution only for hardware that can't run Docker (GPIO, sensors)
+
+### Core Concepts
+
+**LocalExecutor**: Backend service that spawns containers directly via Docker SDK. No runner process, no polling - instant execution. This is the default for local development.
+
+**RemoteExecutor**: Backend service that pushes jobs to connected runner agents via WebSocket. For remote Docker hosts, specialized hardware, distributed execution.
+
+**Runner Agent**: Process that runs on remote machines, connects to backend via WebSocket, receives job assignments immediately. Has a local orchestrator (Docker or Native).
+
+**Orchestrator**: How steps actually execute on a runner:
+- `DockerOrchestrator`: Runs steps in containers (most common)
+- `NativeOrchestrator`: Runs steps directly on host (embedded devices only)
+- `KubernetesOrchestrator`: Runs steps as K8s Jobs (future)
+
+**Workspace**: Per-pipeline-run working directory containing:
+```
+/workspace/
+|-- repo/           # Git checkout
+|-- home/           # Persistent $HOME (caches, .local/bin survive across steps)
++-- .control/       # Step config, logs, metadata
+```
+
+**Control Layer**: Thin wrapper in every step container handling heartbeat, log streaming, status reporting.
+
+### Step Requirements (New Pipeline YAML)
+
+```yaml
+steps:
+  - name: "Build firmware"
+    type: docker
+    config:
+      image: "arm-toolchain:latest"
+      command: "make firmware"
+    requires:
+      arch: arm64
+
+  - name: "Run tests"
+    type: docker
+    config:
+      image: "lazyaf-test-runner:latest"  # Pre-built with deps
+      command: "pytest -v"
+
+  - name: "Flash and test hardware"
+    type: script
+    config:
+      command: "flash-firmware && run-hardware-tests"
+    requires:
+      has: gpio,camera
+      runner_id: pi-workshop-1  # Pin to specific device
+```
+
+### Workspace Portability
+
+| Scenario | Strategy |
+|----------|----------|
+| Same Docker host | Shared named volume (fast) |
+| Different machines | Git-based sync (push after step, pull before) |
+| Kubernetes | PersistentVolumeClaim |
+
+---
+
+### Lifecycle State Machines
+
+All state transitions are guarded by locks and idempotency keys to prevent race conditions and duplicate executions.
+
+#### Step Lifecycle
+
+```
+[pending] --> [assigned] --> [preparing] --> [running] --> [completing]
+                                                 |              |
+                                                 | exit_0       | finalized
+                                                 v              v
+                                            [timeout]      [completed]
+                                                 |
+                                                 v
+[cancelled] <-- cancel (any state) ------- [failed]
+```
+
+| State | Description |
+|-------|-------------|
+| `pending` | Created, waiting for executor |
+| `assigned` | Assigned to runner, awaiting ACK (remote only) |
+| `preparing` | Pulling image, setting up workspace |
+| `running` | Container executing |
+| `completing` | Processing results |
+| `completed` | Exit code 0, success |
+| `failed` | Non-zero exit or exception |
+| `cancelled` | User cancelled |
+| `timeout` | Exceeded time limit |
+
+**Idempotency**: Each step execution has an `execution_key = "{pipeline_run_id}:{step_index}:{attempt}"`. Duplicate requests return existing execution.
+
+#### Workspace Lifecycle
+
+```
+[creating] --> [ready] <--> [in_use] --> [cleaning] --> [destroyed]
+     |                          |
+     | create_failed            | audit_detects_orphan
+     v                          v
+ [failed]                  [orphaned] --> manual cleanup --> destroyed
+```
+
+| State | Description |
+|-------|-------------|
+| `creating` | Volume being created, repo cloning |
+| `ready` | Available, no active steps |
+| `in_use` | Step(s) currently executing |
+| `cleaning` | Pipeline done, destroying volume |
+| `destroyed` | Cleaned up (terminal) |
+| `orphaned` | Lost track, needs manual cleanup |
+| `failed` | Creation failed |
+
+**Locking**:
+- Exclusive lock for creation/cleanup
+- Shared lock for step execution (allows parallel steps)
+- Use count tracks concurrent usage
+
+#### Pipeline Run Lifecycle
+
+```
+[pending] --> [preparing] --> [running] --> [completing] --> [completed]
+                   |              |
+                   | prep_failed  | step_failed
+                   v              v
+              [failed] <----- [failed]
+                   ^
+                   | timeout
+             [cancelled] <-- cancel (any non-terminal)
+```
+
+**Exactly-once step execution**: Pipeline executor skips steps with completed `execution_key`.
+
+**Trigger deduplication**: Triggers have a `trigger_key` (e.g., `push:{repo}:{sha}`). Duplicates within 1 hour are ignored.
+
+#### Runner Lifecycle (Remote Only)
+
+```
+[disconnected] --> [connecting] --> [idle] --> [assigned] --> [busy]
+       ^                                            |            |
+       |                                            | ack_timeout|
+       |                                            v            |
+       |                                        [dead] <---------+
+       |                                            |
+       +------- heartbeat_timeout -----------------+
+       |                                            |
+       +------------- reconnect -------------------+
+```
+
+| State | Description |
+|-------|-------------|
+| `disconnected` | No WebSocket connection |
+| `connecting` | WebSocket open, registration pending |
+| `idle` | Ready to accept jobs |
+| `assigned` | Job sent, awaiting ACK |
+| `busy` | Executing step |
+| `dead` | Heartbeat timeout, presumed crashed |
+
+**Job recovery**: When runner dies mid-job, step is re-queued if still in `running` state (prevents duplicate if completion was lost).
+
+#### Synchronization Requirements
+
+| Resource | Lock Type | Implementation |
+|----------|-----------|----------------|
+| Step assignment | Row lock | `SELECT FOR UPDATE` on step row |
+| Step execution | Idempotency key | Unique `execution_key` |
+| Workspace access | Shared/Exclusive | Redis or DB advisory lock |
+| Pipeline execution | Exclusive | One executor per pipeline run |
+| Trigger dedup | Time-windowed key | Unique `trigger_key` within window |
+
+#### Crash Recovery
+
+On backend restart:
+1. **Steps**: Find non-terminal steps, reattach to running containers or re-queue
+2. **Pipelines**: Resume execution (idempotent - skips completed steps)
+3. **Workspaces**: Audit for orphans, cleanup stale volumes
+4. **Runners**: Mark as dead, wait for reconnection
+
+---
+
+### Phase 12.0: Unify Runner Entrypoints
+**Goal**: Fix immediate pain, unblock future phases
+
+The current entrypoints are ~1800 lines each with 95% duplication. This phase extracts common code into a shared package.
+
+- [ ] Create `runner-common/` package with shared utilities
+  - `git_helpers.py` - clone, branch, push, commit operations
+  - `context_helpers.py` - `.lazyaf-context/` management
+  - `job_helpers.py` - heartbeat, logging, status reporting
+  - `test_helpers.py` - test detection and execution
+- [ ] Create unified entrypoint that dispatches by agent type
+- [ ] Reduce Claude/Gemini-specific code to ~100 lines each (just CLI invocation)
+- [ ] Verify existing pipelines still work
+
+**Effort**: 2-3 days
+**Risk**: Low
+**Outcome**: Maintainable entrypoints, foundation for new architecture
+
+---
+
+### Phase 12.1: LocalExecutor + Step State Machine
+**Goal**: Instant step execution with proper state management
+
+The fast path - backend spawns containers directly, with full lifecycle tracking.
+
+- [ ] Implement Step state machine (pending → preparing → running → completing → completed/failed)
+- [ ] Create `StepExecution` model with `execution_key` for idempotency
+  ```python
+  class StepExecution:
+      execution_key: str  # "{pipeline_run_id}:{step_index}:{attempt}" - UNIQUE
+      status: StepStatus  # State machine state
+      container_id: str | None
+      exit_code: int | None
+  ```
+- [ ] Create `LocalExecutor` service in `backend/app/services/execution/`
+  ```python
+  class LocalExecutor:
+      """Spawns containers directly via Docker SDK. Zero latency."""
+      async def execute_step(request: StepExecutionRequest) -> AsyncGenerator[str, StepResult]
+      # Idempotent - returns existing execution if execution_key exists
+  ```
+- [ ] Add Docker SDK (`docker` package) to backend dependencies
+- [ ] Mount Docker socket to backend container in docker-compose
+- [ ] Timeout handling with automatic container kill
+- [ ] Container crash detection and proper state transition to `failed`
+- [ ] Real-time log streaming from container to pipeline executor
+- [ ] Crash recovery: on startup, find orphaned steps and re-queue or fail them
+- [ ] Test: idempotency (same request twice returns same result)
+
+**Effort**: 1.5 weeks
+**Risk**: Medium
+**Outcome**: Local dev is instant with proper state tracking and crash recovery
+
+---
+
+### Phase 12.2: Workspace State Machine & Pipeline Integration
+**Goal**: Proper workspace lifecycle with locking and cleanup
+
+- [ ] Implement Workspace state machine (creating → ready ↔ in_use → cleaning → destroyed)
+- [ ] Create `Workspace` model with state and use_count
+  ```python
+  class Workspace:
+      id: str  # "lazyaf-ws-{pipeline_run_id}"
+      status: WorkspaceStatus
+      use_count: int  # For concurrent step access
+      pipeline_run_id: str
+  ```
+- [ ] Workspace locking (exclusive for create/cleanup, shared for step execution)
+- [ ] Idempotent workspace creation (`get_or_create_workspace`)
+- [ ] Create `ExecutionRouter` that routes steps to appropriate executor
+- [ ] Update `pipeline_executor.py` to use ExecutionRouter instead of job queue
+- [ ] Pipeline run state machine (pending → preparing → running → completing → completed)
+- [ ] Trigger deduplication with `trigger_key` (prevents duplicate pipeline runs)
+- [ ] Exactly-once step execution (skip steps with completed `execution_key`)
+- [ ] Workspace cleanup on pipeline completion
+- [ ] Orphan detection: periodic audit finds abandoned workspaces
+- [ ] Test: multi-step pipeline with different images, crash recovery
+
+**Effort**: 1.5 weeks
+**Risk**: Medium
+**Outcome**: Robust workspace lifecycle, exactly-once execution, no orphaned resources
+
+---
+
+### Phase 12.3: Control Layer & Step Images
+**Goal**: Proper container communication and base images
+
+- [ ] Create control layer script (`/control/run.py`)
+  - Reads step config from `/workspace/.control/step_config.json`
+  - Reports status to backend (running, completed, failed)
+  - Streams logs to backend
+  - Heartbeat during long operations
+- [ ] Create base image (`lazyaf-base`)
+  - Python 3.12-slim + git + curl + control layer
+  - `ENTRYPOINT ["python", "/control/run.py"]`
+- [ ] Create agent images inheriting from base
+  - `lazyaf-claude`: base + Claude CLI + agent wrapper
+  - `lazyaf-gemini`: base + Gemini CLI + agent wrapper
+- [ ] Workspace HOME persistence (`HOME=/workspace/home`)
+  - pip/npm/uv caches persist across steps
+  - `~/.local/bin` for user-installed tools
+- [ ] New API endpoints for step containers
+  - `POST /api/steps/{step_id}/status`
+  - `POST /api/steps/{step_id}/logs`
+  - `POST /api/steps/{step_id}/heartbeat`
+- [ ] Test: agent step → script step → agent step with shared HOME
+
+**Effort**: 1-1.5 weeks
+**Risk**: Medium
+**Outcome**: Steps run in proper containers with backend communication
+
+---
+
+### Phase 12.4: Migrate Script/Docker Steps
+**Goal**: All non-agent steps use new architecture
+
+- [ ] Pipeline executor routes script/docker steps through orchestrator
+- [ ] Remove `execute_script_step` and `execute_docker_step` from runner entrypoints
+- [ ] Steps can specify custom images in pipeline YAML
+- [ ] Migrate test-suite.yaml to use pre-built image
+- [ ] Create example `lazyaf-test-runner` Dockerfile with uv + deps
+- [ ] Test: existing pipelines work, new multi-image pipelines work
+
+**Effort**: 1 week
+**Risk**: Medium (migration path)
+**Outcome**: Script/docker steps don't need runners
+
+---
+
+### Phase 12.5: Migrate Agent Steps
+**Goal**: Agent steps also use new architecture
+
+- [ ] Agent steps spawn ephemeral containers via orchestrator
+- [ ] Agent wrapper script handles Claude/Gemini CLI invocation
+- [ ] Remove old runner polling infrastructure
+- [ ] Runners no longer long-lived - spawned per step
+- [ ] Test: Claude → script → Gemini pipeline works
+
+**Effort**: 1-1.5 weeks
+**Risk**: Higher (changes agent execution model)
+**Outcome**: All step types use unified architecture
+
+---
+
+### Phase 12.6: RemoteExecutor & Runner State Machine
+**Goal**: Millisecond-latency job assignment with proper connection lifecycle
+
+Event-driven architecture - no polling, backend pushes jobs immediately.
+
+- [ ] Implement Runner state machine (disconnected → connecting → idle → assigned → busy)
+- [ ] Create `Runner` model with state tracking
+  ```python
+  class Runner:
+      id: str
+      status: RunnerStatus  # State machine state
+      labels: dict  # {"arch": "arm64", "has": "gpio,camera"}
+      current_step_id: str | None
+      last_heartbeat: datetime
+  ```
+- [ ] Create `RemoteExecutor` service in backend
+  ```python
+  class RemoteExecutor:
+      """Pushes jobs to remote runners via WebSocket."""
+      async def register_runner(runner_id, labels, websocket) -> None
+      async def execute_step(runner_id, step_config) -> AsyncGenerator[str, StepResult]
+      # Handles ACK timeout, heartbeat monitoring, death detection
+  ```
+- [ ] WebSocket endpoint for runner connections (`/ws/runner`)
+  - Registration with auth timeout (10s)
+  - ACK required for job assignment (5s timeout)
+  - Heartbeat monitoring (30s death timeout)
+  - Graceful drain for shutdown
+- [ ] Job recovery on runner death
+  - If runner dies mid-job, re-queue step if still in `running` state
+  - Prevents duplicate execution if completion message was lost
+- [ ] Reconnection handling
+  - Same runner_id can reconnect after death
+  - Rejects duplicate connections from same runner_id
+- [ ] Create `runner-agent` package (runs on target machines)
+  - Connects to backend via WebSocket (NAT-friendly)
+  - Sends ACK on job receipt
+  - Heartbeat thread during execution
+  - Auto-reconnect on disconnect
+- [ ] `NativeOrchestrator` for embedded devices
+  - Runs steps directly on host (no Docker)
+  - Git-based workspace sync
+- [ ] Test: runner death mid-job → step re-queued → new runner picks up
+
+**Effort**: 2 weeks
+**Risk**: Medium-High
+**Outcome**: Robust remote execution with proper failure handling
+
+**Example runner deployment:**
+```bash
+# On Raspberry Pi
+export LAZYAF_BACKEND_URL="http://192.168.1.100:8000"
+export LAZYAF_RUNNER_ID="pi-workshop-1"
+export LAZYAF_LABELS="arch=arm64,has=gpio,has=camera"
+export LAZYAF_ORCHESTRATOR="native"
+
+python -m lazyaf_runner  # Connects via WebSocket, receives jobs immediately
+```
+
+**WebSocket Protocol:**
+```
+Runner -> Backend: {"type": "register", "runner_id": "...", "labels": {...}}
+Backend -> Runner: {"type": "execute_step", "step_id": "...", "image": "...", ...}
+Runner -> Backend: {"type": "log", "step_id": "...", "line": "..."}
+Runner -> Backend: {"type": "step_complete", "step_id": "...", "exit_code": 0}
+```
+
+---
+
+### Phase 12.7: Debug Re-Run Mode
+**Goal**: Re-run failed pipelines with breakpoints for interactive debugging
+
+The primary use case: someone points you at a failed pipeline and you need to figure out what went wrong. Debug mode lets you re-run with breakpoints, inspect state, and iterate.
+
+#### Debug Re-Run Workflow
+
+```
+1. User sees failed pipeline → clicks "Debug Re-run"
+2. Modal shows:
+   - Step list with checkboxes for breakpoints (dynamic, not YAML)
+   - Commit selection: "Same as failure (abc123)" OR "Different branch/commit"
+3. User starts debug run
+4. Pipeline executes until breakpoint
+5. UI shows rich context + CLI join command
+6. User connects via CLI, inspects, continues or aborts
+7. Repeat until done or pipeline completes
+```
+
+#### UI at Breakpoint
+
+When a breakpoint is hit, the UI displays:
+
+| Field | Description |
+|-------|-------------|
+| **Current Commit** | SHA + message of commit being tested |
+| **Runtime Info** | Host, orchestrator type, container image, image SHA |
+| **Step Info** | Current step name, index, type |
+| **Logs** | Full job/pipeline logs up to this point |
+| **Join Command** | Pre-populated CLI command to copy/paste |
+| **Controls** | Resume, Abort buttons |
+
+#### Two Connection Modes
+
+The CLI supports two ways to connect, depending on what you need:
+
+**1. Sidecar Mode** (inspect filesystem only)
+```bash
+lazyaf debug <session-id> --sidecar
+```
+- Spawns a debug sidecar container with workspace volume mounted
+- Read-only inspection of checkout, build artifacts, logs
+- Useful when step container has exited or you just need to look at files
+- Full shell with common tools (vim, git, htop, etc.)
+
+**2. Live Shell Mode** (process in running container)
+```bash
+lazyaf debug <session-id> --shell
+```
+- Creates a new process inside the current step container
+- Access to full runtime environment (same image, env vars, installed packages)
+- Can run the same commands the step would run
+- Only available when step container is still running (at breakpoint)
+
+Both modes use WebSocket transport (not SSH) for simplicity.
+
+#### CLI Commands
+
+```bash
+# Connect to debug session (default: sidecar if container stopped, shell if running)
+lazyaf debug <session-id> --token <token>
+
+# Explicit mode selection
+lazyaf debug <session-id> --sidecar --token <token>
+lazyaf debug <session-id> --shell --token <token>
+
+# Control commands (from within debug shell or separately)
+lazyaf debug <session-id> --resume      # Continue to next breakpoint
+lazyaf debug <session-id> --abort       # Cancel the debug run
+lazyaf debug <session-id> --status      # Show current state
+```
+
+Inside a debug shell, special commands:
+```
+@resume    # Continue pipeline (alias for --resume)
+@abort     # Cancel debug run (alias for --abort)
+@status    # Show breakpoint info
+@help      # List available commands
+```
+
+#### API Endpoints
+
+```
+# Start debug re-run from failed pipeline
+POST /api/pipeline-runs/{id}/debug-rerun
+  Body: {
+    breakpoints: ["step-id-1", "step-id-2"],  # Steps to break before
+    use_original_commit: bool,                 # true = same commit as failure
+    commit_sha: string | null,                 # if use_original_commit=false
+    branch: string | null                      # if use_original_commit=false
+  }
+  Returns: { run_id, debug_session_id }
+
+# Get debug session info (for UI display)
+GET /api/debug/{session_id}
+  Returns: {
+    status: "waiting" | "connected" | "timeout" | "ended",
+    current_step: { name, index, type },
+    commit: { sha, message },
+    runtime: { host, orchestrator, image, image_sha },
+    logs: string,
+    join_command: string,
+    token: string
+  }
+
+# Control debug session
+POST /api/debug/{session_id}/resume     # Continue to next breakpoint
+POST /api/debug/{session_id}/abort      # Cancel debug run
+POST /api/debug/{session_id}/extend     # Extend timeout
+
+# WebSocket endpoint for terminal
+WS /api/debug/{session_id}/terminal?mode=sidecar|shell&token=<token>
+```
+
+#### Debug Session States
+
+```
+[pending] --> [waiting_at_bp] --> [connected] --> [ended]
+                    |                   |
+                    | timeout           | timeout/disconnect
+                    v                   v
+               [timeout]           [timeout]
+```
+
+| State | Description |
+|-------|-------------|
+| `pending` | Debug run started, executing before first breakpoint |
+| `waiting_at_bp` | At breakpoint, waiting for user to connect |
+| `connected` | User connected via CLI |
+| `timeout` | Session timed out (default 1hr, max 4hr) |
+| `ended` | User resumed/aborted, or pipeline completed |
+
+#### Pipeline Run States (Extended)
+
+| State | Description |
+|-------|-------------|
+| `debug_pending` | Debug re-run created, not yet started |
+| `debug_running` | Executing between breakpoints |
+| `debug_waiting` | At breakpoint, waiting for user |
+| `debug_connected` | User connected, inspecting |
+
+#### Sidecar Container
+
+```dockerfile
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y \
+    vim nano less \
+    git curl wget \
+    htop tree jq \
+    python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# WebSocket terminal server
+COPY debug-terminal-server /usr/local/bin/
+ENTRYPOINT ["debug-terminal-server"]
+```
+
+Mounts workspace volume at `/workspace`. Lightweight, starts fast.
+
+#### Security
+
+- **One-time tokens**: Generated per debug session, single use
+- **Session timeout**: Default 1 hour, max 4 hours, extendable
+- **Token expiry**: Tokens expire with session
+- **Resource limits**: Debug containers have CPU/memory limits
+- **No SSH**: WebSocket only, simpler attack surface
+- **Future**: Integrate with auth system when available
+
+#### Implementation Phases
+
+**Phase 12.7a: Core Debug Re-Run (MVP)**
+- [ ] `POST /api/pipeline-runs/{id}/debug-rerun` endpoint
+- [ ] `DebugSession` model and service
+- [ ] Pipeline executor honors breakpoints, pauses execution
+- [ ] `GET /api/debug/{session_id}` for session info
+- [ ] Resume/abort endpoints
+- [ ] UI: "Debug Re-run" button on failed pipelines
+- [ ] UI: Breakpoint selector modal
+- [ ] UI: Commit selector (original vs custom)
+- [ ] UI: Debug panel showing context when at breakpoint
+
+**Phase 12.7b: CLI Connection**
+- [ ] `lazyaf debug` command structure
+- [ ] WebSocket terminal client in CLI
+- [ ] Sidecar mode: spawn debug container, connect
+- [ ] Shell mode: exec into running container
+- [ ] Special commands (@resume, @abort, @status)
+- [ ] Token-based authentication
+
+**Phase 12.7c: Polish**
+- [ ] Session timeout management
+- [ ] Reconnection handling (resume interrupted session)
+- [ ] UI improvements (better log display, status indicators)
+- [ ] `--extend` to add time to session
+- [ ] Cleanup: remove debug containers on session end
+
+**Effort**: 2-3 weeks
+**Risk**: Medium
+**Outcome**: Operators can re-run failed pipelines with breakpoints and connect via CLI to debug
+
+---
+
+### Phase 12.8: Cleanup & Polish
+**Goal**: Remove legacy code, document new model
+
+- [ ] Remove old runner entrypoints (archive for reference)
+- [ ] Update docker-compose for new architecture
+- [ ] Remove `runner_pool.py` polling infrastructure
+- [ ] Documentation: runner deployment, custom images, step requirements
+- [ ] Example Dockerfiles for common step images
+
+**Effort**: 1 week
+**Outcome**: Clean, documented system
+
+---
+
+### Phase 12.9: Kubernetes Orchestrator (Future)
+**Goal**: Same code works on Kubernetes
+
+- [ ] Implement `KubernetesOrchestrator`
+- [ ] PersistentVolumeClaims for workspaces
+- [ ] K8s Jobs for step execution
+- [ ] Node selectors based on runner labels
+- [ ] Test in K8s environment
+
+**Effort**: 2-3 weeks when needed
+**Outcome**: Production-ready K8s deployment
+
+---
+
 ## Tech Debt (After Core Workflow Works)
 
 ### TD1: Entrypoint Refactor
@@ -1511,12 +2186,17 @@ interface PlaygroundState {
   - 9.1c: Agent Parity - ✅ COMPLETE
   - 9.1d: Context Directory - ✅ COMPLETE
 - Phase 10: Events & Triggers - ✅ COMPLETE (card triggers, push triggers, auto-merge)
-- **Phase 11: Agent Playground - NEXT** (rapid agent experimentation)
-  - 11a: Foundation (backend service, SSE streaming, runner integration)
-  - 11b: Frontend - Test Once mode
-  - 11c: Diff capture & Save to branch
-  - 11d: Cancellation support
-  - 11e: Polish
-  - Future: Test Continuous mode, sample text input, file-specific input
+- Phase 11: Agent Playground - deferred (rapid agent experimentation)
+- **Phase 12: Runner Architecture Refactor - NEXT** (multi-image pipelines, hardware runners)
+  - 12.0: Unify Runner Entrypoints (2-3 days) - fix immediate pain
+  - 12.1: LocalExecutor + Step State Machine (~1.5 weeks) - zero latency + idempotency
+  - 12.2: Workspace State Machine + Pipeline Integration (~1.5 weeks) - locking, cleanup, exactly-once
+  - 12.3: Control Layer & Step Images (~1.5 weeks) - proper container communication
+  - 12.4: Migrate Script/Docker Steps (~1 week) - cut over to new architecture
+  - 12.5: Migrate Agent Steps (~1.5 weeks) - agents as ephemeral containers
+  - 12.6: RemoteExecutor + Runner State Machine (~2 weeks) - WebSocket push, failure recovery
+  - 12.7: Debug Mode (~2-3 weeks) - SSH/web terminal into workspaces, breakpoints, auto-debug on failure
+  - 12.8: Cleanup & Polish (~1 week)
+  - 12.9: Kubernetes Orchestrator (future)
 - Phase 9.5: Webhooks - deferred (external triggers from GitHub/Gitea)
-- Phase 12: Reporting & Artifacts - future
+- Phase 13: Reporting & Artifacts - future

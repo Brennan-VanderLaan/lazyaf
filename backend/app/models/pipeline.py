@@ -68,3 +68,4 @@ class StepRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     pipeline_run: Mapped["PipelineRun"] = relationship("PipelineRun", back_populates="step_runs")
+    executions: Mapped[list["StepExecution"]] = relationship("StepExecution", back_populates="step_run", cascade="all, delete-orphan")

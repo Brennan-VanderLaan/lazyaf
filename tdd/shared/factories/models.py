@@ -172,6 +172,7 @@ class RunnerFactory(BaseFactory):
 
 # Import Pipeline models
 from app.models.pipeline import Pipeline, PipelineRun, StepRun, RunStatus
+from app.models.step_execution import StepExecution, ExecutionStatus
 
 
 class PipelineFactory(BaseFactory):
@@ -281,4 +282,64 @@ class StepRunFactory(BaseFactory):
         )
         with_job = factory.Trait(
             job_id=factory.LazyFunction(generate_uuid),
+        )
+
+
+class StepExecutionFactory(BaseFactory):
+    """Factory for creating StepExecution instances."""
+
+    class Meta:
+        model = StepExecution
+
+    id = factory.LazyFunction(generate_uuid)
+    execution_key = factory.LazyFunction(
+        lambda: f"run-{generate_uuid()[:8]}:0:1"
+    )
+    step_run_id = factory.LazyFunction(generate_uuid)
+    status = ExecutionStatus.PENDING.value
+    runner_id = None
+    container_id = None
+    exit_code = None
+    started_at = None
+    completed_at = None
+    created_at = factory.LazyFunction(datetime.utcnow)
+
+    class Params:
+        """Parameters for creating step executions in specific states."""
+
+        preparing = factory.Trait(
+            status=ExecutionStatus.PREPARING.value,
+            container_id=factory.LazyFunction(
+                lambda: fake.hexify(text="^^^^^^^^^^^^", upper=False)
+            ),
+        )
+        running = factory.Trait(
+            status=ExecutionStatus.RUNNING.value,
+            container_id=factory.LazyFunction(
+                lambda: fake.hexify(text="^^^^^^^^^^^^", upper=False)
+            ),
+            started_at=factory.LazyFunction(datetime.utcnow),
+        )
+        completed = factory.Trait(
+            status=ExecutionStatus.COMPLETED.value,
+            exit_code=0,
+            started_at=factory.LazyFunction(datetime.utcnow),
+            completed_at=factory.LazyFunction(datetime.utcnow),
+        )
+        failed = factory.Trait(
+            status=ExecutionStatus.FAILED.value,
+            exit_code=1,
+            started_at=factory.LazyFunction(datetime.utcnow),
+            completed_at=factory.LazyFunction(datetime.utcnow),
+        )
+        cancelled = factory.Trait(
+            status=ExecutionStatus.CANCELLED.value,
+        )
+        with_runner = factory.Trait(
+            runner_id=factory.LazyFunction(generate_uuid),
+        )
+        with_container = factory.Trait(
+            container_id=factory.LazyFunction(
+                lambda: fake.hexify(text="^^^^^^^^^^^^", upper=False)
+            ),
         )

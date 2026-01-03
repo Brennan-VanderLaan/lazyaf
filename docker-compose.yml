@@ -13,9 +13,6 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - DOCKER_HOST=unix:///var/run/docker.sock
-    # Allow container to access Docker daemon
-    group_add:
-      - docker
     restart: unless-stopped
 
   frontend:

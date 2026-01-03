@@ -12,6 +12,7 @@ description = "Visual orchestrator for AI agents to handle feature development"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "aiodocker>=0.25.0",
     "aiosqlite>=0.22.1",
     "alembic>=1.14.0",
     "docker>=7.1.0",

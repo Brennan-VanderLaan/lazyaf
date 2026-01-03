@@ -51,6 +51,7 @@ class PipelineRun(Base):
 
     pipeline: Mapped["Pipeline"] = relationship("Pipeline", back_populates="runs")
     step_runs: Mapped[list["StepRun"]] = relationship("StepRun", back_populates="pipeline_run", cascade="all, delete-orphan")
+    workspace: Mapped["Workspace | None"] = relationship("Workspace", back_populates="pipeline_run", uselist=False, cascade="all, delete-orphan")
 
 
 class StepRun(Base):

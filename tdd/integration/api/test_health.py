@@ -73,7 +73,7 @@ class TestOpenAPISchema:
             "/api/repos/{repo_id}/cards",
             "/api/cards/{card_id}",
             "/api/jobs/{job_id}",
-            "/api/runners",
+            # Note: Runners now use WebSocket at /ws/runner (Phase 12.6)
         ]
 
         for path in expected_paths:

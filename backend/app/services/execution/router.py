@@ -237,8 +237,5 @@ class ExecutionRouter:
 
     async def _get_remote_executor(self, decision: RoutingDecision):
         """Get RemoteExecutor for the decision."""
-        # RemoteExecutor not yet implemented (Phase 12.6)
-        raise NotImplementedError(
-            "RemoteExecutor not yet implemented. "
-            f"Cannot route to remote for: {decision.reason}"
-        )
+        from .remote_executor import get_remote_executor
+        return get_remote_executor()

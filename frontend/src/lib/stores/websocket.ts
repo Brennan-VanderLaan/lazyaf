@@ -4,11 +4,12 @@ import { cardsStore } from './cards';
 import { jobsStore, type JobStatusUpdate } from './jobs';
 import { pipelinesStore, activeRunsStore } from './pipelines';
 import { reposStore } from './repos';
+import { debugStore, type DebugBreakpointEvent, type DebugStatusEvent, type DebugResumeEvent } from './debug';
 
 export type WebSocketStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
 interface WebSocketMessage {
-  type: 'card_updated' | 'card_deleted' | 'job_status' | 'runner_status' | 'pipeline_updated' | 'pipeline_deleted' | 'pipeline_run_status' | 'step_run_status' | 'repo_created' | 'repo_updated' | 'repo_deleted';
+  type: 'card_updated' | 'card_deleted' | 'job_status' | 'runner_status' | 'pipeline_updated' | 'pipeline_deleted' | 'pipeline_run_status' | 'step_run_status' | 'repo_created' | 'repo_updated' | 'repo_deleted' | 'debug_breakpoint' | 'debug_status' | 'debug_resume';
   payload: unknown;
 }
 
@@ -89,6 +90,15 @@ function createWebSocketStore() {
         break;
       case 'repo_deleted':
         reposStore.deleteLocal((message.payload as { id: string }).id);
+        break;
+      case 'debug_breakpoint':
+        debugStore.handleBreakpoint(message.payload as DebugBreakpointEvent);
+        break;
+      case 'debug_status':
+        debugStore.handleStatus(message.payload as DebugStatusEvent);
+        break;
+      case 'debug_resume':
+        debugStore.handleResume(message.payload as DebugResumeEvent);
         break;
     }
   }

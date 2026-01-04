@@ -417,7 +417,6 @@ class PipelineExecutor:
         await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
 
         # Phase 12.4: Route step to appropriate executor
-        # Agent steps still use job queue (until Phase 12.5)
         # Continuation steps need affinity, so they use job queue for remote runners
         routing_decision = self._router.route(
             step_type=step_type,
@@ -426,12 +425,13 @@ class PipelineExecutor:
             previous_runner_id=previous_runner_id if is_continuation else None,
         )
 
-        # Use LocalExecutor for script/docker steps without special requirements
+        # Use LocalExecutor for script/docker/agent steps without special requirements
         # Only if local execution is enabled (disabled in tests)
+        # Phase 12.5: Agent steps now use LocalExecutor
         use_local_executor = (
             self._use_local_executor
             and routing_decision.executor_type == ExecutorType.LOCAL
-            and step_type in ("script", "docker")
+            and step_type in ("script", "docker", "agent")
             and not is_continuation  # Continuations need job queue for proper workspace handling
         )
 
@@ -448,6 +448,10 @@ class PipelineExecutor:
                 step_config=step_config,
                 timeout=timeout,
                 continue_in_context=continue_in_context,
+                # Agent-specific params (Phase 12.5)
+                agent_file_ids=agent_file_ids,
+                prompt_template=prompt_template,
+                previous_step_logs=previous_step_logs,
             )
             return
 
@@ -484,11 +488,15 @@ class PipelineExecutor:
         step_config: dict,
         timeout: int,
         continue_in_context: bool,
+        # Agent-specific params (Phase 12.5)
+        agent_file_ids: list[str] | None = None,
+        prompt_template: str | None = None,
+        previous_step_logs: str | None = None,
     ) -> None:
         """
-        Execute a step locally using LocalExecutor (Phase 12.4).
+        Execute a step locally using LocalExecutor (Phase 12.4 + 12.5).
 
-        This is the fast path for script/docker steps without special requirements.
+        This is the fast path for script/docker/agent steps without special requirements.
         """
         step_name = step_run.step_name
         logger.info(f"Executing step {step_index} locally: {step_name}")
@@ -508,13 +516,35 @@ class PipelineExecutor:
             workspace_path = f"/tmp/lazyaf-workspace-{pipeline_run.id}"
 
         try:
+            # Build agent_config for agent steps (Phase 12.5)
+            agent_config = None
+            if step_type == "agent":
+                # Backend URL for container to communicate back
+                backend_url = "http://host.docker.internal:8000"
+                agent_config = {
+                    "runner_type": step_config.get("runner_type", "claude-code"),
+                    "title": step_config.get("title", step_name),
+                    "description": step_config.get("description", ""),
+                    "model": step_config.get("model"),
+                    "agent_file_ids": agent_file_ids or [],
+                    "prompt_template": prompt_template,
+                    "previous_step_logs": previous_step_logs,
+                    "repo_url": repo.get_internal_git_url(backend_url),
+                    "branch_name": f"lazyaf/{step_run.id[:8]}",
+                    "base_branch": repo.default_branch,
+                    "is_continuation": False,  # Non-continuation steps only in LocalExecutor
+                    "pipeline_run_id": pipeline_run.id,
+                }
+
             # Build execution config
             exec_config = build_execution_config(
                 step_type=step_type,
                 step_config=step_config,
                 workspace_path=workspace_path,
                 timeout_seconds=timeout,
-                use_control_layer=False,  # Direct execution without control layer for now
+                use_control_layer=(step_type == "agent"),  # Use control layer for agent steps
+                backend_url="http://host.docker.internal:8000" if step_type == "agent" else None,
+                agent_config=agent_config,
             )
 
             # Create execution key for idempotency

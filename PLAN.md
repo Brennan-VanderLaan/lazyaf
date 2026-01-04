@@ -178,8 +178,8 @@ Detailed documentation for completed phases is in `historical-documents/`.
 
 ## Current Status
 
-**Completed**: Phases 1-11, 12.0, 12.1, 12.2, 12.3, 12.4
-**Next**: Phase 12.5 (Migrate Agent Steps)
+**Completed**: Phases 1-11, 12.0, 12.1, 12.2, 12.3, 12.4, 12.5
+**Next**: Phase 12.6 (RemoteExecutor & Runner State Machine)
 
 ### Phase 12 Progress
 
@@ -190,8 +190,9 @@ Detailed documentation for completed phases is in `historical-documents/`.
 | 12.2 | Workspace & Pipeline State Machines | COMPLETE | 272 pass |
 | 12.3 | Control Layer & Step Images | COMPLETE | 302 pass |
 | 12.4 | Migrate Script/Docker Steps | COMPLETE | 302+ pass |
+| 12.5 | Migrate Agent Steps | COMPLETE | 48+ pass |
 
-Phase 12.4 complete. Script/docker steps now route through LocalExecutor for instant execution (when enabled via `LAZYAF_USE_LOCAL_EXECUTOR=1`).
+Phase 12.5 complete. Agent steps (Claude/Gemini) now route through LocalExecutor for instant execution. Both pipeline steps AND standalone cards use the new architecture when `LAZYAF_USE_LOCAL_EXECUTOR=1` is enabled.
 
 The target workflow is now fully functional:
 1. Ingest repos via CLI
@@ -1576,46 +1577,83 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
 ### Phase 12.5: Migrate Agent Steps
 **Goal**: Agent steps also use new architecture
 
-#### Tests First (Define Contracts)
+**Status**: COMPLETE (48+ tests passing)
 
-**test_agent_step_contract.py** - Write BEFORE implementing agent migration
+#### Tests First (Define Contracts) ✅
+
+**test_agent_step_contract.py** - 22 tests
 | Test | Defines Contract |
 |------|------------------|
-| `test_agent_step_spawns_container` | Agent runs in container, not runner |
-| `test_agent_wrapper_invokes_cli` | Claude CLI called correctly |
-| `test_agent_uses_correct_image` | `lazyaf-claude` image used |
+| `test_agent_step_routes_to_local_executor` | Agent routes locally by default |
+| `test_agent_step_uses_correct_image_claude` | `lazyaf-claude:latest` used |
+| `test_agent_step_uses_correct_image_gemini` | `lazyaf-gemini:latest` used |
+| `test_agent_wrapper_invokes_wrapper` | Wrapper script invoked, not direct CLI |
+| `test_agent_config_includes_*` | Title, description, model, agent files, etc. |
+| `test_claude_agent_has_anthropic_api_key` | API key injected |
+| `test_gemini_agent_has_gemini_api_key` | API key injected |
 
-**test_polling_removal.py** - Write BEFORE removing polling
+**test_polling_removal.py** - 10 tests
 | Test | Defines Contract |
 |------|------------------|
-| `test_no_runner_polling_calls` | Backend doesn't poll runners |
-| `test_runners_not_long_lived` | No persistent runner processes |
+| `test_agent_step_bypasses_job_queue` | No job_queue.enqueue() for local agents |
+| `test_runners_not_registered_for_local_execution` | No runner registration needed |
+| `test_no_heartbeat_required_from_runners` | LocalExecutor handles liveness |
+| `test_job_queue_still_works_for_legacy` | Backward compat preserved |
 
-- [ ] Write `test_agent_step_contract.py` (defines agent execution)
-- [ ] Write `test_polling_removal.py` (defines what's removed)
+**test_card_local_execution.py** - 16 tests
+| Test | Defines Contract |
+|------|------------------|
+| `test_agent_card_routes_to_local_when_enabled` | Cards use LocalExecutor |
+| `test_card_status_updates` | Status transitions work |
+| `test_websocket_broadcasts` | Real-time updates via WebSocket |
 
-#### Implementation (Make Tests Pass)
+- [x] Write `test_agent_step_contract.py` (defines agent execution)
+- [x] Write `test_polling_removal.py` (defines what's removed)
+- [x] Write `test_card_local_execution.py` (defines card execution)
 
-- [ ] Agent steps spawn ephemeral containers via orchestrator
-- [ ] Agent wrapper script handles Claude/Gemini CLI invocation
-- [ ] Remove old runner polling infrastructure
-- [ ] Runners no longer long-lived - spawned per step
+#### Implementation (Make Tests Pass) ✅
 
-#### Integration Validation
+- [x] Created `agent_wrapper.py` - Handles git clone, branch, CLI invocation, commit/push
+- [x] Updated `config_builder.py` - Wrapper invocation, API key injection
+- [x] Updated `local_executor.py` - Agent config in control directory
+- [x] Updated `pipeline_executor.py` - Routes agent steps through LocalExecutor
+- [x] Created `card_executor.py` - Local execution for standalone cards
+- [x] Updated `cards.py` router - Routes agent cards through LocalExecutor
 
-- [ ] `test_claude_script_gemini_pipeline.py`:
-  - Claude step (container)
-  - Script step (container)
-  - Gemini step (container)
-  - All share workspace
+#### Files Created
+
+| File | Purpose | Tests |
+|------|---------|-------|
+| `images/base/control/agent_wrapper.py` | Agent execution wrapper (~350 lines) | - |
+| `backend/app/services/card_executor.py` | Local card execution helper | - |
+| `tdd/unit/execution/test_agent_step_contract.py` | Agent step tests | 22 |
+| `tdd/unit/execution/test_polling_removal.py` | Polling removal tests | 10 |
+| `tdd/unit/execution/test_card_local_execution.py` | Card execution tests | 16 |
+
+#### Files Modified
+
+| File | Changes |
+|------|---------|
+| `backend/app/services/execution/config_builder.py` | Wrapper command, API key injection |
+| `backend/app/services/execution/local_executor.py` | Agent config in control directory |
+| `backend/app/services/pipeline_executor.py` | Route agents through LocalExecutor |
+| `backend/app/routers/cards.py` | Route agent cards through LocalExecutor |
+
+#### Configuration
+
+- **Environment Variable**: `LAZYAF_USE_LOCAL_EXECUTOR=1` enables local execution
+- Agent steps now bypass job queue when enabled
+- Both pipeline steps AND standalone cards use LocalExecutor
+- Continuations still use job queue (preserved for Phase 12.6 remote runners)
 
 #### Done Criteria
 
-- [ ] Agent step contract tests pass
-- [ ] Polling removal verified
-- [ ] Cross-agent pipeline works
+- [x] Agent step contract tests pass (22/22)
+- [x] Polling removal tests pass (10/10)
+- [x] Card local execution tests pass (16/16)
+- [x] All existing tests still pass
 
-**Effort**: 1-1.5 weeks
+**Effort**: 1 week
 **Risk**: Higher (changes agent execution model)
 **Outcome**: All step types use unified architecture
 

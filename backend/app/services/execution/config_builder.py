@@ -1,17 +1,19 @@
 """
-Config Builder for Phase 12.4.
+Config Builder for Phase 12.4 + 12.5.
 
 Builds ExecutionConfig from step configuration (step_type + step_config).
 Handles:
 - Default images for script/agent steps
 - Command wrapping for shell execution
-- Environment variable merging
+- Environment variable merging (including API keys for agents)
 - Working directory configuration
+- Agent wrapper invocation for agent steps
 """
 
 from typing import Any, Dict, List, Optional
 
 from .local_executor import ExecutionConfig
+from app.config import get_settings
 
 
 # Default images for each step type
@@ -31,6 +33,7 @@ def build_execution_config(
     timeout_seconds: int = 3600,
     use_control_layer: bool = False,
     backend_url: Optional[str] = None,
+    agent_config: Optional[Dict[str, Any]] = None,
 ) -> ExecutionConfig:
     """
     Build an ExecutionConfig from step configuration.
@@ -42,6 +45,7 @@ def build_execution_config(
         timeout_seconds: Execution timeout
         use_control_layer: Whether to use control layer for execution
         backend_url: Backend URL for control layer communication
+        agent_config: Agent-specific config for agent steps (repo URL, branch, etc.)
 
     Returns:
         ExecutionConfig ready for LocalExecutor
@@ -52,8 +56,8 @@ def build_execution_config(
     # Get command
     command = _get_command(step_type, step_config)
 
-    # Get environment
-    environment = _get_environment(step_config, use_control_layer)
+    # Get environment (includes API keys for agent steps)
+    environment = _get_environment(step_config, use_control_layer, step_type)
 
     # Get working directory
     working_dir = step_config.get("working_dir", "/workspace")
@@ -67,6 +71,7 @@ def build_execution_config(
         working_dir=working_dir,
         use_control_layer=use_control_layer,
         backend_url=backend_url,
+        agent_config=agent_config,
     )
 
 
@@ -152,39 +157,23 @@ def _build_agent_command(step_config: Dict[str, Any]) -> List[str]:
     """
     Build command for agent step execution.
 
-    Agent steps run the AI agent CLI (claude, gemini, etc.)
-    with the appropriate configuration.
+    Agent steps invoke the agent wrapper script, which handles:
+    - Git clone/checkout/branch
+    - Prompt building
+    - Agent CLI invocation (Claude/Gemini)
+    - Commit and push
+
+    The wrapper reads agent config from step_config.json written by LocalExecutor.
     """
-    runner_type = step_config.get("runner_type", "claude-code")
-    title = step_config.get("title", "")
-    description = step_config.get("description", "")
-
-    # Combine title and description for prompt
-    prompt = f"{title}\n\n{description}".strip()
-
-    if runner_type in ("claude-code", "claude", "any"):
-        # Claude Code CLI invocation
-        return [
-            "claude",
-            "-p",  # Print mode (non-interactive)
-            prompt,
-        ]
-    elif runner_type == "gemini":
-        # Gemini SDK invocation (placeholder)
-        return [
-            "python",
-            "-m",
-            "gemini_agent",
-            prompt,
-        ]
-    else:
-        # Unknown runner, default to claude
-        return ["claude", "-p", prompt]
+    # Agent steps always invoke the wrapper script
+    # The wrapper handles git, prompt building, and CLI invocation
+    return ["python", "/control/agent_wrapper.py"]
 
 
 def _get_environment(
     step_config: Dict[str, Any],
     use_control_layer: bool = False,
+    step_type: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Build environment variables for execution.
@@ -192,6 +181,7 @@ def _get_environment(
     Includes:
     - User-specified environment from step_config
     - HOME set to /workspace/home for cache persistence (when using control layer)
+    - API keys for agent steps (ANTHROPIC_API_KEY, GEMINI_API_KEY)
     """
     env = {}
 
@@ -204,5 +194,17 @@ def _get_environment(
     # Set HOME for cache persistence when using control layer
     if use_control_layer:
         env.setdefault("HOME", "/workspace/home")
+
+    # Add API keys for agent steps
+    if step_type == "agent":
+        settings = get_settings()
+        runner_type = step_config.get("runner_type", "claude-code")
+
+        if runner_type in ("claude-code", "claude", "any"):
+            if settings.anthropic_api_key:
+                env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+        elif runner_type == "gemini":
+            if settings.gemini_api_key:
+                env["GEMINI_API_KEY"] = settings.gemini_api_key
 
     return env

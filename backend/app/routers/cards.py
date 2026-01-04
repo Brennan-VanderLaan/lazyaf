@@ -14,6 +14,7 @@ from app.schemas import CardCreate, CardRead, CardUpdate
 from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
+from app.services.card_executor import is_local_executor_enabled, start_card_locally
 
 router = APIRouter(tags=["cards"])
 
@@ -236,7 +237,34 @@ async def start_card(
     settings = get_settings()
     prompt_template = card.prompt_template or settings.default_prompt_template
 
-    # Queue the job for a runner
+    # Phase 12.5: Use LocalExecutor for agent steps when enabled
+    if is_local_executor_enabled() and card.step_type == "agent":
+        # Execute locally via LocalExecutor (non-blocking)
+        await start_card_locally(
+            card=card,
+            repo=repo,
+            job=job,
+            db=db,
+            agent_file_ids=agent_file_ids,
+            prompt_template=prompt_template,
+        )
+
+        # Broadcast job queued/starting status
+        await manager.send_job_status({
+            "id": job_id,
+            "card_id": card.id,
+            "status": "queued",
+            "error": None,
+            "started_at": None,
+            "completed_at": None,
+        })
+
+        # Broadcast card update
+        await manager.send_card_updated(card_to_ws_dict(card))
+
+        return card
+
+    # Legacy path: Queue the job for a runner
     # Use internal git server for ingested repos (runner constructs URL from BACKEND_URL + repo_id)
     queued_job = QueuedJob(
         id=job_id,

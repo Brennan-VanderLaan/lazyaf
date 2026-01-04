@@ -58,6 +58,8 @@ class ExecutionConfig:
     heartbeat_interval: float = 10.0        # Heartbeat interval (seconds)
     log_batch_size: int = 100               # Log batch size
     log_batch_interval: float = 1.0         # Log batch interval (seconds)
+    # Agent step support (Phase 12.5)
+    agent_config: Optional[dict] = None     # Agent-specific config for wrapper
 
 
 @dataclass
@@ -140,6 +142,7 @@ class LocalExecutor:
         - Backend URL for communication
         - Command to execute
         - Environment and timeout settings
+        - Agent-specific config (repo URL, branch, title, etc.) for agent steps
 
         Args:
             key: Execution key
@@ -174,6 +177,23 @@ class LocalExecutor:
             "log_batch_size": config.log_batch_size,
             "log_batch_interval": config.log_batch_interval,
         }
+
+        # Add agent-specific config for agent steps (Phase 12.5)
+        if config.agent_config:
+            step_config.update({
+                "agent_type": config.agent_config.get("runner_type", "claude-code"),
+                "title": config.agent_config.get("title", ""),
+                "description": config.agent_config.get("description", ""),
+                "model": config.agent_config.get("model"),
+                "agent_file_ids": config.agent_config.get("agent_file_ids", []),
+                "prompt_template": config.agent_config.get("prompt_template"),
+                "previous_step_logs": config.agent_config.get("previous_step_logs"),
+                "repo_url": config.agent_config.get("repo_url"),
+                "branch_name": config.agent_config.get("branch_name"),
+                "base_branch": config.agent_config.get("base_branch"),
+                "is_continuation": config.agent_config.get("is_continuation", False),
+                "pipeline_run_id": config.agent_config.get("pipeline_run_id"),
+            })
 
         config_path = control_dir / "step_config.json"
         config_path.write_text(json.dumps(step_config, indent=2))

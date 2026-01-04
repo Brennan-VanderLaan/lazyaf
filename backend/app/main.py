@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.database import init_db
 from app.routers import repos, cards, jobs, agent_files, pipelines, lazyaf_files
-from app.routers import git, playground, models, steps, ws_runners
+from app.routers import git, playground, models, steps, ws_runners, debug
 from app.services.websocket import manager
 
 # Import models to ensure they're registered with Base before init_db
@@ -70,6 +70,7 @@ app.include_router(playground.session_router)
 app.include_router(models.router)
 app.include_router(steps.router)
 app.include_router(ws_runners.router)  # Phase 12.6: WebSocket runner endpoint
+app.include_router(debug.router)  # Phase 12.7: Debug re-run endpoints
 
 
 @app.get("/health")

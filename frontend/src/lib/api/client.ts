@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, DebugRerunRequest, DebugRerunResponse, DebugSessionInfo } from './types';
 
 const BASE_URL = '/api';
 
@@ -278,4 +278,27 @@ export interface ModelsListResponse {
 export const models = {
   list: (refresh: boolean = false) =>
     request<ModelsListResponse>(`/models${refresh ? '?refresh=true' : ''}`),
+};
+
+// Debug sessions (Phase 12.7)
+export const debug = {
+  createRerun: (runId: string, data: DebugRerunRequest) =>
+    request<DebugRerunResponse>(`/pipeline-runs/${runId}/debug-rerun`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  getSession: (sessionId: string) =>
+    request<DebugSessionInfo>(`/debug/${sessionId}`),
+
+  resume: (sessionId: string) =>
+    request<{ status: string }>(`/debug/${sessionId}/resume`, { method: 'POST' }),
+
+  abort: (sessionId: string) =>
+    request<{ status: string }>(`/debug/${sessionId}/abort`, { method: 'POST' }),
+
+  extend: (sessionId: string, additionalMinutes: number = 30) =>
+    request<{ expires_at: string }>(`/debug/${sessionId}/extend?additional_minutes=${additionalMinutes}`, {
+      method: 'POST',
+    }),
 };

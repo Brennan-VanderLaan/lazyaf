@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models import Pipeline, PipelineRun, StepRun, RunStatus, Job, Card, Repo
+from app.models.debug_session import DebugSession, DebugSessionStatus
 from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
@@ -34,6 +35,9 @@ from app.services.execution.router import ExecutionRouter, ExecutorType
 from app.services.execution.config_builder import build_execution_config
 from app.services.execution.local_executor import get_local_executor, ExecutionResult
 from app.services.execution.idempotency import ExecutionKey
+
+# Phase 12.7: Debug session service
+from app.services.execution.debug_session_service import get_debug_session_service
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +359,7 @@ class PipelineExecutor:
 
         Phase 12.4: Routes script/docker steps to LocalExecutor for instant execution.
         Agent steps and steps with special requirements use job queue (legacy path).
+        Phase 12.7: Checks for debug breakpoints before executing.
 
         Args:
             previous_runner_id: The runner that executed the previous step (for continuation affinity)
@@ -366,6 +371,14 @@ class PipelineExecutor:
 
         step = steps[step_index]
         step_name = step.get("name", f"Step {step_index + 1}")
+
+        # Phase 12.7: Check for debug breakpoint
+        debug_session = await self._check_for_breakpoint(db, pipeline_run.id, step_index, step_name)
+        if debug_session:
+            # Breakpoint hit - pause execution and wait for resume
+            logger.info(f"Breakpoint hit at step {step_index}: {step_name}")
+            return  # Execution will continue when user calls resume
+
         step_type = step.get("type", "script")
         step_config = step.get("config", {})
         timeout = step.get("timeout", 300)
@@ -1107,6 +1120,118 @@ class PipelineExecutor:
         else:
             logger.error(f"Merge failed: {merge_result}")
             await self._complete_pipeline(db, pipeline_run, success=False)
+
+    async def _check_for_breakpoint(
+        self,
+        db: AsyncSession,
+        pipeline_run_id: str,
+        step_index: int,
+        step_name: str,
+    ) -> DebugSession | None:
+        """
+        Check if there's a debug session with a breakpoint at this step.
+
+        If a breakpoint is found:
+        1. Updates debug session status to WAITING_AT_BP
+        2. Sets current_step_index and current_step_name
+        3. Broadcasts debug_breakpoint event via WebSocket
+        4. Returns the debug session
+
+        Returns None if no breakpoint (continue execution normally).
+        """
+        # Find active debug session for this pipeline run
+        result = await db.execute(
+            select(DebugSession)
+            .where(DebugSession.pipeline_run_id == pipeline_run_id)
+            .where(DebugSession.status.in_([
+                DebugSessionStatus.PENDING.value,
+                DebugSessionStatus.WAITING_AT_BP.value,
+                DebugSessionStatus.CONNECTED.value,
+            ]))
+        )
+        debug_session = result.scalar_one_or_none()
+
+        if not debug_session:
+            return None
+
+        # Check if this step_index is in the breakpoints list
+        breakpoints = json.loads(debug_session.breakpoints or "[]")
+        if step_index not in breakpoints:
+            return None
+
+        # Breakpoint found! Update session status
+        await get_debug_session_service().on_breakpoint_hit(
+            db=db,
+            session_id=debug_session.id,
+            step_index=step_index,
+            step_name=step_name,
+        )
+
+        # Broadcast debug_breakpoint event
+        await manager.broadcast({
+            "type": "debug_breakpoint",
+            "data": {
+                "session_id": debug_session.id,
+                "pipeline_run_id": pipeline_run_id,
+                "step_index": step_index,
+                "step_name": step_name,
+            },
+        })
+
+        return debug_session
+
+    async def resume_from_breakpoint(
+        self,
+        db: AsyncSession,
+        debug_session: DebugSession,
+    ) -> None:
+        """
+        Resume pipeline execution after a debug breakpoint.
+
+        Called when user triggers resume from CLI or UI.
+        Continues execution from the step that was paused.
+        """
+        # Get the pipeline run
+        result = await db.execute(
+            select(PipelineRun)
+            .where(PipelineRun.id == debug_session.pipeline_run_id)
+            .options(selectinload(PipelineRun.step_runs))
+        )
+        pipeline_run = result.scalar_one_or_none()
+        if not pipeline_run:
+            logger.error(f"PipelineRun {debug_session.pipeline_run_id} not found for resume")
+            return
+
+        # Get the pipeline and repo
+        result = await db.execute(select(Pipeline).where(Pipeline.id == pipeline_run.pipeline_id))
+        pipeline = result.scalar_one_or_none()
+        if not pipeline:
+            logger.error(f"Pipeline {pipeline_run.pipeline_id} not found for resume")
+            return
+
+        result = await db.execute(select(Repo).where(Repo.id == pipeline.repo_id))
+        repo = result.scalar_one_or_none()
+        if not repo:
+            logger.error(f"Repo {pipeline.repo_id} not found for resume")
+            return
+
+        # Get the step index where we paused
+        step_index = debug_session.current_step_index
+        if step_index is None:
+            logger.error(f"No current_step_index for debug session {debug_session.id}")
+            return
+
+        steps = parse_steps(pipeline.steps)
+
+        logger.info(f"Resuming pipeline run {pipeline_run.id[:8]} from step {step_index}")
+
+        # Mark session as ended
+        debug_session.status = DebugSessionStatus.ENDED.value
+        await db.commit()
+
+        # Continue execution - re-call _execute_step which will now proceed
+        # (since the session is ended, the breakpoint check will pass)
+        await self._execute_step(db, pipeline_run, repo, steps, step_index)
 
     async def cancel_run(self, db: AsyncSession, pipeline_run: PipelineRun) -> PipelineRun:
         """

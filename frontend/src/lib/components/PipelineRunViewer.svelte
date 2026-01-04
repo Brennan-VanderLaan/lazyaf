@@ -1,8 +1,10 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, onDestroy } from 'svelte';
-  import type { PipelineRun, StepRun, RunStatus, StepLogsResponse } from '../api/types';
+  import type { PipelineRun, StepRun, RunStatus, StepLogsResponse, Pipeline } from '../api/types';
   import { activeRunsStore } from '../stores/pipelines';
-  import { pipelineRuns as runsApi } from '../api/client';
+  import { pipelineRuns as runsApi, pipelines as pipelinesApi } from '../api/client';
+  import DebugRerunModal from './DebugRerunModal.svelte';
+  import DebugPanel from './DebugPanel.svelte';
 
   export let run: PipelineRun;
 
@@ -14,6 +16,24 @@
   let stepLogs: StepLogsResponse | null = null;
   let loadingLogs = false;
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
+
+  // Debug state
+  let pipeline: Pipeline | null = null;
+  let showDebugModal = false;
+  let debugSessionId: string | null = null;
+  let debugToken: string | null = null;
+
+  // Load pipeline data for debug modal
+  $: canDebug = run.status === 'failed' || run.status === 'cancelled';
+
+  onMount(async () => {
+    // Load pipeline for debug modal
+    try {
+      pipeline = await pipelinesApi.get(run.pipeline_id);
+    } catch (e) {
+      // Pipeline may not exist, that's okay
+    }
+  });
 
   // Auto-refresh while running
   $: if (run.status === 'running' || run.status === 'pending') {
@@ -108,6 +128,17 @@
     const minutes = Math.floor(seconds / 60);
     return `${minutes}m ${seconds % 60}s`;
   }
+
+  function handleDebugStarted(event: CustomEvent<{ sessionId: string; token: string; runId: string }>) {
+    showDebugModal = false;
+    debugSessionId = event.detail.sessionId;
+    debugToken = event.detail.token;
+  }
+
+  function handleDebugClose() {
+    debugSessionId = null;
+    debugToken = null;
+  }
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
@@ -189,12 +220,38 @@
       {#if run.status === 'running' || run.status === 'pending'}
         <button type="button" class="btn-cancel" on:click={handleCancel}>Cancel Pipeline</button>
       {/if}
+      {#if canDebug && pipeline}
+        <button type="button" class="btn-debug" on:click={() => showDebugModal = true}>
+          Debug Re-run
+        </button>
+      {/if}
       <button type="button" class="btn-secondary" on:click={() => dispatch('close')}>
         Close
       </button>
     </footer>
+
+    {#if debugSessionId && debugToken}
+      <div class="debug-panel-container">
+        <DebugPanel
+          sessionId={debugSessionId}
+          token={debugToken}
+          on:close={handleDebugClose}
+          on:resumed={() => { /* Refresh run state */ }}
+          on:aborted={() => { /* Refresh run state */ }}
+        />
+      </div>
+    {/if}
   </div>
 </div>
+
+{#if showDebugModal && pipeline}
+  <DebugRerunModal
+    {run}
+    {pipeline}
+    on:close={() => showDebugModal = false}
+    on:started={handleDebugStarted}
+  />
+{/if}
 
 <style>
   .modal-backdrop {
@@ -467,5 +524,20 @@
   .btn-cancel:hover {
     background: var(--error-color);
     color: white;
+  }
+
+  .btn-debug {
+    background: var(--primary-color);
+    color: white;
+  }
+
+  .btn-debug:hover {
+    background: var(--primary-hover);
+  }
+
+  .debug-panel-container {
+    margin-top: 1rem;
+    border-top: 1px solid var(--border-color);
+    padding-top: 1rem;
   }
 </style>

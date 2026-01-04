@@ -21,6 +21,18 @@ from app.schemas.steps import (
     LogsResponse,
     HeartbeatResponse,
 )
+from app.schemas.debug import (
+    DebugRerunRequest,
+    DebugRerunResponse,
+    DebugStepInfo,
+    DebugCommitInfo,
+    DebugRuntimeInfo,
+    DebugSessionInfo,
+    DebugResumeResponse,
+    DebugExtendRequest,
+    DebugExtendResponse,
+    DebugAbortResponse,
+)
 
 __all__ = [
     "RepoCreate",
@@ -49,4 +61,14 @@ __all__ = [
     "StatusResponse",
     "LogsResponse",
     "HeartbeatResponse",
+    "DebugRerunRequest",
+    "DebugRerunResponse",
+    "DebugStepInfo",
+    "DebugCommitInfo",
+    "DebugRuntimeInfo",
+    "DebugSessionInfo",
+    "DebugResumeResponse",
+    "DebugExtendRequest",
+    "DebugExtendResponse",
+    "DebugAbortResponse",
 ]

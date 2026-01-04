@@ -1,18 +1,15 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
-  import { poolStatus, runnersStore } from '../stores/runners';
-  import { runners as runnersApi } from '../api/client';
-  import type { DockerCommand, Runner } from '../api/types';
+  /**
+   * Runner Panel - Phase 12.6 WebSocket-based Architecture
+   *
+   * Displays connected runners and their status.
+   * Runner data is pushed via WebSocket - no polling required.
+   */
+  import { poolStatus, runnersStore, connectedRunners } from '../stores/runners';
+  import type { Runner, RunnerStatus } from '../api/types';
 
   let showRunners = true;
-  let showDockerModal = false;
-  let showLogsModal = false;
-  let dockerCommand: DockerCommand | null = null;
-  let copyFeedback = '';
-  let selectedRunner: Runner | null = null;
-  let logs: string[] = [];
-  let logsLoading = false;
-  let logPollInterval: ReturnType<typeof setInterval> | null = null;
+  let showHelpModal = false;
 
   // Group runners by type
   $: groupedRunners = $runnersStore.reduce((acc, runner) => {
@@ -26,97 +23,27 @@
 
   $: runnerTypes = Object.keys(groupedRunners).sort();
 
-  onMount(() => {
-    poolStatus.startPolling(2000);
-    runnersStore.startPolling(2000);
-  });
-
-  onDestroy(() => {
-    poolStatus.stopPolling();
-    runnersStore.stopPolling();
-    stopLogPolling();
-  });
-
-  let selectedRunnerType: string = 'claude-code';
-
-  async function openDockerModal() {
-    showDockerModal = true;
-    try {
-      dockerCommand = await runnersApi.dockerCommand(selectedRunnerType, false);
-    } catch (e) {
-      console.error('Failed to get docker command:', e);
-    }
-  }
-
-  async function copyCommand(withSecrets: boolean) {
-    if (!dockerCommand) return;
-    try {
-      if (withSecrets) {
-        dockerCommand = await runnersApi.dockerCommand(selectedRunnerType, true);
-      }
-      const cmd = withSecrets ? dockerCommand.command_with_secrets : dockerCommand.command;
-      await navigator.clipboard.writeText(cmd);
-      copyFeedback = withSecrets ? 'Copied with secrets!' : 'Copied!';
-      setTimeout(() => copyFeedback = '', 2000);
-    } catch (e) {
-      console.error('Failed to copy:', e);
-    }
-  }
-
-  async function changeRunnerType(runnerType: string) {
-    selectedRunnerType = runnerType;
-    try {
-      dockerCommand = await runnersApi.dockerCommand(runnerType, false);
-    } catch (e) {
-      console.error('Failed to get docker command:', e);
-    }
-  }
-
-  async function openLogsModal(runner: Runner) {
-    selectedRunner = runner;
-    showLogsModal = true;
-    logs = [];
-    await loadLogs();
-    startLogPolling();
-  }
-
-  function closeLogsModal() {
-    showLogsModal = false;
-    selectedRunner = null;
-    stopLogPolling();
-  }
-
-  async function loadLogs() {
-    if (!selectedRunner) return;
-    logsLoading = true;
-    try {
-      const result = await runnersApi.logs(selectedRunner.id);
-      logs = result.logs;
-    } catch (e) {
-      console.error('Failed to load logs:', e);
-    } finally {
-      logsLoading = false;
-    }
-  }
-
-  function startLogPolling() {
-    if (logPollInterval) return;
-    logPollInterval = setInterval(loadLogs, 2000);
-  }
-
-  function stopLogPolling() {
-    if (logPollInterval) {
-      clearInterval(logPollInterval);
-      logPollInterval = null;
-    }
-  }
-
-  function getStatusColor(status: string): string {
+  function getStatusColor(status: RunnerStatus): string {
     switch (status) {
       case 'idle': return 'var(--success-color, #a6e3a1)';
-      case 'busy': return 'var(--warning-color, #f9e2af)';
-      case 'offline': return 'var(--error-color, #f38ba8)';
+      case 'busy':
+      case 'assigned': return 'var(--warning-color, #f9e2af)';
+      case 'connecting': return 'var(--primary-color, #89b4fa)';
+      case 'disconnected': return 'var(--text-muted, #6c7086)';
+      case 'dead': return 'var(--error-color, #f38ba8)';
       default: return 'var(--text-muted, #6c7086)';
+    }
+  }
+
+  function getStatusLabel(status: RunnerStatus): string {
+    switch (status) {
+      case 'idle': return 'Ready';
+      case 'busy': return 'Executing';
+      case 'assigned': return 'Starting...';
+      case 'connecting': return 'Connecting';
+      case 'disconnected': return 'Offline';
+      case 'dead': return 'Dead';
+      default: return status;
     }
   }
 </script>
@@ -124,33 +51,25 @@
 <div class="runner-panel">
   <div class="panel-header">
     <h2>Runners</h2>
-    <button class="btn-icon" on:click={openDockerModal} title="Get Docker command">
-      🐳
+    <button class="btn-icon" on:click={() => showHelpModal = true} title="How to start a runner">
+      ?
     </button>
   </div>
 
-  {#if $poolStatus}
-    <div class="pool-stats">
-      <div class="stat">
-        <span class="stat-value">{$poolStatus.total_runners}</span>
-        <span class="stat-label">Total</span>
-      </div>
-      <div class="stat">
-        <span class="stat-value idle">{$poolStatus.idle_runners}</span>
-        <span class="stat-label">Idle</span>
-      </div>
-      <div class="stat">
-        <span class="stat-value busy">{$poolStatus.busy_runners}</span>
-        <span class="stat-label">Busy</span>
-      </div>
-      <div class="stat">
-        <span class="stat-value queued">{$poolStatus.queued_jobs}</span>
-        <span class="stat-label">Queued</span>
-      </div>
+  <div class="pool-stats">
+    <div class="stat">
+      <span class="stat-value">{$connectedRunners.length}</span>
+      <span class="stat-label">Connected</span>
     </div>
-  {:else}
-    <div class="loading">Loading...</div>
-  {/if}
+    <div class="stat">
+      <span class="stat-value idle">{$poolStatus.idle_runners}</span>
+      <span class="stat-label">Ready</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value busy">{$poolStatus.busy_runners}</span>
+      <span class="stat-label">Busy</span>
+    </div>
+  </div>
 
   <button
     class="btn-toggle"
@@ -164,7 +83,7 @@
       {#if $runnersStore.length === 0}
         <div class="no-runners">
           <p>No runners connected</p>
-          <p class="hint">Click 🐳 to get the Docker command</p>
+          <p class="hint">Click ? to see how to start a runner</p>
         </div>
       {:else}
         {#each runnerTypes as runnerType (runnerType)}
@@ -174,30 +93,29 @@
               <span class="runner-count">{groupedRunners[runnerType].length}</span>
             </div>
             {#each groupedRunners[runnerType] as runner (runner.id)}
-              <button
-                class="runner-item"
-                on:click={() => openLogsModal(runner)}
-              >
+              <div class="runner-item">
                 <span
                   class="status-dot"
                   style="background: {getStatusColor(runner.status)}"
                 ></span>
                 <div class="runner-info">
                   <div class="runner-main">
-                    <span class="runner-name">{runner.name}</span>
-                    <span class="runner-status">{runner.status}</span>
+                    <span class="runner-name">{runner.name || runner.id.slice(0, 8)}</span>
+                    <span
+                      class="runner-status"
+                      style="color: {getStatusColor(runner.status)}"
+                    >
+                      {getStatusLabel(runner.status)}
+                    </span>
                   </div>
-                  {#if runner.current_job_title}
+                  {#if runner.current_step_execution_id}
                     <div class="runner-job">
                       <span class="job-icon">⚡</span>
-                      <span class="job-title">{runner.current_job_title}</span>
+                      <span class="job-title">Executing step</span>
                     </div>
                   {/if}
                 </div>
-                {#if runner.log_count > 0}
-                  <span class="log-count">{runner.log_count} lines</span>
-                {/if}
-              </button>
+              </div>
             {/each}
           </div>
         {/each}
@@ -206,116 +124,54 @@
   {/if}
 </div>
 
-<!-- Docker Command Modal -->
-{#if showDockerModal}
+<!-- Help Modal -->
+{#if showHelpModal}
   <div
     class="modal-backdrop"
-    on:click={() => showDockerModal = false}
-    on:keydown={(e) => e.key === 'Escape' && (showDockerModal = false)}
+    on:click={() => showHelpModal = false}
+    on:keydown={(e) => e.key === 'Escape' && (showHelpModal = false)}
     role="dialog"
     aria-modal="true"
     tabindex="-1"
   >
     <div class="modal" on:click|stopPropagation role="document">
       <div class="modal-header">
-        <h3>Start a Runner</h3>
-        <button class="btn-close" on:click={() => showDockerModal = false}>✕</button>
+        <h3>Starting a Runner</h3>
+        <button class="btn-close" on:click={() => showHelpModal = false}>✕</button>
       </div>
 
       <div class="modal-body">
         <p class="modal-description">
-          Run this command to start a runner that will connect to the backend and wait for jobs.
+          Runners connect to the backend via WebSocket and execute pipeline steps.
         </p>
 
-        <div class="runner-type-selector">
-          <label>Runner Type:</label>
-          <div class="runner-type-buttons">
-            <button
-              class="runner-type-btn"
-              class:selected={selectedRunnerType === 'claude-code'}
-              on:click={() => changeRunnerType('claude-code')}
-            >
-              Claude Code
-            </button>
-            <button
-              class="runner-type-btn"
-              class:selected={selectedRunnerType === 'gemini'}
-              on:click={() => changeRunnerType('gemini')}
-            >
-              Gemini CLI
-            </button>
-          </div>
+        <h4>Using Docker (Recommended)</h4>
+        <div class="command-box">
+          <code>docker run --rm -it \
+  -e LAZYAF_BACKEND_URL=http://host.docker.internal:8000 \
+  -e ANTHROPIC_API_KEY=your-key \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  lazyaf-runner-agent</code>
         </div>
 
-        {#if dockerCommand}
-          <div class="command-box">
-            <code>{dockerCommand.command}</code>
-          </div>
-
-          <div class="modal-actions">
-            <button class="btn-secondary" on:click={() => copyCommand(false)}>
-              📋 Copy
-            </button>
-            <button class="btn-primary" on:click={() => copyCommand(true)}>
-              🔐 Copy with Secrets
-            </button>
-          </div>
-
-          {#if copyFeedback}
-            <div class="copy-feedback">{copyFeedback}</div>
-          {/if}
-
-          <div class="env-vars">
-            <h4>Environment Variables</h4>
-            <ul>
-              <li><code>BACKEND_URL</code> - Backend API URL (default: http://host.docker.internal:8000)</li>
-              {#if selectedRunnerType === 'claude-code'}
-                <li><code>ANTHROPIC_API_KEY</code> - Your Anthropic API key (required)</li>
-              {:else}
-                <li><code>GEMINI_API_KEY</code> - Your Gemini API key (required)</li>
-              {/if}
-            </ul>
-          </div>
-        {:else}
-          <div class="loading">Loading command...</div>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
-
-<!-- Logs Modal -->
-{#if showLogsModal && selectedRunner}
-  <div
-    class="modal-backdrop"
-    on:click={closeLogsModal}
-    on:keydown={(e) => e.key === 'Escape' && closeLogsModal()}
-    role="dialog"
-    aria-modal="true"
-    tabindex="-1"
-  >
-    <div class="modal modal-logs" on:click|stopPropagation role="document">
-      <div class="modal-header">
-        <div class="logs-header-info">
-          <h3>{selectedRunner.name}</h3>
-          <span
-            class="status-badge"
-            style="background: {getStatusColor(selectedRunner.status)}20; color: {getStatusColor(selectedRunner.status)}"
-          >
-            {selectedRunner.status}
-          </span>
+        <h4>Using Python Directly</h4>
+        <div class="command-box">
+          <code>export LAZYAF_BACKEND_URL="http://localhost:8000"
+export LAZYAF_RUNNER_ID="my-runner"
+export ANTHROPIC_API_KEY="your-key"
+python -m lazyaf_runner</code>
         </div>
-        <button class="btn-close" on:click={closeLogsModal}>✕</button>
-      </div>
 
-      <div class="logs-container">
-        {#if logs.length > 0}
-          <pre class="logs-content">{logs.join('\n')}</pre>
-        {:else if logsLoading}
-          <div class="logs-empty">Loading logs...</div>
-        {:else}
-          <div class="logs-empty">No logs yet</div>
-        {/if}
+        <div class="env-vars">
+          <h4>Environment Variables</h4>
+          <ul>
+            <li><code>LAZYAF_BACKEND_URL</code> - Backend WebSocket URL (required)</li>
+            <li><code>LAZYAF_RUNNER_ID</code> - Optional runner ID</li>
+            <li><code>LAZYAF_LABELS</code> - Labels for job routing (e.g., "arch=arm64,has=gpio")</li>
+            <li><code>ANTHROPIC_API_KEY</code> - For Claude Code runners</li>
+            <li><code>GEMINI_API_KEY</code> - For Gemini runners</li>
+          </ul>
+        </div>
       </div>
     </div>
   </div>
@@ -353,7 +209,8 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 1rem;
+    font-size: 0.9rem;
+    font-weight: 600;
   }
 
   .btn-icon:hover {
@@ -362,7 +219,7 @@
 
   .pool-stats {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 0.5rem;
     margin-bottom: 0.75rem;
   }
@@ -383,7 +240,6 @@
 
   .stat-value.idle { color: var(--success-color, #a6e3a1); }
   .stat-value.busy { color: var(--warning-color, #f9e2af); }
-  .stat-value.queued { color: var(--primary-color, #89b4fa); }
 
   .stat-label {
     font-size: 0.7rem;
@@ -454,12 +310,6 @@
     padding: 0.5rem;
     border-radius: 4px;
     font-size: 0.8rem;
-    width: 100%;
-    background: none;
-    border: none;
-    cursor: pointer;
-    text-align: left;
-    color: inherit;
   }
 
   .runner-item:hover {
@@ -496,7 +346,6 @@
   }
 
   .runner-status {
-    color: var(--text-muted, #6c7086);
     text-transform: capitalize;
     font-size: 0.75rem;
   }
@@ -523,13 +372,6 @@
     text-overflow: ellipsis;
   }
 
-  .log-count {
-    margin-left: auto;
-    font-size: 0.7rem;
-    color: var(--text-muted, #6c7086);
-    flex-shrink: 0;
-  }
-
   .no-runners {
     padding: 1rem;
     text-align: center;
@@ -543,12 +385,6 @@
   .no-runners .hint {
     font-size: 0.8rem;
     opacity: 0.7;
-  }
-
-  .loading {
-    padding: 1rem;
-    text-align: center;
-    color: var(--text-muted, #6c7086);
   }
 
   /* Modal styles */
@@ -574,11 +410,6 @@
     flex-direction: column;
   }
 
-  .modal-logs {
-    max-width: 800px;
-    height: 80vh;
-  }
-
   .modal-header {
     display: flex;
     justify-content: space-between;
@@ -594,20 +425,6 @@
     color: var(--text-color, #cdd6f4);
   }
 
-  .logs-header-info {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-  }
-
-  .status-badge {
-    padding: 0.2rem 0.5rem;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    font-weight: 500;
-    text-transform: capitalize;
-  }
-
   .btn-close {
     background: none;
     border: none;
@@ -621,38 +438,20 @@
     overflow-y: auto;
   }
 
-  .logs-container {
-    flex: 1;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .logs-content {
-    flex: 1;
-    margin: 0;
-    padding: 1rem;
-    background: var(--surface-alt, #181825);
-    font-family: 'Fira Code', 'Consolas', monospace;
-    font-size: 0.8rem;
-    color: var(--text-color, #cdd6f4);
-    overflow: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
-  .logs-empty {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--text-muted, #6c7086);
-  }
-
   .modal-description {
     margin: 0 0 1rem;
     color: var(--text-muted, #6c7086);
     font-size: 0.9rem;
+  }
+
+  .modal-body h4 {
+    margin: 1rem 0 0.5rem;
+    font-size: 0.9rem;
+    color: var(--text-color, #cdd6f4);
+  }
+
+  .modal-body h4:first-of-type {
+    margin-top: 0;
   }
 
   .command-box {
@@ -666,58 +465,16 @@
 
   .command-box code {
     font-family: 'Fira Code', 'Consolas', monospace;
-    font-size: 0.85rem;
+    font-size: 0.8rem;
     color: var(--text-color, #cdd6f4);
     white-space: pre-wrap;
     word-break: break-all;
   }
 
-  .modal-actions {
-    display: flex;
-    gap: 0.5rem;
-    margin-bottom: 1rem;
-  }
-
-  .btn-primary, .btn-secondary {
-    flex: 1;
-    padding: 0.6rem 1rem;
-    border-radius: 6px;
-    font-size: 0.85rem;
-    font-weight: 500;
-    cursor: pointer;
-    border: none;
-  }
-
-  .btn-primary {
-    background: var(--primary-color, #89b4fa);
-    color: var(--primary-text, #1e1e2e);
-  }
-
-  .btn-secondary {
-    background: var(--surface-alt, #313244);
-    color: var(--text-color, #cdd6f4);
-  }
-
-  .btn-primary:hover, .btn-secondary:hover {
-    opacity: 0.9;
-  }
-
-  .copy-feedback {
-    text-align: center;
-    color: var(--success-color, #a6e3a1);
-    font-size: 0.85rem;
-    margin-bottom: 1rem;
-  }
-
   .env-vars {
     border-top: 1px solid var(--border-color, #45475a);
     padding-top: 1rem;
-  }
-
-  .env-vars h4 {
-    margin: 0 0 0.5rem;
-    font-size: 0.9rem;
-    color: var(--text-color, #cdd6f4);
+    margin-top: 1rem;
   }
 
   .env-vars ul {
@@ -736,42 +493,5 @@
     padding: 0.1rem 0.3rem;
     border-radius: 3px;
     font-size: 0.8rem;
-  }
-
-  .runner-type-selector {
-    margin-bottom: 1rem;
-  }
-
-  .runner-type-selector label {
-    display: block;
-    margin-bottom: 0.5rem;
-    font-size: 0.9rem;
-    color: var(--text-color, #cdd6f4);
-  }
-
-  .runner-type-buttons {
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  .runner-type-btn {
-    flex: 1;
-    padding: 0.6rem 1rem;
-    background: var(--surface-alt, #181825);
-    border: 2px solid var(--border-color, #45475a);
-    border-radius: 6px;
-    color: var(--text-color, #cdd6f4);
-    font-size: 0.85rem;
-    cursor: pointer;
-    transition: border-color 0.15s, background 0.15s;
-  }
-
-  .runner-type-btn:hover {
-    border-color: var(--primary-color, #89b4fa);
-  }
-
-  .runner-type-btn.selected {
-    border-color: var(--primary-color, #89b4fa);
-    background: rgba(137, 180, 250, 0.1);
   }
 </style>

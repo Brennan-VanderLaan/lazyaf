@@ -1,15 +1,16 @@
 import { writable } from 'svelte/store';
-import type { Card, Pipeline, PipelineRun, StepRun, Repo } from '../api/types';
+import type { Card, Pipeline, PipelineRun, StepRun, Repo, RunnerStatusUpdate, StepLogUpdate, StepStatusUpdate } from '../api/types';
 import { cardsStore } from './cards';
 import { jobsStore, type JobStatusUpdate } from './jobs';
 import { pipelinesStore, activeRunsStore } from './pipelines';
 import { reposStore } from './repos';
 import { debugStore, type DebugBreakpointEvent, type DebugStatusEvent, type DebugResumeEvent } from './debug';
+import { handleRunnerStatusUpdate, clearRunners } from './runners';
 
 export type WebSocketStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
 interface WebSocketMessage {
-  type: 'card_updated' | 'card_deleted' | 'job_status' | 'runner_status' | 'pipeline_updated' | 'pipeline_deleted' | 'pipeline_run_status' | 'step_run_status' | 'repo_created' | 'repo_updated' | 'repo_deleted' | 'debug_breakpoint' | 'debug_status' | 'debug_resume';
+  type: 'card_updated' | 'card_deleted' | 'job_status' | 'runner_status' | 'pipeline_updated' | 'pipeline_deleted' | 'pipeline_run_status' | 'step_run_status' | 'step_logs' | 'step_status' | 'repo_created' | 'repo_updated' | 'repo_deleted' | 'debug_breakpoint' | 'debug_status' | 'debug_resume';
   payload: unknown;
 }
 
@@ -52,6 +53,8 @@ function createWebSocketStore() {
     ws.onclose = () => {
       status.set('disconnected');
       ws = null;
+      // Clear runner state since we won't receive updates while disconnected
+      clearRunners();
       // Reconnect after 3 seconds
       reconnectTimeout = setTimeout(connect, 3000);
     };
@@ -69,7 +72,18 @@ function createWebSocketStore() {
         jobsStore.updateFromWebSocket(message.payload as JobStatusUpdate);
         break;
       case 'runner_status':
-        // Runner status is handled by polling in runnersStore
+        // Phase 12.6: Runner status is now pushed via WebSocket, no polling
+        handleRunnerStatusUpdate(message.payload as RunnerStatusUpdate);
+        break;
+      case 'step_logs':
+        // Phase 12.6: Step logs pushed from remote runners
+        // TODO: Route to step log viewer if implemented
+        console.debug('step_logs:', message.payload);
+        break;
+      case 'step_status':
+        // Phase 12.6: Step status update from remote runner
+        // This is more granular than step_run_status - for real-time updates
+        console.debug('step_status:', message.payload);
         break;
       case 'pipeline_updated':
         pipelinesStore.updateLocal(message.payload as Pipeline);

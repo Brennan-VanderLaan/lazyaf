@@ -1,8 +1,14 @@
 export type CardStatus = 'todo' | 'in_progress' | 'in_review' | 'done' | 'failed';
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
-export type RunnerStatus = 'idle' | 'busy' | 'offline';
+
+// Phase 12.6: Extended runner states for WebSocket-based lifecycle
+export type RunnerStatus = 'disconnected' | 'connecting' | 'idle' | 'assigned' | 'busy' | 'dead';
+
 export type RunnerType = 'any' | 'claude-code' | 'gemini';
 export type StepType = 'agent' | 'script' | 'docker';
+
+// Phase 12.1: Step execution states
+export type ExecutionStatus = 'pending' | 'assigned' | 'preparing' | 'running' | 'completing' | 'completed' | 'failed' | 'cancelled' | 'timeout';
 
 export interface StepConfig {
   command?: string;        // For script/docker steps
@@ -119,38 +125,51 @@ export interface Job {
   test_output: string | null;
 }
 
+// Phase 12.6: Updated Runner interface for WebSocket-based architecture
 export interface Runner {
   id: string;
-  name: string;
+  name: string | null;
   runner_type: string;
   status: RunnerStatus;
-  current_job_id: string | null;
-  current_job_title: string | null;
+  labels: Record<string, unknown> | null;
+  current_step_execution_id: string | null;
+  websocket_id: string | null;
   last_heartbeat: string;
-  registered_at: string;
-  log_count: number;
+  connected_at: string | null;
+  created_at: string | null;
 }
 
+// WebSocket runner status update payload (from backend broadcasts)
+export interface RunnerStatusUpdate {
+  id: string;
+  name?: string | null;
+  status: RunnerStatus;
+  runner_type?: string;
+}
+
+// Derived pool status (computed from runners list)
 export interface PoolStatus {
   total_runners: number;
   idle_runners: number;
   busy_runners: number;
-  offline_runners: number;
-  queued_jobs: number;
-  pending_jobs: number;
+  disconnected_runners: number;
+  dead_runners: number;
 }
 
-export interface RunnerLogs {
-  logs: string[];
-  total: number;
+// Step log update (from WebSocket broadcast)
+export interface StepLogUpdate {
+  runner_id: string;
+  step_id: string;
+  lines: string[];
 }
 
-export interface DockerCommand {
-  command: string;
-  command_with_secrets: string;
-  image: string;
-  runner_type: string;
-  env_vars: Record<string, string>;
+// Step status update (from WebSocket broadcast)
+export interface StepStatusUpdate {
+  runner_id: string;
+  step_id: string;
+  status: 'completed' | 'failed';
+  exit_code: number;
+  error: string | null;
 }
 
 export interface JobLogs {

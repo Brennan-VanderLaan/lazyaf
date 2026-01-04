@@ -45,3 +45,14 @@ backend/git_repos/
 
 # Logs
 *.log
+
+# Test artifacts
+tdd/frontend/e2e-results/
+tdd/frontend/e2e-report/
+tdd/frontend/coverage/
+tdd/frontend/playwright-report/
+tdd/frontend/test-results/
+**/htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

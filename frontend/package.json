@@ -8,20 +8,48 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
+
+    "test": "echo 'Run: pnpm test:e2e or pnpm test:unit' && exit 1",
+
     "test:e2e": "playwright test --config=../tdd/frontend/playwright.config.ts",
     "test:e2e:ui": "playwright test --config=../tdd/frontend/playwright.config.ts --ui",
+    "test:e2e:headed": "playwright test --config=../tdd/frontend/playwright.config.ts --headed",
+    "test:e2e:debug": "playwright test --config=../tdd/frontend/playwright.config.ts --debug",
+
     "test:e2e:mocked": "playwright test --config=../tdd/frontend/playwright.config.ts --project=mocked",
-    "test:e2e:real": "playwright test --config=../tdd/frontend/playwright.config.ts --project=real"
+    "test:e2e:stories": "playwright test --config=../tdd/frontend/playwright.config.ts --project=stories",
+    "test:e2e:critical": "playwright test --config=../tdd/frontend/playwright.config.ts --project=critical",
+    "test:e2e:ui-tests": "playwright test --config=../tdd/frontend/playwright.config.ts --project=ui",
+    "test:e2e:realtime": "playwright test --config=../tdd/frontend/playwright.config.ts --project=realtime",
+    "test:e2e:real": "playwright test --config=../tdd/frontend/playwright.config.ts --project=real",
+    "test:e2e:all": "playwright test --config=../tdd/frontend/playwright.config.ts --project=all",
+
+    "test:e2e:p0": "playwright test --config=../tdd/frontend/playwright.config.ts ../tdd/frontend/e2e/stories/02-card-lifecycle ../tdd/frontend/e2e/critical-failures",
+    "test:e2e:cards": "playwright test --config=../tdd/frontend/playwright.config.ts --grep 'Card'",
+    "test:e2e:pipeline": "playwright test --config=../tdd/frontend/playwright.config.ts --grep 'Pipeline'",
+    "test:e2e:runner": "playwright test --config=../tdd/frontend/playwright.config.ts --grep 'Runner'",
+    "test:e2e:debug-rerun": "playwright test --config=../tdd/frontend/playwright.config.ts --grep 'Debug'",
+    "test:e2e:playground": "playwright test --config=../tdd/frontend/playwright.config.ts --grep 'Playground'",
+
+    "test:e2e:report": "playwright show-report ../tdd/frontend/e2e-report",
+
+    "test:unit": "vitest run --config=../tdd/frontend/vitest.config.ts",
+    "test:unit:watch": "vitest --config=../tdd/frontend/vitest.config.ts",
+    "test:unit:coverage": "vitest run --config=../tdd/frontend/vitest.config.ts --coverage"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",
     "@sveltejs/vite-plugin-svelte": "^6.2.1",
+    "@testing-library/svelte": "^5.2.0",
     "@tsconfig/svelte": "^5.0.6",
     "@types/node": "^24.10.1",
+    "@vitest/coverage-v8": "^2.1.0",
+    "jsdom": "^25.0.0",
     "svelte": "^5.43.8",
     "svelte-check": "^4.3.4",
     "typescript": "~5.9.3",
-    "vite": "^7.2.4"
+    "vite": "^7.2.4",
+    "vitest": "^2.1.0"
   },
   "dependencies": {
     "svelte-spa-router": "^4.0.1"

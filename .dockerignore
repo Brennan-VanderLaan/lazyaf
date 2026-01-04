@@ -1,0 +1,52 @@
+# Node modules - installed in container
+**/node_modules
+node_modules
+
+# Git
+.git
+.gitignore
+
+# Test results/reports - mounted as volumes
+tdd/frontend/e2e-results
+tdd/frontend/e2e-report
+tdd/frontend/coverage
+**/htmlcov
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+**/__pycache__
+**/*.pyc
+**/*.pyo
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+backend/.venv
+**/.venv
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build outputs
+dist
+build
+*.tsbuildinfo
+
+# Environment files (keep examples)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Docker compose override (local customizations)
+docker-compose.override.yml

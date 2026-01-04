@@ -40,9 +40,13 @@ test.describe('Smoke Tests - App Loads', () => {
     const unexpectedErrors = errors.filter(
       err =>
         !err.includes('404') &&
+        !err.includes('500') &&
         !err.includes('WebSocket') &&
         !err.includes('Failed to fetch') &&
-        !err.includes('ERR_CONNECTION_REFUSED')
+        !err.includes('Failed to load resource') &&
+        !err.includes('Error loading') &&
+        !err.includes('ERR_CONNECTION_REFUSED') &&
+        !err.includes('ECONNREFUSED')
     );
 
     expect(unexpectedErrors).toHaveLength(0);

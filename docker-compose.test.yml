@@ -1,19 +1,22 @@
 # Docker Compose for Frontend Tests
 #
-# Usage:
-#   docker compose -f docker-compose.test.yml run --rm test pnpm test:e2e:stories
-#   docker compose -f docker-compose.test.yml run --rm test pnpm test:e2e:p0
-#   docker compose -f docker-compose.test.yml up test-ui  # For Playwright UI (needs X11/display)
+# Usage (without backend - mocked tests):
+#   .\scripts\test.ps1 docker e2e:mocked
+#   ./scripts/test.sh docker e2e:mocked
 #
-# Quick commands via scripts:
-#   .\scripts\test.ps1 docker e2e:stories
-#   ./scripts/test.sh docker e2e:stories
+# Usage (with backend - full E2E):
+#   .\scripts\test.ps1 docker-full e2e
+#   ./scripts/test.sh docker-full e2e
+#
+# Or directly:
+#   docker compose -f docker-compose.test.yml run --rm test test:e2e:mocked
+#   docker compose -f docker-compose.test.yml run --rm test-with-backend test:e2e:all
 
 # Use separate project name to avoid conflicts with main lazyaf stack
 name: lazyaf-tests
 
 services:
-  # Headless test runner
+  # Headless test runner (no backend - for mocked tests)
   test:
     build:
       context: .
@@ -30,21 +33,48 @@ services:
       - CI=true
       - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
     working_dir: /app/tdd/frontend
-    # Default: run story tests (work with mocked backend)
     entrypoint: ["pnpm"]
-    command: ["test:e2e:stories"]
+    command: ["test:e2e:mocked"]
+
+  # Headless test runner WITH backend
+  test-with-backend:
+    build:
+      context: .
+      dockerfile: tdd/frontend/Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./tdd/frontend/e2e:/app/tdd/frontend/e2e:ro
+      - ./tdd/frontend/fixtures:/app/tdd/frontend/fixtures:ro
+      - ./frontend/src:/app/frontend/src:ro
+      - ./tdd/frontend/e2e-results:/app/tdd/frontend/e2e-results
+      - ./tdd/frontend/e2e-report:/app/tdd/frontend/e2e-report
+    environment:
+      - CI=true
+      - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+      - VITE_BACKEND_URL=http://backend:8000
+      - BACKEND_URL=http://backend:8000
+    working_dir: /app/tdd/frontend
+    entrypoint: ["pnpm"]
+    command: ["test:e2e:all"]
 
   # Interactive UI mode (requires X11 forwarding or VNC)
   test-ui:
     build:
       context: .
       dockerfile: tdd/frontend/Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
     volumes:
       - ./tdd/frontend:/app/tdd/frontend
       - ./frontend/src:/app/frontend/src:ro
     environment:
       - DISPLAY=${DISPLAY:-:0}
       - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+      - VITE_BACKEND_URL=http://backend:8000
+      - BACKEND_URL=http://backend:8000
     ports:
       - "9323:9323"  # Playwright UI port
     working_dir: /app/tdd/frontend
@@ -54,25 +84,7 @@ services:
     # volumes:
     #   - /tmp/.X11-unix:/tmp/.X11-unix
 
-  # Run with backend for real tier tests
-  test-real:
-    build:
-      context: .
-      dockerfile: tdd/frontend/Dockerfile
-    depends_on:
-      - backend
-    volumes:
-      - ./tdd/frontend/e2e-results:/app/tdd/frontend/e2e-results
-      - ./tdd/frontend/e2e-report:/app/tdd/frontend/e2e-report
-    environment:
-      - CI=true
-      - BACKEND_URL=http://backend:8000
-      - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-    working_dir: /app/tdd/frontend
-    entrypoint: ["pnpm"]
-    command: ["test:e2e:real"]
-
-  # Backend service for real tier tests
+  # Backend service for tests
   backend:
     build:
       context: ./backend
@@ -83,7 +95,8 @@ services:
     expose:
       - "8000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s

@@ -20,7 +20,7 @@
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("backend", "frontend", "all", "help", "install", "docker")]
+    [ValidateSet("backend", "frontend", "all", "help", "install", "docker", "docker-full")]
     [string]$Target = "help",
 
     [Parameter(Position=1)]
@@ -66,13 +66,17 @@ SETUP
 -----
   .\scripts\test.ps1 install              Install test dependencies
 
-DOCKER (isolated environment)
------------------------------
+DOCKER (isolated environment - no backend)
+------------------------------------------
   .\scripts\test.ps1 docker build         Build test container
-  .\scripts\test.ps1 docker e2e           Run all E2E tests in Docker
-  .\scripts\test.ps1 docker e2e:stories   Run story tests in Docker
-  .\scripts\test.ps1 docker e2e:p0        Run P0 tests in Docker
+  .\scripts\test.ps1 docker e2e:mocked    Run mocked tests (no backend)
   .\scripts\test.ps1 docker shell         Open shell in test container
+
+DOCKER-FULL (with backend)
+--------------------------
+  .\scripts\test.ps1 docker-full build    Build test + backend containers
+  .\scripts\test.ps1 docker-full e2e      Run all E2E tests with backend
+  .\scripts\test.ps1 docker-full e2e:stories  Run story tests with backend
 
 "@ -ForegroundColor Cyan
 }
@@ -273,24 +277,58 @@ switch ($Target) {
                 "" {
                     Write-Host @"
 
-Docker Test Options
-===================
+Docker Test Options (no backend)
+================================
 
   .\scripts\test.ps1 docker build       Build the test container
   .\scripts\test.ps1 docker shell       Open bash shell in container
-  .\scripts\test.ps1 docker e2e         Run all E2E tests
-  .\scripts\test.ps1 docker e2e:stories Run story tests
-  .\scripts\test.ps1 docker e2e:p0      Run P0 critical tests
-  .\scripts\test.ps1 docker e2e:cards   Run card tests
-  .\scripts\test.ps1 docker e2e:playground Run playground tests
+  .\scripts\test.ps1 docker e2e:mocked  Run mocked tests (recommended)
 
-First time? Run: .\scripts\test.ps1 docker build
+For tests WITH backend, use: .\scripts\test.ps1 docker-full
 
 "@ -ForegroundColor Cyan
                 }
                 default {
-                    Write-Host "`n=== Running Tests in Docker ===" -ForegroundColor Cyan
+                    Write-Host "`n=== Running Tests in Docker (no backend) ===" -ForegroundColor Cyan
                     docker compose -f docker-compose.test.yml run --rm test "test:$TestType"
+                }
+            }
+        }
+        finally {
+            Pop-Location
+        }
+    }
+    "docker-full" {
+        Push-Location "$ProjectRoot"
+        try {
+            switch ($TestType) {
+                "build" {
+                    Write-Host "`n=== Building Test + Backend Containers ===" -ForegroundColor Cyan
+                    docker compose -f docker-compose.test.yml build test-with-backend backend
+                }
+                "shell" {
+                    Write-Host "`n=== Opening Shell in Test Container ===" -ForegroundColor Cyan
+                    docker compose -f docker-compose.test.yml run --rm test-with-backend /bin/bash
+                }
+                "" {
+                    Write-Host @"
+
+Docker-Full Test Options (with backend)
+=======================================
+
+  .\scripts\test.ps1 docker-full build       Build test + backend containers
+  .\scripts\test.ps1 docker-full e2e         Run all E2E tests
+  .\scripts\test.ps1 docker-full e2e:stories Run story tests
+  .\scripts\test.ps1 docker-full e2e:p0      Run P0 critical tests
+  .\scripts\test.ps1 docker-full shell       Open shell in test container
+
+First time? Run: .\scripts\test.ps1 docker-full build
+
+"@ -ForegroundColor Cyan
+                }
+                default {
+                    Write-Host "`n=== Running Tests in Docker (with backend) ===" -ForegroundColor Cyan
+                    docker compose -f docker-compose.test.yml run --rm test-with-backend "test:$TestType"
                 }
             }
         }

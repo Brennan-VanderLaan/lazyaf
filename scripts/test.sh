@@ -69,13 +69,17 @@ SETUP
 -----
   ./scripts/test.sh install              Install test dependencies
 
-DOCKER (isolated environment)
------------------------------
+DOCKER (isolated environment - no backend)
+------------------------------------------
   ./scripts/test.sh docker build         Build test container
-  ./scripts/test.sh docker e2e           Run all E2E tests in Docker
-  ./scripts/test.sh docker e2e:stories   Run story tests in Docker
-  ./scripts/test.sh docker e2e:p0        Run P0 tests in Docker
+  ./scripts/test.sh docker e2e:mocked    Run mocked tests (no backend)
   ./scripts/test.sh docker shell         Open shell in test container
+
+DOCKER-FULL (with backend)
+--------------------------
+  ./scripts/test.sh docker-full build    Build test + backend containers
+  ./scripts/test.sh docker-full e2e      Run all E2E tests with backend
+  ./scripts/test.sh docker-full e2e:stories  Run story tests with backend
 
 EOF
     echo -e "${NC}"
@@ -276,25 +280,56 @@ case "$TARGET" in
                 echo -e "${CYAN}"
                 cat << 'DOCKEREOF'
 
-Docker Test Options
-===================
+Docker Test Options (no backend)
+================================
 
   ./scripts/test.sh docker build       Build the test container
   ./scripts/test.sh docker shell       Open bash shell in container
-  ./scripts/test.sh docker e2e         Run all E2E tests
-  ./scripts/test.sh docker e2e:stories Run story tests
-  ./scripts/test.sh docker e2e:p0      Run P0 critical tests
-  ./scripts/test.sh docker e2e:cards   Run card tests
-  ./scripts/test.sh docker e2e:playground Run playground tests
+  ./scripts/test.sh docker e2e:mocked  Run mocked tests (recommended)
 
-First time? Run: ./scripts/test.sh docker build
+For tests WITH backend, use: ./scripts/test.sh docker-full
 
 DOCKEREOF
                 echo -e "${NC}"
                 ;;
             *)
-                echo -e "\n${CYAN}=== Running Tests in Docker ===${NC}"
+                echo -e "\n${CYAN}=== Running Tests in Docker (no backend) ===${NC}"
                 docker compose -f docker-compose.test.yml run --rm test "test:$TEST_TYPE"
+                ;;
+        esac
+        ;;
+    docker-full)
+        cd "$PROJECT_ROOT"
+        case "$TEST_TYPE" in
+            build)
+                echo -e "\n${CYAN}=== Building Test + Backend Containers ===${NC}"
+                docker compose -f docker-compose.test.yml build test-with-backend backend
+                ;;
+            shell)
+                echo -e "\n${CYAN}=== Opening Shell in Test Container ===${NC}"
+                docker compose -f docker-compose.test.yml run --rm test-with-backend /bin/bash
+                ;;
+            "")
+                echo -e "${CYAN}"
+                cat << 'DOCKEREOF'
+
+Docker-Full Test Options (with backend)
+=======================================
+
+  ./scripts/test.sh docker-full build       Build test + backend containers
+  ./scripts/test.sh docker-full e2e         Run all E2E tests
+  ./scripts/test.sh docker-full e2e:stories Run story tests
+  ./scripts/test.sh docker-full e2e:p0      Run P0 critical tests
+  ./scripts/test.sh docker-full shell       Open shell in test container
+
+First time? Run: ./scripts/test.sh docker-full build
+
+DOCKEREOF
+                echo -e "${NC}"
+                ;;
+            *)
+                echo -e "\n${CYAN}=== Running Tests in Docker (with backend) ===${NC}"
+                docker compose -f docker-compose.test.yml run --rm test-with-backend "test:$TEST_TYPE"
                 ;;
         esac
         ;;

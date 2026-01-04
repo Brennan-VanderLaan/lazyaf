@@ -2,6 +2,7 @@
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import type { DebugSessionInfo, DebugSessionStatus } from '../api/types';
   import { debug as debugApi } from '../api/client';
+  import { debugStore } from '../stores/debug';
 
   export let sessionId: string;
   export let token: string;
@@ -23,10 +24,25 @@
   $: isAtBreakpoint = session?.status === 'waiting_at_bp' || session?.status === 'connected';
   $: isTerminal = session?.status === 'timeout' || session?.status === 'ended';
 
+  // Subscribe to WebSocket debug events
+  $: debugSessions = $debugStore;
+  $: debugSessionFromWs = debugSessions.get(sessionId);
+
+  // React to WebSocket updates
+  $: if (debugSessionFromWs && session) {
+    if (debugSessionFromWs.status !== session.status) {
+      // Status changed via WebSocket - fetch full session data
+      loadSession();
+    }
+    if (debugSessionFromWs.status === 'resumed') {
+      dispatch('resumed');
+    }
+  }
+
   onMount(() => {
     loadSession();
-    // Poll for updates every 3 seconds
-    pollInterval = setInterval(loadSession, 3000);
+    // Poll for updates every 5 seconds (increased since WebSocket provides real-time updates)
+    pollInterval = setInterval(loadSession, 5000);
     // Update time remaining every second
     const timeInterval = setInterval(updateTimeRemaining, 1000);
     return () => {

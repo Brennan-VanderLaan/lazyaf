@@ -65,11 +65,14 @@ export default defineConfig({
   // Test file pattern
   testMatch: '**/*.spec.ts',
 
-  // Fail fast on CI
+  // Parallel execution settings
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : undefined,
+  // Workers: use PLAYWRIGHT_WORKERS env var, or 50% of CPUs in CI, or auto locally
+  workers: process.env.PLAYWRIGHT_WORKERS
+    ? parseInt(process.env.PLAYWRIGHT_WORKERS)
+    : process.env.CI ? '50%' : undefined,
 
   // Reporter
   reporter: [

@@ -12,6 +12,8 @@ const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
 
 async function globalSetup(config: FullConfig) {
   console.log('\n=== E2E Test Suite Starting ===\n');
+  console.log(`BACKEND_URL env: ${process.env.BACKEND_URL}`);
+  console.log(`Using BACKEND_URL: ${BACKEND_URL}`);
 
   // Check if we're running real tier tests
   const runningRealTier = config.projects.some(

@@ -10,7 +10,10 @@
 
 import { APIRequestContext, expect } from '@playwright/test';
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
+// Read at runtime to ensure env var is available
+function getBackendUrl(): string {
+  return process.env.BACKEND_URL || 'http://localhost:8000';
+}
 
 // ==============================================================================
 // Types

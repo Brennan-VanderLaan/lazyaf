@@ -40,10 +40,10 @@
   }
 </script>
 
-<div class="agent-panel">
+<div class="agent-panel" data-testid="agent-panel">
   <div class="panel-header">
     <h2>Agent Files</h2>
-    <button class="btn-icon" on:click={openNewModal} title="Create new agent file">
+    <button class="btn-icon" data-testid="add-agent-btn" on:click={openNewModal} title="Create new agent file">
       +
     </button>
   </div>
@@ -56,10 +56,12 @@
   </button>
 
   {#if showAgents}
-    <div class="agent-list">
+    <div class="agent-list" data-testid="agent-list">
       {#each $agentFilesStore as agent (agent.id)}
         <button
           class="agent-item"
+          data-testid="agent-item"
+          data-agent-id={agent.id}
           on:click={() => openEditModal(agent)}
         >
           <span class="agent-name">{agent.name}</span>

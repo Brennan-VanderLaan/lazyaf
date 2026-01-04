@@ -138,7 +138,7 @@
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 </script>
 
-<div class="pipelines-page">
+<div class="pipelines-page" data-testid="pipelines-page">
   <header class="page-header">
     <div class="header-left">
       <h1>Pipelines</h1>
@@ -147,7 +147,7 @@
       {/if}
     </div>
     {#if $selectedRepoId}
-      <button class="btn-primary" on:click={handleCreate}>
+      <button class="btn-primary" data-testid="add-pipeline" on:click={handleCreate}>
         + New Pipeline
       </button>
     {/if}
@@ -187,9 +187,9 @@
             <h2>From Repository</h2>
             <span class="section-hint">.lazyaf/pipelines/</span>
           </div>
-          <div class="pipelines-grid">
+          <div class="pipelines-grid" data-testid="pipeline-list">
             {#each repoPipelines as pipeline}
-              <div class="pipeline-card repo-card">
+              <div class="pipeline-card repo-card" data-testid="pipeline" data-pipeline-name={pipeline.name}>
                 <div class="card-header">
                   <h3>
                     {pipeline.name}
@@ -244,9 +244,9 @@
         {:else if $pipelinesStore.length === 0}
           <p class="empty-section">No platform pipelines. <button class="btn-link" on:click={handleCreate}>Create one</button></p>
         {:else}
-          <div class="pipelines-grid">
+          <div class="pipelines-grid" data-testid="pipeline-list">
             {#each $pipelinesStore as pipeline}
-              <div class="pipeline-card">
+              <div class="pipeline-card" data-testid="pipeline" data-pipeline-id={pipeline.id}>
                 <div class="card-header">
                   <h3>{pipeline.name}</h3>
                   <div class="card-actions">
@@ -290,7 +290,7 @@
             <p>No pipeline runs yet</p>
           </div>
         {:else}
-          <div class="runs-table-container">
+          <div class="runs-table-container" data-testid="runs-list">
             <table class="runs-table">
               <thead>
                 <tr>

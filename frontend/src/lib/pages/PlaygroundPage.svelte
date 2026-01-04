@@ -236,7 +236,7 @@
   });
 </script>
 
-<div class="playground-page">
+<div class="playground-page" data-testid="playground-page">
   <header class="page-header">
     <div class="header-left">
       <h1>Agent Playground</h1>
@@ -264,7 +264,7 @@
   {:else}
     <div class="playground-layout">
       <!-- Configuration Panel -->
-      <aside class="config-panel">
+      <aside class="config-panel" data-testid="config-panel">
         <h2>Configuration</h2>
 
         <div class="form-group">
@@ -346,6 +346,8 @@
           <label for="task">Task Description</label>
           <textarea
             id="task"
+            name="task"
+            data-testid="task-input"
             placeholder="Describe what you want the agent to do..."
             value={$playgroundStore.taskOverride}
             on:input={(e) => playgroundStore.setConfig({ taskOverride: e.currentTarget.value })}
@@ -380,13 +382,14 @@
           {#if $canStart}
             <button
               class="btn-primary"
+              data-testid="start-test-btn"
               on:click={handleStartTest}
               disabled={!$playgroundStore.branch || !$playgroundStore.taskOverride}
             >
               Test Once
             </button>
           {:else if $isRunning}
-            <button class="btn-danger" on:click={handleCancel}>
+            <button class="btn-danger" data-testid="cancel-btn" on:click={handleCancel}>
               Cancel
             </button>
           {/if}
@@ -419,6 +422,7 @@
           </div>
           <div
             class="logs-container"
+            data-testid="logs-container"
             bind:this={logsContainer}
             on:scroll={handleLogsScroll}
           >
@@ -441,7 +445,7 @@
 
         <!-- Diff Section -->
         {#if $hasResult && ($playgroundStore.diff || $playgroundStore.filesChanged.length > 0)}
-          <section class="diff-section">
+          <section class="diff-section" data-testid="diff-section">
             <div class="section-header">
               <h3>Changes</h3>
             </div>

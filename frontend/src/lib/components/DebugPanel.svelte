@@ -162,7 +162,7 @@
   }
 </script>
 
-<div class="debug-panel">
+<div class="debug-panel" data-testid="debug-panel">
   <div class="header">
     <h3>Debug Session</h3>
     <button class="close-btn" on:click={() => dispatch('close')}>x</button>
@@ -176,7 +176,7 @@
     <div class="content">
       <!-- Status Section -->
       <div class="section status-section">
-        <div class="status-indicator" style="--status-color: {getStatusColor(session.status)}">
+        <div class="status-indicator" data-testid="debug-status" data-status={session.status} style="--status-color: {getStatusColor(session.status)}">
           <span class="status-dot"></span>
           <span class="status-text">{getStatusText(session.status)}</span>
         </div>
@@ -263,6 +263,7 @@
           </button>
           <button
             class="action-btn abort-btn"
+            data-testid="abort-btn"
             on:click={handleAbort}
             disabled={actionLoading !== null}
           >
@@ -270,6 +271,7 @@
           </button>
           <button
             class="action-btn resume-btn"
+            data-testid="resume-btn"
             on:click={handleResume}
             disabled={actionLoading !== null}
           >

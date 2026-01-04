@@ -266,7 +266,7 @@
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div class="modal-backdrop" on:click={handleBackdropClick} role="dialog" aria-modal="true">
-  <div class="modal" on:click|stopPropagation role="document">
+  <div class="modal" data-testid="pipeline-editor" on:click|stopPropagation role="document">
     <form on:submit|preventDefault={handleSubmit}>
       <header class="modal-header">
         <h2>{isEdit ? 'Edit Pipeline' : 'New Pipeline'}</h2>
@@ -304,9 +304,9 @@
           {#if steps.length === 0}
             <p class="no-steps">Add steps to your pipeline</p>
           {:else}
-            <div class="steps-list">
+            <div class="steps-list" data-testid="steps">
               {#each steps as step, index}
-                <div class="step-card">
+                <div class="step-card" data-testid="step" data-step-index={index}>
                   <div class="step-header">
                     <span class="step-number">{index + 1}</span>
                     <input

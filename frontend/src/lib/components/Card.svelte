@@ -43,6 +43,9 @@
 
 <div
   class="card"
+  data-testid="card"
+  data-card-id={card.id}
+  data-status={card.status}
   draggable="true"
   on:dragstart={handleDragStart}
   on:click={() => dispatch('click', card)}

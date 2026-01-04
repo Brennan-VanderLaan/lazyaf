@@ -24,7 +24,10 @@ class TestRunnerStatus:
 
     def test_runner_status_values(self):
         """RunnerStatus enum should have all expected values."""
-        expected_statuses = {"idle", "busy", "offline"}
+        # Phase 12.6: Extended status set for WebSocket-based runner management
+        expected_statuses = {
+            "disconnected", "connecting", "idle", "assigned", "busy", "dead", "offline"
+        }
         actual_statuses = {status.value for status in RunnerStatus}
         assert actual_statuses == expected_statuses
 
@@ -34,6 +37,11 @@ class TestRunnerStatus:
         assert RunnerStatus.IDLE == "idle"
         assert RunnerStatus.BUSY == "busy"
         assert RunnerStatus.OFFLINE == "offline"
+        # Phase 12.6: New WebSocket states
+        assert RunnerStatus.DISCONNECTED == "disconnected"
+        assert RunnerStatus.CONNECTING == "connecting"
+        assert RunnerStatus.ASSIGNED == "assigned"
+        assert RunnerStatus.DEAD == "dead"
 
 
 class TestRunnerModel:

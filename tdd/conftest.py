@@ -97,31 +97,31 @@ def _mark_test(request):
 
 
 # -----------------------------------------------------------------------------
-# Runner Pool and Job Queue Fixtures
+# RemoteExecutor and Job Queue Fixtures
 # -----------------------------------------------------------------------------
 
 @pytest_asyncio.fixture
-async def clean_runner_pool():
-    """Clean runner pool state before and after each test.
+async def clean_remote_executor():
+    """Clean RemoteExecutor state before and after each test.
 
-    This fixture ensures tests have a fresh runner pool state and
+    This fixture ensures tests have a fresh RemoteExecutor state and
     cleans up afterward to prevent test pollution.
     """
-    from app.services.runner_pool import runner_pool
+    from app.services.execution.remote_executor import get_remote_executor
+
+    executor = get_remote_executor()
 
     # Clear before
-    runner_pool._runners = {}
-    runner_pool._running = False
-    runner_pool._worker_task = None
+    executor._connections = {}
+    executor._runner_states = {}
+    executor._pending_acks = {}
 
-    yield runner_pool
+    yield executor
 
     # Clear after
-    if runner_pool._running:
-        await runner_pool.stop()
-    runner_pool._runners = {}
-    runner_pool._running = False
-    runner_pool._worker_task = None
+    executor._connections = {}
+    executor._runner_states = {}
+    executor._pending_acks = {}
 
 
 @pytest_asyncio.fixture

@@ -167,22 +167,8 @@ class TestAPISmokeTests:
         assert done_response.status_code == 200
         assert done_response.json()["status"] == "done"
 
-    async def test_runners_list(self, client):
-        """Runners list endpoint responds."""
-        response = await client.get("/api/runners")
-        assert response.status_code == 200
-        assert isinstance(response.json(), list)
-
-    async def test_runners_register(self, client):
-        """Runners register endpoint accepts request."""
-        response = await client.post(
-            "/api/runners/register",
-            json={"name": "test-runner"},
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "runner_id" in data
-        assert "name" in data
+    # Note: Runners now use WebSocket instead of HTTP (Phase 12.6)
+    # WebSocket tests are in tdd/unit/execution/test_websocket_protocol.py
 
 
 @pytest.mark.demo

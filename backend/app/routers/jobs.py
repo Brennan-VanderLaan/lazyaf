@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import Job, Card
 from app.schemas import JobRead
-from app.services.runner_pool import runner_pool
 from app.services.websocket import manager
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -163,9 +162,7 @@ async def job_callback(job_id: str, callback: JobCallback, db: AsyncSession = De
                 db, card, "in_progress", card.status
             )
 
-    # Mark runner as idle
-    if callback.status in ("completed", "failed"):
-        runner_pool.mark_runner_idle(job_id)
+    # Note: Runner idle marking is handled by RemoteExecutor via WebSocket (Phase 12.6)
 
     # Notify pipeline executor if this job is part of a pipeline (Phase 9)
     if callback.status in ("completed", "failed") and job.step_run_id:

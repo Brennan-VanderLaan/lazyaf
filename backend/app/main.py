@@ -5,8 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import init_db
-from app.routers import repos, cards, jobs, runners, agent_files, pipelines, lazyaf_files
-from app.routers import git, playground, models, steps
+from app.routers import repos, cards, jobs, agent_files, pipelines, lazyaf_files
+from app.routers import git, playground, models, steps, ws_runners
 from app.services.websocket import manager
 
 # Import models to ensure they're registered with Base before init_db
@@ -18,15 +18,28 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from app.database import engine
-    from app.services.runner_pool import runner_pool
     from app.services.playground_service import playground_service
+    from app.services.execution.remote_executor import get_remote_executor
+    from app.services.execution.job_recovery import get_job_recovery_service
 
     await init_db()
-    await runner_pool.start()
+
+    # Start RemoteExecutor timeout monitor
+    remote_executor = get_remote_executor()
+    await remote_executor.start_monitor()
+
     await playground_service.start()
+
+    # Recover orphaned steps on startup
+    # (Commented out until we have proper DB session management)
+    # job_recovery = get_job_recovery_service()
+    # async with get_db_session() as db:
+    #     await job_recovery.recover_orphaned_steps(db)
+
     yield
+
     await playground_service.stop()
-    await runner_pool.stop()
+    await remote_executor.stop_monitor()
     await engine.dispose()
 
 
@@ -48,7 +61,6 @@ app.add_middleware(
 app.include_router(repos.router)
 app.include_router(cards.router)
 app.include_router(jobs.router)
-app.include_router(runners.router)
 app.include_router(agent_files.router)
 app.include_router(pipelines.router)
 app.include_router(lazyaf_files.router)
@@ -57,6 +69,7 @@ app.include_router(playground.router)
 app.include_router(playground.session_router)
 app.include_router(models.router)
 app.include_router(steps.router)
+app.include_router(ws_runners.router)  # Phase 12.6: WebSocket runner endpoint
 
 
 @app.get("/health")

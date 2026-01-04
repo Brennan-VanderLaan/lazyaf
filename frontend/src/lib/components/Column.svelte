@@ -39,6 +39,8 @@
 <div
   class="column"
   class:drag-over={isDragOver}
+  data-column={status}
+  data-testid="column"
   on:dragover={handleDragOver}
   on:dragleave={handleDragLeave}
   on:drop={handleDrop}

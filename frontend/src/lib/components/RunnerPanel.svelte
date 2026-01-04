@@ -48,7 +48,7 @@
   }
 </script>
 
-<div class="runner-panel">
+<div class="runner-panel" data-testid="runner-panel">
   <div class="panel-header">
     <h2>Runners</h2>
     <button class="btn-icon" on:click={() => showHelpModal = true} title="How to start a runner">
@@ -56,7 +56,7 @@
     </button>
   </div>
 
-  <div class="pool-stats">
+  <div class="pool-stats" data-testid="pool-stats">
     <div class="stat">
       <span class="stat-value">{$connectedRunners.length}</span>
       <span class="stat-label">Connected</span>
@@ -81,7 +81,7 @@
   {#if showRunners}
     <div class="runner-list">
       {#if $runnersStore.length === 0}
-        <div class="no-runners">
+        <div class="no-runners" data-testid="no-runners">
           <p>No runners connected</p>
           <p class="hint">Click ? to see how to start a runner</p>
         </div>
@@ -93,7 +93,7 @@
               <span class="runner-count">{groupedRunners[runnerType].length}</span>
             </div>
             {#each groupedRunners[runnerType] as runner (runner.id)}
-              <div class="runner-item">
+              <div class="runner-item" data-testid="runner-item" data-runner-id={runner.id} data-status={runner.status}>
                 <span
                   class="status-dot"
                   style="background: {getStatusColor(runner.status)}"

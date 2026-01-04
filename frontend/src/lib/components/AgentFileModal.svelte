@@ -74,7 +74,7 @@
 <svelte:window on:keydown={handleKeydown} />
 
 <div class="modal-backdrop" on:click={handleBackdropClick} role="dialog" aria-modal="true">
-  <div class="modal" on:click|stopPropagation role="document">
+  <div class="modal" data-testid="agent-file-modal" on:click|stopPropagation role="document">
     <div class="modal-header">
       <h2>{isEdit ? 'Edit Agent File' : 'New Agent File'}</h2>
       <button class="btn-close" on:click={() => dispatch('close')}>✕</button>
@@ -85,6 +85,8 @@
         <label for="name">Agent Name</label>
         <input
           id="name"
+          name="name"
+          data-testid="agent-name-input"
           type="text"
           bind:value={name}
           placeholder="e.g., Python Expert, Documentation Writer"
@@ -109,6 +111,8 @@
         <label for="description">Description</label>
         <input
           id="description"
+          name="description"
+          data-testid="agent-description-input"
           type="text"
           bind:value={description}
           placeholder="What does this agent do?"
@@ -119,6 +123,8 @@
         <label for="content">Agent Prompt</label>
         <textarea
           id="content"
+          name="content"
+          data-testid="agent-content-input"
           bind:value={content}
           placeholder="Define the agent's system prompt and capabilities..."
           rows="12"
@@ -165,7 +171,7 @@
             <button type="button" class="btn-secondary" on:click={() => dispatch('close')}>
               Cancel
             </button>
-            <button type="submit" class="btn-primary" disabled={submitting}>
+            <button type="submit" class="btn-primary" data-testid="create-agent-btn" disabled={submitting}>
               {submitting ? 'Creating...' : 'Create Agent File'}
             </button>
           </div>

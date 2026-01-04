@@ -82,7 +82,7 @@
 <svelte:window on:keydown={handleKeydown} />
 
 <div class="modal-backdrop" on:click={handleBackdropClick}>
-  <div class="modal" on:click|stopPropagation>
+  <div class="modal" data-testid="debug-rerun-modal" on:click|stopPropagation>
     <div class="header">
       <h2>Debug Re-run</h2>
       <button class="close-btn" on:click={() => dispatch('close')}>x</button>
@@ -104,9 +104,9 @@
           </div>
         </div>
 
-        <div class="steps-list">
+        <div class="steps-list" data-testid="breakpoint-list">
           {#each pipeline.steps as step, index}
-            <label class="step-item" class:selected={selectedBreakpoints.has(index)}>
+            <label class="step-item" data-testid="breakpoint-item" data-step-index={index} class:selected={selectedBreakpoints.has(index)}>
               <input
                 type="checkbox"
                 checked={selectedBreakpoints.has(index)}
@@ -167,7 +167,7 @@
       <button class="cancel-btn" on:click={() => dispatch('close')} disabled={isLoading}>
         Cancel
       </button>
-      <button class="start-btn" on:click={startDebugRun} disabled={isLoading}>
+      <button class="start-btn" data-testid="start-debug-btn" on:click={startDebugRun} disabled={isLoading}>
         {isLoading ? 'Starting...' : 'Start Debug Run'}
       </button>
     </div>

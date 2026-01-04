@@ -1,0 +1,39 @@
+{
+  "name": "lazyaf-frontend-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:debug": "playwright test --debug",
+    "test:e2e:mocked": "playwright test --project=mocked",
+    "test:e2e:stories": "playwright test --project=stories",
+    "test:e2e:critical": "playwright test --project=critical",
+    "test:e2e:ui-tests": "playwright test --project=ui",
+    "test:e2e:realtime": "playwright test --project=realtime",
+    "test:e2e:real": "playwright test --project=real",
+    "test:e2e:all": "playwright test --project=all",
+    "test:e2e:p0": "playwright test e2e/stories/02-card-lifecycle e2e/critical-failures",
+    "test:e2e:cards": "playwright test --grep Card",
+    "test:e2e:pipeline": "playwright test --grep Pipeline",
+    "test:e2e:runner": "playwright test --grep Runner",
+    "test:e2e:debug-rerun": "playwright test --grep Debug",
+    "test:e2e:playground": "playwright test --grep Playground",
+    "test:e2e:report": "playwright show-report e2e-report",
+    "test:unit": "vitest run",
+    "test:unit:watch": "vitest",
+    "test:unit:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "@sveltejs/vite-plugin-svelte": "^6.2.1",
+    "@testing-library/svelte": "^5.2.0",
+    "@vitest/coverage-v8": "^2.1.0",
+    "jsdom": "^25.0.0",
+    "svelte": "^5.43.8",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4",
+    "vitest": "^2.1.0"
+  }
+}

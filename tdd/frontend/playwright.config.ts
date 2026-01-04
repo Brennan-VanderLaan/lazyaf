@@ -1,23 +1,58 @@
 /**
  * Playwright Configuration for E2E Tests
  *
- * Two-tier test architecture:
- * 1. MOCKED tier - Fast tests with mocked backend responses
- * 2. REAL tier - Comprehensive tests against real backend (minus AI calls)
+ * ============================================================================
+ * QUICK START - Run from frontend/ directory
+ * ============================================================================
  *
- * Run commands:
- *   pnpm test:e2e           - Run all E2E tests
- *   pnpm test:e2e:ui        - Run with Playwright UI
- *   pnpm test:e2e:mocked    - Run only mocked tier (fast)
- *   pnpm test:e2e:real      - Run only real tier (comprehensive)
+ * By Project (test category):
+ *   pnpm test:e2e:mocked     - Smoke tests with mocked backend (fast)
+ *   pnpm test:e2e:stories    - All customer story tests
+ *   pnpm test:e2e:critical   - Critical failure handling (P0)
+ *   pnpm test:e2e:ui-tests   - UI completeness tests
+ *   pnpm test:e2e:realtime   - Real-time sync tests
+ *   pnpm test:e2e:real       - Full integration (needs backend)
+ *   pnpm test:e2e:all        - Everything
  *
- * Environment setup for real tier:
- *   LAZYAF_TEST_MODE=true - Enable test API endpoints
- *   LAZYAF_MOCK_AI=true   - Mock AI API calls
+ * By Feature (grep patterns):
+ *   pnpm test:e2e:p0         - All P0 tests (cards + critical failures)
+ *   pnpm test:e2e:cards      - Card lifecycle tests
+ *   pnpm test:e2e:pipeline   - Pipeline tests
+ *   pnpm test:e2e:runner     - Runner visibility tests
+ *   pnpm test:e2e:debug-rerun - Debug re-run tests
+ *   pnpm test:e2e:playground - Agent playground tests
+ *
+ * Interactive modes:
+ *   pnpm test:e2e:ui         - Playwright UI (best for development)
+ *   pnpm test:e2e:headed     - See browser while running
+ *   pnpm test:e2e:debug      - Step-through debugging
+ *   pnpm test:e2e:report     - View last test report
+ *
+ * Run specific test file:
+ *   pnpm test:e2e --grep "Create Card"
+ *   pnpm test:e2e ../tdd/frontend/e2e/stories/02-card-lifecycle/create-card.spec.ts
+ *
+ * ============================================================================
+ * ENVIRONMENT SETUP
+ * ============================================================================
+ *
+ * For mocked tier (default):
+ *   Just run the commands above - no backend needed
+ *
+ * For real tier:
+ *   1. Start backend: cd backend && LAZYAF_TEST_MODE=true LAZYAF_MOCK_AI=true uvicorn app.main:app
+ *   2. Run tests: pnpm test:e2e:real
+ *
+ * ============================================================================
  */
 
 import { defineConfig, devices } from '@playwright/test';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+// ESM-compatible __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Backend URLs
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
@@ -79,14 +114,60 @@ export default defineConfig({
       testMatch: ['**/smoke/**/*.spec.ts', '**/mocked/**/*.spec.ts'],
       use: {
         ...devices['Desktop Chrome'],
-        // Custom storage state for mocked tests
         storageState: undefined,
       },
-      // No backend dependency - all responses mocked
     },
 
     // =========================================================================
-    // REAL TIER - Tests against real backend (minus AI)
+    // STORIES - Customer journey tests (can run mocked or real)
+    // =========================================================================
+    {
+      name: 'stories',
+      testMatch: ['**/stories/**/*.spec.ts'],
+      use: {
+        ...devices['Desktop Chrome'],
+        actionTimeout: 15000,
+        navigationTimeout: 20000,
+      },
+    },
+
+    // =========================================================================
+    // CRITICAL FAILURES - Error handling tests (P0)
+    // =========================================================================
+    {
+      name: 'critical',
+      testMatch: ['**/critical-failures/**/*.spec.ts'],
+      use: {
+        ...devices['Desktop Chrome'],
+        actionTimeout: 10000,
+      },
+    },
+
+    // =========================================================================
+    // UI COMPLETENESS - Quality assurance tests
+    // =========================================================================
+    {
+      name: 'ui',
+      testMatch: ['**/ui-completeness/**/*.spec.ts'],
+      use: {
+        ...devices['Desktop Chrome'],
+      },
+    },
+
+    // =========================================================================
+    // REALTIME SYNC - Multi-user broadcast tests
+    // =========================================================================
+    {
+      name: 'realtime',
+      testMatch: ['**/realtime-sync/**/*.spec.ts'],
+      use: {
+        ...devices['Desktop Chrome'],
+        actionTimeout: 5000, // Real-time should be fast
+      },
+    },
+
+    // =========================================================================
+    // REAL TIER - Full integration tests against real backend
     // =========================================================================
     {
       name: 'real-setup',
@@ -101,23 +182,31 @@ export default defineConfig({
       dependencies: ['real-setup'],
       use: {
         ...devices['Desktop Chrome'],
-        // Longer timeouts for real backend operations
         actionTimeout: 10000,
         navigationTimeout: 15000,
       },
     },
 
     // =========================================================================
-    // SMOKE TESTS - Run on both tiers (uses mocked project by default)
+    // ALL - Run everything (for CI)
     // =========================================================================
-    // Smoke tests are included in 'mocked' project above
+    {
+      name: 'all',
+      testMatch: ['**/*.spec.ts'],
+      testIgnore: ['**/setup/*.setup.ts'],
+      use: {
+        ...devices['Desktop Chrome'],
+        actionTimeout: 15000,
+        navigationTimeout: 20000,
+      },
+    },
   ],
 
   // Web server configuration
   webServer: [
-    // Frontend dev server
+    // Frontend dev server (path relative to tdd/frontend)
     {
-      command: 'cd ../../frontend && pnpm dev',
+      command: 'pnpm --dir ../../frontend dev',
       url: FRONTEND_URL,
       reuseExistingServer: !process.env.CI,
       timeout: 120000,

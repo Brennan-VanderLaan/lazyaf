@@ -4,8 +4,10 @@ LazyAF CLI - Ingest repos and land changes.
 Usage:
     lazyaf ingest /path/to/repo --name my-project
     lazyaf land <repo_id> --branch feature/foo
+    lazyaf debug <session_id> --token <token>
 """
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -323,6 +325,218 @@ def branches(repo_id: str, server: str | None):
             markers.append("[blue]lazyaf[/blue]")
         marker_str = " ".join(markers)
         console.print(f"  [cyan]{branch['name']}[/cyan]  {branch['commit'][:8]}  {marker_str}")
+
+
+@cli.command()
+@click.argument("session_id")
+@click.option("--token", "-t", required=True, help="Debug session auth token")
+@click.option("--sidecar", is_flag=True, help="Use sidecar mode (filesystem inspection)")
+@click.option("--shell", is_flag=True, help="Use shell mode (exec into running container)")
+@click.option("--resume", "do_resume", is_flag=True, help="Resume pipeline execution")
+@click.option("--abort", "do_abort", is_flag=True, help="Abort debug session")
+@click.option("--status", "do_status", is_flag=True, help="Show session status")
+@click.option("--server", "-s", default=None, help="LazyAF server URL")
+def debug(
+    session_id: str,
+    token: str,
+    sidecar: bool,
+    shell: bool,
+    do_resume: bool,
+    do_abort: bool,
+    do_status: bool,
+    server: str | None,
+):
+    """
+    Connect to a debug session for interactive debugging.
+
+    Debug sessions are created when you click "Debug Re-run" on a failed pipeline.
+    Use the join command shown in the UI to connect.
+
+    Examples:
+        lazyaf debug abc123 --token xyz --sidecar
+        lazyaf debug abc123 --token xyz --shell
+        lazyaf debug abc123 --token xyz --status
+        lazyaf debug abc123 --token xyz --resume
+        lazyaf debug abc123 --token xyz --abort
+    """
+    server_url = server or get_server_url()
+
+    # Handle control commands (non-interactive)
+    if do_resume or do_abort or do_status:
+        asyncio.run(_handle_control_command(
+            server_url, session_id, token, do_resume, do_abort, do_status
+        ))
+        return
+
+    # Default to sidecar mode if neither specified
+    mode = "shell" if shell else "sidecar"
+
+    # Connect to terminal WebSocket
+    asyncio.run(_connect_terminal(server_url, session_id, token, mode))
+
+
+async def _handle_control_command(
+    server_url: str,
+    session_id: str,
+    token: str,
+    do_resume: bool,
+    do_abort: bool,
+    do_status: bool,
+):
+    """Handle control commands (resume/abort/status)."""
+    headers = {"Authorization": f"Bearer {token}"}
+
+    try:
+        with httpx.Client(timeout=30.0, headers=headers) as client:
+            if do_status:
+                response = client.get(f"{server_url}/api/debug/{session_id}")
+                response.raise_for_status()
+                info = response.json()
+
+                console.print(Panel.fit(
+                    f"Session ID: [cyan]{info['id']}[/cyan]\n"
+                    f"Status: [yellow]{info['status']}[/yellow]\n"
+                    f"Current Step: {info.get('current_step', {}).get('name', 'N/A')}\n"
+                    f"Expires: {info.get('expires_at', 'N/A')}",
+                    title="Debug Session Status",
+                ))
+
+            elif do_resume:
+                response = client.post(f"{server_url}/api/debug/{session_id}/resume")
+                response.raise_for_status()
+                console.print("[green]Pipeline execution resumed.[/green]")
+
+            elif do_abort:
+                response = client.post(f"{server_url}/api/debug/{session_id}/abort")
+                response.raise_for_status()
+                console.print("[yellow]Debug session aborted.[/yellow]")
+
+    except httpx.ConnectError:
+        console.print(f"[red]Error:[/red] Could not connect to {server_url}")
+        sys.exit(1)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            console.print(f"[red]Error:[/red] Session {session_id} not found")
+        elif e.response.status_code == 410:
+            console.print(f"[red]Error:[/red] Session has expired")
+        else:
+            console.print(f"[red]Error:[/red] API returned {e.response.status_code}")
+            console.print(e.response.text)
+        sys.exit(1)
+
+
+async def _connect_terminal(
+    server_url: str,
+    session_id: str,
+    token: str,
+    mode: str,
+):
+    """Connect to debug terminal via WebSocket."""
+    try:
+        import websockets
+    except ImportError:
+        console.print("[red]Error:[/red] websockets package not installed")
+        console.print("Run: pip install websockets")
+        sys.exit(1)
+
+    # Convert HTTP URL to WebSocket URL
+    ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://")
+    uri = f"{ws_url}/api/debug/{session_id}/terminal?mode={mode}&token={token}"
+
+    console.print(f"Connecting to debug session [cyan]{session_id}[/cyan] ({mode} mode)...")
+
+    try:
+        async with websockets.connect(uri) as websocket:
+            console.print("[green]Connected![/green] Type @help for commands, Ctrl+C to disconnect.")
+            console.print()
+
+            # Run interactive terminal
+            await _run_terminal(websocket)
+
+    except websockets.exceptions.InvalidStatusCode as e:
+        if e.status_code == 4001:
+            console.print("[red]Error:[/red] Invalid token")
+        elif e.status_code == 4002:
+            console.print("[red]Error:[/red] Cannot connect - session not at breakpoint")
+        elif e.status_code == 4004:
+            console.print("[red]Error:[/red] Session not found")
+        else:
+            console.print(f"[red]Error:[/red] Connection failed (code {e.status_code})")
+        sys.exit(1)
+    except websockets.exceptions.ConnectionClosed as e:
+        console.print(f"[yellow]Disconnected:[/yellow] {e.reason or 'Connection closed'}")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+
+async def _run_terminal(websocket):
+    """Run interactive terminal session."""
+    import json
+
+    async def receive_messages():
+        """Receive and display messages from server."""
+        try:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type", "")
+
+                    if msg_type == "response":
+                        console.print(data.get("message", ""))
+                    elif msg_type == "info":
+                        console.print(f"[dim]{data.get('message', '')}[/dim]")
+                    elif msg_type == "data":
+                        # Terminal output
+                        sys.stdout.write(data.get("content", ""))
+                        sys.stdout.flush()
+                    else:
+                        console.print(f"[dim]< {message}[/dim]")
+                except json.JSONDecodeError:
+                    # Raw output
+                    sys.stdout.write(message)
+                    sys.stdout.flush()
+        except Exception:
+            pass
+
+    async def send_input():
+        """Read and send user input."""
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                # Read line from stdin (blocking)
+                line = await loop.run_in_executor(None, sys.stdin.readline)
+                if not line:
+                    break
+                await websocket.send(line.rstrip("\n"))
+
+                # Check for exit commands
+                if line.strip().lower() in {"@resume", "@abort"}:
+                    await asyncio.sleep(0.5)  # Give server time to respond
+                    break
+        except Exception:
+            pass
+
+    # Run receive and send concurrently
+    receive_task = asyncio.create_task(receive_messages())
+    send_task = asyncio.create_task(send_input())
+
+    try:
+        # Wait for either task to complete
+        done, pending = await asyncio.wait(
+            [receive_task, send_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Cancel remaining tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Disconnecting...[/yellow]")
 
 
 if __name__ == "__main__":

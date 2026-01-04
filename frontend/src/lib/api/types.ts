@@ -433,3 +433,58 @@ export interface PlaygroundLogEvent {
   data: string;
   timestamp: string;
 }
+
+// Debug session types (Phase 12.7)
+export type DebugSessionStatus = 'pending' | 'waiting_at_bp' | 'connected' | 'timeout' | 'ended';
+
+export interface DebugSession {
+  id: string;
+  pipeline_run_id: string;
+  status: DebugSessionStatus;
+  current_step_index: number | null;
+  current_step_name: string | null;
+  expires_at: string | null;
+}
+
+export interface DebugStepInfo {
+  name: string;
+  index: number;
+  type: string;
+}
+
+export interface DebugCommitInfo {
+  sha: string;
+  message: string;
+}
+
+export interface DebugRuntimeInfo {
+  host: string;
+  orchestrator: string;
+  image: string;
+  image_sha: string | null;
+}
+
+export interface DebugSessionInfo {
+  id: string;
+  status: DebugSessionStatus;
+  current_step: DebugStepInfo | null;
+  commit: DebugCommitInfo;
+  runtime: DebugRuntimeInfo;
+  logs: string;
+  join_command: string;
+  token: string;
+  expires_at: string | null;
+}
+
+export interface DebugRerunRequest {
+  breakpoints: number[];
+  use_original_commit: boolean;
+  commit_sha?: string;
+  branch?: string;
+}
+
+export interface DebugRerunResponse {
+  run_id: string;
+  debug_session_id: string;
+  token: string;
+}

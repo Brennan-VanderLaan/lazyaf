@@ -1,385 +1,566 @@
-# Frontend Testing Strategy for LazyAF Recovery
+# Frontend E2E Testing Guide
 
-This document outlines the testing strategy for recovering the LazyAF frontend after Phase 12 backend changes.
-
-## Current State Analysis
-
-### Frontend Test Infrastructure: NONE
-
-The frontend currently has:
-- **No test framework configured** (no vitest, jest, or playwright in package.json)
-- **No test scripts** in package.json
-- **No existing test files** (.test.ts, .spec.ts)
-
-### Backend Changes That Broke Frontend (Phase 12)
-
-| Component | Old Behavior | New Behavior |
-|-----------|-------------|--------------|
-| Runner endpoints | HTTP polling `/api/runners`, `/api/runners/status` | **REMOVED** - WebSocket only |
-| Runner states | `idle`, `busy`, `offline` | `disconnected`, `connecting`, `idle`, `assigned`, `busy`, `dead` |
-| Runner logs | HTTP `/api/runners/{id}/logs` | **REMOVED** - WebSocket `step_logs` messages |
-| Step execution | N/A | New states: `pending`, `preparing`, `running`, `completing`, `completed`, `failed`, `cancelled` |
-| WebSocket messages | Basic types | New: `step_logs`, `step_status`, `runner_status` |
-
-### Broken Frontend Components
-
-1. **`runners.ts` store** - Calls removed HTTP endpoints (`runnersApi.list()`, `runnersApi.status()`)
-2. **`RunnerPanel.svelte`** - Uses polling that 404s, filters by old states (`idle`, `busy`, `offline`)
-3. **`types.ts`** - Has `RunnerStatus = 'idle' | 'busy' | 'offline'` (missing new states)
-4. **`client.ts`** - Has `runners.list()`, `runners.status()`, `runners.logs()` that no longer exist
+This document provides everything needed to understand and implement E2E tests for LazyAF's frontend.
 
 ---
 
-## Recommended Test Architecture
+## Application Context (For LLMs)
 
-### Directory Structure
+**LazyAF** is a CI/CD automation platform with AI-powered code generation. Think of it as a self-hosted GitHub Actions replacement with built-in AI code assistance.
+
+### Core Concepts
+
+| Concept | Description |
+|---------|-------------|
+| **Card** | A work item (like a ticket). Cards can trigger AI execution or pipeline runs. Status: `todo` → `in_progress` → `in_review` → `done`/`failed` |
+| **Pipeline** | A sequence of steps (build, test, deploy). Can be triggered manually, by cards, or by git push |
+| **Runner** | An execution agent (Docker container or k8s pod) that runs pipeline steps. States: `disconnected`, `connecting`, `idle`, `assigned`, `busy`, `dead` |
+| **Step** | A single unit within a pipeline. States: `pending`, `preparing`, `running`, `completing`, `completed`, `failed`, `cancelled` |
+| **Agent File** | A markdown file with instructions for AI execution |
+| **Debug Re-Run** | Ability to set breakpoints and re-run a failed pipeline, pausing at specific steps |
+| **Agent Playground** | Ephemeral testing environment for AI agents. Run agents against repo states without creating cards. Critical for validating AI behavior. Uses SSE for log streaming. |
+
+### Architecture
 
 ```
-tdd/
-├── frontend/                    # All frontend tests
-│   ├── unit/                    # Fast isolated tests
-│   │   ├── stores/              # Store logic tests
-│   │   └── utils/               # Utility function tests
-│   ├── integration/             # Component + store tests
-│   │   ├── websocket/           # WebSocket message handling
-│   │   └── api/                 # API client tests
-│   ├── e2e/                     # End-to-end browser tests
-│   │   ├── smoke/               # Critical path tests
-│   │   └── scenarios/           # User workflow tests
-│   ├── fixtures/                # Mock data and test utilities
-│   │   ├── websocket-messages/  # Sample WS payloads
-│   │   └── api-responses/       # Sample API responses
-│   └── README.md                # This file
-└── ...existing backend tests...
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            Frontend (Svelte)                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐  ┌──────────────┐ │
+│  │  Board   │  │ Pipeline │  │  Runner  │  │ Debug   │  │  Playground  │ │
+│  │  View    │  │  Editor  │  │  Panel   │  │ Modal   │  │  (Phase 11)  │ │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬────┘  └──────┬───────┘ │
+│       │             │             │              │              │         │
+│  ┌────┴─────────────┴─────────────┴──────────────┴──────────────┤         │
+│  │                    WebSocket Store                           │   SSE   │
+│  │         (Real-time updates for ALL state changes)            │─────────┤
+│  └──────────────────────────┬───────────────────────────────────┘         │
+└─────────────────────────────┼─────────────────────────────────────────────┘
+                              │ WebSocket                             │ SSE
+                              ▼                                       ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           Backend (FastAPI)                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐  ┌──────────────┐ │
+│  │   API    │  │ Executor │  │  Runner  │  │  Debug  │  │  Playground  │ │
+│  │ Routes   │  │ (Local/  │  │  Manager │  │ Ctrl    │  │  Service     │ │
+│  │          │  │  Remote) │  │          │  │         │  │  (SSE)       │ │
+│  └──────────┘  └──────────┘  └──────────┘  └─────────┘  └──────────────┘ │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Test Framework Recommendations
+**Note**: The Playground uses SSE (Server-Sent Events) for log streaming, not WebSocket.
+This is because playground sessions are ephemeral and don't need bidirectional communication.
 
-| Layer | Framework | Why |
-|-------|-----------|-----|
-| Unit | **Vitest** | Native ESM, fast, works with Svelte/Vite |
-| Integration | **Vitest + @testing-library/svelte** | Test components with stores |
-| E2E | **Playwright** | Cross-browser, reliable, good DX |
+### Key Technical Details
+
+1. **WebSocket-First**: All real-time state comes via WebSocket. The frontend subscribes and updates stores reactively.
+2. **Stores Pattern**: Svelte stores (`runners.ts`, `cards.ts`, `debug.ts`) hold state and are updated by WebSocket handlers.
+3. **No HTTP Polling**: Runner status, step logs, card updates all come via WebSocket events.
 
 ---
 
-## Phase-by-Phase Test Plan
+## Test Organization
 
-### Phase 1: Minimum Viable Fix (Prevent 404s)
+Tests are organized by **customer stories** rather than technical components. This ensures tests validate real user value.
 
-**Goal**: Stop the frontend from crashing due to removed endpoints
+```
+tdd/frontend/e2e/
+├── stories/                    # User journey tests
+│   ├── 01-setup/               # Initial setup workflows
+│   ├── 02-card-lifecycle/      # Card creation → execution → review (P0)
+│   ├── 03-pipeline-lifecycle/  # Pipeline creation and execution
+│   ├── 04-runner-visibility/   # Runner pool management
+│   ├── 05-git-operations/      # Diff viewing, rebasing, conflicts
+│   ├── 06-debug-rerun/         # Debug breakpoint workflows (Phase 12.7)
+│   └── 07-agent-playground/    # AI agent testing sandbox (P1)
+├── critical-failures/          # Error handling tests (P0)
+├── ui-completeness/            # UI quality assurance
+├── realtime-sync/              # Multi-user broadcast tests
+├── smoke/                      # Quick sanity checks
+└── scenarios/                  # Legacy - to be migrated
+```
 
-**Tests to Write FIRST** (before fixing):
+### Priority System
+
+| Priority | Meaning | When to Implement |
+|----------|---------|-------------------|
+| **P0** | Must work or product is broken | Implement first, block releases |
+| **P1** | Core functionality | Implement before P2 |
+| **P2** | Quality/polish features | Implement as time allows |
+
+**P0 tests** are in:
+- `stories/02-card-lifecycle/` - The core value proposition
+- `critical-failures/` - Error recovery scenarios
+
+**P1 tests** include:
+- `stories/07-agent-playground/` - Critical for AI development workflow
+
+---
+
+## How to Implement Tests
+
+### Step 1: Understand the Test File
+
+Each test file has:
+1. A **user story** in the header comment
+2. A **priority** level
+3. A **run command** for focused testing
+4. Skeleton tests marked with `test.skip()`
+
+Example header:
+```typescript
+/**
+ * E2E Tests - Create Card
+ *
+ * Story: As a developer, I want to create a card describing work to be done
+ * so that the AI or a pipeline can execute it.
+ *
+ * Priority: P0 - Core functionality
+ *
+ * Run with: pnpm test:e2e --grep "Create Card"
+ */
+```
+
+### Step 2: Read Related Application Code
+
+Before implementing, read:
+
+1. **The component being tested**: `frontend/src/lib/components/*.svelte`
+2. **The relevant store**: `frontend/src/lib/stores/*.ts`
+3. **API types**: `frontend/src/lib/api/types.ts`
+4. **WebSocket message handlers**: `frontend/src/lib/stores/websocket.ts`
+
+### Step 3: Convert `test.skip()` to `test()`
+
+Replace skeleton with real implementation:
 
 ```typescript
-// tdd/frontend/unit/stores/runners.test.ts
+// BEFORE (skeleton)
+test.skip('can create card with title and description', async ({ page }) => {
+  // Fill card form
+  // Submit
+  // Assert: card appears on board
+});
 
-describe('Runner Store - Graceful Degradation', () => {
-  it('should not crash when runner API returns 404', async () => {
-    // Mock fetch to return 404
-    // Call runnersStore.load()
-    // Assert: no thrown error, store has error state
-  });
+// AFTER (implemented)
+test('can create card with title and description', async ({ page }) => {
+  await page.goto('/');
 
-  it('should set error state when polling fails', async () => {
-    // Start polling with mocked failing endpoint
-    // Assert: error store has meaningful message
-  });
+  // Open create card modal
+  await page.click('[data-testid="create-card-button"]');
+
+  // Fill form
+  await page.fill('[data-testid="card-title-input"]', 'Fix login bug');
+  await page.fill('[data-testid="card-description-input"]', 'Login fails on mobile');
+
+  // Submit
+  await page.click('[data-testid="card-submit-button"]');
+
+  // Assert card appears
+  await expect(page.locator('[data-testid="card-item"]')).toContainText('Fix login bug');
 });
 ```
 
-**What These Tests Validate**:
-- Frontend doesn't break when endpoints are missing
-- Users see error state, not blank screen
+### Step 4: Use Appropriate Test Patterns
 
-### Phase 2: Runner Visibility (WebSocket Rewrite)
+#### Pattern: Mocking WebSocket Events
 
-**Goal**: Runners appear when they connect via WebSocket
-
-**Tests to Write**:
+For tests that need to simulate backend events without a real backend:
 
 ```typescript
-// tdd/frontend/integration/websocket/runner-updates.test.ts
+import { MockWebSocket } from '../../fixtures/mock-websocket';
+import { runnerStatusMessages } from '../../fixtures/websocket-messages/runner-messages';
 
-describe('Runner WebSocket Updates', () => {
-  it('should add runner to store when runner_status message received', () => {
-    // Send mock WS message: { type: 'runner_status', payload: { id: '...', status: 'idle' } }
-    // Assert: runnersStore contains the runner
-  });
+test('runner appears when WebSocket event received', async ({ page }) => {
+  await page.goto('/');
 
-  it('should update runner state on state transition messages', () => {
-    // Send: runner connects (status: idle)
-    // Send: runner assigned (status: assigned)
-    // Send: runner busy (status: busy)
-    // Assert: store reflects each state
-  });
+  // Inject mock WebSocket message via page.evaluate
+  await page.evaluate((message) => {
+    // Access the app's WebSocket handler
+    window.__testWebSocketHandler__(message);
+  }, runnerStatusMessages.idle);
 
-  it('should handle all new runner states', () => {
-    const states = ['disconnected', 'connecting', 'idle', 'assigned', 'busy', 'dead'];
-    // For each state, send message and verify store accepts it
-  });
-
-  it('should remove runner when disconnected', () => {
-    // Add runner, then send disconnect message
-    // Assert: runner removed from store OR status is 'disconnected'
-  });
+  // Assert runner visible
+  await expect(page.locator('[data-testid="runner-item"]')).toBeVisible();
 });
 ```
 
-**E2E Tests**:
+#### Pattern: Multi-User Tests (Browser Contexts)
+
+For testing real-time collaboration:
 
 ```typescript
-// tdd/frontend/e2e/scenarios/runner-visibility.spec.ts
+test('User B sees card created by User A', async ({ browser }) => {
+  // Create two isolated browser contexts
+  const contextA = await browser.newContext();
+  const contextB = await browser.newContext();
 
-test.describe('Runner Visibility', () => {
-  test('shows empty state when no runners connected', async ({ page }) => {
-    await page.goto('/');
-    await expect(page.locator('[data-testid="runner-panel"]')).toContainText('No runners connected');
-  });
+  const pageA = await contextA.newPage();
+  const pageB = await contextB.newPage();
 
-  test('shows runner when one connects via WebSocket', async ({ page }) => {
-    await page.goto('/');
-    // Inject mock WS message (via page.evaluate or mock server)
-    await expect(page.locator('[data-testid="runner-item"]')).toBeVisible();
-  });
+  // Both navigate to same board
+  await pageA.goto('/');
+  await pageB.goto('/');
 
-  test('updates runner status in real-time', async ({ page }) => {
-    // Start with idle runner
-    // Trigger status change
-    // Assert: UI shows new status
-  });
+  // User A creates card
+  await pageA.click('[data-testid="create-card-button"]');
+  await pageA.fill('[data-testid="card-title-input"]', 'New Feature');
+  await pageA.click('[data-testid="card-submit-button"]');
+
+  // User B should see it within 2 seconds (real-time)
+  await expect(pageB.locator('[data-testid="card-item"]'))
+    .toContainText('New Feature', { timeout: 2000 });
+
+  // Cleanup
+  await contextA.close();
+  await contextB.close();
 });
 ```
 
-### Phase 3: Step Execution Status
-
-**Goal**: Show execution substates in UI
-
-**Tests to Write**:
+#### Pattern: Testing Error States
 
 ```typescript
-// tdd/frontend/integration/websocket/step-status.test.ts
+test('shows error when backend disconnects', async ({ page }) => {
+  await page.goto('/');
 
-describe('Step Execution Status Updates', () => {
-  const stepStates = ['pending', 'preparing', 'running', 'completing', 'completed', 'failed', 'cancelled'];
-
-  it.each(stepStates)('should handle %s step status', (status) => {
-    // Send step_status message with given status
-    // Assert: step in pipeline run has correct status
+  // Simulate WebSocket close
+  await page.evaluate(() => {
+    window.__testWebSocketClose__();
   });
 
-  it('should update step logs in real-time', () => {
-    // Send step_logs message
-    // Assert: logs appear in correct step
-  });
+  // Assert error state visible
+  await expect(page.locator('[data-testid="connection-error"]')).toBeVisible();
+  await expect(page.locator('[data-testid="reconnecting-indicator"]')).toBeVisible();
 });
 ```
 
-**E2E Tests**:
+#### Pattern: Waiting for Async Operations
 
 ```typescript
-// tdd/frontend/e2e/scenarios/pipeline-execution.spec.ts
+test('pipeline run completes', async ({ page }) => {
+  await page.goto('/pipelines/test-pipeline');
 
-test.describe('Pipeline Execution Visibility', () => {
-  test('shows step progress during execution', async ({ page }) => {
-    // Navigate to pipeline
-    // Trigger run
-    // Assert: progress bar updates
-    // Assert: step statuses change from pending -> running -> completed
-  });
+  // Start run
+  await page.click('[data-testid="run-pipeline-button"]');
 
-  test('shows step logs while running', async ({ page }) => {
-    // During execution, logs should stream
-    await expect(page.locator('.logs-content')).not.toBeEmpty();
-  });
+  // Wait for completion (may take time)
+  await expect(page.locator('[data-testid="run-status"]'))
+    .toHaveText('Completed', { timeout: 30000 });
 
-  test('shows error state when step fails', async ({ page }) => {
-    // Trigger failing step
-    // Assert: error badge appears
-    // Assert: error message displayed
-  });
-});
-```
-
-### Phase 4: Docker Command & Logs
-
-**Tests to Write** (only if needed):
-
-```typescript
-// tdd/frontend/integration/api/docker-command.test.ts
-
-describe('Docker Command API', () => {
-  it('should fetch docker command for runner type', async () => {
-    // Call runnersApi.dockerCommand('claude-code')
-    // Assert: returns command string
-  });
+  // Verify all steps show completed
+  const steps = page.locator('[data-testid="step-status"]');
+  await expect(steps).toHaveCount(3);
+  for (let i = 0; i < 3; i++) {
+    await expect(steps.nth(i)).toHaveAttribute('data-status', 'completed');
+  }
 });
 ```
 
 ---
 
-## Test Fixture Design
+## Test Fixtures
 
 ### WebSocket Message Fixtures
 
+Located in `fixtures/websocket-messages/`:
+
+| File | Purpose |
+|------|---------|
+| `runner-messages.ts` | Runner state transitions, lifecycle sequences |
+| `step-messages.ts` | Step execution states, log messages |
+| `debug-messages.ts` | Debug breakpoint, status, resume events |
+
+Usage:
 ```typescript
-// tdd/frontend/fixtures/websocket-messages/runner-messages.ts
+import { runnerStatusMessages, runnerLifecycleSequence } from '../../fixtures/websocket-messages/runner-messages';
+import { debugBreakpointMessages } from '../../fixtures/websocket-messages/debug-messages';
 
-export const runnerMessages = {
-  connected: {
-    type: 'runner_status',
-    payload: {
-      id: 'runner-1',
-      name: 'test-runner',
-      status: 'idle',
-      runner_type: 'claude-code',
-    },
-  },
+// Use pre-built messages
+const idleRunner = runnerStatusMessages.idle;
 
-  stateTransitions: {
-    idle: { type: 'runner_status', payload: { id: 'runner-1', status: 'idle' } },
-    assigned: { type: 'runner_status', payload: { id: 'runner-1', status: 'assigned' } },
-    busy: { type: 'runner_status', payload: { id: 'runner-1', status: 'busy' } },
-    disconnected: { type: 'runner_status', payload: { id: 'runner-1', status: 'disconnected' } },
-    dead: { type: 'runner_status', payload: { id: 'runner-1', status: 'dead' } },
-  },
-};
-```
-
-### Mock WebSocket Helper
-
-```typescript
-// tdd/frontend/fixtures/mock-websocket.ts
-
-export class MockWebSocket {
-  private handlers: Map<string, Function[]> = new Map();
-
-  addEventListener(event: string, handler: Function) {
-    if (!this.handlers.has(event)) {
-      this.handlers.set(event, []);
-    }
-    this.handlers.get(event)!.push(handler);
-  }
-
-  // Simulate receiving a message
-  simulateMessage(data: object) {
-    const handlers = this.handlers.get('message') || [];
-    handlers.forEach(h => h({ data: JSON.stringify(data) }));
-  }
-
-  simulateOpen() {
-    const handlers = this.handlers.get('open') || [];
-    handlers.forEach(h => h());
-  }
-
-  simulateClose() {
-    const handlers = this.handlers.get('close') || [];
-    handlers.forEach(h => h());
-  }
+// Or use sequences for complex scenarios
+for (const message of runnerLifecycleSequence) {
+  await simulateWebSocketMessage(page, message);
 }
 ```
+
+### MockWebSocket Helper
+
+```typescript
+import { MockWebSocket } from '../../fixtures/mock-websocket';
+
+const ws = new MockWebSocket();
+ws.simulateOpen();
+ws.simulateMessage(runnerStatusMessages.idle);
+ws.simulateClose();
+```
+
+---
+
+## Two-Tier Test Architecture
+
+### Mocked Tier (Fast)
+
+- **No backend required**
+- All API calls intercepted via `page.route()`
+- WebSocket events simulated
+- Runs in < 60 seconds
+- Good for: UI logic, component behavior, form validation
+
+```bash
+pnpm test:e2e:mocked
+```
+
+### Real Tier (Comprehensive)
+
+- **Requires backend** with `LAZYAF_TEST_MODE=true`
+- Real database operations (reset between tests)
+- Real WebSocket events
+- AI calls mocked via `LAZYAF_MOCK_AI=true`
+- Good for: Integration, workflows, data persistence
+
+```bash
+# Start backend first
+cd backend && LAZYAF_TEST_MODE=true LAZYAF_MOCK_AI=true uvicorn app.main:app
+
+# Run tests
+pnpm test:e2e:real
+```
+
+---
+
+## Adding `data-testid` Attributes
+
+When tests fail because selectors don't exist, add `data-testid` attributes to components:
+
+```svelte
+<!-- BEFORE -->
+<button on:click={createCard}>Create</button>
+
+<!-- AFTER -->
+<button data-testid="create-card-button" on:click={createCard}>Create</button>
+```
+
+Common test IDs needed:
+
+| Component | Test ID Pattern |
+|-----------|-----------------|
+| Cards | `card-item`, `card-title-input`, `card-submit-button` |
+| Runners | `runner-panel`, `runner-item`, `runner-status-{state}` |
+| Pipelines | `pipeline-editor`, `run-pipeline-button`, `step-item` |
+| Modals | `{name}-modal`, `modal-close-button` |
+| Forms | `{name}-form`, `{field}-input`, `{name}-submit-button` |
+
+---
+
+## Debug Re-Run Tests (Phase 12.7)
+
+Phase 12.7 adds breakpoint-based debugging. These tests are in `stories/06-debug-rerun/`.
+
+### Key Components
+
+- `DebugRerunModal.svelte` - UI for selecting breakpoints
+- `debug.ts` store - Manages debug session state
+- WebSocket events: `debug_breakpoint`, `debug_status`, `debug_resume`
+
+### Test Flow
+
+```typescript
+test('can set breakpoint and pause execution', async ({ page }) => {
+  // Navigate to failed run
+  await page.goto('/runs/failed-run-123');
+
+  // Open debug modal
+  await page.click('[data-testid="debug-rerun-button"]');
+
+  // Select breakpoint at step 2
+  await page.click('[data-testid="breakpoint-step-2"]');
+
+  // Start debug run
+  await page.click('[data-testid="start-debug-button"]');
+
+  // Simulate breakpoint hit
+  await simulateWebSocketMessage(page, debugBreakpointMessages.step2);
+
+  // Assert paused state visible
+  await expect(page.locator('[data-testid="debug-paused-indicator"]')).toBeVisible();
+  await expect(page.locator('[data-testid="current-step"]')).toContainText('Run Tests');
+});
+```
+
+---
+
+## Agent Playground Tests (Phase 11)
+
+The Agent Playground is critical for testing AI agent behavior against repo states. Tests are in `stories/07-agent-playground/`.
+
+### Key Difference: SSE Instead of WebSocket
+
+The Playground uses **Server-Sent Events (SSE)** for real-time log streaming, not WebSocket. This changes how you mock events in tests.
+
+### Key Components
+
+- `PlaygroundPage.svelte` - Main UI (configuration + results)
+- `playground.ts` store - Session state, SSE connection management
+- API endpoints: `/api/repos/{id}/playground/test`, `/api/playground/{session}/stream`
+
+### Test Flow
+
+```typescript
+test('can run agent test and see logs', async ({ page }) => {
+  await page.goto('/playground');
+
+  // Configure test
+  await page.fill('[data-testid="task-input"]', 'Fix the login bug');
+  await page.selectOption('[data-testid="model-select"]', 'claude-sonnet-4-5');
+
+  // Start test
+  await page.click('[data-testid="test-once-button"]');
+
+  // Assert: status changes
+  await expect(page.locator('[data-testid="status"]')).toHaveText('Running');
+
+  // Assert: logs appear (SSE streaming)
+  await expect(page.locator('[data-testid="log-panel"]')).not.toBeEmpty();
+
+  // Wait for completion
+  await expect(page.locator('[data-testid="status"]'))
+    .toHaveText('Completed', { timeout: 60000 });
+
+  // Assert: diff visible
+  await expect(page.locator('[data-testid="diff-viewer"]')).toBeVisible();
+});
+```
+
+### Mocking SSE Events
+
+```typescript
+// For mocked tier tests, intercept SSE endpoint
+await page.route('**/api/playground/*/stream', async route => {
+  // Return SSE stream with mock events
+  await route.fulfill({
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream' },
+    body: [
+      'event: log\ndata: {"line": "Starting execution..."}\n\n',
+      'event: log\ndata: {"line": "Cloning repo..."}\n\n',
+      'event: status\ndata: {"status": "running"}\n\n',
+      'event: complete\ndata: {"status": "completed", "diff": "..."}\n\n',
+    ].join(''),
+  });
+});
+```
+
+### Playground-Specific Test IDs
+
+| Element | Test ID |
+|---------|---------|
+| Task input | `task-input` |
+| Branch selector | `branch-select` |
+| Runner selector | `runner-select` |
+| Model selector | `model-select` |
+| Test Once button | `test-once-button` |
+| Cancel button | `cancel-button` |
+| Reset button | `reset-button` |
+| Status indicator | `status` |
+| Log panel | `log-panel` |
+| Diff viewer | `diff-viewer` |
+| Elapsed time | `elapsed-time` |
 
 ---
 
 ## What NOT to Test
 
-### TypeScript Will Catch These
-- Type mismatches (e.g., wrong RunnerStatus values)
+### TypeScript Catches These
+- Type mismatches
 - Missing required fields
 - Wrong function signatures
-
-**Recommendation**: Fix types first, let compiler catch issues
-
-### Implementation Details to Avoid Testing
-- Internal store structure (test behavior, not shape)
-- CSS classes or styling
-- Component internal state that isn't user-visible
-- Specific DOM structure (use test IDs instead)
 
 ### Low-Value Tests
 - Static text content
 - Exact error message wording
+- CSS styling
 - Animation timing
-- Tooltip content
+
+### Implementation Details
+- Internal store structure
+- Component internal state
+- DOM structure (use test IDs)
 
 ---
 
-## CI/CD Integration
+## Running Tests
 
-### Proposed Pipeline Stages
+```bash
+# All E2E tests
+pnpm test:e2e
 
-```yaml
-# .github/workflows/frontend-tests.yml
+# With Playwright UI (interactive)
+pnpm test:e2e:ui
 
-stages:
-  - typecheck:        # < 30s - svelte-check, tsc
-  - unit:             # < 1min - vitest unit tests
-  - integration:      # < 2min - vitest component tests
-  - e2e:              # < 5min - playwright tests (headed or headless)
+# Specific test file
+pnpm test:e2e --grep "Create Card"
 
-triggers:
-  typecheck: every push
-  unit: every push
-  integration: PR only
-  e2e: PR to main, manual
-```
+# Specific story
+pnpm test:e2e --grep "Card Lifecycle"
 
-### Test Commands
-
-```json
-// package.json scripts to add
-{
-  "scripts": {
-    "test": "vitest",
-    "test:unit": "vitest run --dir tdd/frontend/unit",
-    "test:integration": "vitest run --dir tdd/frontend/integration",
-    "test:e2e": "playwright test",
-    "test:e2e:ui": "playwright test --ui",
-    "test:coverage": "vitest run --coverage"
-  }
-}
+# Only P0 tests (by pattern)
+pnpm test:e2e e2e/stories/02-card-lifecycle e2e/critical-failures
 ```
 
 ---
 
-## Priority Order for Implementation
+## Checklist for Implementing a Test
 
-### Immediate (Before Any Fixes)
+- [ ] Read the user story in the file header
+- [ ] Read related component/store code
+- [ ] Replace `test.skip()` with `test()`
+- [ ] Add `data-testid` attributes to components if needed
+- [ ] Use fixtures for WebSocket messages
+- [ ] Handle async waits with appropriate timeouts
+- [ ] Test both success and error paths
+- [ ] Run the test: `pnpm test:e2e --grep "Test Name"`
+- [ ] Verify test passes/fails appropriately
 
-1. **Add Vitest + Playwright to package.json**
-2. **Write smoke E2E test**: "App loads without console errors"
-3. **Write runner store unit test**: "Handles missing API gracefully"
+---
 
-### Phase 1 Fixes
+## File Reference
 
-4. **Test**: Runner store error handling
-5. **Test**: WebSocket connection status display
+| Path | Purpose |
+|------|---------|
+| `playwright.config.ts` | Test configuration, projects, timeouts |
+| `e2e/global-setup.ts` | Runs before all tests |
+| `e2e/global-teardown.ts` | Runs after all tests |
+| `fixtures/mock-websocket.ts` | WebSocket simulation helper |
+| `fixtures/websocket-messages/*.ts` | Pre-built message fixtures |
+| `fixtures/page-objects/*.ts` | Page Object Models (POMs) |
 
-### Phase 2 Fixes
+---
 
-6. **Test**: WebSocket runner updates flow
-7. **Test**: All 6 runner states handled
-8. **E2E**: Runner appears when connected
+## Common Issues
 
-### Phase 3 Fixes
+### "Timeout waiting for selector"
+- Add `data-testid` to the element
+- Increase timeout if operation is slow
+- Check if element is conditionally rendered
 
-9. **Test**: Step status WebSocket messages
-10. **Test**: Step logs streaming
-11. **E2E**: Pipeline execution visibility
+### "WebSocket not connected"
+- For mocked tests: ensure mock is set up before actions
+- For real tests: ensure backend is running
+
+### "Test passed locally but fails in CI"
+- Add explicit waits for async operations
+- Don't rely on timing assumptions
+- Use `expect().toBeVisible()` instead of immediate assertions
 
 ---
 
 ## Summary
 
-| Test Type | Framework | Runs | Purpose |
-|-----------|-----------|------|---------|
-| Unit | Vitest | Every push | Test store logic in isolation |
-| Integration | Vitest + Testing Library | PRs | Test component + store interaction |
-| E2E | Playwright | PRs to main | Test real user workflows |
-
-**Key Principles**:
-- Test behavior, not implementation
-- Use test IDs, not DOM structure
-- Mock at boundaries (WebSocket, fetch)
-- Let TypeScript handle type errors
-- E2E tests should be resilient to refactors
+| Concept | Key Point |
+|---------|-----------|
+| Organization | Stories-based, not component-based |
+| Priority | P0 = blocking, P1 = core, P2 = polish |
+| Fixtures | Use pre-built WebSocket messages |
+| Selectors | Always use `data-testid` |
+| Two-tier | Mocked (fast) vs Real (comprehensive) |
+| Async | Use appropriate timeouts, wait for state |

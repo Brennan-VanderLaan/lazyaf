@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, DebugRerunRequest, DebugRerunResponse, DebugSessionInfo } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, DebugRerunRequest, DebugRerunResponse, DebugSessionInfo } from './types';
 
 const BASE_URL = '/api';
 
@@ -142,14 +142,9 @@ export const jobs = {
 };
 
 // Runners
-export const runners = {
-  list: () => request<Runner[]>('/runners'),
-  status: () => request<PoolStatus>('/runners/status'),
-  logs: (runnerId: string, offset: number = 0) =>
-    request<RunnerLogs>(`/runners/${runnerId}/logs?offset=${offset}`),
-  dockerCommand: (runnerType: string = 'claude-code', withSecrets: boolean = false) =>
-    request<DockerCommand>(`/runners/docker-command?runner_type=${runnerType}&with_secrets=${withSecrets}`),
-};
+// Phase 12.6: HTTP endpoints removed - runners are now managed via WebSocket only
+// Runner status is received via WebSocket broadcasts, not HTTP polling
+// See websocket.ts and runners.ts store for the new implementation
 
 // Agent Files
 export const agentFiles = {

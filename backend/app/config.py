@@ -12,9 +12,19 @@ class Settings(BaseModel):
     gemini_api_key: str | None = None
     default_runner_type: str = "any"  # any, claude-code, gemini
     default_prompt_template: str | None = None  # Global default prompt template for AI agents
+    # Test mode settings
+    test_mode: bool = False  # Enable test endpoints (reset, seed)
+    mock_ai: bool = False  # Mock AI API calls (claude/gemini) - for E2E tests
 
     class Config:
         env_file = ".env"
+
+
+def _parse_bool(value: str | None, default: bool = False) -> bool:
+    """Parse boolean from environment variable string."""
+    if value is None:
+        return default
+    return value.lower() in ("true", "1", "yes", "on")
 
 
 @lru_cache
@@ -26,4 +36,6 @@ def get_settings() -> Settings:
         docker_host=os.getenv("DOCKER_HOST"),
         default_runner_type=os.getenv("DEFAULT_RUNNER_TYPE", "any"),
         default_prompt_template=os.getenv("DEFAULT_PROMPT_TEMPLATE"),
+        test_mode=_parse_bool(os.getenv("LAZYAF_TEST_MODE")),
+        mock_ai=_parse_bool(os.getenv("LAZYAF_MOCK_AI")),
     )

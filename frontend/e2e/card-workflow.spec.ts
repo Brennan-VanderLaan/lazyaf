@@ -40,8 +40,16 @@ async function waitForWebSocket(page: Page) {
 
 // Helper: Select a repo in the sidebar
 async function selectRepo(page: Page, repoName: string) {
-  await page.locator('.repo-item').filter({ hasText: repoName }).click();
-  await expect(page.locator('.board-header h1')).toContainText(repoName);
+  // Wait for repo list to load
+  await page.waitForSelector('.repo-item', { timeout: 5000 });
+
+  // Find and click the specific repo
+  const repoItem = page.locator('.repo-item').filter({ hasText: repoName });
+  await expect(repoItem).toBeVisible({ timeout: 5000 });
+  await repoItem.click();
+
+  // Wait for board to show the selected repo
+  await expect(page.locator('.board-header h1')).toContainText(repoName, { timeout: 5000 });
 }
 
 

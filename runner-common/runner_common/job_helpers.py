@@ -12,6 +12,8 @@ This module handles all communication with the LazyAF backend:
 import threading
 from typing import Optional, List, Union
 
+import requests
+
 
 class RegistrationError(Exception):
     """Raised when runner registration fails."""
@@ -21,6 +23,11 @@ class RegistrationError(Exception):
 class NeedsReregister(Exception):
     """Raised when the runner needs to re-register with the backend."""
     pass
+
+
+def _get_session() -> requests.Session:
+    """Get a requests session."""
+    return requests.Session()
 
 
 def send_heartbeat(
@@ -39,7 +46,15 @@ def send_heartbeat(
     Returns:
         True if heartbeat was acknowledged, False otherwise
     """
-    raise NotImplementedError("TODO: Implement send_heartbeat()")
+    try:
+        session = _get_session()
+        response = session.post(
+            f"{backend_url}/api/runners/{runner_id}/heartbeat",
+            timeout=timeout,
+        )
+        return response.status_code == 200
+    except (requests.RequestException, ConnectionError):
+        return False
 
 
 def report_status(
@@ -61,7 +76,18 @@ def report_status(
         test_results: Optional test results dict
         timeout: Request timeout in seconds
     """
-    raise NotImplementedError("TODO: Implement report_status()")
+    payload = {"status": status}
+    if error is not None:
+        payload["error"] = error
+    if test_results is not None:
+        payload["test_results"] = test_results
+
+    session = _get_session()
+    session.post(
+        f"{backend_url}/api/jobs/{job_id}/callback",
+        json=payload,
+        timeout=timeout,
+    )
 
 
 def complete_job(
@@ -85,7 +111,20 @@ def complete_job(
         test_results: Optional test results dict
         timeout: Request timeout in seconds
     """
-    raise NotImplementedError("TODO: Implement complete_job()")
+    payload = {"success": success}
+    if error is not None:
+        payload["error"] = error
+    if pr_url is not None:
+        payload["pr_url"] = pr_url
+    if test_results is not None:
+        payload["test_results"] = test_results
+
+    session = _get_session()
+    session.post(
+        f"{backend_url}/api/runners/{runner_id}/complete",
+        json=payload,
+        timeout=timeout,
+    )
 
 
 def log_to_backend(
@@ -103,7 +142,16 @@ def log_to_backend(
         backend_url: Backend base URL
         timeout: Request timeout in seconds
     """
-    raise NotImplementedError("TODO: Implement log_to_backend()")
+    # Wrap single line in a list
+    if isinstance(lines, str):
+        lines = [lines]
+
+    session = _get_session()
+    session.post(
+        f"{backend_url}/api/runners/{runner_id}/logs",
+        json={"lines": lines},
+        timeout=timeout,
+    )
 
 
 def register(
@@ -129,7 +177,23 @@ def register(
     Raises:
         RegistrationError: If registration fails
     """
-    raise NotImplementedError("TODO: Implement register()")
+    payload = {"runner_type": runner_type}
+    if name is not None:
+        payload["name"] = name
+    if runner_id is not None:
+        payload["runner_id"] = runner_id
+
+    try:
+        session = _get_session()
+        response = session.post(
+            f"{backend_url}/api/runners",
+            json=payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as e:
+        raise RegistrationError(f"Registration failed: {e}") from e
 
 
 def poll_for_job(
@@ -151,7 +215,17 @@ def poll_for_job(
     Raises:
         NeedsReregister: If the runner is no longer recognized (404)
     """
-    raise NotImplementedError("TODO: Implement poll_for_job()")
+    session = _get_session()
+    response = session.get(
+        f"{backend_url}/api/runners/{runner_id}/job",
+        timeout=timeout,
+    )
+
+    if response.status_code == 404:
+        raise NeedsReregister("Runner not recognized by backend")
+
+    data = response.json()
+    return data.get("job")
 
 
 class HeartbeatThread(threading.Thread):
@@ -187,8 +261,11 @@ class HeartbeatThread(threading.Thread):
 
     def run(self) -> None:
         """Run the heartbeat loop."""
-        raise NotImplementedError("TODO: Implement HeartbeatThread.run()")
+        while not self._stop_event.is_set():
+            send_heartbeat(self.runner_id, self.backend_url)
+            self._stop_event.wait(self.interval)
 
     def stop(self) -> None:
         """Stop the heartbeat thread."""
-        raise NotImplementedError("TODO: Implement HeartbeatThread.stop()")
+        self._stop_event.set()
+        self.join(timeout=self.interval + 1)

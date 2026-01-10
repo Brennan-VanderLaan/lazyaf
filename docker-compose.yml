@@ -42,5 +42,17 @@ services:
     deploy:
       replicas: ${GEMINI_RUNNERS:-1}
 
+  runner-mock:
+    build: ./runner-mock
+    environment:
+      - BACKEND_URL=http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+    deploy:
+      replicas: ${MOCK_RUNNERS:-0}
+    profiles:
+      - testing
+
 volumes:
   lazyaf-data:

@@ -13,7 +13,7 @@ class PlaygroundTestRequest(BaseModel):
 
     agent_id: str | None = None  # Platform agent file ID
     repo_agent_name: str | None = None  # OR repo-defined agent name
-    runner_type: str = "claude-code"  # claude-code | gemini
+    runner_type: str = "claude-code"  # claude-code | gemini | mock
     model: str | None = None  # Specific model (e.g., claude-sonnet-4-20250514, gemini-2.5-pro)
     branch: str  # Branch to test against
     task_override: str | None = None  # Optional task description override

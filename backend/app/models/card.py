@@ -20,6 +20,7 @@ class RunnerType(str, Enum):
     ANY = "any"  # Any available runner
     CLAUDE_CODE = "claude-code"
     GEMINI = "gemini"
+    MOCK = "mock"  # Mock executor for E2E testing
 
 
 class StepType(str, Enum):

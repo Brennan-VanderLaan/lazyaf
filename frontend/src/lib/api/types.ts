@@ -1,7 +1,7 @@
 export type CardStatus = 'todo' | 'in_progress' | 'in_review' | 'done' | 'failed';
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
 export type RunnerStatus = 'idle' | 'busy' | 'offline';
-export type RunnerType = 'any' | 'claude-code' | 'gemini';
+export type RunnerType = 'any' | 'claude-code' | 'gemini' | 'mock';
 export type StepType = 'agent' | 'script' | 'docker';
 
 export interface StepConfig {
@@ -404,7 +404,7 @@ export type AgentModel = ClaudeModel | GeminiModel;
 export interface PlaygroundTestRequest {
   agent_id?: string | null;
   repo_agent_name?: string | null;
-  runner_type: 'claude-code' | 'gemini';
+  runner_type: 'claude-code' | 'gemini' | 'mock';
   model?: AgentModel | null;  // Specific model to use
   branch: string;
   task_override?: string | null;

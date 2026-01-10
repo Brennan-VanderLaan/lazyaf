@@ -17,11 +17,22 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from app.database import engine
+    from app.database import engine, async_session
     from app.services.runner_pool import runner_pool
     from app.services.playground_service import playground_service
+    from app.services.execution import recover_orphaned_executions
 
     await init_db()
+
+    # Recover any orphaned step executions from previous crash/restart
+    async with async_session() as session:
+        recovered = await recover_orphaned_executions(session)
+        if recovered:
+            import logging
+            logging.getLogger(__name__).info(
+                f"Recovered {len(recovered)} orphaned step executions on startup"
+            )
+
     await runner_pool.start()
     await playground_service.start()
     yield

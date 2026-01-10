@@ -29,20 +29,23 @@ $script:FrontendProcess = $null
 function Cleanup {
     Write-Host "Cleaning up..." -ForegroundColor Yellow
 
-    # Stop Docker backend
-    Write-Host "Stopping E2E backend container..."
+    # Stop Docker backend - only stop specific e2e containers, not all containers
+    Write-Host "Stopping E2E backend containers..."
     Push-Location $ProjectRoot
     try {
-        & cmd.exe /c "docker compose --profile e2e down" 2>$null
+        & cmd.exe /c "docker compose stop backend-e2e runner-mock-e2e" 2>$null
+        & cmd.exe /c "docker compose rm -f backend-e2e runner-mock-e2e" 2>$null
     }
     catch { }
     Pop-Location
 
+    # Kill frontend process tree (cmd.exe + node/vite child processes)
     if ($script:FrontendProcess) {
         try {
             if (!$script:FrontendProcess.HasExited) {
-                Write-Host "Stopping frontend (PID: $($script:FrontendProcess.Id))"
-                Stop-Process -Id $script:FrontendProcess.Id -Force -ErrorAction SilentlyContinue
+                Write-Host "Stopping frontend (PID: $($script:FrontendProcess.Id)) and child processes..."
+                # Kill the entire process tree using taskkill /T
+                & cmd.exe /c "taskkill /PID $($script:FrontendProcess.Id) /T /F" 2>$null
             }
         }
         catch { }

@@ -6,10 +6,13 @@ services:
     volumes:
       - ./backend/app:/app/app
       - lazyaf-data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket for LocalExecutor
+      - lazyaf-workspaces:/workspaces  # Shared workspace volumes
     environment:
       - DATABASE_URL=sqlite+aiosqlite:////app/data/lazyaf.db
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
     restart: unless-stopped
 
   frontend:
@@ -82,3 +85,4 @@ services:
 
 volumes:
   lazyaf-data:
+  lazyaf-workspaces:  # Shared workspace volumes for LocalExecutor

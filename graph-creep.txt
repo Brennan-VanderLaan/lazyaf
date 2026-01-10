@@ -1,0 +1,912 @@
+# Pipeline Node Graph UI - Implementation Plan
+# "Graph Creep" - ComfyUI-style Pipeline Editor
+#
+# Goal: Replace form-based PipelineEditor.svelte with visual node graph
+# that supports state-machine-style branching and parallel execution.
+
+================================================================================
+CONTEXT & DECISIONS
+================================================================================
+
+Key decisions made:
+- Skip incremental UI improvements, go straight to node graph
+- DB is source of truth (YAML export is secondary)
+- Parallel execution IS feasible - infrastructure already supports it
+- Use Svelte Flow library for node graph rendering
+- Must look nice and be responsive
+
+Current state:
+- Frontend: Svelte-based, PipelineEditor.svelte is ~1,299 lines (form-based)
+- Backend: pipeline_executor.py handles sequential execution
+- Job queue + runner pool already support parallel job execution
+- Data model: Pipeline.steps is JSON array with positional indexing
+- Existing fields: on_success/on_failure support "next|stop|trigger:{id}" but UI doesn't expose all options
+
+Why parallel is NOT hard:
+- job_queue.py already handles multiple concurrent jobs
+- runner_pool.py has independent runners pulling from queue
+- DB schema has no sequential constraints
+- Blocking is in orchestration layer (pipeline_executor.py), not infrastructure
+- Just need to fan-out multiple _execute_step() calls instead of one
+
+================================================================================
+PHASE 1: DATA MODEL (2-3 days)
+================================================================================
+
+Goal: Define graph-based pipeline schema that supports nodes, edges, and parallel branches.
+
+1.1 Update backend/app/schemas/pipeline.py
+----------------------------------------------------------------------
+
+Add new models alongside existing ones (no breaking changes):
+
+```python
+from enum import Enum
+from typing import Optional
+from pydantic import BaseModel
+
+class EdgeCondition(str, Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    ALWAYS = "always"
+
+class PipelineEdge(BaseModel):
+    """Connection between two steps in the pipeline graph"""
+    id: str                          # Unique edge ID
+    from_step: str                   # Source step ID (or "START" for entry point)
+    to_step: str                     # Target step ID (or "END" for terminal)
+    condition: EdgeCondition         # When this edge is followed
+
+class PipelineNodePosition(BaseModel):
+    """UI position for node graph rendering"""
+    x: float
+    y: float
+
+class PipelineStepV2(BaseModel):
+    """Graph-based step definition with stable ID"""
+    id: str                          # Stable unique identifier (UUID)
+    name: str
+    type: StepType                   # script | docker | agent
+    config: dict                     # Type-specific configuration
+    position: Optional[PipelineNodePosition] = None  # UI layout position
+    # Note: on_success/on_failure moved to edges
+
+class PipelineGraphModel(BaseModel):
+    """Graph-based pipeline definition"""
+    steps: dict[str, PipelineStepV2]  # Keyed by step ID
+    edges: list[PipelineEdge]
+    entry_points: list[str]           # Step IDs that start execution (usually one)
+
+    # Metadata
+    version: int = 2                  # Schema version for migration
+```
+
+1.2 Update database model (backend/app/models/pipeline.py)
+----------------------------------------------------------------------
+
+Add new column to Pipeline model:
+
+```python
+class Pipeline(Base):
+    # ... existing fields ...
+
+    # New: Graph-based step definition (nullable for migration)
+    steps_graph: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    # Helper to get steps in either format
+    def get_execution_graph(self) -> PipelineGraphModel | None:
+        if self.steps_graph:
+            return PipelineGraphModel(**self.steps_graph)
+        return None
+```
+
+1.3 Migration strategy
+----------------------------------------------------------------------
+
+- Add steps_graph column as nullable
+- Executor checks steps_graph first, falls back to steps array
+- New pipelines created via node UI use steps_graph
+- Old pipelines continue working with steps array
+- Optional: Add migration endpoint to convert array -> graph
+
+1.4 Conversion utility (backend/app/services/pipeline_converter.py)
+----------------------------------------------------------------------
+
+```python
+def array_to_graph(steps: list[PipelineStepConfig]) -> PipelineGraphModel:
+    """Convert legacy array-based steps to graph model"""
+    graph_steps = {}
+    edges = []
+
+    for i, step in enumerate(steps):
+        step_id = step.id or f"step_{i}"
+        graph_steps[step_id] = PipelineStepV2(
+            id=step_id,
+            name=step.name,
+            type=step.type,
+            config=step.config,
+            position=PipelineNodePosition(x=0, y=i * 150)  # Vertical layout
+        )
+
+        # Create edge to next step
+        if i < len(steps) - 1:
+            next_id = steps[i + 1].id or f"step_{i + 1}"
+            edges.append(PipelineEdge(
+                id=f"edge_{i}",
+                from_step=step_id,
+                to_step=next_id,
+                condition=EdgeCondition.SUCCESS
+            ))
+
+    entry = steps[0].id or "step_0" if steps else None
+    return PipelineGraphModel(
+        steps=graph_steps,
+        edges=edges,
+        entry_points=[entry] if entry else []
+    )
+```
+
+================================================================================
+PHASE 2: PARALLEL EXECUTION (2-3 days)
+================================================================================
+
+Goal: Modify pipeline_executor.py to support graph traversal and parallel branches.
+
+2.1 Update PipelineRun tracking
+----------------------------------------------------------------------
+
+Current: `current_step: int` (single step index)
+New: `active_steps: list[str]` (multiple step IDs running in parallel)
+
+In backend/app/models/pipeline.py, update PipelineRun:
+
+```python
+class PipelineRun(Base):
+    # ... existing fields ...
+
+    # Replace current_step with active tracking
+    active_step_ids: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    completed_step_ids: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+```
+
+2.2 Modify pipeline_executor.py
+----------------------------------------------------------------------
+
+Key changes to PipelineExecutor class:
+
+a) Add graph traversal methods:
+
+```python
+async def _get_next_steps(
+    self,
+    db: AsyncSession,
+    graph: PipelineGraphModel,
+    completed_step_id: str,
+    condition: EdgeCondition
+) -> list[str]:
+    """Get all steps that should execute after a step completes"""
+    next_step_ids = []
+    for edge in graph.edges:
+        if edge.from_step == completed_step_id and edge.condition == condition:
+            next_step_ids.append(edge.to_step)
+    return next_step_ids
+
+async def _get_ready_steps(
+    self,
+    db: AsyncSession,
+    graph: PipelineGraphModel,
+    pipeline_run: PipelineRun
+) -> list[str]:
+    """Get steps whose dependencies are all satisfied"""
+    ready = []
+    completed = set(pipeline_run.completed_step_ids or [])
+    active = set(pipeline_run.active_step_ids or [])
+
+    for step_id in graph.steps:
+        if step_id in completed or step_id in active:
+            continue
+
+        # Check if all incoming edges are satisfied
+        incoming = [e for e in graph.edges if e.to_step == step_id]
+        if not incoming:
+            # Entry point - check if in entry_points
+            if step_id in graph.entry_points:
+                ready.append(step_id)
+        else:
+            # All sources must be completed
+            if all(e.from_step in completed for e in incoming):
+                ready.append(step_id)
+
+    return ready
+```
+
+b) Modify _execute_step to use step ID:
+
+```python
+async def _execute_step_by_id(
+    self,
+    db: AsyncSession,
+    pipeline_run: PipelineRun,
+    step_id: str,
+    ...
+) -> None:
+    """Execute a specific step by ID (not index)"""
+    graph = pipeline_run.pipeline.get_execution_graph()
+    step = graph.steps[step_id]
+
+    # Add to active steps
+    active = pipeline_run.active_step_ids or []
+    active.append(step_id)
+    pipeline_run.active_step_ids = active
+
+    # Create StepRun, Card, Job as before...
+    # Enqueue job...
+```
+
+c) Modify on_step_complete for fan-out:
+
+```python
+async def on_step_complete(
+    self,
+    db: AsyncSession,
+    step_run_id: int,
+    success: bool,
+    ...
+) -> None:
+    """Handle step completion - may trigger multiple next steps"""
+    step_run = await self._get_step_run(db, step_run_id)
+    pipeline_run = step_run.pipeline_run
+    graph = pipeline_run.pipeline.get_execution_graph()
+
+    if not graph:
+        # Fall back to legacy sequential execution
+        return await self._on_step_complete_legacy(...)
+
+    # Update tracking
+    active = pipeline_run.active_step_ids or []
+    completed = pipeline_run.completed_step_ids or []
+
+    active.remove(step_run.step_id)
+    completed.append(step_run.step_id)
+
+    pipeline_run.active_step_ids = active
+    pipeline_run.completed_step_ids = completed
+
+    # Determine next steps based on success/failure
+    condition = EdgeCondition.SUCCESS if success else EdgeCondition.FAILURE
+    next_steps = await self._get_next_steps(db, graph, step_run.step_id, condition)
+
+    # Also check ALWAYS edges
+    always_steps = await self._get_next_steps(db, graph, step_run.step_id, EdgeCondition.ALWAYS)
+    next_steps.extend(always_steps)
+
+    if not next_steps and not active:
+        # No more steps to run and nothing active - pipeline complete
+        await self._complete_pipeline(db, pipeline_run, success)
+        return
+
+    # Fan out: execute all next steps in parallel
+    for step_id in next_steps:
+        if step_id == "END":
+            continue  # Terminal edge
+        await self._execute_step_by_id(db, pipeline_run, step_id, ...)
+```
+
+2.3 Join semantics
+----------------------------------------------------------------------
+
+For steps that have multiple incoming edges (join points):
+- Step only executes when ALL incoming edges are satisfied
+- This is handled by _get_ready_steps() checking all sources are completed
+
+Example graph:
+  START -> A -> B --(success)--> D
+              -> C --(success)--> D
+
+D will only execute after BOTH B and C complete successfully.
+
+2.4 WebSocket updates
+----------------------------------------------------------------------
+
+Update broadcast messages to include:
+- Multiple active steps
+- Graph structure for UI rendering
+- Per-step status updates
+
+================================================================================
+PHASE 3: NODE GRAPH UI (5-7 days)
+================================================================================
+
+Goal: Build ComfyUI-style visual editor using Svelte Flow.
+
+3.1 Install dependencies
+----------------------------------------------------------------------
+
+```bash
+cd frontend
+npm install @xyflow/svelte
+```
+
+Note: @xyflow/svelte is the Svelte port of React Flow (same team).
+
+3.2 Create component structure
+----------------------------------------------------------------------
+
+frontend/src/lib/components/pipeline/
+├── PipelineGraph.svelte        # Main canvas container
+├── nodes/
+│   ├── BaseNode.svelte         # Common node wrapper (ports, selection, etc.)
+│   ├── ScriptNode.svelte       # Script step configuration
+│   ├── DockerNode.svelte       # Docker step configuration
+│   ├── AgentNode.svelte        # Agent step configuration
+│   └── StartNode.svelte        # Entry point indicator
+├── edges/
+│   ├── SuccessEdge.svelte      # Green edge for success path
+│   ├── FailureEdge.svelte      # Red edge for failure path
+│   └── AlwaysEdge.svelte       # Gray edge for always path
+├── panels/
+│   ├── NodePalette.svelte      # Draggable node types to add
+│   ├── PropertiesPanel.svelte  # Selected node configuration
+│   └── Toolbar.svelte          # Save, export, zoom controls
+└── stores/
+    └── pipelineGraph.ts        # Svelte store for graph state
+
+3.3 Main PipelineGraph.svelte
+----------------------------------------------------------------------
+
+```svelte
+<script lang="ts">
+  import { SvelteFlow, Background, Controls, MiniMap } from '@xyflow/svelte';
+  import '@xyflow/svelte/dist/style.css';
+
+  import ScriptNode from './nodes/ScriptNode.svelte';
+  import DockerNode from './nodes/DockerNode.svelte';
+  import AgentNode from './nodes/AgentNode.svelte';
+  import SuccessEdge from './edges/SuccessEdge.svelte';
+  import FailureEdge from './edges/FailureEdge.svelte';
+
+  import { pipelineGraphStore } from './stores/pipelineGraph';
+
+  export let pipelineId: string;
+
+  const nodeTypes = {
+    script: ScriptNode,
+    docker: DockerNode,
+    agent: AgentNode,
+  };
+
+  const edgeTypes = {
+    success: SuccessEdge,
+    failure: FailureEdge,
+    always: DefaultEdge,
+  };
+
+  // Load pipeline on mount
+  onMount(async () => {
+    await pipelineGraphStore.load(pipelineId);
+  });
+
+  // Handle new connections
+  function onConnect(connection) {
+    pipelineGraphStore.addEdge({
+      ...connection,
+      type: 'success', // Default to success, user can change
+    });
+  }
+
+  // Handle node deletion
+  function onNodesDelete(nodes) {
+    pipelineGraphStore.removeNodes(nodes.map(n => n.id));
+  }
+</script>
+
+<div class="pipeline-graph-container">
+  <SvelteFlow
+    nodes={$pipelineGraphStore.nodes}
+    edges={$pipelineGraphStore.edges}
+    {nodeTypes}
+    {edgeTypes}
+    {onConnect}
+    {onNodesDelete}
+    fitView
+  >
+    <Background />
+    <Controls />
+    <MiniMap />
+  </SvelteFlow>
+
+  <NodePalette on:addNode={handleAddNode} />
+  <PropertiesPanel selectedNode={$selectedNode} />
+  <Toolbar on:save={handleSave} on:export={handleExport} />
+</div>
+
+<style>
+  .pipeline-graph-container {
+    width: 100%;
+    height: 100%;
+    position: relative;
+  }
+</style>
+```
+
+3.4 Node components
+----------------------------------------------------------------------
+
+Each node type wraps the existing step configuration forms.
+
+Example ScriptNode.svelte:
+
+```svelte
+<script lang="ts">
+  import { Handle, Position } from '@xyflow/svelte';
+
+  export let id: string;
+  export let data: {
+    name: string;
+    config: {
+      command: string;
+      shell: string;
+      timeout: number;
+    };
+  };
+
+  let editing = false;
+</script>
+
+<div class="script-node" class:selected>
+  <!-- Input handle (left side) -->
+  <Handle type="target" position={Position.Left} />
+
+  <div class="node-header">
+    <span class="node-icon">📜</span>
+    <span class="node-title">{data.name || 'Script'}</span>
+  </div>
+
+  <div class="node-body">
+    {#if editing}
+      <input bind:value={data.name} placeholder="Step name" />
+      <textarea bind:value={data.config.command} placeholder="Command" />
+      <select bind:value={data.config.shell}>
+        <option value="bash">Bash</option>
+        <option value="sh">Shell</option>
+        <option value="pwsh">PowerShell</option>
+      </select>
+    {:else}
+      <code class="command-preview">{data.config.command || 'No command'}</code>
+    {/if}
+  </div>
+
+  <!-- Output handles (right side) -->
+  <Handle
+    type="source"
+    position={Position.Right}
+    id="success"
+    style="top: 30%; background: #10b981;"
+  />
+  <Handle
+    type="source"
+    position={Position.Right}
+    id="failure"
+    style="top: 70%; background: #ef4444;"
+  />
+</div>
+
+<style>
+  .script-node {
+    background: #1e1e2e;
+    border: 2px solid #45475a;
+    border-radius: 8px;
+    padding: 12px;
+    min-width: 200px;
+    color: #cdd6f4;
+  }
+
+  .script-node.selected {
+    border-color: #89b4fa;
+    box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.3);
+  }
+
+  .node-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  .command-preview {
+    font-size: 12px;
+    background: #313244;
+    padding: 4px 8px;
+    border-radius: 4px;
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+</style>
+```
+
+3.5 Graph store (pipelineGraph.ts)
+----------------------------------------------------------------------
+
+```typescript
+import { writable, derived } from 'svelte/store';
+import type { Node, Edge } from '@xyflow/svelte';
+
+interface PipelineGraphState {
+  pipelineId: string | null;
+  nodes: Node[];
+  edges: Edge[];
+  isDirty: boolean;
+}
+
+function createPipelineGraphStore() {
+  const { subscribe, set, update } = writable<PipelineGraphState>({
+    pipelineId: null,
+    nodes: [],
+    edges: [],
+    isDirty: false,
+  });
+
+  return {
+    subscribe,
+
+    async load(pipelineId: string) {
+      const response = await fetch(`/api/pipelines/${pipelineId}`);
+      const pipeline = await response.json();
+
+      // Convert backend model to Svelte Flow format
+      const nodes = Object.values(pipeline.steps_graph?.steps || {}).map(step => ({
+        id: step.id,
+        type: step.type,
+        position: step.position || { x: 0, y: 0 },
+        data: { name: step.name, config: step.config },
+      }));
+
+      const edges = (pipeline.steps_graph?.edges || []).map(edge => ({
+        id: edge.id,
+        source: edge.from_step,
+        target: edge.to_step,
+        sourceHandle: edge.condition,
+        type: edge.condition,
+      }));
+
+      set({ pipelineId, nodes, edges, isDirty: false });
+    },
+
+    async save() {
+      update(state => {
+        // Convert Svelte Flow format back to backend model
+        const steps = {};
+        for (const node of state.nodes) {
+          steps[node.id] = {
+            id: node.id,
+            name: node.data.name,
+            type: node.type,
+            config: node.data.config,
+            position: node.position,
+          };
+        }
+
+        const edges = state.edges.map(edge => ({
+          id: edge.id,
+          from_step: edge.source,
+          to_step: edge.target,
+          condition: edge.sourceHandle || 'success',
+        }));
+
+        const entry_points = state.nodes
+          .filter(n => !state.edges.some(e => e.target === n.id))
+          .map(n => n.id);
+
+        fetch(`/api/pipelines/${state.pipelineId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            steps_graph: { steps, edges, entry_points, version: 2 }
+          }),
+        });
+
+        return { ...state, isDirty: false };
+      });
+    },
+
+    addNode(type: string, position: { x: number, y: number }) {
+      update(state => ({
+        ...state,
+        isDirty: true,
+        nodes: [...state.nodes, {
+          id: crypto.randomUUID(),
+          type,
+          position,
+          data: { name: `New ${type}`, config: {} },
+        }],
+      }));
+    },
+
+    addEdge(edge: Partial<Edge>) {
+      update(state => ({
+        ...state,
+        isDirty: true,
+        edges: [...state.edges, {
+          id: crypto.randomUUID(),
+          ...edge,
+        }],
+      }));
+    },
+
+    removeNodes(nodeIds: string[]) {
+      update(state => ({
+        ...state,
+        isDirty: true,
+        nodes: state.nodes.filter(n => !nodeIds.includes(n.id)),
+        edges: state.edges.filter(e =>
+          !nodeIds.includes(e.source) && !nodeIds.includes(e.target)
+        ),
+      }));
+    },
+
+    updateNodeData(nodeId: string, data: any) {
+      update(state => ({
+        ...state,
+        isDirty: true,
+        nodes: state.nodes.map(n =>
+          n.id === nodeId ? { ...n, data: { ...n.data, ...data } } : n
+        ),
+      }));
+    },
+  };
+}
+
+export const pipelineGraphStore = createPipelineGraphStore();
+```
+
+3.6 Auto-layout for imported pipelines
+----------------------------------------------------------------------
+
+When converting legacy array pipelines, apply dagre layout:
+
+```bash
+npm install dagre @types/dagre
+```
+
+```typescript
+import dagre from 'dagre';
+
+function applyAutoLayout(nodes: Node[], edges: Edge[]): Node[] {
+  const g = new dagre.graphlib.Graph();
+  g.setGraph({ rankdir: 'LR', nodesep: 50, ranksep: 100 });
+  g.setDefaultEdgeLabel(() => ({}));
+
+  nodes.forEach(node => {
+    g.setNode(node.id, { width: 200, height: 100 });
+  });
+
+  edges.forEach(edge => {
+    g.setEdge(edge.source, edge.target);
+  });
+
+  dagre.layout(g);
+
+  return nodes.map(node => {
+    const { x, y } = g.node(node.id);
+    return { ...node, position: { x, y } };
+  });
+}
+```
+
+================================================================================
+PHASE 4: POLISH & YAML EXPORT (2-3 days)
+================================================================================
+
+Goal: Make it look nice, responsive, and add YAML export for in-repo versioning.
+
+4.1 Styling improvements
+----------------------------------------------------------------------
+
+- Dark theme consistent with rest of app (Catppuccin-style colors)
+- Smooth animations for node selection, edge creation
+- Responsive layout that works on different screen sizes
+- Keyboard shortcuts:
+  - Delete: Remove selected nodes/edges
+  - Ctrl+S: Save
+  - Ctrl+Z: Undo (if implemented)
+  - Space+drag: Pan canvas
+
+4.2 Edge styling by condition
+----------------------------------------------------------------------
+
+```svelte
+<!-- SuccessEdge.svelte -->
+<script>
+  import { BaseEdge, getBezierPath } from '@xyflow/svelte';
+  export let sourceX, sourceY, targetX, targetY;
+
+  $: [path] = getBezierPath({ sourceX, sourceY, targetX, targetY });
+</script>
+
+<BaseEdge {path} style="stroke: #10b981; stroke-width: 2;" />
+<text class="edge-label" x={(sourceX + targetX) / 2} y={(sourceY + targetY) / 2 - 10}>
+  success
+</text>
+
+<!-- FailureEdge.svelte - same but stroke: #ef4444 -->
+```
+
+4.3 YAML export (backend/app/services/pipeline_yaml_export.py)
+----------------------------------------------------------------------
+
+```python
+import yaml
+from app.schemas.pipeline import PipelineGraphModel
+
+def graph_to_yaml(graph: PipelineGraphModel, pipeline_name: str) -> str:
+    """Export graph model to YAML format for .lazyaf/pipelines/"""
+
+    # Build step definitions
+    steps = []
+    for step_id, step in graph.steps.items():
+        step_def = {
+            'id': step.id,
+            'name': step.name,
+            'type': step.type.value,
+            **step.config,
+        }
+
+        # Find outgoing edges
+        success_targets = [e.to_step for e in graph.edges
+                         if e.from_step == step_id and e.condition == 'success']
+        failure_targets = [e.to_step for e in graph.edges
+                         if e.from_step == step_id and e.condition == 'failure']
+
+        if success_targets:
+            step_def['on_success'] = success_targets[0] if len(success_targets) == 1 else success_targets
+        if failure_targets:
+            step_def['on_failure'] = failure_targets[0] if len(failure_targets) == 1 else failure_targets
+
+        steps.append(step_def)
+
+    pipeline_yaml = {
+        'name': pipeline_name,
+        'version': 2,
+        'entry_points': graph.entry_points,
+        'steps': steps,
+    }
+
+    return yaml.dump(pipeline_yaml, default_flow_style=False, sort_keys=False)
+```
+
+4.4 Export endpoint (backend/app/routers/pipelines.py)
+----------------------------------------------------------------------
+
+```python
+@router.get("/{pipeline_id}/export/yaml")
+async def export_pipeline_yaml(
+    pipeline_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    pipeline = await get_pipeline(db, pipeline_id)
+    graph = pipeline.get_execution_graph()
+
+    if not graph:
+        # Convert legacy to graph first
+        graph = array_to_graph(pipeline.steps)
+
+    yaml_content = graph_to_yaml(graph, pipeline.name)
+
+    return Response(
+        content=yaml_content,
+        media_type="application/x-yaml",
+        headers={
+            "Content-Disposition": f"attachment; filename={pipeline.name}.yaml"
+        }
+    )
+```
+
+4.5 UI export button
+----------------------------------------------------------------------
+
+Add to Toolbar.svelte:
+
+```svelte
+<button on:click={exportYaml} title="Export to YAML">
+  <DownloadIcon />
+  Export YAML
+</button>
+
+<script>
+  async function exportYaml() {
+    const response = await fetch(`/api/pipelines/${pipelineId}/export/yaml`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${pipelineName}.yaml`;
+    a.click();
+  }
+</script>
+```
+
+================================================================================
+MIGRATION STRATEGY
+================================================================================
+
+1. Add steps_graph column (nullable) - no breaking change
+2. Executor checks steps_graph first, falls back to steps array
+3. New pipelines from node UI use steps_graph
+4. Add "Convert to Graph" button on legacy pipelines
+5. Eventually deprecate array format (not urgent)
+
+================================================================================
+TESTING STRATEGY
+================================================================================
+
+1. Unit tests for graph model conversion (array <-> graph)
+2. Unit tests for parallel execution logic (_get_ready_steps, _get_next_steps)
+3. Integration tests for pipeline execution with branches
+4. E2E tests for node graph UI (create, connect, save, execute)
+5. Visual regression tests for node styling
+
+================================================================================
+RISKS & MITIGATIONS
+================================================================================
+
+Risk: Svelte Flow library issues
+Mitigation: It's backed by xyflow team (React Flow), well-maintained. Fallback: build minimal custom canvas.
+
+Risk: Complex edge cases in parallel execution
+Mitigation: Start with simple fan-out/fan-in. Defer cycles, conditional joins.
+
+Risk: Performance with large graphs
+Mitigation: Svelte Flow handles virtualization. Add node limit warning if needed.
+
+Risk: YAML export format compatibility
+Mitigation: Version field in YAML. Maintain backwards compat with v1 format.
+
+================================================================================
+DEFINITION OF DONE
+================================================================================
+
+MVP is complete when:
+- [ ] Can create new pipeline via node graph UI
+- [ ] Can add script, docker, and agent nodes
+- [ ] Can connect nodes with success/failure edges
+- [ ] Can execute pipeline with parallel branches
+- [ ] Can export to YAML
+- [ ] UI is responsive and visually polished
+- [ ] Legacy pipelines still work (backwards compat)
+
+================================================================================
+ESTIMATED TIMELINE
+================================================================================
+
+Phase 1 (Data Model):     2-3 days
+Phase 2 (Parallel Exec):  2-3 days
+Phase 3 (Node Graph UI):  5-7 days
+Phase 4 (Polish + YAML):  2-3 days
+Testing & Buffer:         2-3 days
+                         -------------
+Total:                    ~2-3 weeks
+
+================================================================================
+KEY FILES TO MODIFY
+================================================================================
+
+Backend:
+- backend/app/schemas/pipeline.py (new graph models)
+- backend/app/models/pipeline.py (steps_graph column)
+- backend/app/services/pipeline_executor.py (parallel execution)
+- backend/app/services/pipeline_converter.py (new file)
+- backend/app/services/pipeline_yaml_export.py (new file)
+- backend/app/routers/pipelines.py (export endpoint)
+
+Frontend:
+- frontend/src/lib/components/pipeline/PipelineGraph.svelte (new)
+- frontend/src/lib/components/pipeline/nodes/*.svelte (new)
+- frontend/src/lib/components/pipeline/edges/*.svelte (new)
+- frontend/src/lib/components/pipeline/stores/pipelineGraph.ts (new)
+- frontend/src/routes/.../+page.svelte (integrate new component)
+- frontend/package.json (@xyflow/svelte, dagre)
+
+================================================================================

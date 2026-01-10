@@ -34,6 +34,7 @@ test = [
     "factory-boy>=3.3.0",
     "faker>=30.0.0",
     "pytest-timeout>=2.3.0",
+    "pytest-playwright>=0.5.0",
 ]
 dev = [
     "lazyaf-backend[test]",
@@ -58,7 +59,9 @@ markers = [
     "unit: Fast isolated tests (no I/O)",
     "integration: Tests with database and API",
     "demo: Runtime demonstrations and smoke tests",
+    "e2e: End-to-end tests with real backend and mock executor",
     "slow: Tests that take longer than 1 second",
+    "browser: Tests requiring Playwright browser",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

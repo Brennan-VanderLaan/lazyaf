@@ -54,5 +54,31 @@ services:
     profiles:
       - testing
 
+  # E2E Testing Services
+  backend-e2e:
+    build: ./backend
+    ports:
+      - "8765:8000"
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////tmp/e2e_test.db
+    profiles:
+      - e2e
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  runner-mock-e2e:
+    build: ./runner-mock
+    environment:
+      - BACKEND_URL=http://backend-e2e:8000
+    depends_on:
+      backend-e2e:
+        condition: service_healthy
+    profiles:
+      - e2e
+
 volumes:
   lazyaf-data:

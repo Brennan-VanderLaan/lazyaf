@@ -168,6 +168,73 @@ async def delete_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
     await manager.send_repo_deleted(repo_id)
 
 
+@router.post("/{repo_id}/test-setup", response_model=RepoRead)
+async def test_setup_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    TEST ONLY: Initialize a repo with minimal git data for e2e testing.
+
+    This creates a bare repo with an initial commit so that card workflows
+    can be tested without requiring actual git data to be pushed.
+    """
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if repo.is_ingested:
+        return repo  # Already set up
+
+    try:
+        # Create bare repo if it doesn't exist
+        if not git_repo_manager.repo_exists(repo_id):
+            git_repo_manager.create_bare_repo(repo_id)
+
+        # Initialize with a minimal commit using dulwich
+        from dulwich.repo import Repo as DulwichRepo
+        from dulwich.objects import Blob, Tree, Commit
+
+        repo_path = git_repo_manager.get_repo_path(repo_id)
+        dulwich_repo = DulwichRepo(str(repo_path))
+
+        # Create a README blob
+        readme_content = b"# Test Repository\n\nCreated for e2e testing.\n"
+        blob = Blob.from_string(readme_content)
+        dulwich_repo.object_store.add_object(blob)
+
+        # Create a tree with the README
+        tree = Tree()
+        tree.add(b"README.md", 0o100644, blob.id)
+        dulwich_repo.object_store.add_object(tree)
+
+        # Create initial commit
+        commit = Commit()
+        commit.tree = tree.id
+        commit.author = commit.committer = b"LazyAF Test <test@lazyaf.local>"
+        commit.author_time = commit.commit_time = 0
+        commit.author_timezone = commit.commit_timezone = 0
+        commit.encoding = b"UTF-8"
+        commit.message = b"Initial commit for e2e testing"
+        dulwich_repo.object_store.add_object(commit)
+
+        # Set branch ref and HEAD
+        branch_ref = f"refs/heads/{repo.default_branch}".encode()
+        dulwich_repo.refs[branch_ref] = commit.id
+        dulwich_repo.refs.set_symbolic_ref(b"HEAD", branch_ref)
+
+        # Mark as ingested
+        repo.is_ingested = True
+        await db.commit()
+        await db.refresh(repo)
+
+        # Broadcast update
+        await manager.send_repo_updated(repo_to_dict(repo))
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to setup test repo: {e}")
+
+    return repo
+
+
 @router.get("/{repo_id}/branches")
 async def list_branches(repo_id: str, db: AsyncSession = Depends(get_db)):
     """List all branches in the internal git repo."""

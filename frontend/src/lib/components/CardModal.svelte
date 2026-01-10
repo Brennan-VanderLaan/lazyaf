@@ -101,6 +101,7 @@
     { value: 'any', label: 'Any Runner' },
     { value: 'claude-code', label: 'Claude Code' },
     { value: 'gemini', label: 'Gemini CLI' },
+    { value: 'mock', label: 'Mock (Testing)' },
   ];
 
   const stepTypeOptions: { value: StepType; label: string; description: string }[] = [

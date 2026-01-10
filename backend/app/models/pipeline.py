@@ -68,3 +68,42 @@ class StepRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     pipeline_run: Mapped["PipelineRun"] = relationship("PipelineRun", back_populates="step_runs")
+    executions: Mapped[list["StepExecution"]] = relationship("StepExecution", back_populates="step_run", cascade="all, delete-orphan")
+
+
+class StepExecutionStatus(str, Enum):
+    """Status values for step executions."""
+    PENDING = "pending"
+    ASSIGNED = "assigned"
+    PREPARING = "preparing"
+    RUNNING = "running"
+    COMPLETING = "completing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
+
+
+class StepExecution(Base):
+    """
+    Tracks individual execution attempts for a step.
+
+    Each StepRun can have multiple StepExecutions (for retries).
+    The execution_key ensures idempotent execution:
+        execution_key = "{pipeline_run_id}:{step_index}:{attempt}"
+    """
+    __tablename__ = "step_executions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    execution_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    step_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("step_runs.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default=StepExecutionStatus.PENDING.value)
+    runner_id: Mapped[str | None] = mapped_column(String(36), nullable=True)  # Remote executor only
+    container_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # Local executor only
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    step_run: Mapped["StepRun"] = relationship("StepRun", back_populates="executions")

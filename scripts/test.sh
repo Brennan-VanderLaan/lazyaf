@@ -20,12 +20,15 @@ FRONTEND_PID=""
 
 cleanup() {
     echo "Cleaning up..."
-    # Stop Docker backend
-    echo "Stopping E2E backend container..."
-    docker compose --profile e2e down 2>/dev/null || true
+    # Stop Docker backend - only stop specific e2e containers, not all containers
+    echo "Stopping E2E backend containers..."
+    docker compose stop backend-e2e runner-mock-e2e 2>/dev/null || true
+    docker compose rm -f backend-e2e runner-mock-e2e 2>/dev/null || true
 
     if [ -n "$FRONTEND_PID" ] && kill -0 "$FRONTEND_PID" 2>/dev/null; then
-        echo "Stopping frontend (PID: $FRONTEND_PID)"
+        echo "Stopping frontend (PID: $FRONTEND_PID) and child processes..."
+        # Kill the entire process group
+        pkill -P "$FRONTEND_PID" 2>/dev/null || true
         kill "$FRONTEND_PID" 2>/dev/null || true
         wait "$FRONTEND_PID" 2>/dev/null || true
     fi

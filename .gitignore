@@ -45,3 +45,11 @@ backend/git_repos/
 
 # Logs
 *.log
+
+# Test results
+frontend/playwright-report/
+frontend/test-results/
+.pytest_cache/
+htmlcov/
+coverage.xml
+.coverage

@@ -5,6 +5,7 @@ This module provides a clean interface for git operations used by runners.
 All functions are designed to be testable and raise specific exceptions on failure.
 """
 
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,25 @@ class GitError(Exception):
 class GitAuthError(GitError):
     """Raised when git authentication fails."""
     pass
+
+
+def _run_git(args: list[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a git command and return the result."""
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+        return result
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.lower() if e.stderr else ""
+        # Check for authentication errors
+        if any(keyword in stderr for keyword in ["authentication", "denied", "unauthorized", "401", "403", "invalid credentials"]):
+            raise GitAuthError(f"Git authentication failed: {e.stderr}") from e
+        raise GitError(f"Git command failed: {e.stderr}") from e
 
 
 def clone(url: str, path: Path, branch: Optional[str] = None) -> None:
@@ -32,7 +52,18 @@ def clone(url: str, path: Path, branch: Optional[str] = None) -> None:
         GitError: If the clone operation fails
         GitAuthError: If authentication is required but fails
     """
-    raise NotImplementedError("TODO: Implement clone()")
+    args = ["clone", url, str(path)]
+    if branch:
+        args.extend(["--branch", branch])
+
+    try:
+        _run_git(args)
+    except GitError as e:
+        # Re-check stderr for more specific error types
+        error_msg = str(e).lower()
+        if "could not read from remote" in error_msg or "authentication" in error_msg:
+            raise GitAuthError(f"Clone failed - authentication required: {e}") from e
+        raise GitError(f"Clone failed: {e}") from e
 
 
 def checkout(path: Path, branch: str) -> None:
@@ -46,7 +77,12 @@ def checkout(path: Path, branch: str) -> None:
     Raises:
         GitError: If the checkout fails (e.g., branch doesn't exist)
     """
-    raise NotImplementedError("TODO: Implement checkout()")
+    try:
+        _run_git(["checkout", branch], cwd=path)
+    except GitError as e:
+        if "did not match" in str(e).lower() or "pathspec" in str(e).lower():
+            raise GitError(f"Branch '{branch}' does not exist") from e
+        raise
 
 
 def get_current_branch(path: Path) -> str:
@@ -59,7 +95,8 @@ def get_current_branch(path: Path) -> str:
     Returns:
         The current branch name as a string
     """
-    raise NotImplementedError("TODO: Implement get_current_branch()")
+    result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=path)
+    return result.stdout.strip()
 
 
 def get_sha(path: Path) -> str:
@@ -72,7 +109,8 @@ def get_sha(path: Path) -> str:
     Returns:
         40-character hex SHA of HEAD commit
     """
-    raise NotImplementedError("TODO: Implement get_sha()")
+    result = _run_git(["rev-parse", "HEAD"], cwd=path)
+    return result.stdout.strip()
 
 
 def push(path: Path, branch: str, set_upstream: bool = False, force: bool = False) -> None:
@@ -88,7 +126,15 @@ def push(path: Path, branch: str, set_upstream: bool = False, force: bool = Fals
     Raises:
         GitError: If the push is rejected or fails
     """
-    raise NotImplementedError("TODO: Implement push()")
+    args = ["push"]
+    if set_upstream:
+        args.extend(["-u", "origin", branch])
+    else:
+        args.extend(["origin", branch])
+    if force:
+        args.append("--force")
+
+    _run_git(args, cwd=path)
 
 
 def configure_git(email: str, name: str) -> None:
@@ -99,7 +145,8 @@ def configure_git(email: str, name: str) -> None:
         email: User email for commits
         name: User name for commits
     """
-    raise NotImplementedError("TODO: Implement configure_git()")
+    _run_git(["config", "--global", "user.email", email])
+    _run_git(["config", "--global", "user.name", name])
 
 
 def branch_exists(path: Path, branch: str, remote: bool = False) -> bool:
@@ -114,4 +161,11 @@ def branch_exists(path: Path, branch: str, remote: bool = False) -> bool:
     Returns:
         True if the branch exists, False otherwise
     """
-    raise NotImplementedError("TODO: Implement branch_exists()")
+    if remote:
+        # Check remote branches
+        result = _run_git(["ls-remote", "--heads", "origin", branch], cwd=path, check=False)
+        return bool(result.stdout.strip())
+    else:
+        # Check local branches
+        result = _run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=path, check=False)
+        return result.returncode == 0

@@ -433,3 +433,85 @@ export interface PlaygroundLogEvent {
   data: string;
   timestamp: string;
 }
+
+// =============================================================================
+// Graph-Based Pipeline Types (Graph Creep)
+// =============================================================================
+
+export type EdgeCondition = 'success' | 'failure' | 'always';
+
+export interface PipelineNodePosition {
+  x: number;
+  y: number;
+}
+
+export interface PipelineEdge {
+  id: string;
+  from_step: string;
+  to_step: string;
+  condition: EdgeCondition;
+}
+
+export interface PipelineStepV2 {
+  id: string;
+  name: string;
+  type: StepType;
+  config: StepConfig & {
+    runner_type?: RunnerType;
+    title?: string;
+    description?: string;
+    agent_file_ids?: string[];
+    prompt_template?: string;
+    agent?: string;
+  };
+  position?: PipelineNodePosition;
+  timeout: number;
+  continue_in_context?: boolean;
+}
+
+export interface PipelineGraphModel {
+  steps: Record<string, PipelineStepV2>;
+  edges: PipelineEdge[];
+  entry_points: string[];  // Derived from edges connected to Start node
+  start_position?: { x: number; y: number };  // Position of the Start node
+  version: number;
+}
+
+// Extended Pipeline interface for graph support
+export interface PipelineV2 extends Pipeline {
+  steps_graph?: PipelineGraphModel | null;
+}
+
+export interface PipelineCreateV2 extends PipelineCreate {
+  steps_graph?: PipelineGraphModel;
+}
+
+export interface PipelineUpdateV2 extends PipelineUpdate {
+  steps_graph?: PipelineGraphModel;
+}
+
+// Extended StepRun for graph pipelines
+export interface StepRunV2 extends StepRun {
+  step_id?: string | null;  // Graph step ID
+}
+
+// Extended PipelineRun for parallel execution tracking
+export interface PipelineRunV2 extends PipelineRun {
+  active_step_ids?: string[];
+  completed_step_ids?: string[];
+  step_runs: StepRunV2[];
+}
+
+// Svelte Flow node data types
+export interface PipelineNodeData {
+  step: PipelineStepV2;
+  status?: RunStatus;
+  isEntryPoint: boolean;
+  onEdit?: (stepId: string) => void;
+  onDelete?: (stepId: string) => void;
+}
+
+export interface PipelineEdgeData {
+  condition: EdgeCondition;
+  isActive?: boolean;
+}

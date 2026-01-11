@@ -149,15 +149,17 @@ async def create_pipeline(repo_id: str, pipeline: PipelineCreate, db: AsyncSessi
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Repo not found")
 
-    # Serialize steps and triggers to JSON
+    # Serialize steps, steps_graph, and triggers to JSON
     steps_json = serialize_steps(pipeline.steps)
     triggers_json = serialize_triggers(pipeline.triggers)
+    steps_graph_json = pipeline.steps_graph.model_dump_json() if pipeline.steps_graph else None
 
     db_pipeline = Pipeline(
         repo_id=repo_id,
         name=pipeline.name,
         description=pipeline.description,
         steps=steps_json,
+        steps_graph=steps_graph_json,
         triggers=triggers_json,
         is_template=pipeline.is_template,
     )
@@ -367,6 +369,18 @@ async def cancel_pipeline_run(run_id: str, db: AsyncSession = Depends(get_db)):
     run = result.scalar_one()
 
     return run
+
+
+@router.get("/api/step-runs/{step_run_id}", response_model=StepRunRead)
+async def get_step_run(step_run_id: str, db: AsyncSession = Depends(get_db)):
+    """Get a specific step run by ID."""
+    result = await db.execute(
+        select(StepRun).where(StepRun.id == step_run_id)
+    )
+    step_run = result.scalar_one_or_none()
+    if not step_run:
+        raise HTTPException(status_code=404, detail="Step run not found")
+    return step_run
 
 
 @router.get("/api/pipeline-runs/{run_id}/steps/{step_index}/logs")

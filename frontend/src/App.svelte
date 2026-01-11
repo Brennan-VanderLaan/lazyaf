@@ -6,6 +6,7 @@
   import AgentPanel from './lib/components/AgentPanel.svelte';
   import BoardPage from './lib/pages/BoardPage.svelte';
   import PipelinesPage from './lib/pages/PipelinesPage.svelte';
+  import PipelineEditorPage from './lib/pages/PipelineEditorPage.svelte';
   import PlaygroundPage from './lib/pages/PlaygroundPage.svelte';
   import { websocketStore } from './lib/stores/websocket';
   import { hasRunningJobs } from './lib/stores/jobs';
@@ -15,6 +16,7 @@
   const routes = {
     '/': BoardPage,
     '/pipelines': PipelinesPage,
+    '/pipelines/:id/edit': PipelineEditorPage,
     '/playground': PlaygroundPage,
   };
 

@@ -254,8 +254,20 @@ async def run_pipeline(
             detail="Repo must be ingested before running pipelines"
         )
 
-    # Parse steps to get count
-    steps = parse_steps(pipeline.steps)
+    # Parse steps from either steps_graph (new) or steps (legacy)
+    steps = []
+    if pipeline.steps_graph:
+        try:
+            graph = json.loads(pipeline.steps_graph)
+            steps = list(graph.get("steps", {}).values())
+            entry_points = graph.get("entry_points", [])
+            if not entry_points:
+                raise HTTPException(status_code=400, detail="Pipeline must have at least one entry point")
+        except (json.JSONDecodeError, TypeError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid steps_graph: {e}")
+    else:
+        steps = parse_steps(pipeline.steps)
+
     if not steps:
         raise HTTPException(status_code=400, detail="Pipeline has no steps defined")
 

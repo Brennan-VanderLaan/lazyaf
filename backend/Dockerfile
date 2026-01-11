@@ -2,8 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install curl for healthcheck
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+# Build arg to include dev dependencies (for e2e testing)
+ARG INCLUDE_DEV=false
+
+# Install curl for healthcheck and git for tests
+RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm -rf /var/lib/apt/lists/*
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -11,8 +14,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # Copy project files
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies
-RUN uv sync --frozen --no-dev
+# Install dependencies (include dev deps if INCLUDE_DEV=true)
+RUN if [ "$INCLUDE_DEV" = "true" ]; then uv sync --frozen --all-extras; else uv sync --frozen --no-dev; fi
 
 # Copy application code
 COPY app ./app

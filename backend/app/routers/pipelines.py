@@ -1,7 +1,9 @@
 import json
 from typing import Optional
 
+import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -197,6 +199,9 @@ async def update_pipeline(pipeline_id: str, update: PipelineUpdate, db: AsyncSes
             value = serialize_steps(value)
         elif key == "triggers" and value is not None:
             value = serialize_triggers(value)
+        elif key == "steps_graph" and value is not None:
+            # Serialize steps_graph dict to JSON string
+            value = json.dumps(value)
         setattr(pipeline, key, value)
 
     await db.commit()
@@ -428,3 +433,90 @@ async def get_step_logs(run_id: str, step_index: int, db: AsyncSession = Depends
         "error": step_run.error,
         "status": step_run.status,
     }
+
+
+# ============================================================================
+# Pipeline Export
+# ============================================================================
+
+@router.get("/api/pipelines/{pipeline_id}/export/yaml")
+async def export_pipeline_yaml(pipeline_id: str, db: AsyncSession = Depends(get_db)):
+    """Export a pipeline to YAML format."""
+    result = await db.execute(select(Pipeline).where(Pipeline.id == pipeline_id))
+    pipeline = result.scalar_one_or_none()
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    # Build the YAML structure
+    export_data = {
+        "name": pipeline.name,
+        "description": pipeline.description,
+        "version": 2,
+    }
+
+    # Use steps_graph if available, otherwise fall back to legacy steps
+    if pipeline.steps_graph:
+        graph = json.loads(pipeline.steps_graph)
+        steps = graph.get("steps", {})
+        edges = graph.get("edges", [])
+        entry_points = graph.get("entry_points", [])
+
+        # Convert graph to YAML-friendly format
+        export_data["entry_points"] = entry_points
+        export_data["steps"] = {}
+
+        for step_id, step in steps.items():
+            step_export = {
+                "name": step.get("name", step_id),
+                "type": step.get("type", "script"),
+            }
+
+            # Add config if present
+            if step.get("config"):
+                step_export["config"] = step["config"]
+
+            # Find outgoing edges for this step
+            success_targets = []
+            failure_targets = []
+            always_targets = []
+
+            for edge in edges:
+                if edge.get("from_step") == step_id:
+                    target = edge.get("to_step")
+                    condition = edge.get("condition", "success")
+                    if condition == "success":
+                        success_targets.append(target)
+                    elif condition == "failure":
+                        failure_targets.append(target)
+                    elif condition == "always":
+                        always_targets.append(target)
+
+            if success_targets:
+                step_export["on_success"] = success_targets if len(success_targets) > 1 else success_targets[0]
+            if failure_targets:
+                step_export["on_failure"] = failure_targets if len(failure_targets) > 1 else failure_targets[0]
+            if always_targets:
+                step_export["on_always"] = always_targets if len(always_targets) > 1 else always_targets[0]
+
+            export_data["steps"][step_id] = step_export
+    else:
+        # Legacy format - convert steps array to YAML
+        steps = parse_steps(pipeline.steps)
+        export_data["steps"] = []
+        for step in steps:
+            step_export = {
+                "name": step.get("name", "Unnamed"),
+                "type": step.get("type", "script"),
+            }
+            if step.get("config"):
+                step_export["config"] = step["config"]
+            export_data["steps"].append(step_export)
+
+    # Generate YAML with nice formatting
+    yaml_content = yaml.dump(export_data, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+    return Response(
+        content=yaml_content,
+        media_type="application/x-yaml",
+        headers={"Content-Disposition": f"attachment; filename={pipeline.name.replace(' ', '_')}.yaml"}
+    )

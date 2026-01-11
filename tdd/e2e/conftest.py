@@ -47,10 +47,11 @@ sys.path.insert(0, str(tdd_path))
 # Configuration
 # -----------------------------------------------------------------------------
 
-BACKEND_HOST = "127.0.0.1"
-BACKEND_PORT = 8765  # Use non-default port for tests
-BACKEND_URL = f"http://{BACKEND_HOST}:{BACKEND_PORT}"
-FRONTEND_URL = "http://localhost:5173"  # Vite dev server
+# Allow override via environment for Docker-based testing
+BACKEND_HOST = os.environ.get("E2E_BACKEND_HOST", "127.0.0.1")
+BACKEND_PORT = int(os.environ.get("E2E_BACKEND_PORT", "8765"))
+BACKEND_URL = os.environ.get("E2E_BACKEND_URL", f"http://{BACKEND_HOST}:{BACKEND_PORT}")
+FRONTEND_URL = os.environ.get("E2E_FRONTEND_URL", "http://localhost:5173")
 
 # Timeouts
 BACKEND_STARTUP_TIMEOUT = 30  # seconds
@@ -144,10 +145,19 @@ def e2e_backend() -> Generator[str, None, None]:
 async def api_client(client) -> AsyncGenerator:
     """Async HTTP client for API calls.
 
-    For quick tests (not marked slow): uses ASGI test client from root conftest.
-    The 'client' fixture is defined in tdd/conftest.py.
+    When E2E_BACKEND_URL is set (Docker mode): uses real HTTP client to connect
+    to the running backend server, sharing the job queue with mock runners.
+
+    Otherwise (quick tests): uses ASGI test client from root conftest for speed.
     """
-    yield client
+    # Check if we're running in Docker mode (real backend server)
+    if os.environ.get("E2E_BACKEND_URL"):
+        # Use real HTTP client to connect to the running backend
+        async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=30.0) as real_client:
+            yield real_client
+    else:
+        # Use ASGI test client for quick in-process tests
+        yield client
 
 
 # -----------------------------------------------------------------------------
@@ -236,10 +246,10 @@ async def websocket_client(e2e_backend: str) -> AsyncGenerator[WebSocketTestClie
 # -----------------------------------------------------------------------------
 
 @pytest_asyncio.fixture
-async def test_repo(client, clean_git_repos) -> dict:
+async def test_repo(api_client, clean_git_repos) -> dict:
     """Create and ingest a minimal test repository.
 
-    Uses fixtures from root conftest.
+    Uses api_client fixture which connects to real backend in Docker mode.
     """
     import tempfile
 
@@ -272,7 +282,7 @@ async def test_repo(client, clean_git_repos) -> dict:
         )
 
         # Ingest into LazyAF
-        response = await client.post(
+        response = await api_client.post(
             "/api/repos/ingest",
             json={"path": str(repo_path), "name": "e2e-test-repo"},
         )
@@ -280,7 +290,7 @@ async def test_repo(client, clean_git_repos) -> dict:
         ingest_data = response.json()
 
         # Get full repo data
-        repo_response = await client.get(f"/api/repos/{ingest_data['id']}")
+        repo_response = await api_client.get(f"/api/repos/{ingest_data['id']}")
         assert repo_response.status_code == 200
 
         yield repo_response.json()

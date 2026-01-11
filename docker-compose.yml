@@ -59,11 +59,16 @@ services:
 
   # E2E Testing Services
   backend-e2e:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        INCLUDE_DEV: "true"
     ports:
       - "8765:8000"
     environment:
       - DATABASE_URL=sqlite+aiosqlite:////tmp/e2e_test.db
+    volumes:
+      - ./tdd:/tdd  # Mount test directory for running e2e tests
     profiles:
       - e2e
     healthcheck:

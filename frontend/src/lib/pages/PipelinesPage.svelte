@@ -1,16 +1,14 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { push } from 'svelte-spa-router';
   import { pipelinesStore, activeRunsStore, hasActiveRuns } from '../stores/pipelines';
   import { selectedRepoId, selectedRepo } from '../stores/repos';
   import type { Pipeline, PipelineRun, RunStatus, RepoPipeline } from '../api/types';
   import { lazyafFiles } from '../api/client';
-  import PipelineEditor from '../components/PipelineEditor.svelte';
   import PipelineRunViewer from '../components/PipelineRunViewer.svelte';
 
   type TabType = 'pipelines' | 'runs';
   let activeTab: TabType = 'pipelines';
-  let showEditor = false;
-  let editingPipeline: Pipeline | null = null;
   let viewingRun: PipelineRun | null = null;
   let repoPipelines: RepoPipeline[] = [];
   let repoPipelinesLoading = false;
@@ -74,13 +72,13 @@
   });
 
   function handleCreate() {
-    editingPipeline = null;
-    showEditor = true;
+    // Navigate to graph editor for new pipeline
+    push(`/pipelines/new/edit?repo_id=${$selectedRepoId}`);
   }
 
   function handleEdit(pipeline: Pipeline) {
-    editingPipeline = pipeline;
-    showEditor = true;
+    // Navigate to graph editor for existing pipeline
+    push(`/pipelines/${pipeline.id}/edit`);
   }
 
   async function handleRun(pipeline: Pipeline) {
@@ -348,17 +346,6 @@
     </div>
   {/if}
 </div>
-
-{#if showEditor}
-  <PipelineEditor
-    repoId={$selectedRepoId || ''}
-    pipeline={editingPipeline}
-    on:close={() => showEditor = false}
-    on:created={() => showEditor = false}
-    on:updated={() => showEditor = false}
-    on:deleted={() => showEditor = false}
-  />
-{/if}
 
 {#if viewingRun}
   <PipelineRunViewer

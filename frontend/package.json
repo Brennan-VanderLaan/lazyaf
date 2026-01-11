@@ -23,6 +23,7 @@
     "vite": "^7.2.4"
   },
   "dependencies": {
+    "@xyflow/svelte": "^1.0.0",
     "svelte-spa-router": "^4.0.1"
   }
 }

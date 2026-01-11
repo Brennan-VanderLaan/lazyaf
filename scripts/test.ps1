@@ -171,15 +171,18 @@ function Show-Help {
     Write-Host "  unit        - Run fast isolated unit tests"
     Write-Host "  integration - Run API and database tests"
     Write-Host "  demo        - Run workflow demonstrations"
-    Write-Host "  e2e         - Run full browser E2E tests (starts backend & frontend)"
-    Write-Host "  e2e-quick   - Run E2E API tests only (no browser, no servers needed)"
+    Write-Host "  e2e         - Run full browser E2E tests (starts Docker backend & frontend)"
+    Write-Host "  e2e-quick   - Run E2E API tests only (no browser, no Docker needed)"
     Write-Host "  coverage    - Run tests with coverage report"
-    Write-Host "  all         - Run all tests (default)"
+    Write-Host "  all         - Run all tests except slow e2e (default)"
     Write-Host ""
     Write-Host "E2E options (after 'e2e'):" -ForegroundColor Cyan
     Write-Host "  --headed    - Run with visible browser"
     Write-Host "  --debug     - Debug mode with inspector"
     Write-Host "  --ui        - Open Playwright UI"
+    Write-Host ""
+    Write-Host "Note: 'all' excludes slow e2e tests that require Docker." -ForegroundColor Yellow
+    Write-Host "      Use 'e2e' to run full browser tests with Docker containers."
 }
 
 # Register cleanup handler
@@ -257,8 +260,12 @@ try {
         "all" {
             Push-Location $BackendDir
             try {
-                Write-Host "Running all tests..." -ForegroundColor Cyan
-                uv run pytest ../tdd -v --tb=short
+                Write-Host "Running all tests (excluding slow e2e tests that need Docker)..." -ForegroundColor Cyan
+                # Run unit, integration, demos normally
+                uv run pytest ../tdd/unit ../tdd/integration ../tdd/demos -v --tb=short
+                # Run e2e tests excluding slow ones (they require Docker containers via 'test.ps1 e2e')
+                Write-Host "Running e2e quick tests..." -ForegroundColor Cyan
+                uv run pytest ../tdd/e2e -v --tb=short -m "not slow"
             }
             finally {
                 Pop-Location

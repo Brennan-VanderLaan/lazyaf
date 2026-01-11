@@ -639,7 +639,7 @@ class TestGraphPipelineUIBehaviors:
             "version": 2
         }
 
-        update_response = await api_client.put(
+        update_response = await api_client.patch(
             f"/api/pipelines/{pipeline_id}",
             json={"steps_graph": updated_graph},
         )
@@ -679,7 +679,7 @@ class TestGraphPipelineUIBehaviors:
             "version": 2
         }
 
-        update_response = await api_client.put(
+        update_response = await api_client.patch(
             f"/api/pipelines/{pipeline_id}",
             json={"steps_graph": updated_graph},
         )
@@ -719,7 +719,7 @@ class TestGraphPipelineUIBehaviors:
             "version": 2
         }
 
-        update_response = await api_client.put(
+        update_response = await api_client.patch(
             f"/api/pipelines/{pipeline_id}",
             json={"steps_graph": updated_graph},
         )
@@ -755,7 +755,7 @@ class TestGraphPipelineUIBehaviors:
             "version": 2
         }
 
-        update_response = await api_client.put(
+        update_response = await api_client.patch(
             f"/api/pipelines/{pipeline_id}",
             json={"steps_graph": updated_graph},
         )

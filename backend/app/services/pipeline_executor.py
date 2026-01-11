@@ -5,7 +5,7 @@ Orchestrates multi-step pipeline workflows by:
 1. Creating pipeline runs and step runs
 2. Enqueuing steps as jobs (via temporary cards for tracking)
 3. Handling step completion callbacks
-4. Evaluating on_success/on_failure branching logic
+4. Graph-based parallel execution with fan-out/fan-in
 5. Broadcasting status via WebSocket
 """
 
@@ -47,62 +47,39 @@ def parse_steps_graph(steps_graph_str: str | None) -> dict | None:
         return None
 
 
-def get_steps_from_graph(graph: dict) -> list[dict]:
-    """Convert graph steps dict to ordered list based on entry_points and edges."""
-    steps_dict = graph.get("steps", {})
+def parse_json_list(json_str: str | None) -> list:
+    """Parse a JSON list string, returning empty list on failure."""
+    if not json_str:
+        return []
+    try:
+        result = json.loads(json_str)
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def get_upstream_step_ids(graph: dict, step_id: str) -> list[str]:
+    """Get all step IDs that have edges pointing TO this step."""
     edges = graph.get("edges", [])
-    entry_points = graph.get("entry_points", [])
+    return [e["from_step"] for e in edges if e.get("to_step") == step_id]
 
-    # For now, convert to sequential list starting from entry_points
-    # This is a simplified approach - full parallel execution requires more work
-    visited = set()
-    ordered_steps = []
 
-    def add_step_and_successors(step_id: str, condition: str = "success"):
-        if step_id in visited or step_id not in steps_dict:
-            return
-        visited.add(step_id)
-        step = steps_dict[step_id].copy()
-        step["id"] = step_id
-        ordered_steps.append(step)
+def get_downstream_edges(graph: dict, step_id: str, condition: str) -> list[dict]:
+    """Get all edges FROM this step matching the given condition (success/failure/always)."""
+    edges = graph.get("edges", [])
+    result = []
+    for edge in edges:
+        if edge.get("from_step") == step_id:
+            edge_condition = edge.get("condition", "success")
+            # Match condition: success matches success, failure matches failure, always matches both
+            if edge_condition == condition or edge_condition == "always":
+                result.append(edge)
+    return result
 
-        # Find outgoing edges and add successors
-        for edge in edges:
-            if edge.get("from_step") == step_id:
-                # Map edge condition to on_success/on_failure
-                edge_condition = edge.get("condition", "success")
-                next_step_id = edge.get("to_step")
-                if next_step_id and next_step_id not in visited:
-                    # Store the edge info on the current step
-                    if edge_condition == "success" or edge_condition == "always":
-                        step["on_success"] = len(ordered_steps)  # Will be updated
-                    if edge_condition == "failure" or edge_condition == "always":
-                        step["on_failure"] = len(ordered_steps)  # Will be updated
-                    add_step_and_successors(next_step_id, edge_condition)
 
-    # Start from entry points
-    for entry_point in entry_points:
-        add_step_and_successors(entry_point)
-
-    # Now fix up the on_success/on_failure indices
-    step_id_to_index = {s["id"]: i for i, s in enumerate(ordered_steps)}
-    for step in ordered_steps:
-        step_id = step["id"]
-        for edge in edges:
-            if edge.get("from_step") == step_id:
-                next_step_id = edge.get("to_step")
-                if next_step_id in step_id_to_index:
-                    edge_condition = edge.get("condition", "success")
-                    next_index = step_id_to_index[next_step_id]
-                    if edge_condition == "success":
-                        step["on_success"] = next_index
-                    elif edge_condition == "failure":
-                        step["on_failure"] = next_index
-                    elif edge_condition == "always":
-                        step["on_success"] = next_index
-                        step["on_failure"] = next_index
-
-    return ordered_steps
+def count_total_steps(graph: dict) -> int:
+    """Count total steps in a graph."""
+    return len(graph.get("steps", {}))
 
 
 def pipeline_run_to_ws_dict(run: PipelineRun) -> dict:
@@ -116,6 +93,8 @@ def pipeline_run_to_ws_dict(run: PipelineRun) -> dict:
         "current_step": run.current_step,
         "steps_completed": run.steps_completed,
         "steps_total": run.steps_total,
+        "active_step_ids": parse_json_list(run.active_step_ids),
+        "completed_step_ids": parse_json_list(run.completed_step_ids),
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
         "created_at": run.created_at.isoformat() if run.created_at else None,
@@ -128,6 +107,7 @@ def step_run_to_ws_dict(step_run: StepRun) -> dict:
         "id": step_run.id,
         "pipeline_run_id": step_run.pipeline_run_id,
         "step_index": step_run.step_index,
+        "step_id": step_run.step_id,
         "step_name": step_run.step_name,
         "status": step_run.status,
         "job_id": step_run.job_id,
@@ -299,53 +279,225 @@ class PipelineExecutor:
         """
         Start a new pipeline run.
 
-        Creates PipelineRun, then starts executing the first step.
+        For graph-based pipelines (v2): Executes ALL entry points in parallel.
+        For legacy pipelines (v1): Executes steps sequentially.
 
         trigger_context can contain:
         - branch: The branch to work on
         - commit_sha: The specific commit
         - card_id: The card that triggered the pipeline (for card_complete triggers)
         """
-        # Support both steps_graph (new) and steps (legacy)
-        steps = []
         graph = parse_steps_graph(pipeline.steps_graph)
+
         if graph:
-            steps = get_steps_from_graph(graph)
-            logger.info(f"Using steps_graph with {len(steps)} steps")
+            # Graph-based (v2) pipeline - execute entry points in parallel
+            entry_points = graph.get("entry_points", [])
+            steps_dict = graph.get("steps", {})
+            total_steps = count_total_steps(graph)
+
+            logger.info(f"Using steps_graph with {total_steps} steps, {len(entry_points)} entry points")
+
+            # Create the pipeline run
+            pipeline_run = PipelineRun(
+                id=str(uuid4()),
+                pipeline_id=pipeline.id,
+                status=RunStatus.RUNNING.value,
+                trigger_type=trigger_type,
+                trigger_ref=trigger_ref,
+                trigger_context=json.dumps(trigger_context) if trigger_context else None,
+                current_step=0,
+                steps_completed=0,
+                steps_total=total_steps,
+                active_step_ids=json.dumps([]),
+                completed_step_ids=json.dumps([]),
+                started_at=datetime.utcnow(),
+            )
+            db.add(pipeline_run)
+            await db.commit()
+            await db.refresh(pipeline_run)
+
+            logger.info(f"Started pipeline run {pipeline_run.id[:8]} for pipeline {pipeline.name}")
+            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+
+            if not entry_points:
+                # No entry points, mark as passed
+                await self._complete_pipeline(db, pipeline_run, success=True)
+            else:
+                # Execute ALL entry points in parallel
+                for step_id in entry_points:
+                    if step_id in steps_dict:
+                        await self._execute_graph_step(
+                            db, pipeline_run, pipeline, repo, graph, step_id, params
+                        )
+                    else:
+                        logger.warning(f"Entry point {step_id} not found in steps")
+
+            return pipeline_run
         else:
+            # Legacy (v1) pipeline - execute sequentially
             steps = parse_steps(pipeline.steps)
             logger.info(f"Using legacy steps with {len(steps)} steps")
 
-        # Create the pipeline run
-        pipeline_run = PipelineRun(
+            pipeline_run = PipelineRun(
+                id=str(uuid4()),
+                pipeline_id=pipeline.id,
+                status=RunStatus.RUNNING.value,
+                trigger_type=trigger_type,
+                trigger_ref=trigger_ref,
+                trigger_context=json.dumps(trigger_context) if trigger_context else None,
+                current_step=0,
+                steps_completed=0,
+                steps_total=len(steps),
+                started_at=datetime.utcnow(),
+            )
+            db.add(pipeline_run)
+            await db.commit()
+            await db.refresh(pipeline_run)
+
+            logger.info(f"Started pipeline run {pipeline_run.id[:8]} for pipeline {pipeline.name}")
+            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+
+            if steps:
+                await self._execute_step(db, pipeline_run, repo, steps, 0, params)
+            else:
+                await self._complete_pipeline(db, pipeline_run, success=True)
+
+            return pipeline_run
+
+    async def _execute_graph_step(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        pipeline: Pipeline,
+        repo: Repo,
+        graph: dict,
+        step_id: str,
+        params: dict[str, Any] | None = None,
+        previous_runner_id: str | None = None,
+    ) -> None:
+        """
+        Execute a single step in a graph-based pipeline.
+
+        This method:
+        1. Creates a StepRun for tracking
+        2. Creates a temporary Card + Job for the runner system
+        3. Updates active_step_ids to track running steps
+        4. Enqueues the job for a runner to pick up
+        """
+        steps_dict = graph.get("steps", {})
+        step = steps_dict.get(step_id)
+        if not step:
+            logger.error(f"Step {step_id} not found in graph")
+            return
+
+        step_name = step.get("name", step_id)
+        step_type = step.get("type", "script")
+        step_config = step.get("config", {})
+
+        # Get step index for legacy compatibility (use insertion order)
+        step_ids = list(steps_dict.keys())
+        step_index = step_ids.index(step_id) if step_id in step_ids else 0
+
+        logger.info(f"Executing graph step {step_id}: {step_name} (type={step_type})")
+
+        # Add to active steps
+        active_ids = parse_json_list(pipeline_run.active_step_ids)
+        if step_id not in active_ids:
+            active_ids.append(step_id)
+            pipeline_run.active_step_ids = json.dumps(active_ids)
+
+        # Create the step run
+        step_run = StepRun(
             id=str(uuid4()),
-            pipeline_id=pipeline.id,
+            pipeline_run_id=pipeline_run.id,
+            step_index=step_index,
+            step_id=step_id,  # Graph step ID
+            step_name=step_name,
             status=RunStatus.RUNNING.value,
-            trigger_type=trigger_type,
-            trigger_ref=trigger_ref,
-            trigger_context=json.dumps(trigger_context) if trigger_context else None,
-            current_step=0,
-            steps_completed=0,
-            steps_total=len(steps),
             started_at=datetime.utcnow(),
         )
-        db.add(pipeline_run)
+        db.add(step_run)
         await db.commit()
+        await db.refresh(step_run)
         await db.refresh(pipeline_run)
 
-        logger.info(f"Started pipeline run {pipeline_run.id[:8]} for pipeline {pipeline.name}")
-
-        # Broadcast pipeline run started
+        # Broadcast updates
+        await manager.send_step_run_status(step_run_to_ws_dict(step_run))
         await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
 
-        # Execute the first step
-        if steps:
-            await self._execute_step(db, pipeline_run, repo, steps, 0, params)
-        else:
-            # No steps, mark as passed
-            await self._complete_pipeline(db, pipeline_run, success=True)
+        # Create a temporary card for the job/runner infrastructure
+        card_title = f"[Pipeline] {step_name}"
+        card_description = f"Pipeline: {pipeline.name}\nStep: {step_name}"
 
-        return pipeline_run
+        # For agent steps, use description from config
+        if step_type == "agent":
+            card_title = step_config.get("title", card_title)
+            card_description = step_config.get("description", card_description)
+
+        card = Card(
+            id=str(uuid4()),
+            repo_id=repo.id,
+            title=card_title,
+            description=card_description,
+            status="in_progress",
+            runner_type=step_config.get("runner_type", "any"),
+            step_type=step_type,
+            step_config=json.dumps(step_config) if step_config else None,
+            pipeline_run_id=pipeline_run.id,
+            pipeline_step_index=step_index,
+        )
+        db.add(card)
+
+        # Create the job
+        job_id = str(uuid4())
+        job = Job(
+            id=job_id,
+            card_id=card.id,
+            status="queued",
+            step_type=step_type,
+            step_config=json.dumps(step_config) if step_config else None,
+            step_run_id=step_run.id,
+        )
+        db.add(job)
+
+        card.job_id = job_id
+        card.branch_name = f"lazyaf/{job_id[:8]}"
+        step_run.job_id = job_id
+
+        await db.commit()
+
+        # Queue the job
+        queued_job = QueuedJob(
+            id=job_id,
+            card_id=card.id,
+            repo_id=repo.id,
+            repo_url=repo.remote_url or "",
+            base_branch=repo.default_branch,
+            card_title=card_title,
+            card_description=card_description,
+            runner_type=step_config.get("runner_type", "any"),
+            use_internal_git=True,
+            step_type=step_type,
+            step_config=step_config,
+            pipeline_run_id=pipeline_run.id,
+            step_id=step_id,
+            step_index=step_index,
+            step_name=step_name,
+            required_runner_id=previous_runner_id,
+        )
+        await job_queue.enqueue(queued_job)
+
+        logger.info(f"Enqueued job {job_id[:8]} for graph step {step_id}: {step_name}")
+
+        # Broadcast job queued
+        await manager.send_job_status({
+            "id": job_id,
+            "card_id": card.id,
+            "status": "queued",
+            "error": None,
+            "started_at": None,
+            "completed_at": None,
+        })
 
     async def _execute_step(
         self,
@@ -524,7 +676,15 @@ class PipelineExecutor:
         Handle step completion.
 
         Called from job_callback when a job with step_run_id completes.
-        Evaluates on_success/on_failure and proceeds accordingly.
+
+        For graph-based pipelines:
+        - Updates completed_step_ids and active_step_ids
+        - Finds all downstream edges based on success/failure
+        - Triggers ready downstream steps (fan-out)
+        - Handles fan-in by checking all upstream dependencies
+
+        For legacy pipelines:
+        - Uses sequential step execution with on_success/on_failure
 
         Args:
             runner_id: The runner that executed this step (for continuation affinity)
@@ -593,23 +753,160 @@ class PipelineExecutor:
 
         logger.info(f"Step {step_run.step_index} ({step_run.step_name}) completed: {'success' if step_success else 'failed'}")
 
-        # Get step definition to determine next action
-        # Support both steps_graph (new) and steps (legacy)
+        # Check if this is a graph-based pipeline
         graph = parse_steps_graph(pipeline.steps_graph)
-        if graph:
-            steps = get_steps_from_graph(graph)
+
+        if graph and step_run.step_id:
+            # Graph-based execution with parallel support
+            await self._handle_graph_step_complete(
+                db, pipeline_run, pipeline, repo, graph, step_run.step_id, step_success, runner_id
+            )
         else:
+            # Legacy sequential execution
             steps = parse_steps(pipeline.steps)
+            if step_run.step_index >= len(steps):
+                logger.error(f"Step index {step_run.step_index} out of range")
+                return
 
-        if step_run.step_index >= len(steps):
-            logger.error(f"Step index {step_run.step_index} out of range")
-            return
+            step = steps[step_run.step_index]
+            action = step.get("on_success" if step_success else "on_failure", "stop" if not step_success else "next")
+            await self._handle_action(db, pipeline_run, repo, steps, step_run.step_index, action, step_success, runner_id=runner_id)
 
-        step = steps[step_run.step_index]
-        action = step.get("on_success" if step_success else "on_failure", "stop" if not step_success else "next")
+    async def _handle_graph_step_complete(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        pipeline: Pipeline,
+        repo: Repo,
+        graph: dict,
+        completed_step_id: str,
+        step_success: bool,
+        runner_id: str | None = None,
+    ) -> None:
+        """
+        Handle completion of a graph step with parallel execution support.
 
-        # Handle the action, passing runner_id for continuation affinity
-        await self._handle_action(db, pipeline_run, repo, steps, step_run.step_index, action, step_success, runner_id=runner_id)
+        This method:
+        1. Updates completed_step_ids and active_step_ids
+        2. Finds downstream edges based on success/failure condition
+        3. For each downstream step, checks if all upstream dependencies are satisfied (fan-in)
+        4. Executes ready downstream steps (fan-out)
+        5. Completes pipeline when all steps are done
+        """
+        steps_dict = graph.get("steps", {})
+
+        # Update tracking sets
+        completed_ids = set(parse_json_list(pipeline_run.completed_step_ids))
+        active_ids = set(parse_json_list(pipeline_run.active_step_ids))
+
+        # Mark this step as completed
+        completed_ids.add(completed_step_id)
+        active_ids.discard(completed_step_id)
+
+        pipeline_run.completed_step_ids = json.dumps(list(completed_ids))
+        pipeline_run.active_step_ids = json.dumps(list(active_ids))
+        await db.commit()
+        await db.refresh(pipeline_run)
+
+        logger.info(f"Graph step {completed_step_id} completed. Active: {list(active_ids)}, Completed: {list(completed_ids)}")
+
+        # Find downstream edges based on the step result
+        condition = "success" if step_success else "failure"
+        downstream_edges = get_downstream_edges(graph, completed_step_id, condition)
+
+        logger.info(f"Found {len(downstream_edges)} downstream edges for condition '{condition}'")
+
+        # Track which steps are ready to execute
+        steps_to_execute = []
+
+        for edge in downstream_edges:
+            next_step_id = edge.get("to_step")
+            if not next_step_id or next_step_id not in steps_dict:
+                continue
+
+            # Skip if already completed or currently active
+            if next_step_id in completed_ids or next_step_id in active_ids:
+                logger.info(f"Skipping {next_step_id} - already completed or active")
+                continue
+
+            # Fan-in check: are ALL upstream dependencies satisfied?
+            upstream_ids = get_upstream_step_ids(graph, next_step_id)
+
+            if self._all_upstream_satisfied(graph, next_step_id, completed_ids):
+                steps_to_execute.append(next_step_id)
+                logger.info(f"Step {next_step_id} is ready (all {len(upstream_ids)} upstream deps satisfied)")
+            else:
+                logger.info(f"Step {next_step_id} waiting for more upstream deps. Has: {upstream_ids}, Completed: {completed_ids}")
+
+        # Execute ready downstream steps (fan-out)
+        for step_id in steps_to_execute:
+            await self._execute_graph_step(
+                db, pipeline_run, pipeline, repo, graph, step_id, None, runner_id
+            )
+
+        # Refresh to get latest state after executing new steps
+        await db.refresh(pipeline_run)
+
+        # Check if pipeline is complete
+        # Complete when: no active steps AND (all steps completed OR we failed with no more to run)
+        active_ids = set(parse_json_list(pipeline_run.active_step_ids))
+        completed_ids = set(parse_json_list(pipeline_run.completed_step_ids))
+        total_steps = count_total_steps(graph)
+
+        if not active_ids:
+            # No steps running - check if we're done
+            if len(completed_ids) >= total_steps:
+                # All steps completed
+                all_passed = await self._check_all_steps_passed(db, pipeline_run)
+                await self._complete_pipeline(db, pipeline_run, success=all_passed)
+            elif not steps_to_execute:
+                # No more steps can run (failed branch or dead end)
+                # Pipeline is complete, but may have failed
+                all_passed = await self._check_all_steps_passed(db, pipeline_run)
+                await self._complete_pipeline(db, pipeline_run, success=all_passed)
+
+    def _all_upstream_satisfied(
+        self,
+        graph: dict,
+        step_id: str,
+        completed_ids: set[str],
+    ) -> bool:
+        """
+        Check if all upstream dependencies for a step are satisfied.
+
+        A step can execute when ALL its incoming edges come from completed steps
+        AND the edge conditions match (success edge requires success, etc).
+        """
+        edges = graph.get("edges", [])
+
+        # Find all edges pointing to this step
+        incoming_edges = [e for e in edges if e.get("to_step") == step_id]
+
+        if not incoming_edges:
+            # Entry point or no dependencies - can execute
+            return True
+
+        # Check if at least one edge's source is completed (OR semantic for multiple paths)
+        # For fan-in, we need ALL sources to be completed
+        for edge in incoming_edges:
+            from_step = edge.get("from_step")
+            if from_step not in completed_ids:
+                return False
+
+        return True
+
+    async def _check_all_steps_passed(self, db: AsyncSession, pipeline_run: PipelineRun) -> bool:
+        """Check if all completed step runs passed."""
+        result = await db.execute(
+            select(StepRun).where(StepRun.pipeline_run_id == pipeline_run.id)
+        )
+        step_runs = result.scalars().all()
+
+        for sr in step_runs:
+            if sr.status == RunStatus.FAILED.value:
+                return False
+
+        return True
 
     async def _handle_action(
         self,

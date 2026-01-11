@@ -1,13 +1,13 @@
 # LazyAF Test Runner Script (PowerShell)
-# Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|e2e-quick|all|coverage]
+# Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|e2e-quick|graph|all|coverage]
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("unit", "integration", "demo", "e2e", "e2e-quick", "all", "coverage", "help")]
+    [ValidateSet("unit", "integration", "demo", "e2e", "e2e-quick", "graph", "all", "coverage", "help")]
     [string]$TestType = "all",
 
     [Parameter(ValueFromRemainingArguments=$true)]
-    [string[]]$PlaywrightArgs
+    [string[]]$ExtraArgs
 )
 
 $ErrorActionPreference = "Stop"
@@ -166,13 +166,14 @@ function Run-E2ETests {
 }
 
 function Show-Help {
-    Write-Host "Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|e2e-quick|all|coverage]" -ForegroundColor Cyan
+    Write-Host "Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|e2e-quick|graph|all|coverage]" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  unit        - Run fast isolated unit tests"
     Write-Host "  integration - Run API and database tests"
     Write-Host "  demo        - Run workflow demonstrations"
     Write-Host "  e2e         - Run full browser E2E tests (starts Docker backend & frontend)"
     Write-Host "  e2e-quick   - Run E2E API tests only (no browser, no Docker needed)"
+    Write-Host "  graph       - Run graph pipeline E2E tests (starts Docker backend)"
     Write-Host "  coverage    - Run tests with coverage report"
     Write-Host "  all         - Run all tests except slow e2e (default)"
     Write-Host ""
@@ -180,6 +181,10 @@ function Show-Help {
     Write-Host "  --headed    - Run with visible browser"
     Write-Host "  --debug     - Debug mode with inspector"
     Write-Host "  --ui        - Open Playwright UI"
+    Write-Host ""
+    Write-Host "Graph options (after 'graph'):" -ForegroundColor Cyan
+    Write-Host "  -k 'pattern'  - Run tests matching pattern"
+    Write-Host "  --tb=long     - Show full tracebacks"
     Write-Host ""
     Write-Host "Note: 'all' excludes slow e2e tests that require Docker." -ForegroundColor Yellow
     Write-Host "      Use 'e2e' to run full browser tests with Docker containers."
@@ -221,12 +226,19 @@ try {
             }
         }
         "e2e" {
-            Write-Host "Running E2E tests (full browser tests)..." -ForegroundColor Cyan
+            Write-Host "Running E2E tests (full browser + API tests)..." -ForegroundColor Cyan
 
             try {
                 Start-E2EBackend
                 Start-E2EFrontend
-                Run-E2ETests -Args $PlaywrightArgs
+
+                # Run Playwright browser tests
+                Write-Host "Running Playwright browser tests..." -ForegroundColor Yellow
+                Run-E2ETests -Args $ExtraArgs
+
+                # Run Python API e2e tests against the running backend
+                Write-Host "Running Python API e2e tests..." -ForegroundColor Yellow
+                & cmd.exe /c "docker exec -w /app -e PYTHONPATH=/app -e E2E_BACKEND_URL=http://localhost:8000 lazyaf-backend-e2e-1 uv run pytest /tdd/e2e -v --tb=short"
             }
             finally {
                 Cleanup
@@ -240,6 +252,26 @@ try {
             }
             finally {
                 Pop-Location
+            }
+        }
+        "graph" {
+            Write-Host "Running graph pipeline E2E tests (with Docker)..." -ForegroundColor Cyan
+
+            try {
+                Start-E2EBackend
+
+                # Run Python graph pipeline e2e tests against the running backend
+                Write-Host "Running graph pipeline tests..." -ForegroundColor Yellow
+                $argsString = ($ExtraArgs -join " ")
+                # E2E_BACKEND_URL points to localhost:8000 inside the container
+                if ($argsString) {
+                    & cmd.exe /c "docker exec -w /app -e PYTHONPATH=/app -e E2E_BACKEND_URL=http://localhost:8000 lazyaf-backend-e2e-1 uv run pytest /tdd/e2e/test_graph_pipeline.py -v --tb=short $argsString"
+                } else {
+                    & cmd.exe /c "docker exec -w /app -e PYTHONPATH=/app -e E2E_BACKEND_URL=http://localhost:8000 lazyaf-backend-e2e-1 uv run pytest /tdd/e2e/test_graph_pipeline.py -v --tb=short"
+                }
+            }
+            finally {
+                Cleanup
             }
         }
         "coverage" {

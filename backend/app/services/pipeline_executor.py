@@ -37,6 +37,74 @@ def parse_steps(steps_str: str | None) -> list[dict]:
         return []
 
 
+def parse_steps_graph(steps_graph_str: str | None) -> dict | None:
+    """Parse steps_graph from JSON string to dict."""
+    if not steps_graph_str:
+        return None
+    try:
+        return json.loads(steps_graph_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def get_steps_from_graph(graph: dict) -> list[dict]:
+    """Convert graph steps dict to ordered list based on entry_points and edges."""
+    steps_dict = graph.get("steps", {})
+    edges = graph.get("edges", [])
+    entry_points = graph.get("entry_points", [])
+
+    # For now, convert to sequential list starting from entry_points
+    # This is a simplified approach - full parallel execution requires more work
+    visited = set()
+    ordered_steps = []
+
+    def add_step_and_successors(step_id: str, condition: str = "success"):
+        if step_id in visited or step_id not in steps_dict:
+            return
+        visited.add(step_id)
+        step = steps_dict[step_id].copy()
+        step["id"] = step_id
+        ordered_steps.append(step)
+
+        # Find outgoing edges and add successors
+        for edge in edges:
+            if edge.get("from_step") == step_id:
+                # Map edge condition to on_success/on_failure
+                edge_condition = edge.get("condition", "success")
+                next_step_id = edge.get("to_step")
+                if next_step_id and next_step_id not in visited:
+                    # Store the edge info on the current step
+                    if edge_condition == "success" or edge_condition == "always":
+                        step["on_success"] = len(ordered_steps)  # Will be updated
+                    if edge_condition == "failure" or edge_condition == "always":
+                        step["on_failure"] = len(ordered_steps)  # Will be updated
+                    add_step_and_successors(next_step_id, edge_condition)
+
+    # Start from entry points
+    for entry_point in entry_points:
+        add_step_and_successors(entry_point)
+
+    # Now fix up the on_success/on_failure indices
+    step_id_to_index = {s["id"]: i for i, s in enumerate(ordered_steps)}
+    for step in ordered_steps:
+        step_id = step["id"]
+        for edge in edges:
+            if edge.get("from_step") == step_id:
+                next_step_id = edge.get("to_step")
+                if next_step_id in step_id_to_index:
+                    edge_condition = edge.get("condition", "success")
+                    next_index = step_id_to_index[next_step_id]
+                    if edge_condition == "success":
+                        step["on_success"] = next_index
+                    elif edge_condition == "failure":
+                        step["on_failure"] = next_index
+                    elif edge_condition == "always":
+                        step["on_success"] = next_index
+                        step["on_failure"] = next_index
+
+    return ordered_steps
+
+
 def pipeline_run_to_ws_dict(run: PipelineRun) -> dict:
     """Convert a PipelineRun model to a dict for websocket broadcast."""
     return {
@@ -238,7 +306,15 @@ class PipelineExecutor:
         - commit_sha: The specific commit
         - card_id: The card that triggered the pipeline (for card_complete triggers)
         """
-        steps = parse_steps(pipeline.steps)
+        # Support both steps_graph (new) and steps (legacy)
+        steps = []
+        graph = parse_steps_graph(pipeline.steps_graph)
+        if graph:
+            steps = get_steps_from_graph(graph)
+            logger.info(f"Using steps_graph with {len(steps)} steps")
+        else:
+            steps = parse_steps(pipeline.steps)
+            logger.info(f"Using legacy steps with {len(steps)} steps")
 
         # Create the pipeline run
         pipeline_run = PipelineRun(
@@ -518,7 +594,13 @@ class PipelineExecutor:
         logger.info(f"Step {step_run.step_index} ({step_run.step_name}) completed: {'success' if step_success else 'failed'}")
 
         # Get step definition to determine next action
-        steps = parse_steps(pipeline.steps)
+        # Support both steps_graph (new) and steps (legacy)
+        graph = parse_steps_graph(pipeline.steps_graph)
+        if graph:
+            steps = get_steps_from_graph(graph)
+        else:
+            steps = parse_steps(pipeline.steps)
+
         if step_run.step_index >= len(steps):
             logger.error(f"Step index {step_run.step_index} out of range")
             return

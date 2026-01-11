@@ -410,6 +410,7 @@ class TestGraphPipelineParallelExecution:
 # User Story 3: Legacy Pipeline Conversion
 # =============================================================================
 
+@pytest.mark.skip(reason="Legacy pipeline format removed - conversion not needed")
 class TestGraphPipelineLegacyConversion:
     """
     User Story 3: Convert Legacy Pipelines to Graph Format

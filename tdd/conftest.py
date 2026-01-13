@@ -16,9 +16,13 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-# Add backend to path for imports
+# Add backend to path for imports - handle both local and Docker environments
 backend_path = Path(__file__).parent.parent / "backend"
-sys.path.insert(0, str(backend_path))
+if not backend_path.exists():
+    # Running inside Docker container where backend is at /app
+    backend_path = Path("/app")
+if backend_path.exists():
+    sys.path.insert(0, str(backend_path))
 
 from app.database import Base, get_db
 from app.main import app
@@ -192,8 +196,10 @@ def cleanup_git_repos_after_session():
 
     yield
 
-    # Clean up after all tests
+    # Clean up after all tests - handle both local and Docker environments
     git_repos_dir = Path(__file__).parent.parent / "backend" / "git_repos"
+    if not git_repos_dir.parent.exists():
+        git_repos_dir = Path("/app") / "git_repos"
     if git_repos_dir.exists():
         shutil.rmtree(git_repos_dir)
 

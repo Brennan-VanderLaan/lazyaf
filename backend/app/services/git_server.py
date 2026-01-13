@@ -1307,13 +1307,13 @@ class GitRepoManager:
 
         repo = self.get_repo(repo_id)
         if not repo:
-            return {"error": "Repo not found", "files": []}
+            return {"error": "Repo not found", "files": [], "diff": ""}
 
         base_sha = self.get_branch_commit(repo_id, base_branch)
         head_sha = self.get_branch_commit(repo_id, head_branch)
 
         if not base_sha or not head_sha:
-            return {"error": "Branch not found", "files": []}
+            return {"error": "Branch not found", "files": [], "diff": ""}
 
         try:
             # Find merge base to show only changes unique to head_branch
@@ -1411,6 +1411,9 @@ class GitRepoManager:
             except Exception as e:
                 print(f"[git_server] Error counting commits: {e}")
 
+            # Combine all file diffs into a single diff string for convenience
+            combined_diff = "\n".join(f["diff"] for f in files if f["diff"])
+
             return {
                 "base_branch": base_branch,
                 "head_branch": head_branch,
@@ -1420,6 +1423,7 @@ class GitRepoManager:
                 "diff_base_sha": diff_base_sha,    # What we're actually diffing from
                 "commit_count": commit_count,
                 "files": files,
+                "diff": combined_diff,  # Combined diff for convenience
                 "total_additions": sum(f["additions"] for f in files),
                 "total_deletions": sum(f["deletions"] for f in files),
             }
@@ -1428,7 +1432,7 @@ class GitRepoManager:
             print(f"[git_server] Error getting diff: {e}")
             import traceback
             traceback.print_exc()
-            return {"error": str(e), "files": []}
+            return {"error": str(e), "files": [], "diff": ""}
 
     def get_file_content(self, repo_id: str, branch: str, path: str) -> bytes | None:
         """

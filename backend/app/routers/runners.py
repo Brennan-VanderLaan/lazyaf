@@ -121,6 +121,13 @@ async def pool_status():
     )
 
 
+@router.post("/clear-queue")
+async def clear_job_queue():
+    """Clear all pending jobs from the queue. Used for testing cleanup."""
+    count = await job_queue.clear()
+    return {"status": "ok", "cleared": count}
+
+
 @router.post("/register", response_model=RegisterResponse)
 async def register_runner(request: RegisterRequest):
     """Register a runner with the pool. If runner_id is provided and exists, reactivates it."""

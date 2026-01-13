@@ -1,9 +1,9 @@
 # LazyAF Test Runner Script (PowerShell)
-# Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|e2e-quick|graph|all|coverage]
+# Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|all|coverage]
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("unit", "integration", "demo", "e2e", "e2e-quick", "graph", "all", "coverage", "help")]
+    [ValidateSet("unit", "integration", "demo", "e2e", "graph", "all", "coverage", "help")]
     [string]$TestType = "all",
 
     [Parameter(ValueFromRemainingArguments=$true)]
@@ -166,16 +166,15 @@ function Run-E2ETests {
 }
 
 function Show-Help {
-    Write-Host "Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|e2e-quick|graph|all|coverage]" -ForegroundColor Cyan
+    Write-Host "Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|all|coverage]" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  unit        - Run fast isolated unit tests"
     Write-Host "  integration - Run API and database tests"
     Write-Host "  demo        - Run workflow demonstrations"
-    Write-Host "  e2e         - Run full browser E2E tests (starts Docker backend & frontend)"
-    Write-Host "  e2e-quick   - Run E2E API tests only (no browser, no Docker needed)"
-    Write-Host "  graph       - Run graph pipeline E2E tests (starts Docker backend)"
+    Write-Host "  e2e         - Run full E2E tests (starts Docker backend + frontend)"
+    Write-Host "  graph       - Run graph pipeline E2E tests (starts Docker backend only)"
     Write-Host "  coverage    - Run tests with coverage report"
-    Write-Host "  all         - Run all tests except slow e2e (default)"
+    Write-Host "  all         - Run unit, integration, and demo tests (default, no Docker)"
     Write-Host ""
     Write-Host "E2E options (after 'e2e'):" -ForegroundColor Cyan
     Write-Host "  --headed    - Run with visible browser"
@@ -186,8 +185,8 @@ function Show-Help {
     Write-Host "  -k 'pattern'  - Run tests matching pattern"
     Write-Host "  --tb=long     - Show full tracebacks"
     Write-Host ""
-    Write-Host "Note: 'all' excludes slow e2e tests that require Docker." -ForegroundColor Yellow
-    Write-Host "      Use 'e2e' to run full browser tests with Docker containers."
+    Write-Host "Note: 'all' runs fast tests only (no Docker required)." -ForegroundColor Yellow
+    Write-Host "      Use 'e2e' or 'graph' for full E2E tests with Docker."
 }
 
 # Register cleanup handler
@@ -244,16 +243,6 @@ try {
                 Cleanup
             }
         }
-        "e2e-quick" {
-            Push-Location $BackendDir
-            try {
-                Write-Host "Running E2E tests (API tests only, no browser)..." -ForegroundColor Cyan
-                uv run pytest ../tdd/e2e -v --tb=short -m "not slow"
-            }
-            finally {
-                Pop-Location
-            }
-        }
         "graph" {
             Write-Host "Running graph pipeline E2E tests (with Docker)..." -ForegroundColor Cyan
 
@@ -292,12 +281,9 @@ try {
         "all" {
             Push-Location $BackendDir
             try {
-                Write-Host "Running all tests (excluding slow e2e tests that need Docker)..." -ForegroundColor Cyan
-                # Run unit, integration, demos normally
+                Write-Host "Running all tests (unit, integration, demos)..." -ForegroundColor Cyan
+                Write-Host "Note: E2E tests excluded - run 'test.ps1 e2e' or 'test.ps1 graph' for full E2E testing" -ForegroundColor Yellow
                 uv run pytest ../tdd/unit ../tdd/integration ../tdd/demos -v --tb=short
-                # Run e2e tests excluding slow ones (they require Docker containers via 'test.ps1 e2e')
-                Write-Host "Running e2e quick tests..." -ForegroundColor Cyan
-                uv run pytest ../tdd/e2e -v --tb=short -m "not slow"
             }
             finally {
                 Pop-Location

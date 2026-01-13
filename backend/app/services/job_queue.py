@@ -137,6 +137,15 @@ class JobQueue:
     def queue_size(self) -> int:
         return len(self._jobs)
 
+    async def clear(self):
+        """Clear all jobs from the queue. Used for testing cleanup."""
+        async with self._lock:
+            count = len(self._jobs)
+            self._jobs.clear()
+            self._pending.clear()
+            logger.info(f"Cleared job queue ({count} jobs removed)")
+            return count
+
 
 # Global job queue instance
 job_queue = JobQueue()

@@ -87,6 +87,8 @@ services:
         condition: service_healthy
     profiles:
       - e2e
+    deploy:
+      replicas: 2
 
 volumes:
   lazyaf-data:

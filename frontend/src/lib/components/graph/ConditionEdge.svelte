@@ -8,6 +8,7 @@
       isActive?: boolean;
       isCompleted?: boolean;
       onConditionChange?: (condition: EdgeCondition) => void;
+      onDelete?: () => void;
     };
   }
 
@@ -24,16 +25,33 @@
     markerEnd,
   }: Props = $props();
 
+  // Check if this is a self-loop (source and target very close)
+  let isSelfLoop = $derived(
+    Math.abs(sourceX - targetX) < 50 && Math.abs(sourceY - targetY) < 50
+  );
+
+  // Generate self-loop path (circular loop above the node)
+  function getSelfLoopPath(x: number, y: number): [string, number, number] {
+    const loopSize = 60;
+    const path = `M ${x} ${y - 10}
+                  C ${x - loopSize} ${y - loopSize},
+                    ${x + loopSize} ${y - loopSize},
+                    ${x} ${y - 10}`;
+    return [path, x, y - loopSize - 10]; // labelX, labelY above the loop
+  }
+
   // Get path and label position
   let [edgePath, labelX, labelY] = $derived(
-    getBezierPath({
-      sourceX,
-      sourceY,
-      sourcePosition,
-      targetX,
-      targetY,
-      targetPosition,
-    })
+    isSelfLoop
+      ? getSelfLoopPath(sourceX, sourceY)
+      : getBezierPath({
+          sourceX,
+          sourceY,
+          sourcePosition,
+          targetX,
+          targetY,
+          targetPosition,
+        })
   );
 
   // Condition colors
@@ -134,6 +152,14 @@
         >
           <span class="option-icon">-></span>
           <span class="option-label">Always</span>
+        </button>
+        <hr class="picker-divider" />
+        <button
+          class="picker-option delete"
+          onclick={() => { showConditionPicker = false; data?.onDelete?.(); }}
+        >
+          <span class="option-icon">×</span>
+          <span class="option-label">Delete Edge</span>
         </button>
       </div>
     {/if}
@@ -257,5 +283,23 @@
   .option-label {
     font-size: 12px;
     color: var(--text-color);
+  }
+
+  .picker-divider {
+    border: none;
+    border-top: 1px solid var(--border-color);
+    margin: 4px 0;
+  }
+
+  .picker-option.delete {
+    color: var(--error-color);
+  }
+
+  .picker-option.delete .option-icon {
+    color: var(--error-color);
+  }
+
+  .picker-option.delete:hover {
+    background: rgba(255, 100, 100, 0.15);
   }
 </style>

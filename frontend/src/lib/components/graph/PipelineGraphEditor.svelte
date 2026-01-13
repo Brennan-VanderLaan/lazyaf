@@ -94,6 +94,7 @@
         isActive: activeStepIds.includes(edge.from_step) || activeStepIds.includes(edge.to_step),
         isCompleted: completedStepIds.includes(edge.from_step),
         onConditionChange: (condition: EdgeCondition) => changeEdgeCondition(edge.id, condition),
+        onDelete: () => deleteEdge(edge.id),
       },
       animated: activeStepIds.includes(edge.from_step),
     }));
@@ -105,9 +106,10 @@
 
     for (const entryPoint of g.entry_points || []) {
       if (!startEdgeTargets.has(entryPoint) && g.steps[entryPoint]) {
+        const syntheticEdgeId = `__start_to_${entryPoint}`;
         // Create a synthetic edge from Start to this entry point
         missingEntryEdges.push({
-          id: `__start_to_${entryPoint}`,
+          id: syntheticEdgeId,
           source: START_NODE_ID,
           target: entryPoint,
           type: 'condition',
@@ -119,6 +121,7 @@
               // When condition changes, persist as a real edge
               addStartEdge(entryPoint, condition);
             },
+            onDelete: () => deleteEdge(syntheticEdgeId),
           },
           animated: false,
         });
@@ -410,6 +413,33 @@
     const newGraph: PipelineGraphModel = {
       ...graph,
       edges: newEdges,
+    };
+
+    graph = newGraph;
+    onGraphChange?.(newGraph);
+  }
+
+  // Delete an edge by ID
+  function deleteEdge(edgeId: string) {
+    // Handle synthetic edges (from legacy entry_points)
+    if (edgeId.startsWith('__start_to_')) {
+      const targetStep = edgeId.replace('__start_to_', '');
+      const newEntryPoints = (graph.entry_points || []).filter(ep => ep !== targetStep);
+      const newGraph: PipelineGraphModel = {
+        ...graph,
+        entry_points: newEntryPoints.length > 0 ? newEntryPoints : deriveEntryPoints(graph.edges),
+      };
+      graph = newGraph;
+      onGraphChange?.(newGraph);
+      return;
+    }
+
+    // Delete real edge
+    const newEdges = graph.edges.filter(e => e.id !== edgeId);
+    const newGraph: PipelineGraphModel = {
+      ...graph,
+      edges: newEdges,
+      entry_points: deriveEntryPoints(newEdges),
     };
 
     graph = newGraph;

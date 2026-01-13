@@ -179,6 +179,7 @@ class TestGraphPipelineCreate:
 # User Story 2: Execute Pipeline with Parallel Branches
 # =============================================================================
 
+@pytest.mark.slow  # Requires Docker backend with mock runner
 class TestGraphPipelineParallelExecution:
     """
     User Story 2: Execute Pipeline with Parallel Branches
@@ -380,7 +381,7 @@ class TestGraphPipelineParallelExecution:
         run_id = run_response.json()["id"]
 
         # Wait a bit for start to complete and parallel steps to begin
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
         # Check run status - should show multiple active steps
         status_response = await api_client.get(f"/api/pipeline-runs/{run_id}")
@@ -770,6 +771,7 @@ class TestGraphPipelineUIBehaviors:
 # User Story 6: Execution Visualization
 # =============================================================================
 
+@pytest.mark.slow  # Requires Docker backend with mock runner
 class TestGraphPipelineExecutionVisualization:
     """
     User Story 6: Visualize Pipeline Execution on Graph
@@ -890,6 +892,7 @@ class TestGraphPipelineFailureModes:
 
         assert response.status_code in (400, 422)
 
+    @pytest.mark.slow  # Requires Docker backend with mock runner
     async def test_partial_failure_marks_correct_steps(self, api_client, test_repo):
         """When one parallel branch fails, other branch's status is correct."""
         graph_data = {

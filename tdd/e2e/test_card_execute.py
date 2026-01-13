@@ -150,7 +150,7 @@ class TestCardExecuteWithMockRunner:
             if current_card["status"] == "failed":
                 pytest.fail(f"Card failed unexpectedly: {current_card}")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         pytest.fail(f"Card did not reach in_review within {timeout}s. Status: {current_card['status']}")
 
@@ -229,7 +229,7 @@ class TestCardExecuteWithMockRunner:
             if current_card["status"] == "failed":
                 pytest.fail(f"Card failed: {current_card}")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
         else:
             pytest.skip("Card did not reach in_review - mock runner may not be running")
 
@@ -278,7 +278,7 @@ class TestCardExecuteFailureModes:
             if current_card["status"] in ("done", "in_review"):
                 pytest.fail(f"Card should have failed but got status: {current_card['status']}")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         pytest.skip("Card did not reach failed status - mock runner may not be running")
 

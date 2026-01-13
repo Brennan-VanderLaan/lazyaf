@@ -398,7 +398,7 @@ class PipelineExecutor:
         step_ids = list(steps_dict.keys())
         step_index = step_ids.index(step_id) if step_id in step_ids else 0
 
-        logger.info(f"Executing graph step {step_id}: {step_name} (type={step_type})")
+        logger.info(f"[GRAPH] _execute_graph_step called for step '{step_id}': {step_name} (type={step_type})")
 
         # Add to active steps
         active_ids = parse_json_list(pipeline_run.active_step_ids)
@@ -487,7 +487,7 @@ class PipelineExecutor:
         )
         await job_queue.enqueue(queued_job)
 
-        logger.info(f"Enqueued job {job_id[:8]} for graph step {step_id}: {step_name}")
+        logger.info(f"[GRAPH] Enqueued job {job_id[:8]} for graph step '{step_id}': {step_name}")
 
         # Broadcast job queued
         await manager.send_job_status({
@@ -752,16 +752,20 @@ class PipelineExecutor:
         await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
 
         logger.info(f"Step {step_run.step_index} ({step_run.step_name}) completed: {'success' if step_success else 'failed'}")
+        logger.info(f"[GRAPH] on_step_complete - step_run.step_id={step_run.step_id}, pipeline.steps_graph exists={pipeline.steps_graph is not None}")
 
         # Check if this is a graph-based pipeline
         graph = parse_steps_graph(pipeline.steps_graph)
+        logger.info(f"[GRAPH] Parsed graph: {graph is not None}")
 
         if graph and step_run.step_id:
+            logger.info(f"[GRAPH] Using graph-based execution for step '{step_run.step_id}'")
             # Graph-based execution with parallel support
             await self._handle_graph_step_complete(
                 db, pipeline_run, pipeline, repo, graph, step_run.step_id, step_success, runner_id
             )
         else:
+            logger.info(f"[GRAPH] Using LEGACY execution (graph={graph is not None}, step_id={step_run.step_id})")
             # Legacy sequential execution
             steps = parse_steps(pipeline.steps)
             if step_run.step_index >= len(steps):
@@ -793,11 +797,15 @@ class PipelineExecutor:
         4. Executes ready downstream steps (fan-out)
         5. Completes pipeline when all steps are done
         """
+        logger.info(f"[GRAPH] _handle_graph_step_complete called for step '{completed_step_id}' success={step_success}")
         steps_dict = graph.get("steps", {})
+        logger.info(f"[GRAPH] Graph has {len(steps_dict)} steps: {list(steps_dict.keys())}")
+        logger.info(f"[GRAPH] Graph edges: {graph.get('edges', [])}")
 
         # Update tracking sets
         completed_ids = set(parse_json_list(pipeline_run.completed_step_ids))
         active_ids = set(parse_json_list(pipeline_run.active_step_ids))
+        logger.info(f"[GRAPH] Before update - Active: {active_ids}, Completed: {completed_ids}")
 
         # Mark this step as completed
         completed_ids.add(completed_step_id)
@@ -808,38 +816,43 @@ class PipelineExecutor:
         await db.commit()
         await db.refresh(pipeline_run)
 
-        logger.info(f"Graph step {completed_step_id} completed. Active: {list(active_ids)}, Completed: {list(completed_ids)}")
+        logger.info(f"[GRAPH] After update - Active: {list(active_ids)}, Completed: {list(completed_ids)}")
 
         # Find downstream edges based on the step result
         condition = "success" if step_success else "failure"
         downstream_edges = get_downstream_edges(graph, completed_step_id, condition)
 
-        logger.info(f"Found {len(downstream_edges)} downstream edges for condition '{condition}'")
+        logger.info(f"[GRAPH] Found {len(downstream_edges)} downstream edges for condition '{condition}': {downstream_edges}")
 
         # Track which steps are ready to execute
         steps_to_execute = []
 
         for edge in downstream_edges:
             next_step_id = edge.get("to_step")
+            logger.info(f"[GRAPH] Checking edge to '{next_step_id}'")
             if not next_step_id or next_step_id not in steps_dict:
+                logger.info(f"[GRAPH] Skipping edge - next_step_id invalid or not in steps_dict")
                 continue
 
             # Skip if already completed or currently active
             if next_step_id in completed_ids or next_step_id in active_ids:
-                logger.info(f"Skipping {next_step_id} - already completed or active")
+                logger.info(f"[GRAPH] Skipping {next_step_id} - already completed or active")
                 continue
 
             # Fan-in check: are ALL upstream dependencies satisfied?
             upstream_ids = get_upstream_step_ids(graph, next_step_id)
+            logger.info(f"[GRAPH] Step {next_step_id} has upstream deps: {upstream_ids}")
 
             if self._all_upstream_satisfied(graph, next_step_id, completed_ids):
                 steps_to_execute.append(next_step_id)
-                logger.info(f"Step {next_step_id} is ready (all {len(upstream_ids)} upstream deps satisfied)")
+                logger.info(f"[GRAPH] Step {next_step_id} is READY (all {len(upstream_ids)} upstream deps satisfied)")
             else:
-                logger.info(f"Step {next_step_id} waiting for more upstream deps. Has: {upstream_ids}, Completed: {completed_ids}")
+                logger.info(f"[GRAPH] Step {next_step_id} NOT ready - waiting for upstream. Upstream: {upstream_ids}, Completed: {completed_ids}")
 
         # Execute ready downstream steps (fan-out)
+        logger.info(f"[GRAPH] Executing {len(steps_to_execute)} ready steps: {steps_to_execute}")
         for step_id in steps_to_execute:
+            logger.info(f"[GRAPH] Triggering execution of step '{step_id}'")
             await self._execute_graph_step(
                 db, pipeline_run, pipeline, repo, graph, step_id, None, runner_id
             )
@@ -853,17 +866,26 @@ class PipelineExecutor:
         completed_ids = set(parse_json_list(pipeline_run.completed_step_ids))
         total_steps = count_total_steps(graph)
 
+        logger.info(f"[GRAPH] Pipeline completion check - Active: {active_ids}, Completed: {completed_ids}, Total: {total_steps}")
+
         if not active_ids:
+            logger.info(f"[GRAPH] No active steps remaining")
             # No steps running - check if we're done
             if len(completed_ids) >= total_steps:
                 # All steps completed
+                logger.info(f"[GRAPH] All {total_steps} steps completed - marking pipeline complete")
                 all_passed = await self._check_all_steps_passed(db, pipeline_run)
                 await self._complete_pipeline(db, pipeline_run, success=all_passed)
             elif not steps_to_execute:
                 # No more steps can run (failed branch or dead end)
                 # Pipeline is complete, but may have failed
+                logger.info(f"[GRAPH] No more steps to execute - marking pipeline complete (dead end or failure)")
                 all_passed = await self._check_all_steps_passed(db, pipeline_run)
                 await self._complete_pipeline(db, pipeline_run, success=all_passed)
+            else:
+                logger.info(f"[GRAPH] Steps were triggered, waiting for them to complete")
+        else:
+            logger.info(f"[GRAPH] Still have active steps, not completing pipeline yet")
 
     def _all_upstream_satisfied(
         self,

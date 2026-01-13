@@ -599,6 +599,38 @@ async def rebase_card_branch(
     }
 
 
+@router.get("/api/cards/{card_id}/diff")
+async def get_card_diff(
+    card_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get diff for a card's branch against the repo's default branch."""
+    result = await db.execute(select(Card).where(Card.id == card_id))
+    card = result.scalar_one_or_none()
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    if not card.branch_name:
+        raise HTTPException(status_code=400, detail="Card has no branch")
+
+    # Get the repo
+    result = await db.execute(select(Repo).where(Repo.id == card.repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    # Get diff between default branch and card's branch
+    diff = git_repo_manager.get_diff(repo.id, repo.default_branch, card.branch_name)
+
+    if "error" in diff and diff["error"]:
+        raise HTTPException(status_code=400, detail=diff["error"])
+
+    return diff
+
+
 @router.post("/api/cards/{card_id}/resolve-rebase-conflicts")
 async def resolve_rebase_conflicts(
     card_id: str,

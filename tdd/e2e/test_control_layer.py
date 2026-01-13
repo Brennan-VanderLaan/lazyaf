@@ -58,7 +58,7 @@ class TestControlLayerStatusReporting:
             if current_run["status"] in ("completed", "failed"):
                 break
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         # Verify step ran - check logs contain our echo
         steps_response = await api_client.get(f"/api/pipeline-runs/{run['id']}/steps")
@@ -108,7 +108,7 @@ class TestControlLayerStatusReporting:
             if current_run["status"] == "completed":
                 pytest.fail("Pipeline should have failed but completed successfully")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         pytest.skip("Pipeline did not reach failed status - Docker may not be available")
 
@@ -152,7 +152,7 @@ class TestControlLayerStatusReporting:
             if current_run["status"] == "failed":
                 pytest.fail(f"Pipeline failed unexpectedly: {current_run}")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         pytest.skip("Pipeline did not complete - Docker may not be available")
 
@@ -191,7 +191,7 @@ class TestControlLayerLogStreaming:
 
             if current_run["status"] in ("completed", "failed"):
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         # Check logs
         logs_response = await api_client.get(
@@ -233,7 +233,7 @@ class TestControlLayerLogStreaming:
 
             if current_run["status"] in ("completed", "failed"):
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         # Check logs
         logs_response = await api_client.get(
@@ -265,7 +265,7 @@ class TestHomePersistenceAcrossSteps:
                     {
                         "name": "use-step",
                         "type": "script",
-                        "config": {"command": "python -m cowsay 'Persistence works!'"},
+                        "config": {"command": "python -m cowsay -t 'Persistence works!'"},
                     }
                 ],
             },
@@ -293,7 +293,7 @@ class TestHomePersistenceAcrossSteps:
                 # Check which step failed
                 pytest.fail(f"Pipeline failed: {current_run}")
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
 
         pytest.skip("Pipeline did not complete - Docker may not be available")
 
@@ -348,7 +348,7 @@ class TestHomePersistenceAcrossSteps:
             if current_run["status"] == "failed":
                 pytest.fail(f"Pipeline failed: {current_run}")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         pytest.skip("Pipeline did not complete - Docker may not be available")
 
@@ -399,7 +399,7 @@ class TestMixedStepTypePipelines:
             if current_run["status"] == "failed":
                 pytest.fail(f"Pipeline failed - workspace may not persist: {current_run}")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         pytest.skip("Pipeline did not complete - Docker may not be available")
 
@@ -513,7 +513,7 @@ class TestMixedStepTypePipelines:
             if current_run["status"] == "failed":
                 pytest.fail(f"Pipeline failed: {current_run}")
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
 
         pytest.skip("Pipeline did not complete - mock runner may not be available")
 
@@ -562,7 +562,7 @@ class TestControlLayerErrorHandling:
             if current_run["status"] == "completed":
                 pytest.fail("Step should have timed out")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         pytest.skip("Pipeline did not fail - Docker may not be available")
 
@@ -603,6 +603,6 @@ class TestControlLayerErrorHandling:
             if current_run["status"] == "completed":
                 pytest.fail("Step with bad command should have failed")
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
 
         pytest.skip("Pipeline did not fail - Docker may not be available")

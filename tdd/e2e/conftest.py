@@ -34,9 +34,18 @@ import pytest
 import pytest_asyncio
 import httpx
 
-# Add backend to path
+try:
+    import websockets
+except ImportError:
+    websockets = None  # WebSocket tests will be skipped if not installed
+
+# Add backend to path - handle both local and Docker environments
 backend_path = Path(__file__).parent.parent.parent / "backend"
-sys.path.insert(0, str(backend_path))
+if not backend_path.exists():
+    # Running inside Docker container where backend is at /app
+    backend_path = Path("/app")
+if backend_path.exists():
+    sys.path.insert(0, str(backend_path))
 
 # Add tdd root to path for conftest imports
 tdd_path = Path(__file__).parent.parent
@@ -160,6 +169,22 @@ async def api_client(client) -> AsyncGenerator:
         yield client
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def clear_job_queue_before_test(api_client):
+    """Clear the job queue before each test to prevent job accumulation."""
+    try:
+        response = await api_client.post("/api/runners/clear-queue")
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("cleared", 0) > 0:
+                import logging
+                logging.info(f"Cleared {data['cleared']} jobs from queue before test")
+    except Exception:
+        # Ignore errors if endpoint doesn't exist or backend not ready
+        pass
+    yield
+
+
 # -----------------------------------------------------------------------------
 # WebSocket Client Fixture
 # -----------------------------------------------------------------------------
@@ -175,6 +200,8 @@ class WebSocketTestClient:
 
     async def connect(self):
         """Connect to WebSocket."""
+        if websockets is None:
+            raise RuntimeError("websockets package not installed")
         ws_url = self.url.replace("http://", "ws://").replace("https://", "wss://")
         self.ws = await websockets.connect(f"{ws_url}/ws")
         self._receive_task = asyncio.create_task(self._receive_loop())
@@ -188,7 +215,8 @@ class WebSocketTestClient:
                     self.events.append(event)
                 except json.JSONDecodeError:
                     pass
-        except websockets.ConnectionClosed:
+        except Exception:
+            # Handle websockets.ConnectionClosed and other connection errors
             pass
 
     async def wait_for_event(
@@ -235,6 +263,8 @@ class WebSocketTestClient:
 @pytest_asyncio.fixture
 async def websocket_client(e2e_backend: str) -> AsyncGenerator[WebSocketTestClient, None]:
     """WebSocket client for real-time event testing."""
+    if websockets is None:
+        pytest.skip("websockets package not installed")
     client = WebSocketTestClient(e2e_backend)
     await client.connect()
     yield client

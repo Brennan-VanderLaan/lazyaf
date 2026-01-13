@@ -1,9 +1,16 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
+
+# Configure logging to show INFO level for debugging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 from app.database import init_db
 from app.routers import repos, cards, jobs, runners, agent_files, pipelines, lazyaf_files
 from app.routers import git, playground, models, steps
@@ -28,7 +35,6 @@ async def lifespan(app: FastAPI):
     async with async_session() as session:
         recovered = await recover_orphaned_executions(session)
         if recovered:
-            import logging
             logging.getLogger(__name__).info(
                 f"Recovered {len(recovered)} orphaned step executions on startup"
             )

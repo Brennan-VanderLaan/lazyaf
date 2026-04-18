@@ -19,6 +19,24 @@ The core workflow:
 
 ---
 
+## Long-Term Vision: Specification-Driven Development
+
+> Sprint reviews, PRs, and code review evolved to mentor humans. With LLMs in the loop, the leverage shifts from *implementation review* to *specification fidelity* — does the result match the product intent, and can we prove it repeatedly?
+
+LazyAF is moving toward a model where humans **over-specify what the software must do** (features, user stories, acceptance criteria) and LLMs handle implementation. The platform's job is to:
+
+1. **Capture intent** — features, user stories, and acceptance criteria live in a queryable database, not scattered across Jira/Notion/heads.
+2. **Tie tests back to intent** — every test in every repo declares which acceptance criterion it covers, and every run reports back. Test history is keyed to `(criterion, commit, model, prompt)`.
+3. **Run experiments, not just builds** — re-run the same card across multiple model/prompt combinations and compare pass-rates per criterion. Make model + prompt selection an evidence-driven decision.
+4. **Curate context for parallel agents** — the spec DB lets the platform hand each agent the relevant slice of intent (instead of stuffing the whole codebase into a context window).
+5. **Enable cross-repo features** — a "feature" can span multiple repos (frontend + backend + infra), and the platform tracks delivery across all of them.
+
+This direction reframes LazyAF as a *platform for software science*: experiments, leaderboards, regression dashboards, and reusable prompt structures — alongside the day-to-day "active project management" view (cards, kanban, pipelines).
+
+The spec layer is being added to Phase 12.x in parallel with the runner architecture refactor (see Phases 12.2.5, 12.2.6, 12.6.5, 12.6.6).
+
+---
+
 ## Project Structure
 
 ```
@@ -126,6 +144,144 @@ class PipelineStep:
 
 ---
 
+## Specification Layer Models
+
+> Introduced in Phase 12.2.5. These models capture *what the software must do* and let the platform measure whether AI-generated changes still satisfy intent. Hierarchy is intentionally shallow: `Feature -> UserStory -> AcceptanceCriterion`. Tests and runs are orthogonal entities that join back to criteria.
+
+### Feature
+A product capability. Cross-repo by design — a single feature can span frontend, backend, infra, etc.
+
+```python
+class Feature:
+    id: UUID
+    name: str
+    description: str             # Markdown, free-form product narrative
+    repo_ids: list[UUID]         # Repos this feature touches (one or many)
+    status: FeatureStatus        # proposed | active | shipped | deprecated
+    owner: str | None            # Free-form (email, handle, team name)
+    created_at: datetime
+    updated_at: datetime
+```
+
+### UserStory
+A natural-language behavior expectation in the gherkin spirit (less rigid). Belongs to one feature.
+
+```python
+class UserStory:
+    id: UUID
+    feature_id: UUID
+    title: str                   # "User can revoke an API key"
+    persona: str | None          # "As a security-conscious admin"
+    narrative: str               # Free-form: "When X, then Y, so that Z"
+    repo_ids: list[UUID]         # Subset of parent feature's repos
+    priority: int                # Simple integer, not story points
+    status: StoryStatus          # draft | accepted | in_progress | done | blocked
+    created_at: datetime
+    updated_at: datetime
+```
+
+### AcceptanceCriterion
+A single, testable expectation. Natural language; one or more `TestRef`s prove it.
+
+```python
+class AcceptanceCriterion:
+    id: UUID
+    user_story_id: UUID
+    description: str             # "Revoked keys return 401 within 60s globally"
+    is_required: bool            # Story-blocking vs nice-to-have
+    created_at: datetime
+```
+
+### TestRef
+A pointer from a test in the application repo back to one or more acceptance criteria. The application's test suite emits a manifest declaring its `lazyaf_test_id`s; the platform reconciles that manifest against TestRefs to detect drift (orphaned tests, uncovered criteria).
+
+```python
+class TestRef:
+    id: UUID                     # Stable platform-side ID
+    lazyaf_test_id: str          # Stable repo-side identifier (decorator/sidecar)
+    repo_id: UUID
+    file_path: str               # e.g., "tests/api/test_keys.py"
+    test_name: str               # e.g., "test_revoked_key_returns_401"
+    framework: str               # "pytest" | "vitest" | "go-test" | "custom"
+    criterion_ids: list[UUID]    # Many-to-many with AcceptanceCriterion
+    last_seen_commit: str | None # SHA of latest commit where test was observed
+    is_orphaned: bool            # True if test_id no longer found in repo
+```
+
+### TestRun
+The result of executing one TestRef. Joined to commit, and (when run inside an experiment) to model + prompt.
+
+```python
+class TestRun:
+    id: UUID
+    test_ref_id: UUID
+    pipeline_run_id: UUID | None # Pipeline that produced this run
+    step_execution_id: UUID | None
+    commit_sha: str
+    repo_id: UUID
+    status: TestStatus           # passed | failed | skipped | error
+    duration_ms: int
+    output: str | None           # Truncated stdout/stderr or pointer to artifact
+    model: str | None            # e.g., "claude-opus-4-7" - set inside experiments
+    prompt_template_id: UUID | None
+    prompt_version: int | None
+    experiment_id: UUID | None
+    created_at: datetime
+```
+
+### Experiment
+A user-defined run that evaluates one or more (model, prompt) tuples against a card / story / feature. Produces TestRuns tagged with the matrix coordinates so leaderboards can aggregate.
+
+```python
+class Experiment:
+    id: UUID
+    name: str
+    description: str
+    target_type: str             # "card" | "user_story" | "feature"
+    target_id: UUID
+    matrix: dict                 # {"models": [...], "prompts": [...], "repeat": N}
+    status: ExperimentStatus     # draft | running | complete | aborted
+    created_by: str
+    created_at: datetime
+    completed_at: datetime | None
+```
+
+### PromptTemplate
+A versioned, reusable prompt. Leaderboards rank `(template_id, version, model)` by pass-rate per criterion.
+
+```python
+class PromptTemplate:
+    id: UUID
+    name: str
+    purpose: str                 # "implement-from-story" | "fix-failing-test" | etc.
+    versions: list[PromptVersion]
+
+class PromptVersion:
+    id: UUID
+    template_id: UUID
+    version: int
+    body: str                    # The prompt itself, with placeholders
+    placeholders: list[str]      # e.g., ["{story_narrative}", "{failing_test_output}"]
+    created_at: datetime
+    notes: str | None
+```
+
+### Card ↔ Spec Links
+
+The existing `Card` model gains optional links into the spec layer. Cards are still the active unit of work; the spec layer is the meta layer of *why*.
+
+```python
+class Card:
+    # ... existing fields ...
+    feature_id: UUID | None          # If this card delivers part of a feature
+    user_story_id: UUID | None       # If this card delivers a story
+    promotes_to_feature: bool        # Marks card for "promote to feature" workflow
+```
+
+A card with neither link is fine — it's a pure work item (e.g., a bug fix, a chore). When work outgrows a card, the user can promote it to a `Feature` and the card becomes the first child story.
+
+---
+
 ## API Summary
 
 | Endpoint | Purpose |
@@ -140,7 +296,23 @@ class PipelineStep:
 | `/git/{id}.git/*` | Internal git server |
 | `/ws` | WebSocket for real-time updates |
 
-Full API: 31 MCP tools for Claude Desktop orchestration.
+**Specification Layer (Phase 12.2.5+, planned):**
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET/POST /api/features` | Feature CRUD (cross-repo) |
+| `GET/POST /api/features/{id}/stories` | User story CRUD |
+| `GET/POST /api/stories/{id}/criteria` | Acceptance criterion CRUD |
+| `GET/POST /api/test-refs` | Test reference registry |
+| `POST /api/test-refs/reconcile` | Compare repo manifest vs registry |
+| `POST /api/test-results/ingest` | Bulk ingest TestRuns from a step |
+| `GET /api/criteria/{id}/history` | Pass/fail history per (model, prompt) |
+| `GET/POST /api/experiments` | Experiment CRUD + launch |
+| `GET /api/experiments/{id}/results` | Matrix results, ready for leaderboard |
+| `GET/POST /api/prompts` | Prompt template + version CRUD |
+| `GET /api/leaderboards/feature/{id}` | Aggregated pass-rate per (prompt, model) |
+
+Full API: 31 MCP tools for Claude Desktop orchestration (will grow with spec-layer tools).
 
 ---
 
@@ -182,7 +354,16 @@ Detailed documentation for completed phases is in `historical-documents/`.
 
 **Completed**: Phases 1-11, Phase 12.0, Phase 12.1
 **In Progress**: Phase 12.2 (Workspace State Machine & Pipeline Integration)
-**Ready for**: Phase 12.3 (Remote Runners, optional)
+**Next (in order)**:
+1. **Phase 12.2.5** — Specification Data Model (Feature / UserStory / AcceptanceCriterion / PromptTemplate). NEW. Foundation for spec-driven workflow.
+2. **Phase 12.2.6** — Test Result Tie-Back. NEW. Tests in repos report back to LazyAF and join to acceptance criteria.
+3. **Phase 12.3** — Control Layer & Step Images. UPDATED to carry test-result manifests as a first-class channel.
+4. Phases 12.4 → 12.6 — runner architecture refactor continues.
+5. **Phase 12.6.5** — Experiments & Leaderboards. NEW. Matrix runs of (model × prompt) with aggregated pass-rates per criterion.
+6. **Phase 12.6.6** — Spec-Curated Agent Context. NEW. Platform builds a per-card context bundle from the spec layer.
+7. Phases 12.7 → 12.9 — debug, cleanup, K8s.
+
+> **Why this order:** The spec layer (12.2.5 / 12.2.6) goes in *before* 12.3 so the Control Layer protocol can carry test results natively rather than be retrofitted. The evaluation layer (12.6.5 / 12.6.6) goes in *after* remote execution so experiment fan-out can use the new RemoteExecutor.
 
 Phase 12.1 deliverables (COMPLETE):
   - `StepExecution` model with unique `execution_key` for idempotency
@@ -1504,6 +1685,217 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
 
 ---
 
+### Phase 12.2.5: Specification Data Model
+**Goal**: Stand up the spec layer (Feature / UserStory / AcceptanceCriterion / PromptTemplate) with CRUD APIs and a minimal UI. No execution changes yet — just the foundation for Phase 12.2.6 and beyond.
+
+> **Why now (before 12.3):** Phase 12.3 freezes the Control Layer protocol — what steps report back to the backend. Once the spec models exist, 12.3 can extend that protocol with a test-result manifest channel (see Phase 12.2.6) instead of bolting it on later.
+
+#### Tests First (Define Contracts)
+
+**test_feature_crud.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_create_feature_returns_id` | POST `/api/features` returns 201 with UUID |
+| `test_feature_spans_multiple_repos` | `repo_ids` accepts list, validated against existing repos |
+| `test_feature_status_transitions` | proposed -> active -> shipped -> deprecated only |
+| `test_delete_feature_cascades_stories` | Removing feature removes orphaned stories |
+
+**test_user_story_crud.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_story_requires_feature` | Cannot create story without feature_id |
+| `test_story_repos_subset_of_feature` | Story repo_ids must be subset of feature.repo_ids |
+| `test_story_priority_int` | Priority is plain int, not story points enum |
+| `test_story_narrative_freeform` | No gherkin enforcement — markdown OK |
+
+**test_criterion_crud.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_criterion_requires_story` | Cannot create without story |
+| `test_required_blocks_story_done` | Story can't be `done` if any required criterion has no passing TestRun |
+| `test_criterion_can_have_no_tests` | Criterion exists without TestRefs (yet) |
+
+**test_prompt_template_versioning.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_first_version_starts_at_1` | New template gets version 1 |
+| `test_new_version_immutable_predecessor` | Old versions cannot be edited |
+| `test_placeholders_extracted_from_body` | `{story_narrative}` placeholders auto-detected |
+
+**test_card_spec_links.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_card_can_link_to_feature` | `feature_id` settable on existing Card |
+| `test_card_can_link_to_story` | `user_story_id` settable on existing Card |
+| `test_promote_card_creates_feature` | Promotion creates Feature + Story; original Card relinked |
+
+- [ ] Write `test_feature_crud.py`
+- [ ] Write `test_user_story_crud.py`
+- [ ] Write `test_criterion_crud.py`
+- [ ] Write `test_prompt_template_versioning.py`
+- [ ] Write `test_card_spec_links.py`
+
+#### Database Migration
+
+- [ ] Alembic migration creating: `features`, `user_stories`, `acceptance_criteria`, `prompt_templates`, `prompt_versions`
+- [ ] `feature_repos` join table for cross-repo scope
+- [ ] `story_repos` join table
+- [ ] Add nullable `feature_id`, `user_story_id`, `promotes_to_feature` columns to `cards`
+
+#### Implementation (Make Tests Pass)
+
+- [ ] Pydantic schemas in `backend/app/schemas/spec.py`
+- [ ] SQLAlchemy models in `backend/app/models/spec.py`
+- [ ] Service layer in `backend/app/services/spec/` (one module per entity)
+- [ ] Routers in `backend/app/routers/spec.py`
+- [ ] WebSocket events: `feature_updated`, `story_updated`, `criterion_updated`
+- [ ] MCP tools: add spec CRUD to MCP server (so Claude Desktop can author specs)
+
+#### Minimal UI (Frontend)
+
+- [ ] `/specs` route — feature list with status badges
+- [ ] Feature detail page — stories + criteria tree (collapsible)
+- [ ] Story editor — markdown narrative, criterion checklist
+- [ ] Card detail panel: "Linked feature/story" selector + "Promote to feature" button
+
+#### Integration Validation
+
+- [ ] `test_promote_card_to_feature_e2e.py` — full UI flow
+- [ ] `test_cross_repo_feature_appears_on_both_repos` — feature shows in repo views for all linked repos
+- [ ] `test_mcp_can_create_feature_from_claude_desktop`
+
+#### Done Criteria
+
+- [ ] All CRUD test suites pass
+- [ ] UI lets a user define a feature with at least one story and one criterion in under 60s
+- [ ] Existing card workflows unchanged (no regressions)
+
+**Effort**: 1.5-2 weeks
+**Risk**: Low (data + UI, no execution-path changes)
+**Outcome**: Specs exist as first-class entities. Foundation for tying tests + experiments to intent.
+
+> **OPEN QUESTION:** Should `Feature` belong to a higher-level "Project" or "Workspace" entity (multi-tenant org), or live flat at the install level? Defaulting to flat for now; add Workspace if multi-org need emerges.
+
+---
+
+### Phase 12.2.6: Test Result Tie-Back
+**Goal**: Tests in application repos declare a stable identifier; runs flow back into LazyAF and join to acceptance criteria, commits, and (later) experiments.
+
+> **Why now (before 12.3):** This phase defines the test-result manifest format. Phase 12.3's Control Layer needs to know about it so the step→backend protocol can carry test results natively.
+
+#### Test Identifier Convention
+
+The platform supports multiple frameworks via a *manifest convention*. The test runner (pytest, vitest, go test, etc.) emits a JSON file at a known path; the control layer ships it back.
+
+**Manifest path:** `/workspace/.control/test_results.json`
+
+**Manifest schema:**
+```json
+{
+  "schema_version": 1,
+  "framework": "pytest",
+  "commit_sha": "abc123...",
+  "results": [
+    {
+      "lazyaf_test_id": "auth.revoke_key.returns_401",
+      "file_path": "tests/api/test_keys.py",
+      "test_name": "test_revoked_key_returns_401",
+      "status": "passed",
+      "duration_ms": 142,
+      "output": null
+    }
+  ]
+}
+```
+
+**How tests declare their `lazyaf_test_id`:**
+
+| Framework | Mechanism |
+|-----------|-----------|
+| pytest | `@lazyaf_test("auth.revoke_key.returns_401")` decorator (ships in a tiny `pytest-lazyaf` plugin) |
+| vitest / jest | `lazyaf("auth.revoke_key.returns_401", () => { ... })` wrapper |
+| go test | `// lazyaf:auth.revoke_key.returns_401` magic comment above the test func |
+| Anything else | `lazyaf.tests.json` sidecar mapping `{file::test_name -> lazyaf_test_id}` |
+
+The platform doesn't care which mechanism is used — it only cares that the manifest is correctly emitted.
+
+#### Tests First (Define Contracts)
+
+**test_manifest_schema.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_valid_manifest_accepted` | Schema-conformant JSON parses |
+| `test_invalid_status_rejected` | Status must be passed/failed/skipped/error |
+| `test_unknown_test_id_marked_orphan` | `lazyaf_test_id` not in registry → orphan TestRun + warning |
+| `test_missing_commit_sha_rejected` | Commit required for traceability |
+
+**test_result_ingestion.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_ingest_creates_test_runs` | One TestRun per result entry |
+| `test_ingest_idempotent_per_step` | Re-ingesting same step's manifest doesn't duplicate |
+| `test_ingest_links_to_step_execution` | TestRun.step_execution_id populated |
+| `test_ingest_propagates_experiment_context` | If step is part of experiment, model/prompt fields filled |
+
+**test_reconcile_command.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_reconcile_creates_missing_test_refs` | New tests in repo auto-registered |
+| `test_reconcile_marks_disappeared_orphan` | Test removed from repo → TestRef.is_orphaned = true |
+| `test_reconcile_per_repo_scoped` | Reconciliation only affects one repo at a time |
+
+**test_criterion_history_query.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_history_groups_by_commit` | Query returns chronological pass/fail per criterion |
+| `test_history_groups_by_model` | Optional `?model=...` filter |
+| `test_history_groups_by_prompt_version` | Optional `?prompt_version=...` filter |
+
+- [ ] Write `test_manifest_schema.py`
+- [ ] Write `test_result_ingestion.py`
+- [ ] Write `test_reconcile_command.py`
+- [ ] Write `test_criterion_history_query.py`
+
+#### Implementation (Make Tests Pass)
+
+- [ ] Add `test_refs` and `test_runs` tables (Alembic migration)
+- [ ] `POST /api/test-results/ingest` endpoint
+- [ ] `POST /api/test-refs/reconcile` endpoint
+- [ ] `GET /api/criteria/{id}/history` endpoint
+- [ ] Background reconciliation job (run on every successful pipeline)
+- [ ] Reference `pytest-lazyaf` plugin in `runner-common/test_plugins/pytest_lazyaf/`
+- [ ] CLI: `lazyaf tests reconcile <repo>` for manual sync
+- [ ] UI: criterion view shows "last 20 runs" sparkline (pass-rate over time)
+
+#### Integration Validation
+
+- [ ] `test_full_loop.py`:
+  - Create criterion in spec UI
+  - Add `@lazyaf_test("...")` decorated test in repo
+  - Run pipeline that executes pytest
+  - Confirm TestRun appears, criterion history updates
+
+- [ ] `test_orphan_detection.py`:
+  - Test exists in two commits
+  - Removed in third
+  - Reconcile against latest commit marks TestRef orphaned
+
+#### Done Criteria
+
+- [ ] Manifest schema documented + JSON Schema published
+- [ ] At least the pytest plugin works end-to-end
+- [ ] Criterion history endpoint returns data joinable to commits
+
+**Effort**: 1.5-2 weeks
+**Risk**: Medium (cross-language test framework support is a long tail — start with pytest only)
+**Outcome**: Test results flow back to LazyAF with full provenance. Criteria gain a measurable definition of done.
+
+> **OPEN QUESTIONS:**
+> 1. Should `lazyaf_test_id` be a structured dotted path (`feature.story.criterion.assertion`) or an arbitrary string? Defaulting to arbitrary; users can adopt a convention.
+> 2. Are skipped tests informational or do they count against criteria? Defaulting to informational (skipped ≠ failed).
+
+---
+
 ### Phase 12.3: Control Layer & Step Images
 **Goal**: Proper container communication and base images
 
@@ -1518,6 +1910,8 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
 | `test_streams_logs_to_backend` | POST to `/api/steps/{id}/logs` |
 | `test_heartbeat_during_execution` | POST to `/api/steps/{id}/heartbeat` periodically |
 | `test_handles_backend_unavailable` | Retries, eventually fails gracefully |
+| `test_uploads_test_results_manifest` | If `/workspace/.control/test_results.json` exists at completion, ship to `/api/test-results/ingest` (see 12.2.6) |
+| `test_propagates_experiment_context` | step_config carries experiment_id, model, prompt_template_id, prompt_version → forwarded to result ingest |
 
 **test_step_api_endpoints.py** - Write BEFORE implementing API (backend side)
 | Test | Defines Contract |
@@ -1554,6 +1948,7 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
   - Reports status to backend (running, completed, failed)
   - Streams logs to backend
   - Heartbeat during long operations
+  - On step completion, checks for `/workspace/.control/test_results.json` and ships it to `/api/test-results/ingest` with experiment context (Phase 12.2.6 dependency)
 - [ ] Create API endpoints - make endpoint tests pass
   - `POST /api/steps/{step_id}/status`
   - `POST /api/steps/{step_id}/logs`
@@ -1830,6 +2225,146 @@ Backend -> Runner: {"type": "execute_step", "step_id": "...", "image": "...", ..
 Runner -> Backend: {"type": "log", "step_id": "...", "line": "..."}
 Runner -> Backend: {"type": "step_complete", "step_id": "...", "exit_code": 0}
 ```
+
+---
+
+### Phase 12.6.5: Experiments & Model/Prompt Leaderboards
+**Goal**: Run the same target (card / story / feature) across a matrix of (model, prompt_template, prompt_version), aggregate TestRuns, surface a leaderboard. Turn LazyAF into a platform for *software science*.
+
+> **Why now (after 12.6):** Once remote execution is stable, fan-out to many parallel runs becomes cheap. Experiments are the high-value workload that demand fan-out.
+
+#### Tests First (Define Contracts)
+
+**test_experiment_lifecycle.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_create_experiment_validates_matrix` | Matrix must specify at least one model and one prompt |
+| `test_launch_creates_pipeline_run_per_cell` | NxM matrix + repeat=R → N*M*R pipeline runs |
+| `test_experiment_completes_when_all_runs_terminal` | Status flips to `complete` after last run lands |
+| `test_abort_cancels_pending_runs` | Abort cancels queued runs, leaves running ones to finish |
+
+**test_experiment_run_tagging.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_pipeline_run_carries_experiment_id` | `pipeline_runs.experiment_id` populated |
+| `test_test_runs_inherit_matrix_coords` | Each TestRun tagged with model + prompt info |
+| `test_step_config_includes_matrix_cell` | Runner sees model+prompt env vars for agent invocation |
+
+**test_leaderboard_aggregation.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_leaderboard_groups_by_prompt_and_model` | One row per (prompt_template, version, model) |
+| `test_leaderboard_per_criterion_pass_rate` | Pass-rate = passed / (passed + failed) |
+| `test_leaderboard_filters_skipped` | Skipped tests excluded from rate denominator |
+| `test_leaderboard_handles_zero_runs` | Cell with no runs shown as N/A, not 0% |
+
+- [ ] Write `test_experiment_lifecycle.py`
+- [ ] Write `test_experiment_run_tagging.py`
+- [ ] Write `test_leaderboard_aggregation.py`
+
+#### Implementation (Make Tests Pass)
+
+- [ ] `experiments` and `experiment_runs` tables (Alembic migration)
+- [ ] `ExperimentService.launch()` fans out to ExecutionRouter, one pipeline run per matrix cell
+- [ ] Extend `step_config` schema with `experiment_context: {experiment_id, model, prompt_template_id, prompt_version}`
+- [ ] Agent executors (Claude/Gemini) read `model` from step_config to override default
+- [ ] Prompt rendering: `PromptVersion.body` is rendered with `{story_narrative}` etc. resolved from spec layer at experiment-launch time
+- [ ] Aggregation queries (criterion pass-rate per matrix cell)
+- [ ] UI: `/experiments` route — create + monitor experiments, launch from a card/story/feature
+- [ ] UI: leaderboard view per Feature — sortable matrix
+- [ ] MCP tool: `launch_experiment` so Claude Desktop can drive evaluations
+
+#### Integration Validation
+
+- [ ] `test_2x2_experiment_e2e.py`:
+  - 2 models × 2 prompts × 1 repeat = 4 pipeline runs
+  - All complete
+  - Leaderboard renders with 4 rows
+  - At least one row has pass-rate > 0%
+
+- [ ] `test_experiment_with_failing_prompt.py`:
+  - One prompt is intentionally bad
+  - Leaderboard correctly ranks it last
+
+#### Done Criteria
+
+- [ ] Experiment lifecycle tests pass
+- [ ] Pass-rates correctly computed per cell
+- [ ] User can launch a 2x2 experiment from the UI in under 30s
+
+**Effort**: 2-3 weeks
+**Risk**: Medium (fan-out cost — need quotas / cost guardrails)
+**Outcome**: Evidence-driven model + prompt selection. Regression dashboard per feature.
+
+> **OPEN QUESTIONS:**
+> 1. Cost guardrails — a 5x5x3 experiment is 75 agent runs. Do we need per-experiment budget caps + dry-run estimates before launch?
+> 2. Should leaderboards be public (anyone in the org sees them) or private to the experiment creator? Defaulting to org-visible.
+
+---
+
+### Phase 12.6.6: Spec-Curated Agent Context
+**Goal**: When an agent runs against a card, the platform automatically curates the relevant slice of the spec layer (linked feature, story, criteria, related TestRefs) and injects it into the agent's prompt — instead of relying on the agent to discover intent from the codebase.
+
+> **Why now (after 12.6.5):** Experiments will reveal that prompt content matters more than model choice for many tasks. Spec-curated context is the single biggest lever on prompt quality.
+
+#### The Context Curation Problem
+
+A card linked to a UserStory has natural context: the story narrative, all acceptance criteria, related TestRefs (with file paths!), and the parent Feature's description. Without curation, agents either:
+- Get the whole repo dumped in (wastes context, distracts the model), or
+- Get only the card title + description (misses critical intent)
+
+Curation gives the agent: *"Here's the story you're delivering. Here are the criteria you must satisfy. Here are the existing tests that already cover related criteria — read them, don't duplicate them."*
+
+#### Tests First (Define Contracts)
+
+**test_context_bundle_assembly.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_card_with_story_link_pulls_narrative` | Bundle includes full story narrative |
+| `test_bundle_includes_all_criteria` | All criteria for the linked story present |
+| `test_bundle_includes_related_test_paths` | TestRef file paths surfaced (so agent can read them) |
+| `test_bundle_includes_parent_feature_description` | Feature context included |
+| `test_bundle_omits_unrelated_features` | No leakage from sibling features |
+| `test_bundle_handles_card_without_links` | Falls back to card-only context, no error |
+| `test_bundle_size_capped` | Truncates with summary if total > N tokens |
+
+**test_context_injection.py**
+| Test | Defines Contract |
+|------|------------------|
+| `test_bundle_written_to_workspace` | Available at `/workspace/.control/spec_context.md` |
+| `test_executor_includes_in_prompt` | Claude/Gemini wrappers prepend spec_context.md to system prompt |
+| `test_prompt_template_can_reference` | `{spec_context}` placeholder resolves |
+
+- [ ] Write `test_context_bundle_assembly.py`
+- [ ] Write `test_context_injection.py`
+
+#### Implementation (Make Tests Pass)
+
+- [ ] `SpecContextService.build_bundle(card_id) -> str` — assembles markdown
+- [ ] Pipeline executor writes bundle to workspace before agent step
+- [ ] Update Claude/Gemini executor wrappers to read and prepend
+- [ ] Token-budget aware truncation (summarize if oversized)
+- [ ] Add `{spec_context}` placeholder support to PromptTemplate rendering
+
+#### Integration Validation
+
+- [ ] `test_agent_uses_curated_context.py`:
+  - Card linked to story with 3 criteria + 2 existing TestRefs
+  - Agent run completes
+  - Logs show agent referenced criteria by name (heuristic check)
+  - Diff includes new test that satisfies a criterion
+
+#### Done Criteria
+
+- [ ] Context bundle tests pass
+- [ ] Bundle injection works for both Claude and Gemini executors
+- [ ] At least one before/after experiment shows improvement on linked-card pass-rate
+
+**Effort**: 1.5-2 weeks
+**Risk**: Medium (token-budget tuning is iterative)
+**Outcome**: Parallel agents stay coherent because each one gets a precisely-scoped slice of intent. Reduces context-window pressure as the system scales.
+
+> **OPEN QUESTION:** Should the bundle include actual *source code* from related TestRefs (full file content) or just file paths? Defaulting to paths — agent can choose to read what it needs.
 
 ---
 

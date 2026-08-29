@@ -55,45 +55,92 @@ def _unknown_revisions(config: AlembicConfig, versions: list[str]) -> list[str]:
     return unknown
 
 
-def _adopt_unversioned(config: AlembicConfig, connection: sa.Connection) -> None:
-    """Adopt a pre-alembic database: heal, verify parity, then stamp.
+def _baseline_columns() -> dict[str, set[str]]:
+    """Table -> column names exactly as revision 0001 defines them.
 
-    create_all restores wholly-missing tables (the old pre-alembic startup
-    behavior; it never touches existing ones). Existing tables are then
-    checked column-for-column against the model metadata: a drifted schema
-    is refused loudly, because stamping it would record baseline parity that
-    does not exist and every later migration would build on the lie.
+    Derived by running the REAL baseline migration against a scratch
+    in-memory database (no hand-maintained copy that could drift from the
+    migration files).
+    """
+    scratch = sa.create_engine("sqlite://")
+    try:
+        with scratch.connect() as conn:
+            command.upgrade(_alembic_config(conn), ALEMBIC_BASELINE_REVISION)
+            inspector = sa.inspect(conn)
+            return {
+                name: {col["name"] for col in inspector.get_columns(name)}
+                for name in inspector.get_table_names()
+                if name != "alembic_version"
+            }
+    finally:
+        scratch.dispose()
+
+
+def _adopt_unversioned(config: AlembicConfig, connection: sa.Connection) -> None:
+    """Adopt an unversioned database: heal, classify, then stamp.
+
+    create_all first restores wholly-missing tables at the CURRENT model
+    schema (the old pre-alembic startup behavior; it never touches existing
+    tables). The healed schema is then classified three ways:
+
+    1. Matches the current model metadata column-for-column -> the DB is
+       already head-shaped (create_all-built by the pre-alembic startup, or
+       fully hand-migrated): stamp HEAD. Stamping the baseline instead
+       would re-run 0002/0003 over objects that already exist and record a
+       lineage the schema never had.
+    2. Matches revision 0001's columns -> a genuinely old pre-alembic DB:
+       stamp the BASELINE and let the caller's upgrade-to-head run 0002+
+       to add the missing columns/tables (create_all cannot add COLUMNS to
+       existing tables, only whole tables).
+    3. Anything else is drift -> refuse loudly. Stamping would record
+       parity that does not exist and every later migration would build on
+       the lie.
+
+    This function OWNS schema-drift detection for adopted databases; the
+    later migrations' skip-if-present guards rely on it.
     """
     import app.models  # noqa: F401  (register all tables on Base.metadata)
 
     Base.metadata.create_all(connection)
 
     inspector = sa.inspect(connection)
-    drifted = []
-    for table in Base.metadata.sorted_tables:
-        actual = {col["name"] for col in inspector.get_columns(table.name)}
-        drifted.extend(
-            f"{table.name}.{column.name}"
-            for column in table.columns
-            if column.name not in actual
-        )
-    if drifted:
-        raise RuntimeError(
-            "Refusing to adopt drifted database: missing column(s) "
-            f"{', '.join(sorted(drifted))}. {_RECREATE_HINT}"
-        )
 
-    command.stamp(config, ALEMBIC_BASELINE_REVISION)
+    def missing_from(spec: dict[str, set[str]]) -> list[str]:
+        out: list[str] = []
+        for table, columns in spec.items():
+            actual = {col["name"] for col in inspector.get_columns(table)}
+            out.extend(f"{table}.{c}" for c in sorted(columns) if c not in actual)
+        return out
+
+    current = {
+        table.name: {column.name for column in table.columns}
+        for table in Base.metadata.sorted_tables
+    }
+    missing_current = missing_from(current)
+    if not missing_current:
+        command.stamp(config, "head")
+        return
+
+    missing_baseline = missing_from(_baseline_columns())
+    if not missing_baseline:
+        command.stamp(config, ALEMBIC_BASELINE_REVISION)
+        return
+
+    raise RuntimeError(
+        "Refusing to adopt drifted database: missing column(s) "
+        f"{', '.join(sorted(missing_baseline))} (vs the 0001 baseline; vs the "
+        f"current models: {', '.join(sorted(missing_current))}). {_RECREATE_HINT}"
+    )
 
 
 def _run_migrations(connection: sa.Connection) -> None:
     """Bring the schema to alembic head over an existing sync connection.
 
     A database created before alembic existed (by create_all + the old
-    ALTER hacks) is healed, parity-checked, and stamped at the baseline
-    revision rather than migrated; one versioned by an unknown chain (e.g.
-    the abandoned failure_01 branch) fails loudly; fresh databases are
-    built entirely by upgrade.
+    ALTER hacks) is healed and adopted (stamped at head or at the baseline
+    depending on its shape — see _adopt_unversioned); one versioned by an
+    unknown chain (e.g. the abandoned failure_01 branch) fails loudly;
+    fresh databases are built entirely by upgrade.
     """
     config = _alembic_config(connection)
 

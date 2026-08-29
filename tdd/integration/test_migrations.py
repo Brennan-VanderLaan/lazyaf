@@ -4,11 +4,15 @@ Integration tests for the alembic migration path (Phase 0b).
 Covers the startup scenarios init_db must handle:
 - fresh empty database: upgrade-to-head builds the full schema, in parity
   with Base.metadata.create_all (which the test fixtures still use)
-- legacy pre-alembic database (create_all-built, no alembic_version table):
-  healed if a whole table is missing, parity-checked, then stamped at the
-  baseline revision and upgraded, data intact
-- drifted legacy database (a baseline table missing a column): startup
-  refuses with a clear error instead of stamping over the drift
+- unversioned databases (no alembic_version table) are adopted three ways
+  (_adopt_unversioned in app/database.py):
+  1. head-shaped (matches the current models column-for-column, e.g. a
+     create_all-built dev DB) -> stamped at HEAD, schema untouched
+  2. baseline-shaped (columns exactly as revision 0001 defines, i.e. a
+     genuinely old pre-alembic DB without the 0002/0003 columns) ->
+     stamped at 0001, then upgraded so 0002/0003 add what's missing
+  3. anything else (a baseline table missing a column) is drift ->
+     startup refuses with a clear error instead of stamping over it
 - database versioned by an unknown migration chain (real dev DBs carry the
   abandoned failure_01 branch's orphaned revision ids): startup refuses
   with a clear error instead of silently re-stamping
@@ -18,11 +22,16 @@ import logging
 
 import pytest
 import pytest_asyncio
+from alembic import command
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import app.models  # noqa: F401  (register all tables on Base.metadata)
-from app.database import ALEMBIC_BASELINE_REVISION, Base, _run_migrations
+from app.database import ALEMBIC_BASELINE_REVISION, Base, _alembic_config, _run_migrations
+
+# Tip of the migration chain. Every startup path (fresh upgrade, legacy
+# adoption stamp-then-upgrade) must end here.
+ALEMBIC_HEAD_REVISION = "0003"
 
 EXPECTED_TABLES = {
     "repos",
@@ -34,7 +43,16 @@ EXPECTED_TABLES = {
     "pipeline_runs",
     "step_runs",
     "step_executions",
+    # 0002 (Phase 12.2-INT)
+    "workspaces",
+    # 0003 (Phase 12.2.5 spec layer)
+    "features",
+    "user_stories",
+    "acceptance_criteria",
+    "prompt_templates",
 }
+
+SPEC_TABLES = {"features", "user_stories", "acceptance_criteria", "prompt_templates"}
 
 
 @pytest_asyncio.fixture
@@ -103,6 +121,16 @@ async def _create_all(engine):
         await conn.run_sync(Base.metadata.create_all)
 
 
+async def _upgrade_to(engine, revision):
+    async with engine.begin() as conn:
+        await conn.run_sync(lambda c: command.upgrade(_alembic_config(c), revision))
+
+
+async def _downgrade_to(engine, revision):
+    async with engine.begin() as conn:
+        await conn.run_sync(lambda c: command.downgrade(_alembic_config(c), revision))
+
+
 class TestFreshDatabase:
     async def test_upgrade_builds_full_schema(self, engine_factory):
         engine = engine_factory("fresh.db")
@@ -131,12 +159,23 @@ class TestFreshDatabase:
         engine = engine_factory("fresh.db")
         await _migrate(engine)
 
-        assert await _alembic_versions(engine) == [ALEMBIC_BASELINE_REVISION]
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
+
+
+async def _make_baseline_shaped(engine):
+    """Build a genuinely old pre-alembic DB: exactly the 0001 schema (via the
+    real baseline migration's DDL), WITHOUT the 0002/0003 columns/tables and
+    WITHOUT an alembic_version table."""
+    await _upgrade_to(engine, ALEMBIC_BASELINE_REVISION)
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP TABLE alembic_version"))
 
 
 class TestLegacyDatabase:
-    async def test_unstamped_db_gets_stamped_at_baseline(self, engine_factory):
-        """A pre-alembic DB (create_all-built) is stamped, not re-migrated."""
+    async def test_unstamped_headshaped_db_is_stamped_at_head(self, engine_factory):
+        """Adoption branch 1: a create_all-built DB already matches the
+        current models, so it is stamped at HEAD (stamping the baseline
+        would re-run 0002/0003 over it) and the schema is untouched."""
         engine = engine_factory("legacy.db")
         await _create_all(engine)
         before = await _snapshot(engine)
@@ -144,8 +183,70 @@ class TestLegacyDatabase:
         # Would raise "table repos already exists" if it re-ran the baseline
         await _migrate(engine)
 
-        assert await _alembic_versions(engine) == [ALEMBIC_BASELINE_REVISION]
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
         assert await _snapshot(engine) == before
+
+    async def test_baseline_shaped_db_is_stamped_at_baseline_and_upgraded(
+        self, engine_factory
+    ):
+        """Adoption branch 2: a truly old pre-alembic DB (0001 columns only)
+        must NOT be stamped at head — cards.feature_id etc. do not exist and
+        create_all cannot add columns to existing tables. It is stamped at
+        0001 so the real 0002/0003 upgrades add the missing pieces."""
+        engine = engine_factory("baseline_shaped.db")
+        await _make_baseline_shaped(engine)
+        before = await _snapshot(engine)
+        assert "workspaces" not in before
+        assert "feature_id" not in before["cards"]["columns"]
+        assert "executor" not in before["step_runs"]["columns"]
+
+        await _migrate(engine)
+
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
+        after = await _snapshot(engine)
+        assert set(after) == EXPECTED_TABLES
+        assert "feature_id" in after["cards"]["columns"]
+        assert "user_story_id" in after["cards"]["columns"]
+        assert "executor" in after["step_runs"]["columns"]
+
+    async def test_baseline_shaped_db_lands_in_full_head_parity(self, engine_factory):
+        """The adopted-and-upgraded legacy DB is column-for-column and
+        index-for-index identical to a freshly migrated one."""
+        legacy = engine_factory("baseline_parity.db")
+        fresh = engine_factory("fresh_parity.db")
+        await _make_baseline_shaped(legacy)
+
+        await _migrate(legacy)
+        await _migrate(fresh)
+
+        legacy_schema = await _snapshot(legacy)
+        fresh_schema = await _snapshot(fresh)
+        assert set(legacy_schema) == set(fresh_schema)
+        for table in fresh_schema:
+            assert legacy_schema[table]["columns"] == fresh_schema[table]["columns"], table
+            assert legacy_schema[table]["indexes"] == fresh_schema[table]["indexes"], table
+
+    async def test_baseline_shaped_db_data_survives(self, engine_factory):
+        engine = engine_factory("baseline_data.db")
+        await _make_baseline_shaped(engine)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO repos (id, name, default_branch, is_ingested, created_at) "
+                    "VALUES ('r1', 'keepme', 'main', 0, '2026-01-01 00:00:00')"
+                )
+            )
+
+        await _migrate(engine)
+
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT name FROM repos WHERE id = 'r1'"))
+            assert result.scalar_one() == "keepme"
+            # The 0003 columns exist and read NULL for pre-existing rows.
+            result = await conn.execute(
+                text("SELECT feature_id FROM cards LIMIT 1")
+            )  # must not raise "no such column"
+            assert result.first() is None
 
     async def test_legacy_data_survives_adoption(self, engine_factory):
         engine = engine_factory("legacy.db")
@@ -174,12 +275,12 @@ class TestLegacyDatabase:
         await _migrate(engine)
 
         assert "step_executions" in await _table_names(engine)
-        assert await _alembic_versions(engine) == [ALEMBIC_BASELINE_REVISION]
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
 
     async def test_missing_column_raises_drift_error_and_never_stamps(self, engine_factory):
-        """A genuinely-behind DB (baseline table missing a column) is refused.
-
-        Stamping it would record baseline parity that does not exist; the
+        """Adoption branch 3: a DB matching NEITHER the current models NOR
+        the 0001 baseline (a baseline table missing a baseline column) is
+        refused. Stamping it would record parity that does not exist; the
         error must name the drift and the DB must stay unstamped.
         """
         engine = engine_factory("drifted.db")
@@ -248,7 +349,7 @@ class TestUnknownRevisionDatabase:
 
         await _migrate(engine)
 
-        assert await _alembic_versions(engine) == [ALEMBIC_BASELINE_REVISION]
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
 
 
 class TestIdempotency:
@@ -260,7 +361,7 @@ class TestIdempotency:
         await _migrate(engine)
 
         assert await _snapshot(engine) == first
-        assert await _alembic_versions(engine) == [ALEMBIC_BASELINE_REVISION]
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
 
     async def test_second_run_on_adopted_legacy_db(self, engine_factory):
         """Stamp on first startup, then plain no-op upgrades from then on."""
@@ -270,7 +371,117 @@ class TestIdempotency:
         await _migrate(engine)
         await _migrate(engine)
 
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
+
+
+class TestRoundTrip:
+    """upgrade -> downgrade -> upgrade coverage for revisions 0002 and 0003."""
+
+    async def test_downgrade_to_0002_removes_spec_layer_only(self, engine_factory):
+        """0003's downgrade drops the spec tables and the cards link columns,
+        leaving 0002's objects (workspaces, step_runs.executor) intact."""
+        engine = engine_factory("rt_0002.db")
+        await _migrate(engine)
+
+        await _downgrade_to(engine, "0002")
+
+        snapshot = await _snapshot(engine)
+        assert SPEC_TABLES.isdisjoint(set(snapshot))
+        assert "feature_id" not in snapshot["cards"]["columns"]
+        assert "user_story_id" not in snapshot["cards"]["columns"]
+        assert "workspaces" in snapshot
+        assert "executor" in snapshot["step_runs"]["columns"]
+        assert await _alembic_versions(engine) == ["0002"]
+
+    async def test_downgrade_to_baseline_matches_pure_0001_schema(self, engine_factory):
+        """Downgrading head -> 0001 restores exactly the baseline schema
+        (columns and indexes), byte-for-byte with a fresh 0001 upgrade."""
+        engine = engine_factory("rt_down.db")
+        reference = engine_factory("rt_ref.db")
+
+        await _migrate(engine)
+        await _downgrade_to(engine, "0001")
+        await _upgrade_to(reference, "0001")
+
+        assert await _snapshot(engine) == await _snapshot(reference)
         assert await _alembic_versions(engine) == [ALEMBIC_BASELINE_REVISION]
+
+    async def test_roundtrip_restores_head_schema(self, engine_factory):
+        """head -> 0001 -> head lands on the identical schema: 0002/0003's
+        upgrades and downgrades are exact inverses."""
+        engine = engine_factory("rt_full.db")
+        await _migrate(engine)
+        head = await _snapshot(engine)
+
+        await _downgrade_to(engine, "0001")
+        await _upgrade_to(engine, "head")
+
+        assert await _snapshot(engine) == head
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
+
+    async def test_roundtrip_preserves_rows_in_altered_tables(self, engine_factory):
+        """cards and step_runs rows survive the column drops/re-adds; the
+        dropped columns' values are gone by design and come back NULL."""
+        engine = engine_factory("rt_data.db")
+        await _migrate(engine)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO repos (id, name, default_branch, is_ingested, created_at) "
+                    "VALUES ('r1', 'repo', 'main', 0, '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO features (id, title, description, status, repo_ids, created_at, updated_at) "
+                    "VALUES ('f1', 'feat', '', 'draft', '[]', '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO cards (id, repo_id, title, description, status, runner_type, "
+                    "step_type, feature_id, created_at, updated_at) "
+                    "VALUES ('c1', 'r1', 'keepme', '', 'todo', 'any', 'agent', 'f1', "
+                    "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO pipelines (id, repo_id, name, steps, triggers, is_template, created_at, updated_at) "
+                    "VALUES ('p1', 'r1', 'pipe', '[]', '[]', 0, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO pipeline_runs (id, pipeline_id, status, trigger_type, "
+                    "current_step, steps_completed, steps_total, created_at) "
+                    "VALUES ('pr1', 'p1', 'passed', 'manual', 0, 1, 1, '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO step_runs (id, pipeline_run_id, step_index, step_name, status, executor, logs) "
+                    "VALUES ('sr1', 'pr1', 0, 'build', 'passed', 'local', '')"
+                )
+            )
+
+        await _downgrade_to(engine, "0001")
+
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT title FROM cards WHERE id = 'c1'"))
+            assert result.scalar_one() == "keepme"
+            result = await conn.execute(text("SELECT step_name FROM step_runs WHERE id = 'sr1'"))
+            assert result.scalar_one() == "build"
+
+        await _upgrade_to(engine, "head")
+
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT title, feature_id, user_story_id FROM cards WHERE id = 'c1'")
+            )
+            assert result.one() == ("keepme", None, None)
+            result = await conn.execute(text("SELECT executor FROM step_runs WHERE id = 'sr1'"))
+            assert result.scalar_one() is None
 
 
 class TestLoggingIsUntouched:

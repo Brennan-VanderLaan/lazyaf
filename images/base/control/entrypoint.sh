@@ -40,6 +40,22 @@ chown lazyaf:lazyaf \
 # the legacy step_config.json alike.
 find /workspace/.control -maxdepth 1 -name '*.json' -exec chown lazyaf:lazyaf {} + 2>/dev/null || true
 
+# DooD steps (needs: [docker]) mount /var/run/docker.sock, whose group is
+# whatever the daemon host uses (root gid 0 on Docker Desktop). gosu re-inits
+# supplementary groups from /etc/group, so a compose-style group_add would
+# NOT survive the privilege drop - instead join lazyaf to the socket's owning
+# group here, while still root (dogfood run d2f583d9's successor caught the
+# T2 preflight failing with EACCES once tiers moved off root stock images).
+if [ -S /var/run/docker.sock ]; then
+    SOCK_GID="$(stat -c %g /var/run/docker.sock)"
+    SOCK_GROUP="$(getent group "$SOCK_GID" | cut -d: -f1)"
+    if [ -z "$SOCK_GROUP" ]; then
+        groupadd -o -g "$SOCK_GID" docksock
+        SOCK_GROUP=docksock
+    fi
+    usermod -aG "$SOCK_GROUP" lazyaf
+fi
+
 # gosu resets HOME to the passwd entry (/home/lazyaf), clobbering the baked
 # ENV HOME=/workspace/home and any explicit HOME the executor passed - which
 # silently breaks the 12.3 cross-step HOME-persistence contract in BOTH

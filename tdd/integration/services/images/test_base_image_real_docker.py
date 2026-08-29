@@ -227,6 +227,26 @@ class TestStdoutModeAndHomePersistence:
         assert "step-one-was-here" in logs
 
 
+class TestDockerSocketAccess:
+    def test_dropped_user_can_connect_to_mounted_socket(self, docker_client):
+        """Regression for the T2 DooD preflight EACCES: needs:[docker] steps
+        run as the lazyaf user, so the entrypoint must join it to the
+        socket's owning group before gosu (group_add would not survive the
+        privilege drop)."""
+        output = docker_client.containers.run(
+            BASE_IMAGE,
+            command=[
+                "bash", "-c",
+                "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX); "
+                "s.connect('/var/run/docker.sock'); print('SOCK_OK')\" && id",
+            ],
+            volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
+            remove=True,
+        ).decode()
+        assert "SOCK_OK" in output
+        assert "uid=1000" in output  # proves the drop happened before connect
+
+
 class TestControlModeRoundTrip:
     def test_put_archive_config_control_run_and_consume_once(
         self, docker_client, named_volume, stub_backend

@@ -34,10 +34,10 @@
   }
 </script>
 
-<div class="repo-selector">
+<div class="repo-selector" data-testid="repo-selector">
   <div class="repo-header">
     <h2>Repositories</h2>
-    <button class="btn-icon" on:click={() => showAddForm = !showAddForm} title="Add repo">
+    <button class="btn-icon" data-testid="add-repo-btn" on:click={() => showAddForm = !showAddForm} title="Add repo">
       {showAddForm ? '✕' : '+'}
     </button>
   </div>
@@ -46,6 +46,8 @@
     <form class="add-form" on:submit|preventDefault={handleAdd}>
       <input
         type="text"
+        name="repo-name"
+        data-testid="repo-name-input"
         placeholder="Repository name"
         bind:value={newRepo.name}
         required
@@ -71,6 +73,8 @@
     {#each $reposStore as repo}
       <li
         class="repo-item"
+        data-testid="repo-item"
+        data-repo-id={repo.id}
         class:selected={$selectedRepoId === repo.id}
         on:click={() => $selectedRepoId = repo.id}
         on:keydown={(e) => e.key === 'Enter' && ($selectedRepoId = repo.id)}

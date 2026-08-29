@@ -121,7 +121,7 @@
   }
 </script>
 
-<div class="runner-panel">
+<div class="runner-panel" data-testid="runner-panel">
   <div class="panel-header">
     <h2>Runners</h2>
     <button class="btn-icon" on:click={openDockerModal} title="Get Docker command">
@@ -130,7 +130,7 @@
   </div>
 
   {#if $poolStatus}
-    <div class="pool-stats">
+    <div class="pool-stats" data-testid="pool-stats">
       <div class="stat">
         <span class="stat-value">{$poolStatus.total_runners}</span>
         <span class="stat-label">Total</span>
@@ -162,7 +162,7 @@
   {#if showRunners}
     <div class="runner-list">
       {#if $runnersStore.length === 0}
-        <div class="no-runners">
+        <div class="no-runners" data-testid="no-runners">
           <p>No runners connected</p>
           <p class="hint">Click 🐳 to get the Docker command</p>
         </div>
@@ -176,6 +176,9 @@
             {#each groupedRunners[runnerType] as runner (runner.id)}
               <button
                 class="runner-item"
+                data-testid="runner-item"
+                data-runner-id={runner.id}
+                data-status={runner.status}
                 on:click={() => openLogsModal(runner)}
               >
                 <span

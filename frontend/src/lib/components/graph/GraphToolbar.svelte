@@ -15,13 +15,14 @@
   ];
 </script>
 
-<div class="graph-toolbar">
+<div class="graph-toolbar" data-testid="graph-toolbar">
   <div class="toolbar-section">
     <span class="section-label">Quick Add:</span>
     <div class="button-group">
       {#each stepTypes as step}
         <button
           class="add-btn"
+          data-testid="toolbar-add-{step.type}"
           style:--btn-color={step.color}
           onclick={() => onAddStep(step.type)}
           title="{step.label} ({step.shortcut})"

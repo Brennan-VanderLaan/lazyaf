@@ -115,11 +115,11 @@
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div class="modal-backdrop" on:click={handleBackdropClick} role="dialog" aria-modal="true">
-  <div class="modal" on:click|stopPropagation role="document">
+  <div class="modal" data-testid="run-viewer" on:click|stopPropagation role="document">
     <header class="modal-header">
       <div class="header-info">
         <h2>Pipeline Run</h2>
-        <span class="run-status" style="color: {getStatusColor(run.status as RunStatus)}">
+        <span class="run-status" data-testid="run-status" data-status={run.status} style="color: {getStatusColor(run.status as RunStatus)}">
           {getStatusIcon(run.status as RunStatus)} {run.status}
         </span>
       </div>
@@ -143,10 +143,13 @@
         <span>Duration: {formatDuration(run.started_at, run.completed_at)}</span>
       </div>
 
-      <div class="steps-timeline">
+      <div class="steps-timeline" data-testid="steps">
         {#each run.step_runs || [] as stepRun, index}
           <button
             class="step-item"
+            data-testid="step"
+            data-step-index={index}
+            data-status={stepRun.status}
             class:selected={selectedStepIndex === index}
             class:current={run.current_step === index && run.status === 'running'}
             on:click={() => selectStep(index)}
@@ -177,7 +180,7 @@
             {#if stepLogs.error}
               <div class="error-message">{stepLogs.error}</div>
             {/if}
-            <pre class="logs">{stepLogs.logs || '(No logs)'}</pre>
+            <pre class="logs" data-testid="logs">{stepLogs.logs || '(No logs)'}</pre>
           {:else}
             <p class="no-logs">Select a step to view logs</p>
           {/if}

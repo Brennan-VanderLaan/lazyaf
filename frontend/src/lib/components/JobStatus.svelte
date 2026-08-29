@@ -104,7 +104,7 @@
 </script>
 
 {#if job || jobId}
-  <div class="job-status" data-status={job?.status ?? 'queued'}>
+  <div class="job-status" data-testid="job-status" data-status={job?.status ?? 'queued'}>
     <div class="job-header">
       <div class="job-info">
         <span class="job-icon">{job ? statusIcons[job.status] : '⏳'}</span>
@@ -152,12 +152,12 @@
       </div>
     {/if}
 
-    <button class="btn-logs" on:click={toggleLogs} type="button">
+    <button class="btn-logs" data-testid="logs-btn" on:click={toggleLogs} type="button">
       {showLogs ? 'Hide Logs' : 'View Logs'}
     </button>
 
     {#if showLogs}
-      <div class="job-logs">
+      <div class="job-logs" data-testid="job-logs">
         {#if job?.status === 'queued'}
           <div class="logs-empty">Waiting for runner to pick up job...</div>
         {:else if loadingLogs && !logs}

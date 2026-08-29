@@ -462,7 +462,7 @@
   }
 </script>
 
-<div class="graph-editor" class:readonly>
+<div class="graph-editor" data-testid="graph-editor" class:readonly>
   <!-- Toolbar -->
   {#if !readonly}
     <GraphToolbar onAddStep={onToolbarAddStep} />
@@ -477,6 +477,7 @@
     <!-- Main Flow Canvas -->
     <div
       class="flow-wrapper"
+      data-testid="graph-canvas"
       oncontextmenu={(e) => { if (!readonly) onPaneContextMenu(e); }}
       ondragover={(e) => { e.preventDefault(); e.dataTransfer!.dropEffect = 'copy'; }}
       ondrop={(e) => {

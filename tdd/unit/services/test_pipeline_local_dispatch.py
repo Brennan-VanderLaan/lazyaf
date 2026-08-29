@@ -1076,7 +1076,15 @@ class TestDeadlineDiscipline:
         assert "hard deadline" in step.error
         assert stuck.cancel_calls, "container kill was never requested"
 
-        fetched = await fetch_run(env, run_id)
+        # The run's own FAILED status lands via an async continuation after
+        # the step flips - poll for it too (a single immediate read flaked
+        # under the slower dogfood container in run d2f583d9).
+        deadline = asyncio.get_running_loop().time() + 10
+        while asyncio.get_running_loop().time() < deadline:
+            fetched = await fetch_run(env, run_id)
+            if fetched.status == RunStatus.FAILED.value:
+                break
+            await asyncio.sleep(0.05)
         assert fetched.status == RunStatus.FAILED.value
 
         # The abandoned consumer was NOT cancelled - it is still parked on

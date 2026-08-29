@@ -75,6 +75,11 @@ app.include_router(playground.session_router)
 app.include_router(models.router)
 app.include_router(steps.router)
 
+if settings.test_mode:
+    # e2e-only reset/seed surface; module stays unimported when the flag is off
+    from app.routers import test_api
+    app.include_router(test_api.router)
+
 
 @app.get("/health")
 async def health():

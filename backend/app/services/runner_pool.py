@@ -206,6 +206,13 @@ class RunnerPool:
             for r in self._runners.values()
         ]
 
+    def reset(self):
+        """Drop all registered runners. Test-mode reset hook; the background
+        cleanup loop (if running) is left alone - lifespan owns it."""
+        count = len(self._runners)
+        self._runners.clear()
+        logger.info(f"Runner pool reset ({count} runners dropped)")
+
     @property
     def runner_count(self) -> int:
         return len(self._runners)

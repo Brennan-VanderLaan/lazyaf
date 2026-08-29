@@ -108,43 +108,41 @@ def _mark_test(request):
 async def clean_runner_pool():
     """Clean runner pool state before and after each test.
 
-    This fixture ensures tests have a fresh runner pool state and
-    cleans up afterward to prevent test pollution.
+    Uses the pool's own reset()/stop() (the same hooks the test-mode API
+    uses) instead of hand-assigning private attributes, so the fixture
+    cannot drift from the pool's real internals.
     """
     from app.services.runner_pool import runner_pool
 
     # Clear before
-    runner_pool._runners = {}
-    runner_pool._running = False
-    runner_pool._worker_task = None
+    if runner_pool._running:
+        await runner_pool.stop()
+    runner_pool.reset()
 
     yield runner_pool
 
     # Clear after
     if runner_pool._running:
         await runner_pool.stop()
-    runner_pool._runners = {}
-    runner_pool._running = False
-    runner_pool._worker_task = None
+    runner_pool.reset()
 
 
 @pytest_asyncio.fixture
 async def clean_job_queue():
     """Clean job queue state before and after each test.
 
-    This fixture ensures tests have a fresh job queue state.
+    Uses the queue's own clear() (the same hook the test-mode API uses)
+    instead of hand-assigning private attributes.
     """
     from app.services.job_queue import job_queue
 
     # Clear before
-    job_queue._pending = {}
-    job_queue._jobs = []
+    await job_queue.clear()
 
     yield job_queue
 
     # Clear after
-    job_queue._pending = {}
-    job_queue._jobs = []
+    await job_queue.clear()
 
 
 # -----------------------------------------------------------------------------

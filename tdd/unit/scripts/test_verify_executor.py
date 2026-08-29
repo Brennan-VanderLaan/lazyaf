@@ -66,11 +66,13 @@ def make_pipeline(step_types, pipeline_id="pipe-1"):
     }
 
 
-def step_run(index, executor, name=None):
+def step_run(index, executor, name=None, status="passed", logs="a log line\n"):
     return {
         "step_index": index,
         "step_name": name or f"step-{index}",
         "executor": executor,
+        "status": status,
+        "logs": logs,
     }
 
 
@@ -133,6 +135,116 @@ class TestVerifyRun:
         with pytest.raises(SystemExit) as exc:
             verify_executor.verify_run("http://backend:8000", "run-1")
         assert "steps not executed by LocalExecutor" in str(exc.value)
+
+
+class TestControlPathLogProbe:
+    """12.3: a PASSED script step with empty logs = the control-layer
+    reporting path (POST /api/steps/{id}/logs) silently failed."""
+
+    def test_passed_step_with_empty_logs_fails(self, monkeypatch):
+        run = make_run([
+            step_run(0, "local"),
+            step_run(1, "local", name="tier1", logs=""),
+        ])
+        pipeline = make_pipeline(["script", "script"])
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "delivered no logs" in str(exc.value)
+        assert "tier1" in str(exc.value)
+
+    def test_whitespace_only_logs_fail(self, monkeypatch):
+        run = make_run([step_run(0, "local", logs="  \n")])
+        pipeline = make_pipeline(["script"])
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "delivered no logs" in str(exc.value)
+
+    def test_marker_only_logs_fail(self, monkeypatch):
+        """Clobber-shaped case: the backend appended its own '[lazyaf] '
+        marker line but the in-container runtime delivered NOTHING - the
+        probe must not count backend-written markers as delivered logs."""
+        run = make_run([
+            step_run(0, "local", logs="[lazyaf] exit code: 0\n"),
+        ])
+        pipeline = make_pipeline(["script"])
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "delivered no logs" in str(exc.value)
+
+    def test_multiple_marker_lines_and_whitespace_fail(self, monkeypatch):
+        run = make_run([
+            step_run(
+                0,
+                "local",
+                logs="[lazyaf] exit code: 0\n  \n[lazyaf] something else\n",
+            ),
+        ])
+        pipeline = make_pipeline(["script"])
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "delivered no logs" in str(exc.value)
+
+    def test_real_logs_plus_marker_pass(self, monkeypatch):
+        """A healthy control-mode step: runtime-delivered log lines plus
+        the backend's trailing marker line."""
+        run = make_run([
+            step_run(0, "local", logs="hello\nworld\n[lazyaf] exit code: 0\n"),
+        ])
+        pipeline = make_pipeline(["script"])
+        stub_backend(monkeypatch, run, pipeline)
+
+        msg = verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "OK: 1 script step run(s)" in msg
+
+    def test_own_step_is_exempt_from_log_check(self, monkeypatch):
+        """The verify step's own logs are still streaming - never
+        self-fail on an empty own row."""
+        run = make_run([
+            step_run(0, "local"),
+            step_run(1, "local", name="verify-executor", logs=""),
+        ])
+        pipeline = make_pipeline(["script", "script"])
+        stub_backend(monkeypatch, run, pipeline)
+
+        msg = verify_executor.verify_run(
+            "http://backend:8000", "run-1", self_index=1
+        )
+        assert "OK: 2 script step run(s)" in msg
+
+    def test_non_terminal_step_not_log_checked(self, monkeypatch):
+        """A still-running step legitimately has no logs committed yet."""
+        run = make_run([
+            step_run(0, "local"),
+            step_run(1, "local", status="running", logs=""),
+        ])
+        pipeline = make_pipeline(["script", "script"])
+        stub_backend(monkeypatch, run, pipeline)
+
+        msg = verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "OK: 2 script step run(s)" in msg
+
+    def test_main_passes_own_index_from_env(self, monkeypatch, capsys):
+        run = make_run([
+            step_run(0, "local"),
+            step_run(1, "local", name="me", logs=""),
+        ], run_id="r42")
+        pipeline = make_pipeline(["script", "script"])
+        stub_backend(monkeypatch, run, pipeline)
+
+        monkeypatch.setenv("LAZYAF_PIPELINE_RUN_ID", "r42")
+        monkeypatch.setenv("LAZYAF_STEP_INDEX", "1")
+        monkeypatch.delenv("LAZYAF_BACKEND_URL", raising=False)
+
+        verify_executor.main()
+        assert "OK: 2 script step run(s)" in capsys.readouterr().out
 
 
 class TestMain:

@@ -1,53 +1,58 @@
 name: "Test Suite"
-description: "Tiered dogfood CI: T1 unit/demos/integration, T2 Docker integration, T3 e2e quick - each tier gated by scripts/ci_gate.py (R4: skip baseline + executed-count floors), then verify-executor asserts the local execution path ran every script step (12.2-INT exit gate)"
+description: "Tiered dogfood CI: T1 unit/demos/integration, T2 Docker integration, T3 e2e quick - each tier gated by scripts/ci_gate.py (R4: skip baseline + executed-count floors), then verify-executor asserts the local execution path (and, from 12.3, the control-layer reporting path) ran every script step"
 triggers:
   - type: push
     config:
       branches: ["main"]
 
-# 12.2-INT: script steps run in EPHEMERAL containers via LocalExecutor on a
-# shared workspace volume (/workspace/repo checkout, HOME=/workspace/home).
-# Every step pins python:3.12 (full, not slim: bash/curl/git) so uv's venv
-# and $HOME/.local tooling built in one step remain valid in the next.
-# The pin dissolves into the lazyaf-base image at Phase 12.3.
+# 12.3 dogfood ratchet: every step now runs on the lazyaf step images
+# (lazyaf-test-runner:dev / lazyaf-base:dev), which bake LABEL
+# lazyaf.control-layer=1 - so every step of this run executes in CONTROL MODE
+# (in-container control runtime -> POST /api/steps/{id}/status|logs|heartbeat
+# -> StepRun rows + the same step_update/step_log WS frames the UI renders).
+# The dogfood run IS the standing round-trip acceptance for the control layer
+# (R7); a step can set `control: false` in its config to use the old stdout
+# path - verify-executor does so DELIBERATELY (gate independence: the gate
+# must not run on the runtime it verifies), which also keeps the escape
+# hatch exercised on every push.
+#
+# BUILD PREREQUISITE (no phantom :latest - the :dev tags are built locally,
+# never pulled): run `python scripts/build_images.py` once, and again after
+# editing images/** (it skips fresh builds via the lazyaf.content-hash label;
+# `--check` lists missing/stale images without building; the scripts/test
+# `images` lane wraps it). If the images are missing, this pipeline still
+# materializes and triggers fine but the first step fails FAST and LOUD with
+# "Image not found: lazyaf-test-runner:dev" - that message is the rebuild
+# trigger by design; the backend never auto-builds mid-run.
+#
+# HOME=/workspace/home persists across steps on the run's named workspace
+# volume; the images bake PIP_USER/PYTHONUSERBASE/NPM_CONFIG_PREFIX/PATH so
+# per-step tool installs land there without any PATH exports in commands.
 steps:
-  # Interim uv bootstrap - installs into $HOME/.local/bin on the workspace
-  # volume, so later steps inherit it. Dissolves into lazyaf-base at 12.3.
-  - id: "install-uv"
-    name: "Install uv"
-    type: script
-    config:
-      image: "python:3.12"
-      command: |
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-        export PATH="$HOME/.local/bin:$PATH"
-        uv --version
-    continue_in_context: true
-    on_success: next
-    on_failure: stop
-    timeout: 120
-
+  # uv and node are BAKED into lazyaf-test-runner (the 12.2-INT install-uv
+  # bootstrap step dissolved into the image at 12.3, per PLAN).
   - id: "sync-deps"
     name: "Sync Dependencies"
     type: script
     config:
-      image: "python:3.12"
+      image: "lazyaf-test-runner:dev"
       command: |
-        export PATH="$HOME/.local/bin:$PATH"
         cd backend
         uv sync --all-extras
         uv sync --extra test
     continue_in_context: true
     on_success: next
     on_failure: stop
-    timeout: 600
+    # Cold-cache `uv sync` on a fresh workspace volume needs headroom; the
+    # earlier 480 cut was unjustified.
+    timeout: 720
 
   # Tier selections are SINGLE-SOURCED in scripts/run_tier.py (pytest args +
   # junitxml + the R4 ci_gate call); floors live in tdd/tier_floors.json and
   # allowed skip reasons in tdd/skip_baseline.json - see tdd/README.md.
   # A red pytest exits run_tier.py red before the gate runs and stays red.
   #
-  # KNOWN EXCLUSION (stated per R4, not a silent cap): the 21 @slow e2e tests
+  # KNOWN EXCLUSION (stated per R4, not a silent cap): the @slow e2e tests
   # (control layer, real card execution, graph pipeline full-stack) run in NO
   # tier - they need the compose e2e stack, which a step container cannot
   # host yet. They stay runnable on the host via the scripts/test slow lane
@@ -56,32 +61,28 @@ steps:
     name: "T1: Unit + Demos + Integration (no Docker)"
     type: script
     config:
-      image: "python:3.12"
+      image: "lazyaf-test-runner:dev"
       command: |
-        export PATH="$HOME/.local/bin:$PATH"
         python3 scripts/run_tier.py T1
     continue_in_context: true
     on_success: next
     on_failure: stop
     timeout: 1800
 
-  # Interim DooD, step-container edition: the Docker tiers mount the host
-  # socket into their EPHEMERAL step container via an explicit bind mount
-  # (MountSpec addressing, R6). Same tradeoff as the retired runner-socket
-  # variant (host-root-equivalent for these two steps only); formalized and
-  # revisited at Phase 12.4. If the socket is missing, these tests skip with
+  # Interim DooD, step-container edition: the Docker tiers get the host
+  # socket via the `needs: [docker]` step-config sugar - ONE translation
+  # site (pipeline_executor) instead of raw bind-mount specs repeated per
+  # step, which is also the single seam Phase 12.4 rewires. Same tradeoff
+  # as the retired runner-socket variant (host-root-equivalent for these
+  # two steps only). If the socket is missing, these tests skip with
   # "Docker not available" - out of baseline, gate fails (R4).
   - id: "tier2"
     name: "T2: Docker-dependent integration"
     type: script
     config:
-      image: "python:3.12"
-      mounts:
-        - addressing: "bind"
-          source: "/var/run/docker.sock"
-          target: "/var/run/docker.sock"
+      image: "lazyaf-test-runner:dev"
+      needs: ["docker"]
       command: |
-        export PATH="$HOME/.local/bin:$PATH"
         python3 scripts/run_tier.py T2
     continue_in_context: true
     on_success: next
@@ -92,27 +93,30 @@ steps:
     name: "T3: E2E quick tier"
     type: script
     config:
-      image: "python:3.12"
-      mounts:
-        - addressing: "bind"
-          source: "/var/run/docker.sock"
-          target: "/var/run/docker.sock"
+      image: "lazyaf-test-runner:dev"
+      needs: ["docker"]
       command: |
-        export PATH="$HOME/.local/bin:$PATH"
         python3 scripts/run_tier.py T3
     on_success: next
     on_failure: stop
     timeout: 1200
 
-  # 12.2-INT exit-gate ratchet (R1): every script step of THIS run must have
-  # been executed by the LocalExecutor. LAZYAF_PIPELINE_RUN_ID (and friends)
-  # are injected into every step container by LocalExecutor; the backend is
-  # reachable by service DNS name on the shared lazyaf-network.
+  # Exit-gate ratchet (R1), 12.3 edition: every script step of THIS run must
+  # have executor='local' AND (control-layer probe) show logs that arrived via
+  # the POST /api/steps/* path with a StepExecution row per script step.
+  # LAZYAF_PIPELINE_RUN_ID (and friends) are injected into every step
+  # container by LocalExecutor; the backend is reachable by service DNS name
+  # on the shared lazyaf-network. Runs on lazyaf-base:dev in STDOUT mode
+  # (`control: false`): the gate that verifies the control runtime must not
+  # DEPEND on the runtime it verifies - a broken runtime would otherwise
+  # take the gate down with it. This also exercises the `control: false`
+  # escape hatch on every push, so it can never rot silently.
   - id: "verify-executor"
-    name: "Verify executor=local for script steps"
+    name: "Verify executor=local + control path for script steps"
     type: script
     config:
-      image: "python:3.12"
+      image: "lazyaf-base:dev"
+      control: false
       command: |
         python3 scripts/verify_executor.py
     on_success: next

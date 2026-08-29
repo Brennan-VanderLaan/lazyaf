@@ -54,6 +54,15 @@ TIERS: dict[str, dict] = {
             "../tdd/integration/services",
         ],
         "junitxml": "junit-t2.xml",
+        # Floor/baseline coherence: T2 tests REQUIRE the locally-built
+        # lazyaf-*:dev step images. Verify them before pytest so a missing
+        # or stale image is a loud preflight failure with the exact rebuild
+        # command - never a skip the gate has to baseline. Runs through
+        # `uv run` from backend/ (same env as pytest) for the docker SDK.
+        "preflight": {
+            "argv": ["uv", "run", "python", "../scripts/build_images.py", "--check"],
+            "fix": "python scripts/build_images.py",
+        },
     },
     "T3": {
         "name": "E2E quick tier",
@@ -71,6 +80,19 @@ def run_tier(tier: str, extra_pytest_args: list[str]) -> int:
     """Run one tier's pytest selection, then gate its junitxml. Returns rc."""
     spec = TIERS[tier]
     junit_path = REPO_ROOT / spec["junitxml"]
+
+    preflight = spec.get("preflight")
+    if preflight:
+        print(f"[run_tier] {tier}: preflight: {' '.join(preflight['argv'])} (cwd={BACKEND_DIR})")
+        rc = subprocess.run(preflight["argv"], cwd=BACKEND_DIR).returncode
+        if rc != 0:
+            print(
+                f"[run_tier] {tier}: PREFLIGHT FAILED - step images missing/stale.\n"
+                f"[run_tier] {tier}: build them, then re-run this tier:\n"
+                f"[run_tier] {tier}:     {preflight['fix']}",
+                file=sys.stderr,
+            )
+            return rc or 1
 
     pytest_cmd = [
         "uv",

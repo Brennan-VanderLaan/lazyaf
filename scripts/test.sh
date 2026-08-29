@@ -1,6 +1,6 @@
 #!/bin/bash
 # LazyAF Test Runner Script
-# Usage: ./scripts/test.sh [unit|integration|demo|e2e|e2e-quick|slow|tier|all|coverage]
+# Usage: ./scripts/test.sh [unit|integration|demo|e2e|e2e-quick|slow|tier|images|all|coverage]
 
 set -e
 
@@ -121,7 +121,7 @@ case "${1:-all}" in
         uv run pytest ../tdd/e2e -v --tb=short -m "not slow"
         ;;
     slow)
-        # The 21 @slow full-stack e2e tests (control layer, real card
+        # The @slow full-stack e2e tests (control layer, real card
         # execution, graph pipeline). They run in NO CI tier today (stated
         # exclusion per R4 - see tdd/README.md): they need this compose
         # stack, which the legacy runner cannot host. Dogfood CI picks them
@@ -140,6 +140,16 @@ case "${1:-all}" in
         shift  # Remove 'tier' from args
         "$PYTHON" "$PROJECT_ROOT/scripts/run_tier.py" "$@"
         ;;
+    images)
+        # 12.3 step images (lazyaf-base:dev -> lazyaf-claude:dev /
+        # lazyaf-test-runner:dev). Single-sourced in scripts/build_images.py
+        # (dependency order, content-hash staleness skip, --check / --force).
+        # The dogfood pipeline and the control-layer/HOME-persistence tests
+        # need these tags on the local daemon; a missing tag fails a step
+        # loudly with "Image not found: lazyaf-base:dev" by design.
+        shift  # Remove 'images' from args
+        "$PYTHON" "$PROJECT_ROOT/scripts/build_images.py" "$@"
+        ;;
     coverage)
         echo "Running all tests with coverage..."
         uv run pytest ../tdd/unit ../tdd/integration \
@@ -157,7 +167,7 @@ case "${1:-all}" in
         "$PYTHON" "$PROJECT_ROOT/scripts/run_tier.py" T1 T3
         ;;
     *)
-        echo "Usage: $0 [unit|integration|demo|e2e|e2e-quick|slow|tier|all|coverage]"
+        echo "Usage: $0 [unit|integration|demo|e2e|e2e-quick|slow|tier|images|all|coverage]"
         echo ""
         echo "  unit        - Run fast isolated unit tests"
         echo "  integration - Run API and database tests"
@@ -166,6 +176,7 @@ case "${1:-all}" in
         echo "  e2e-quick   - Run E2E API tests only (no browser, no servers needed)"
         echo "  slow        - Run the @slow full-stack e2e tests in the compose stack (no CI tier runs these)"
         echo "  tier        - Run gated CI tier(s) via scripts/run_tier.py (e.g. 'tier T1', 'tier T2')"
+        echo "  images      - Build the 12.3 step images via scripts/build_images.py (--check lists stale)"
         echo "  coverage    - Run tests with coverage report"
         echo "  all         - Run the no-Docker CI tiers T1 + T3 (default; T2 needs Docker)"
         echo ""

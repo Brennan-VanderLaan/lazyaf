@@ -5,7 +5,7 @@ from typing import Any, Optional
 from pydantic import BaseModel, field_validator, model_validator
 
 from app.models.card import StepType
-from app.models.pipeline import RunStatus
+from app.models.pipeline import ExecutorMode, RunStatus
 
 
 # =============================================================================
@@ -215,6 +215,10 @@ class StepRunRead(BaseModel):
     step_name: str
     status: RunStatus
     job_id: str | None = None
+    # Which execution path ran this step (R1). Typed as the ExecutorMode enum
+    # (cross-file contract #3) so an off-vocabulary value is a loud
+    # validation error, never a silently misread string.
+    executor: ExecutorMode | None = None
     logs: str = ""
     error: str | None = None
     started_at: datetime | None = None

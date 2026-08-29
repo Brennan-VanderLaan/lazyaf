@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, onDestroy } from 'svelte';
   import type { PipelineRun, StepRun, RunStatus, StepLogsResponse } from '../api/types';
-  import { activeRunsStore } from '../stores/pipelines';
+  import { activeRunsStore, liveStepLogsStore, stepLogKey } from '../stores/pipelines';
   import { pipelineRuns as runsApi } from '../api/client';
 
   export let run: PipelineRun;
@@ -15,14 +15,34 @@
   let loadingLogs = false;
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
 
+  // Live view of the run: WS frames (pipeline_run_status / step_run_status /
+  // step_update) land in activeRunsStore, so prefer the store's copy over the
+  // prop snapshot. The REST poll below remains as a fallback for missed
+  // frames and also feeds the store.
+  $: liveRun = $activeRunsStore.get(run.id) ?? run;
+
+  // Live log tail streamed over the WS (step_log / step_log_batch) for the
+  // selected step.
+  $: liveLines =
+    selectedStepIndex !== null
+      ? $liveStepLogsStore.get(stepLogKey(run.id, selectedStepIndex)) ?? []
+      : [];
+  $: liveLogText = liveLines.join('\n');
+
+  // What the log pane shows: the persisted snapshot (REST) is authoritative,
+  // but while the WS tail is ahead of the last poll — or before the first
+  // fetch returns — show the live tail so lines appear as they happen. Both
+  // are views of the same stream, so "longer wins" picks the fresher one.
+  $: displayedLogs =
+    liveLogText.length > (stepLogs?.logs?.length ?? 0) ? liveLogText : stepLogs?.logs ?? '';
+
   // Auto-refresh while running
-  $: if (run.status === 'running' || run.status === 'pending') {
+  $: if (liveRun.status === 'running' || liveRun.status === 'pending') {
     if (!refreshInterval) {
       refreshInterval = setInterval(async () => {
         try {
           const updated = await runsApi.get(run.id);
           activeRunsStore.updateRun(updated);
-          run = updated;
           // Refresh logs for selected step
           if (selectedStepIndex !== null) {
             await loadStepLogs(selectedStepIndex);
@@ -57,6 +77,7 @@
 
   function selectStep(index: number) {
     selectedStepIndex = index;
+    stepLogs = null;
     loadStepLogs(index);
   }
 
@@ -119,8 +140,8 @@
     <header class="modal-header">
       <div class="header-info">
         <h2>Pipeline Run</h2>
-        <span class="run-status" data-testid="run-status" data-status={run.status} style="color: {getStatusColor(run.status as RunStatus)}">
-          {getStatusIcon(run.status as RunStatus)} {run.status}
+        <span class="run-status" data-testid="run-status" data-status={liveRun.status} style="color: {getStatusColor(liveRun.status as RunStatus)}">
+          {getStatusIcon(liveRun.status as RunStatus)} {liveRun.status}
         </span>
       </div>
       <button type="button" class="close-btn" on:click={() => dispatch('close')}>✕</button>
@@ -130,28 +151,28 @@
       <div class="progress-bar">
         <div
           class="progress-fill"
-          style="width: {(run.steps_completed / run.steps_total) * 100}%"
-          class:running={run.status === 'running'}
-          class:passed={run.status === 'passed'}
-          class:failed={run.status === 'failed'}
+          style="width: {(liveRun.steps_completed / liveRun.steps_total) * 100}%"
+          class:running={liveRun.status === 'running'}
+          class:passed={liveRun.status === 'passed'}
+          class:failed={liveRun.status === 'failed'}
         ></div>
-        <span class="progress-text">{run.steps_completed} / {run.steps_total} steps</span>
+        <span class="progress-text">{liveRun.steps_completed} / {liveRun.steps_total} steps</span>
       </div>
 
       <div class="run-meta">
-        <span>Trigger: {run.trigger_type}</span>
-        <span>Duration: {formatDuration(run.started_at, run.completed_at)}</span>
+        <span>Trigger: {liveRun.trigger_type}</span>
+        <span>Duration: {formatDuration(liveRun.started_at, liveRun.completed_at)}</span>
       </div>
 
       <div class="steps-timeline" data-testid="steps">
-        {#each run.step_runs || [] as stepRun, index}
+        {#each liveRun.step_runs || [] as stepRun, index}
           <button
             class="step-item"
             data-testid="step"
             data-step-index={index}
             data-status={stepRun.status}
             class:selected={selectedStepIndex === index}
-            class:current={run.current_step === index && run.status === 'running'}
+            class:current={liveRun.current_step === index && liveRun.status === 'running'}
             on:click={() => selectStep(index)}
           >
             <span class="step-status" style="color: {getStatusColor(stepRun.status as RunStatus)}">
@@ -168,28 +189,31 @@
       {#if selectedStepIndex !== null}
         <div class="step-details">
           <div class="step-details-header">
-            <h3>{run.step_runs?.[selectedStepIndex]?.step_name || `Step ${selectedStepIndex + 1}`}</h3>
+            <h3>{liveRun.step_runs?.[selectedStepIndex]?.step_name || `Step ${selectedStepIndex + 1}`}</h3>
             {#if stepLogs?.error}
               <span class="error-badge">Error</span>
             {/if}
           </div>
 
-          {#if loadingLogs}
+          {#if stepLogs?.error}
+            <div class="error-message">{stepLogs.error}</div>
+          {/if}
+          {#if loadingLogs && !displayedLogs}
             <div class="loading">Loading logs...</div>
-          {:else if stepLogs}
-            {#if stepLogs.error}
-              <div class="error-message">{stepLogs.error}</div>
-            {/if}
-            <pre class="logs" data-testid="logs">{stepLogs.logs || '(No logs)'}</pre>
           {:else}
-            <p class="no-logs">Select a step to view logs</p>
+            <!-- displayedLogs prefers the WS live tail while it is ahead of the
+                 last REST snapshot, so lines stream in during local execution
+                 even when no snapshot has loaded yet. -->
+            <pre class="logs" data-testid="logs">{displayedLogs || '(No logs)'}</pre>
           {/if}
         </div>
+      {:else}
+        <p class="no-logs">Select a step to view logs</p>
       {/if}
     </div>
 
     <footer class="modal-footer">
-      {#if run.status === 'running' || run.status === 'pending'}
+      {#if liveRun.status === 'running' || liveRun.status === 'pending'}
         <button type="button" class="btn-cancel" on:click={handleCancel}>Cancel Pipeline</button>
       {/if}
       <button type="button" class="btn-secondary" on:click={() => dispatch('close')}>

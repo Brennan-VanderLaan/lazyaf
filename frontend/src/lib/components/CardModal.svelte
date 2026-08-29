@@ -1,10 +1,10 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, tick } from 'svelte';
-  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType, StepType, StepConfig, AgentFile, RepoAgent, MergedAgent } from '../api/types';
+  import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType, StepType, StepConfig, AgentFile, RepoAgent, MergedAgent, Feature, UserStory } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
   import { agentFilesStore } from '../stores/agentFiles';
-  import { repos, lazyafFiles } from '../api/client';
+  import { repos, lazyafFiles, features as featuresApi } from '../api/client';
   import JobStatus from './JobStatus.svelte';
   import DiffViewer from './DiffViewer.svelte';
   import ConflictResolver from './ConflictResolver.svelte';
@@ -45,6 +45,35 @@
 
   // Agent files - merge platform and repo agents
   let repoAgents: RepoAgent[] = [];
+
+  // Spec layer link (Phase 12.2.5) - optional story link, edit-only (the
+  // CardUpdate schema carries feature_id/user_story_id; CardCreate does not)
+  let specFeatures: Feature[] = [];
+  let specStoriesByFeature: Record<string, UserStory[]> = {};
+  let selectedStoryId: string = card?.user_story_id ?? '';
+
+  async function loadSpecOptions() {
+    try {
+      const featureList = await featuresApi.list();
+      const storyLists = await Promise.all(featureList.map(f => featuresApi.stories(f.id)));
+      const byFeature: Record<string, UserStory[]> = {};
+      featureList.forEach((f, i) => { byFeature[f.id] = storyLists[i]; });
+      specFeatures = featureList;
+      specStoriesByFeature = byFeature;
+    } catch {
+      // Spec layer optional in this modal - degrade to no selector
+      specFeatures = [];
+      specStoriesByFeature = {};
+    }
+  }
+
+  $: allSpecStories = Object.values(specStoriesByFeature).flat();
+  $: linkedStory = card?.user_story_id
+    ? allSpecStories.find(s => s.id === card?.user_story_id) ?? null
+    : null;
+  $: linkedFeature = card?.feature_id
+    ? specFeatures.find(f => f.id === card?.feature_id) ?? null
+    : (linkedStory ? specFeatures.find(f => f.id === linkedStory?.feature_id) ?? null : null);
 
   // Load repo agents when repo changes
   async function loadRepoAgents() {
@@ -137,6 +166,8 @@
     agentFilesStore.load();
     // Load repo-defined agents
     loadRepoAgents();
+    // Load spec features/stories for the optional story link selector
+    loadSpecOptions();
   });
 
   async function loadBranches() {
@@ -167,6 +198,9 @@
       const agentFiles = stepType === 'agent' && selectedAgentFileIds.length > 0 ? selectedAgentFileIds : null;
 
       if (isEdit && card) {
+        const linkStory = selectedStoryId
+          ? allSpecStories.find(s => s.id === selectedStoryId) ?? null
+          : null;
         const updated = await cardsStore.update(card.id, {
           title,
           description,
@@ -175,6 +209,8 @@
           step_config: stepConfig,
           prompt_template: agentPrompt,
           agent_file_ids: agentFiles,
+          user_story_id: linkStory ? linkStory.id : null,
+          feature_id: linkStory ? linkStory.feature_id : null,
         });
         dispatch('updated', updated);
       } else {
@@ -550,6 +586,25 @@
         {/if}
       {/if}
 
+      {#if isEdit && specFeatures.length > 0}
+        <div class="form-group">
+          <label for="link-story">Link to story (optional)</label>
+          <select id="link-story" data-testid="link-story-select" bind:value={selectedStoryId}>
+            <option value="">— No linked story —</option>
+            {#each specFeatures as specFeature (specFeature.id)}
+              {#if (specStoriesByFeature[specFeature.id] ?? []).length > 0}
+                <optgroup label={specFeature.title}>
+                  {#each specStoriesByFeature[specFeature.id] as story (story.id)}
+                    <option value={story.id}>{story.title}</option>
+                  {/each}
+                </optgroup>
+              {/if}
+            {/each}
+          </select>
+          <p class="form-hint">Ties this card to a spec-layer user story for traceability.</p>
+        </div>
+      {/if}
+
       {#if isEdit && card}
         <div class="card-meta">
           <div class="meta-item">
@@ -587,6 +642,14 @@
                 {:else}
                   {runnerTypeOptions.find(o => o.value === card.runner_type)?.label || card.runner_type}
                 {/if}
+              </span>
+            </div>
+          {/if}
+          {#if linkedFeature || linkedStory}
+            <div class="meta-item">
+              <span class="meta-label">Spec:</span>
+              <span class="meta-value" data-testid="card-spec-link">
+                {#if linkedFeature}{linkedFeature.title}{/if}{#if linkedFeature && linkedStory}&nbsp;/&nbsp;{/if}{#if linkedStory}{linkedStory.title}{/if}
               </span>
             </div>
           {/if}

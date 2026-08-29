@@ -31,10 +31,12 @@ from app.models import Card, Pipeline, Repo
 from app.models.card import CardStatus, StepType
 from app.services.git_server import git_repo_manager
 from app.services.job_queue import job_queue
+from app.services.pipeline_executor import pipeline_executor
 from app.services.playground_service import playground_service
 from app.services.runner_pool import runner_pool
 from app.services.trigger_service import reset_trigger_dedup
 from app.services.websocket import manager
+from app.services.workspace_service import workspace_service
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +70,20 @@ async def _reset_trigger_dedup() -> None:
     reset_trigger_dedup()
 
 
+async def _reset_workspace_service() -> None:
+    workspace_service.reset()
+
+
 register_resettable("job_queue", job_queue.clear)
 register_resettable("runner_pool", _reset_runner_pool)
 register_resettable("websocket_manager", manager.reset)
 register_resettable("playground_sessions", playground_service.reset)
 register_resettable("trigger_dedup", _reset_trigger_dedup)
+# Phase 12.2-INT: per-run task registry/state machines/locks + LocalExecutor
+# idempotency cache, and the workspace lock manager - all point at rows the
+# DB reset deletes.
+register_resettable("pipeline_executor", pipeline_executor.reset)
+register_resettable("workspace_service", _reset_workspace_service)
 
 
 def require_test_mode():

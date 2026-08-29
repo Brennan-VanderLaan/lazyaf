@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, Feature, FeatureCreate, FeatureUpdate, UserStory, UserStoryCreate, UserStoryUpdate, AcceptanceCriterion, AcceptanceCriterionCreate, AcceptanceCriterionUpdate, PromptTemplate, PromptTemplateCreate, PromptTemplateUpdate } from './types';
 
 const BASE_URL = '/api';
 
@@ -132,6 +132,7 @@ export const cards = {
       method: 'POST',
       body: JSON.stringify({ onto_branch: ontoBranch || null, resolutions }),
     }),
+  promoteToFeature: (id: string) => request<Feature>(`/cards/${id}/promote-to-feature`, { method: 'POST' }),
 };
 
 // Jobs
@@ -278,4 +279,72 @@ export interface ModelsListResponse {
 export const models = {
   list: (refresh: boolean = false) =>
     request<ModelsListResponse>(`/models${refresh ? '?refresh=true' : ''}`),
+};
+
+// =============================================================================
+// Spec Layer (Phase 12.2.5)
+// =============================================================================
+
+export const features = {
+  list: () => request<Feature[]>('/features'),
+  get: (id: string) => request<Feature>(`/features/${id}`),
+  create: (data: FeatureCreate) => request<Feature>('/features', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  update: (id: string, data: FeatureUpdate) => request<Feature>(`/features/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  }),
+  delete: (id: string) => request<void>(`/features/${id}`, { method: 'DELETE' }),
+  stories: (id: string) => request<UserStory[]>(`/features/${id}/stories`),
+  // Seeds the three north-star Milestone 12 user stories (US-1/US-2/US-3).
+  // Response shape is backend-owned; callers reload the feature list after.
+  seedMilestone12: () => request<unknown>('/features/seed-milestone12', { method: 'POST' }),
+};
+
+export const userStories = {
+  // Unfiltered list (all stories across features); pass featureId to filter
+  // server-side. The Specs page loads everything in one request and groups
+  // client-side (avoids the 1+N per-feature fetch).
+  list: (featureId?: string) =>
+    request<UserStory[]>(`/user-stories${featureId ? `?feature_id=${encodeURIComponent(featureId)}` : ''}`),
+  get: (id: string) => request<UserStory>(`/user-stories/${id}`),
+  create: (data: UserStoryCreate) => request<UserStory>('/user-stories', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  update: (id: string, data: UserStoryUpdate) => request<UserStory>(`/user-stories/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  }),
+  delete: (id: string) => request<void>(`/user-stories/${id}`, { method: 'DELETE' }),
+  criteria: (id: string) => request<AcceptanceCriterion[]>(`/user-stories/${id}/criteria`),
+};
+
+export const criteria = {
+  get: (id: string) => request<AcceptanceCriterion>(`/criteria/${id}`),
+  create: (data: AcceptanceCriterionCreate) => request<AcceptanceCriterion>('/criteria', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  update: (id: string, data: AcceptanceCriterionUpdate) => request<AcceptanceCriterion>(`/criteria/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  }),
+  delete: (id: string) => request<void>(`/criteria/${id}`, { method: 'DELETE' }),
+};
+
+export const promptTemplates = {
+  list: () => request<PromptTemplate[]>('/prompt-templates'),
+  get: (id: string) => request<PromptTemplate>(`/prompt-templates/${id}`),
+  create: (data: PromptTemplateCreate) => request<PromptTemplate>('/prompt-templates', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  update: (id: string, data: PromptTemplateUpdate) => request<PromptTemplate>(`/prompt-templates/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  }),
+  delete: (id: string) => request<void>(`/prompt-templates/${id}`, { method: 'DELETE' }),
 };

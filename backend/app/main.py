@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 from app.database import init_db
 from app.routers import repos, cards, jobs, runners, agent_files, pipelines, lazyaf_files
-from app.routers import git, playground, models, steps
+from app.routers import git, playground, models, steps, spec
 from app.services.websocket import manager
 
 # Import models to ensure they're registered with Base before init_db
@@ -24,10 +24,14 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
+
     from app.database import engine, async_session
     from app.services.runner_pool import runner_pool
     from app.services.playground_service import playground_service
     from app.services.execution import recover_orphaned_executions
+    from app.services.workspace.population import pre_pull_images
+    from app.services.workspace_service import start_orphan_audit
 
     await init_db()
 
@@ -41,7 +45,22 @@ async def lifespan(app: FastAPI):
 
     await runner_pool.start()
     await playground_service.start()
+    # Periodic workspace orphan audit (Phase 12.2-INT). First sweep runs
+    # immediately for startup crash recovery; the loop owns its DB sessions
+    # and survives sweep failures (logged, retried next interval).
+    orphan_audit_task = start_orphan_audit()()
+    # Pre-pull the step/clone images in the background (non-blocking) so the
+    # first pipeline run doesn't sit silently through an implicit pull.
+    # pre_pull_images never raises; failures are logged and the implicit
+    # pull on first use remains the safety net.
+    pre_pull_task = asyncio.create_task(pre_pull_images(), name="image-pre-pull")
     yield
+    for task in (pre_pull_task, orphan_audit_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await playground_service.stop()
     await runner_pool.stop()
     await engine.dispose()
@@ -74,6 +93,7 @@ app.include_router(playground.router)
 app.include_router(playground.session_router)
 app.include_router(models.router)
 app.include_router(steps.router)
+app.include_router(spec.router)
 
 if settings.test_mode:
     # e2e-only reset/seed surface; module stays unimported when the flag is off

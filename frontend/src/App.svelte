@@ -8,6 +8,7 @@
   import PipelinesPage from './lib/pages/PipelinesPage.svelte';
   import PipelineEditorPage from './lib/pages/PipelineEditorPage.svelte';
   import PlaygroundPage from './lib/pages/PlaygroundPage.svelte';
+  import SpecsPage from './lib/pages/SpecsPage.svelte';
   import { websocketStore } from './lib/stores/websocket';
   import { hasRunningJobs } from './lib/stores/jobs';
   import { hasActiveRuns } from './lib/stores/pipelines';
@@ -18,6 +19,7 @@
     '/pipelines': PipelinesPage,
     '/pipelines/:id/edit': PipelineEditorPage,
     '/playground': PlaygroundPage,
+    '/specs': SpecsPage,
   };
 
   onMount(() => {
@@ -47,6 +49,10 @@
         {#if $hasActiveRuns}
           <span class="nav-badge"></span>
         {/if}
+      </a>
+      <a href="/specs" use:link class="nav-item" data-testid="nav-specs" class:active={$location === '/specs'}>
+        <span class="nav-icon">📐</span>
+        <span class="nav-label">Specs</span>
       </a>
       <a href="/playground" use:link class="nav-item" class:active={$location === '/playground'}>
         <span class="nav-icon">{$playgroundRunning ? '⚙️' : '🧪'}</span>

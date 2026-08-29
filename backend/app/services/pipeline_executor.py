@@ -30,17 +30,17 @@ path. Run lifecycle is driven through main's PipelineStateMachine.
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.models import Pipeline, PipelineRun, StepRun, RunStatus, Job, Card, Repo
-from app.models.pipeline import ExecutorMode
+from app.models.pipeline import ExecutorMode, StepExecution, StepExecutionStatus
 from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
@@ -72,6 +72,28 @@ RESET_DRAIN_GRACE = 2.0
 # hit - never one commit per line.
 LOG_FLUSH_MAX_LINES = 200
 LOG_FLUSH_INTERVAL_SECONDS = 0.5
+
+# Extra slack a per-step-execution token lives beyond the step's own hard
+# deadline (12.3 hardening: was a full hour - far wider than any legitimate
+# late report needs).
+STEP_TOKEN_TTL_SLACK = 300
+
+# StepExecution statuses that count as terminal for reconciliation (mirrors
+# app.routers.steps.TERMINAL_EXECUTION_STATUSES - both derive from the enum).
+TERMINAL_STEP_EXECUTION_STATUSES = frozenset({
+    StepExecutionStatus.COMPLETED.value,
+    StepExecutionStatus.FAILED.value,
+    StepExecutionStatus.CANCELLED.value,
+    StepExecutionStatus.TIMEOUT.value,
+})
+
+# StepExecution statuses proving the control runtime NEVER reported: the row
+# was created/prepared at dispatch and no /api/steps POST ever moved it.
+NEVER_REPORTED_STEP_EXECUTION_STATUSES = frozenset({
+    StepExecutionStatus.PENDING.value,
+    StepExecutionStatus.ASSIGNED.value,
+    StepExecutionStatus.PREPARING.value,
+})
 
 
 class LocalStepContextError(RuntimeError):
@@ -775,6 +797,20 @@ class PipelineExecutor:
             logger.info(f"Started pipeline run {pipeline_run.id[:8]} for pipeline {pipeline.name}")
             await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
 
+            # Image preflight (12.3 hardening): every distinct step image is
+            # resolved ONCE up front; a run referencing missing tags fails
+            # with ONE message before step 0 dispatches.
+            preflight_error = await self._preflight_step_images(
+                list(steps_dict.values())
+            )
+            if preflight_error is not None:
+                logger.error(
+                    f"Pipeline run {pipeline_run.id[:8]} failed image "
+                    f"preflight: {preflight_error}"
+                )
+                await self._complete_pipeline(db, pipeline_run, success=False)
+                return pipeline_run
+
             if not entry_points:
                 # No entry points, mark as passed
                 await self._complete_pipeline(db, pipeline_run, success=True)
@@ -818,6 +854,16 @@ class PipelineExecutor:
             logger.info(f"Started pipeline run {pipeline_run.id[:8]} for pipeline {pipeline.name}")
             await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
 
+            # Image preflight (12.3 hardening): see the graph branch above.
+            preflight_error = await self._preflight_step_images(steps)
+            if preflight_error is not None:
+                logger.error(
+                    f"Pipeline run {pipeline_run.id[:8]} failed image "
+                    f"preflight: {preflight_error}"
+                )
+                await self._complete_pipeline(db, pipeline_run, success=False)
+                return pipeline_run
+
             if steps:
                 async with self._run_lock(pipeline_run.id):
                     await self._execute_step(db, pipeline_run, repo, steps, 0, params)
@@ -825,6 +871,46 @@ class PipelineExecutor:
                 await self._complete_pipeline(db, pipeline_run, success=True)
 
             return pipeline_run
+
+    async def _preflight_step_images(self, step_defs: list[dict]) -> str | None:
+        """Resolve every distinct explicitly-configured step image ONCE at
+        run start (12.3 hardening).
+
+        Returns None when all images resolve, else ONE human-readable
+        message naming every missing tag - the caller fails the run with it
+        BEFORE dispatching step 0, instead of dribbling per-step
+        ImageNotFound failures across a partially-executed run.
+
+        Scope: only images named in step configs. Steps without an explicit
+        image use settings.step_default_image, which app startup pre-pulls;
+        resolving it here would force a docker client into runs that route
+        entirely legacy (and into the no-Docker test tier). Preflight
+        infrastructure failures (docker down, guard-blocked client) are
+        logged and non-fatal - per-step dispatch surfaces them loudly.
+        """
+        images = sorted({
+            (step.get("config") or {}).get("image")
+            for step in step_defs
+            if (step.get("config") or {}).get("image")
+        })
+        if not images:
+            return None
+        try:
+            executor = await self._get_local_executor()
+            missing = await executor.find_missing_images(images)
+        except Exception as e:
+            logger.warning(
+                f"Image preflight could not run ({e!r}); dispatch will "
+                f"surface any missing images per-step"
+            )
+            return None
+        if missing:
+            return (
+                "missing step image(s): "
+                + ", ".join(sorted(missing))
+                + " - build or pull them before running this pipeline"
+            )
+        return None
 
     def _init_state_machine(self, run_id: str, total_steps: int) -> None:
         """Create the run's state machine and drive it to RUNNING."""
@@ -1275,6 +1361,7 @@ class PipelineExecutor:
             success = False
             exit_code: int | None = None
             error: str | None = None
+            log_tail: list[str] | None = None
             acquired = False
             workspace_service = None
             workspace_id: str | None = None
@@ -1303,6 +1390,10 @@ class PipelineExecutor:
                 exec_config, exec_context = self._build_local_execution_config(
                     pipeline_run, step_run, step_type, step_config, timeout, params,
                 )
+                await self._prepare_control_mode(
+                    db, executor, step_run, step_config, exec_config,
+                    exec_context, timeout,
+                )
 
                 consumer_task = asyncio.create_task(
                     self._consume_local_events(
@@ -1310,7 +1401,7 @@ class PipelineExecutor:
                     )
                 )
                 try:
-                    success, exit_code, error = await asyncio.wait_for(
+                    success, exit_code, error, log_tail = await asyncio.wait_for(
                         asyncio.shield(consumer_task), timeout=hard_deadline
                     )
                 except asyncio.TimeoutError:
@@ -1395,6 +1486,7 @@ class PipelineExecutor:
             await self._finish_local_step(
                 db, pipeline_run, pipeline, repo, step_run,
                 graph, steps, step, is_graph, success, exit_code, error,
+                log_tail,
             )
         finally:
             if not session_abandoned:
@@ -1681,6 +1773,87 @@ class PipelineExecutor:
         }
         return exec_step_config, exec_context
 
+    async def _prepare_control_mode(
+        self,
+        db: AsyncSession,
+        executor,
+        step_run: StepRun,
+        step_config: dict,
+        exec_config: dict,
+        exec_context: dict,
+        timeout: int,
+    ) -> None:
+        """Decide the step's reporting mode AT DISPATCH TIME (12.3), never
+        mid-flight, and stamp it EXPLICITLY into exec_context["control_mode"]
+        so neither the executor nor the event consumer ever guesses.
+
+        Control mode requires ALL of:
+        - the image bakes the `lazyaf.control-layer` capability label
+          (declared by the image author; LocalExecutor inspects+caches it)
+        - the step did not opt out via `config.control: false` (debug escape
+          hatch; there is NO `control: true` promotion for unlabeled images)
+        - the command is a string (exec-form list commands are the explicit
+          shell-less opt-out and keep stdout mode)
+
+        Selecting control mode creates what the /api/steps/* router
+        authenticates against: the StepExecution row (PREPARING, timeout_at
+        = now + timeout + hard grace) plus a per-step-execution JWT scoped
+        to that row's id, with lifetime = timeout + grace +
+        STEP_TOKEN_TTL_SLACK (not the 24h default, and no longer a full
+        hour: terminal reconciliation 409s zombie posts anyway, so the token
+        only needs to outlive a legitimately late final report). Both travel
+        to the container ONLY via the config file the LocalExecutor delivers
+        with put_archive.
+
+        Stock/unlabeled images take the stdout path with ZERO behavior
+        change.
+        """
+        exec_context["control_mode"] = False
+
+        if step_config.get("control") is False:
+            logger.info(
+                f"Step {step_run.step_index} ({step_run.step_name}): control "
+                f"mode disabled by step config (control: false) - stdout mode"
+            )
+            return
+        if not isinstance(exec_config.get("command", ""), str):
+            return  # exec-form list command: explicit stdout-mode opt-out
+
+        settings = get_settings()
+        image = exec_config.get("image") or settings.step_default_image
+        if not await executor.image_supports_control_layer(image):
+            return
+
+        from app.services.execution.idempotency import ExecutionService
+        from app.services.control_layer.auth import generate_step_token
+
+        execution_service = ExecutionService(db)
+        execution = await execution_service.get_or_create_execution(
+            step_run_id=step_run.id,
+            execution_key=exec_context["execution_key"],
+        )
+        execution.status = StepExecutionStatus.PREPARING.value
+        execution.timeout_at = datetime.utcnow() + timedelta(
+            seconds=timeout + LOCAL_STEP_HARD_TIMEOUT_GRACE
+        )
+        await db.commit()
+
+        token = generate_step_token(
+            step_id=execution.id,
+            execution_key=exec_context["execution_key"],
+            expires_in_seconds=(
+                timeout + LOCAL_STEP_HARD_TIMEOUT_GRACE + STEP_TOKEN_TTL_SLACK
+            ),
+        )
+
+        exec_context["control_mode"] = True
+        exec_context["step_execution_id"] = execution.id
+        exec_context["step_auth_token"] = token
+        logger.info(
+            f"Step {step_run.step_index} ({step_run.step_name}): control mode "
+            f"(image {image}, step_execution {execution.id[:8]})"
+        )
+
     async def _consume_local_events(
         self,
         db: AsyncSession,
@@ -1689,25 +1862,39 @@ class PipelineExecutor:
         executor,
         exec_config: dict,
         exec_context: dict,
-    ) -> tuple[bool, int | None, str | None]:
+    ) -> tuple[bool, int | None, str | None, list[str] | None]:
         """Consume the LocalExecutor event stream, persisting incrementally.
 
         Event shape (see app/services/execution/local_executor.py):
           {"type": "status", "status": "preparing"|"running"|...}
           {"type": "log", "line": "..."}
           {"type": "result", "status": "completed"|"failed"|"timeout",
-           "exit_code": int|None, "error": str|None}
+           "exit_code": int|None, "error": str|None,
+           "log_tail": list[str] (control mode only)}
 
-        Returns (success, exit_code, error).
+        Returns (success, exit_code, error, log_tail) - log_tail is the
+        executor's bounded stdout forensics tail (control mode), passed
+        through to _finish_local_step.
 
         Log persistence is BATCHED (fix 7): lines buffer and flush to the
         StepRun row (one commit) plus the typed WS batch publish every
         LOG_FLUSH_MAX_LINES lines or LOG_FLUSH_INTERVAL_SECONDS - whichever
         first - with a final flush on the terminal event. A pull task (never
         cancelled on the flush timer) keeps the executor generator safe.
+
+        Control mode (12.3, R3 - one writer per datum): when
+        exec_context["control_mode"] is set (EXPLICIT, decided at dispatch -
+        never guessed here), the /api/steps/* router is the sole writer of
+        StepRun.logs / step_log frames and of the intermediate step_update
+        broadcast, so this consumer DROPS log and status events (debug
+        logger only - the runtime still echoes to container stdout for
+        docker-logs forensics). The stream is consumed solely for liveness,
+        the backstop timeout, and the `result` event: the container exit
+        code stays ground truth for terminal state in BOTH modes.
         """
         run_id = pipeline_run.id
         step_index = step_run.step_index
+        control_mode = bool(exec_context.get("control_mode"))
         loop = asyncio.get_running_loop()
         buffer: list[str] = []
         flush_deadline = loop.time() + LOG_FLUSH_INTERVAL_SECONDS
@@ -1750,11 +1937,29 @@ class PipelineExecutor:
 
                 if event_type == "status":
                     status = event.get("status", "")
-                    # Terminal statuses are persisted from the result event;
-                    # the StepRun stays RUNNING through preparing/running.
-                    await manager.publish_step_update(run_id, step_index, status)
+                    if control_mode:
+                        # Router owns intermediate status frames (R3).
+                        logger.debug(
+                            "control-mode step %s of run %s: dropped executor "
+                            "status event %r",
+                            step_index, run_id[:8], status,
+                        )
+                    else:
+                        # Terminal statuses are persisted from the result
+                        # event; the StepRun stays RUNNING through
+                        # preparing/running.
+                        await manager.publish_step_update(run_id, step_index, status)
 
                 elif event_type == "log":
+                    if control_mode:
+                        # Router owns StepRun.logs + step_log frames (R3); no
+                        # buffer append, no WS - stdout stays in docker logs.
+                        logger.debug(
+                            "control-mode step %s of run %s: dropped stdout "
+                            "line %r",
+                            step_index, run_id[:8], event.get("line", ""),
+                        )
+                        continue
                     buffer.append(event.get("line", ""))
                     if (
                         len(buffer) >= LOG_FLUSH_MAX_LINES
@@ -1767,18 +1972,19 @@ class PipelineExecutor:
                     status = event.get("status")
                     exit_code = event.get("exit_code")
                     error = event.get("error")
+                    log_tail = event.get("log_tail")
                     if status == "completed":
-                        return True, exit_code, None
+                        return True, exit_code, None, log_tail
                     if status == "timeout":
                         timeout_s = event.get(
                             "timeout_seconds", exec_config.get("timeout")
                         )
                         return False, exit_code, (
                             error or f"step timed out after {timeout_s}s"
-                        )
+                        ), log_tail
                     if exit_code is not None and not error:
                         error = f"step failed with exit code {exit_code}"
-                    return False, exit_code, error or "step failed"
+                    return False, exit_code, error or "step failed", log_tail
 
                 else:
                     logger.warning(
@@ -1795,7 +2001,7 @@ class PipelineExecutor:
         # The stream ending without a result event is a contract violation -
         # surface it, never treat it as success (R1).
         await flush()
-        return False, None, "executor event stream ended without a result event"
+        return False, None, "executor event stream ended without a result event", None
 
     async def _finish_local_step(
         self,
@@ -1811,6 +2017,7 @@ class PipelineExecutor:
         success: bool,
         exit_code: int | None,
         error: str | None,
+        log_tail: list[str] | None = None,
     ) -> None:
         """Persist a local step's final state and drive the run continuation.
 
@@ -1822,7 +2029,81 @@ class PipelineExecutor:
             await self._finish_local_step_locked(
                 db, pipeline_run, pipeline, repo, step_run,
                 graph, steps, step, is_graph, success, exit_code, error,
+                log_tail,
             )
+
+    async def _load_control_execution(
+        self, db: AsyncSession, pipeline_run: PipelineRun, step_run: StepRun
+    ) -> StepExecution | None:
+        """Load the step's StepExecution row, present iff the step
+        dispatched in control mode (_prepare_control_mode creates it under
+        the dispatch execution key)."""
+        execution_key = f"{pipeline_run.id}:{step_run.step_index}:{step_run.id}"
+        result = await db.execute(
+            select(StepExecution).where(
+                StepExecution.execution_key == execution_key
+            )
+        )
+        return result.scalar_one_or_none()
+
+    def _reconcile_control_execution(
+        self,
+        execution: StepExecution,
+        step: dict,
+        success: bool,
+        exit_code: int | None,
+        error: str | None,
+        warning_lines: list[str],
+    ) -> tuple[bool, str | None]:
+        """Reconcile control-runtime telemetry with the executor's ground
+        truth at step finish (12.3 hardening fix 2).
+
+        (a) A row that never left PREPARING means the control runtime never
+            reported - the step FAILS loudly regardless of exit code 0 (an
+            image without a working /control runtime must never read green).
+        (b) An in-container timeout (exit 124 / runtime-reported timeout)
+            surfaces as a timeout error, not a generic failure.
+        (c) A runtime-reported error (e.g. dropped log lines) is surfaced:
+            a loud warning line for StepRun.logs plus StepRun.error - the
+            step keeps its real exit status.
+        (d) The row is marked terminal so the /api/steps router 409s any
+            zombie-token post arriving after the step finished.
+
+        Returns the possibly-amended (success, error).
+        """
+        timed_out = (
+            exit_code == 124
+            or execution.status == StepExecutionStatus.TIMEOUT.value
+        )
+        if execution.status in NEVER_REPORTED_STEP_EXECUTION_STATUSES:
+            never_msg = (
+                "control runtime never reported "
+                "(image lacks a working /control runtime?)"
+            )
+            success = False
+            error = never_msg if not error else f"{never_msg}; {error}"
+        elif not success and timed_out:
+            timeout_s = step.get("timeout", 300)
+            error = (
+                f"step timed out after {timeout_s}s "
+                f"(in-container timeout, exit code 124)"
+            )
+        if execution.error:
+            warning_lines.append(f"[lazyaf] WARNING: {execution.error}\n")
+            if not error:
+                error = execution.error
+        if execution.status not in TERMINAL_STEP_EXECUTION_STATUSES:
+            if timed_out and not success:
+                execution.status = StepExecutionStatus.TIMEOUT.value
+            elif success:
+                execution.status = StepExecutionStatus.COMPLETED.value
+            else:
+                execution.status = StepExecutionStatus.FAILED.value
+            if execution.completed_at is None:
+                execution.completed_at = datetime.utcnow()
+        if execution.exit_code is None and exit_code is not None:
+            execution.exit_code = exit_code
+        return success, error
 
     async def _finish_local_step_locked(
         self,
@@ -1838,6 +2119,7 @@ class PipelineExecutor:
         success: bool,
         exit_code: int | None,
         error: str | None,
+        log_tail: list[str] | None = None,
     ) -> None:
         await db.refresh(pipeline_run)
         if pipeline_run.status not in (RunStatus.RUNNING.value, RunStatus.PENDING.value):
@@ -1847,11 +2129,51 @@ class PipelineExecutor:
             )
             return
 
+        # Control-mode reconciliation (fix 2): the executor exit code stays
+        # ground truth, but the StepExecution row's telemetry can amend the
+        # verdict (never-reported => fail loudly; exit 124 => timeout error)
+        # and is itself driven terminal here.
+        execution = await self._load_control_execution(db, pipeline_run, step_run)
+        warning_lines: list[str] = []
+        if execution is not None:
+            success, error = self._reconcile_control_execution(
+                execution, step, success, exit_code, error, warning_lines
+            )
+
         step_run.status = RunStatus.PASSED.value if success else RunStatus.FAILED.value
         step_run.completed_at = datetime.utcnow()
         step_run.error = error
+
+        # Assemble everything this finish appends to StepRun.logs, then
+        # append it with ONE targeted SQL expression
+        # (logs = COALESCE(logs,'') || :suffix). NEVER a read-modify-write
+        # of the session-cached blob: in control mode the /api/steps router
+        # wrote StepRun.logs from other sessions, and writing back a stale
+        # cached value would clobber every line it landed (fix 1).
+        suffix_parts: list[str] = []
+        if execution is not None and log_tail:
+            # Forensics (fix 5): persist the executor's bounded stdout tail
+            # when the step failed OR the router landed zero log bytes.
+            result = await db.execute(
+                select(StepRun.logs).where(StepRun.id == step_run.id)
+            )
+            current_logs = result.scalar_one_or_none() or ""
+            if not success or not current_logs:
+                suffix_parts.append(
+                    "".join(f"[container] {line}\n" for line in log_tail)
+                )
+        suffix_parts.extend(warning_lines)
         if exit_code is not None:
-            step_run.logs = (step_run.logs or "") + f"[lazyaf] exit code: {exit_code}\n"
+            suffix_parts.append(f"[lazyaf] exit code: {exit_code}\n")
+        if suffix_parts:
+            await db.execute(
+                update(StepRun)
+                .where(StepRun.id == step_run.id)
+                .values(
+                    logs=func.coalesce(StepRun.logs, "") + "".join(suffix_parts)
+                )
+                .execution_options(synchronize_session=False)
+            )
 
         if success:
             pipeline_run.steps_completed += 1

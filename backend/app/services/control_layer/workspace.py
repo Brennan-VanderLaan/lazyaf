@@ -1,79 +1,23 @@
 """
-Workspace Layout - Phase 12.3
+Step config producer - Phase 12.3.
 
-Defines workspace directory structure and initialization.
+`generate_step_config` is the SINGLE PRODUCER of the step config file
+contract (R3) consumed by the in-container control runtime at
+`images/base/control/` (see `config.py` there). LocalExecutor calls it and
+ships the result verbatim into the step container as
+`/workspace/.control/<step_execution_id>.json` (path announced to the
+runtime via the CONFIG_PATH env var); the runtime verifies and unlinks
+that exact file. The consumer-side contract test
+(`tdd/unit/control_runtime/test_config_contract.py`) pins that the
+consumer understands every key produced here.
+
+The former workspace-layout half of this module (WorkspaceLayout,
+initialize_workspace, get_workspace_paths, write_step_config) was dead
+code and is deleted: `images/base/entrypoint.sh` is the single owner of
+the /workspace HOME skeleton, covered behaviorally by
+`tdd/integration/services/test_home_persistence.py`.
 """
-import json
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-
-@dataclass
-class WorkspaceLayout:
-    """
-    Defines the workspace directory structure.
-
-    /workspace/
-    ├── repo/           # Git repository checkout
-    ├── home/           # Persistent HOME directory
-    │   ├── .cache/     # Cache (pip, etc.)
-    │   ├── .config/    # Config files
-    │   └── .local/
-    │       └── bin/    # User-installed tools
-    └── .control/       # Control layer files
-        └── step_config.json
-    """
-    workspace_root: str = "/workspace"
-
-    @property
-    def root(self) -> str:
-        """Root workspace directory."""
-        return self.workspace_root
-
-    @property
-    def repo(self) -> str:
-        """Repository checkout directory."""
-        return f"{self.workspace_root}/repo"
-
-    @property
-    def home(self) -> str:
-        """Persistent HOME directory."""
-        return f"{self.workspace_root}/home"
-
-    @property
-    def control(self) -> str:
-        """Control layer directory."""
-        return f"{self.workspace_root}/.control"
-
-    @property
-    def required_directories(self) -> List[str]:
-        """List of directories that must exist."""
-        return [
-            "/workspace",
-            "/workspace/repo",
-            "/workspace/home",
-            "/workspace/.control",
-            "/control",  # Control layer script location
-        ]
-
-    @property
-    def control_files(self) -> List[str]:
-        """Files in the control directory."""
-        return [
-            "step_config.json",
-        ]
-
-    @property
-    def home_subdirectories(self) -> List[str]:
-        """Subdirectories under home."""
-        return [
-            ".cache",
-            ".config",
-            ".local",
-            ".local/bin",
-            ".local/share",
-        ]
+from typing import Any, Dict, Optional
 
 
 def generate_step_config(
@@ -86,20 +30,28 @@ def generate_step_config(
     environment: Optional[Dict[str, str]] = None,
     timeout_seconds: int = 3600,
     working_directory: str = "/workspace/repo",
+    shell: str = "bash",
 ) -> Dict[str, Any]:
     """
-    Generate step configuration for the control directory.
+    Generate the step config payload for the in-container control runtime.
+
+    SINGLE PRODUCER of the config file contract (R3): every key here must
+    be understood by the consumer (`images/base/control/config.py`); the
+    contract test asserts consumer-keys are a superset of these.
 
     Args:
         step_id: Step execution ID
         step_run_id: Step run ID
         execution_key: Unique execution key
-        command: Command to execute
+        command: RAW command string (the runtime shell-wraps it)
         backend_url: Backend API URL
-        auth_token: Authentication token
+        auth_token: Authentication token (frozen key name - never "token")
         environment: Additional environment variables
         timeout_seconds: Execution timeout
-        working_directory: Working directory for command
+        working_directory: Working directory for command (frozen key name -
+            never "working_dir")
+        shell: Shell the runtime wraps the command with (sourced from step
+            config; default "bash", images without bash declare e.g. "sh")
 
     Returns:
         Step configuration dictionary
@@ -114,91 +66,7 @@ def generate_step_config(
         "environment": environment or {},
         "timeout_seconds": timeout_seconds,
         "working_directory": working_directory,
+        "shell": shell,
     }
 
     return config
-
-
-def write_step_config(
-    control_dir: str,
-    config: Dict[str, Any],
-) -> Path:
-    """
-    Write step configuration to control directory.
-
-    Args:
-        control_dir: Path to control directory
-        config: Step configuration dictionary
-
-    Returns:
-        Path to written config file
-    """
-    control_path = Path(control_dir)
-    control_path.mkdir(parents=True, exist_ok=True)
-
-    config_path = control_path / "step_config.json"
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-    return config_path
-
-
-def initialize_workspace(workspace: Path) -> None:
-    """
-    Initialize workspace directory structure.
-
-    Creates:
-    - repo/ directory
-    - home/ directory with subdirectories
-    - .control/ directory
-
-    Preserves existing content.
-
-    Args:
-        workspace: Path to workspace root
-    """
-    # Create repo directory
-    repo_dir = workspace / "repo"
-    repo_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create home directory with subdirectories
-    home_dir = workspace / "home"
-    home_subdirs = [
-        ".cache",
-        ".cache/pip",
-        ".config",
-        ".local",
-        ".local/bin",
-        ".local/share",
-        ".npm-global",
-        ".npm-global/bin",
-    ]
-
-    home_dir.mkdir(parents=True, exist_ok=True)
-    for subdir in home_subdirs:
-        (home_dir / subdir).mkdir(parents=True, exist_ok=True)
-
-    # Create control directory
-    control_dir = workspace / ".control"
-    control_dir.mkdir(parents=True, exist_ok=True)
-
-
-def get_workspace_paths(workspace_root: str = "/workspace") -> Dict[str, str]:
-    """
-    Get common workspace paths.
-
-    Args:
-        workspace_root: Root of workspace
-
-    Returns:
-        Dict mapping names to paths
-    """
-    return {
-        "root": workspace_root,
-        "repo": f"{workspace_root}/repo",
-        "home": f"{workspace_root}/home",
-        "control": f"{workspace_root}/.control",
-        "config": f"{workspace_root}/.control/step_config.json",
-        "cache": f"{workspace_root}/home/.cache",
-        "local_bin": f"{workspace_root}/home/.local/bin",
-    }

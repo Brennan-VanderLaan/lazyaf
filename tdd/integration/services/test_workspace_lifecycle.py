@@ -45,11 +45,8 @@ from app.services.workspace_service import (
 # -----------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def docker_client():
-    client = docker.from_env()
-    client.ping()
-    return client
+# docker_client comes from the shared tdd/integration/conftest.py (from_env
+# + ping: Docker down fails loudly there, R4).
 
 
 @pytest.fixture

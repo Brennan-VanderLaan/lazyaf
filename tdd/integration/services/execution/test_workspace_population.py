@@ -67,10 +67,9 @@ def _git(*args: str, cwd: Path) -> str:
     return result.stdout.strip()
 
 
-@pytest.fixture
-def docker_client():
-    import docker
-    return docker.from_env()
+# docker_client comes from the shared tdd/integration/conftest.py (from_env
+# + ping: Docker down fails loudly there, R4 - this file's old copy had
+# drifted ping-less).
 
 
 @pytest.fixture

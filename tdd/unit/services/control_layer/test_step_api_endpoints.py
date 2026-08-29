@@ -7,8 +7,28 @@ These tests define the backend API contract for step communication:
 - POST /api/steps/{step_id}/heartbeat - Extends timeout
 - Auth token required for all endpoints
 
-Write these tests BEFORE implementing the step API.
+Phase 12.3 bridge contract (wave2-123-wiring design, R3) + the adversarial
+review hardening:
+- /logs is the SOLE writer of StepRun.logs + the log WS frames in control
+  mode: ONE step_log_batch frame per POST (lines rstripped of the trailing
+  newline - the frontend consumes step_log_batch alongside step_log), one
+  string-join append per POST, one commit
+- /status broadcasts step_update for `running` ONLY and NEVER writes
+  StepRun.status (terminal StepRun state belongs to _finish_local_step; the
+  old mirror's "completed" vocabulary vs RunStatus.PASSED divergence is
+  dead)
+- terminal StepExecutions accept NO further writes (409) - zombie tokens
+  from finished steps cannot smear logs/telemetry
+- heartbeat extensions never SHRINK timeout_at
+- broadcast assertions run through the REAL ConnectionManager with a
+  capturing transport - never an AsyncMock (R6)
+
+Dropped plumbing (12.3 cleanup, noted per design): LogLine.stream/timestamp
+were accepted-and-discarded wire fields - now deleted from the schema (the
+runtime may still send them; pydantic ignores unknown keys). The heartbeat
+`progress` field and GET /api/steps/{id} had no reader anywhere - gone.
 """
+import json
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -205,18 +225,23 @@ class TestLogsEndpoint:
 
         assert response.status_code == 401
 
-    async def test_logs_default_stream_is_stdout(self, client, step_execution):
-        """Default stream is stdout if not specified."""
+    async def test_logs_tolerate_dropped_wire_fields(self, client, step_execution):
+        """stream/timestamp are DELETED from the schema (accepted-and-
+        discarded plumbing, 12.3 cleanup) - a runtime still sending them
+        gets a normal 200 with the content transported."""
         response = await client.post(
             f"/api/steps/{step_execution['id']}/logs",
             json={
-                "content": "Default stream test\n",
-                "timestamp": datetime.utcnow().isoformat(),
+                "lines": [
+                    {"content": "tolerant\n", "stream": "stdout",
+                     "timestamp": datetime.utcnow().isoformat()},
+                ],
             },
             headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
         )
 
         assert response.status_code == 200
+        assert response.json()["lines_appended"] == 1
 
 
 # -----------------------------------------------------------------------------
@@ -252,23 +277,27 @@ class TestHeartbeatEndpoint:
         data = response.json()
         assert "last_seen" in data
 
-    async def test_heartbeat_with_progress(self, client, step_execution):
-        """Heartbeat can include progress information."""
+    async def test_heartbeat_ignores_dropped_progress_field(
+        self, client, db_session, step_execution
+    ):
+        """`progress` was write-only plumbing with no reader anywhere - it is
+        deleted (12.3 cleanup). A runtime still sending it gets a normal 200
+        (pydantic ignores unknown keys) and nothing is stored."""
+        from app.models import StepExecution
+
         response = await client.post(
             f"/api/steps/{step_execution['id']}/heartbeat",
             json={
-                "progress": {
-                    "percent": 75,
-                    "message": "Processing files...",
-                    "current_file": "src/main.py",
-                },
+                "progress": {"percent": 75, "message": "Processing files..."},
             },
             headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
         )
 
         assert response.status_code == 200
-        data = response.json()
-        assert data["progress_updated"] is True
+        assert "progress_updated" not in response.json()
+        execution = await db_session.get(StepExecution, step_execution["id"])
+        await db_session.refresh(execution)
+        assert execution.progress is None
 
     async def test_heartbeat_requires_auth(self, client, step_execution):
         """Heartbeat endpoint requires authentication."""
@@ -279,9 +308,12 @@ class TestHeartbeatEndpoint:
 
         assert response.status_code == 401
 
-    async def test_heartbeat_prevents_timeout(self, client, step_execution):
-        """Regular heartbeats prevent step timeout."""
-        # This is more of an integration test, but defines the contract
+    async def test_heartbeat_prevents_timeout(self, client, db_session, step_execution):
+        """Regular heartbeats extend timeout_at into the future."""
+        from datetime import datetime
+
+        from app.models import StepExecution
+
         response = await client.post(
             f"/api/steps/{step_execution['id']}/heartbeat",
             json={"extend_seconds": 60},
@@ -289,16 +321,252 @@ class TestHeartbeatEndpoint:
         )
 
         assert response.status_code == 200
+        assert response.json()["timeout_extended"] is True
+        execution = await db_session.get(StepExecution, step_execution["id"])
+        await db_session.refresh(execution)
+        assert execution.timeout_at is not None
+        assert execution.timeout_at > datetime.utcnow()
 
-        # Step should still be active - use the steps GET endpoint
-        get_response = await client.get(
-            f"/api/steps/{step_execution['id']}",
+    async def test_heartbeat_never_shrinks_timeout(
+        self, client, db_session, step_execution
+    ):
+        """timeout_at = max(current, now + extend_seconds): a short/late
+        heartbeat must never pull an already-earned deadline closer."""
+        from app.models import StepExecution
+
+        far_future = datetime.utcnow() + timedelta(hours=2)
+        execution = await db_session.get(StepExecution, step_execution["id"])
+        execution.timeout_at = far_future
+        await db_session.commit()
+
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/heartbeat",
+            json={"extend_seconds": 1},
             headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
         )
 
-        assert get_response.status_code == 200
-        data = get_response.json()
-        assert data["status"] != "timeout"
+        assert response.status_code == 200
+        assert response.json()["timeout_extended"] is False
+        await db_session.refresh(execution)
+        assert execution.timeout_at == far_future
+
+
+# -----------------------------------------------------------------------------
+# Contract: the 12.3 bridge - WS frames + StepRun ownership (R3/R6)
+# -----------------------------------------------------------------------------
+
+class TestLogsBroadcastBridge:
+    """/logs bridges to step_log_batch frames: ONE frame per POST (12.3
+    hardening - never a frame per line), addressed like the step_log frames
+    the frontend already consumes."""
+
+    async def test_batch_logs_broadcast_one_step_log_batch_frame(
+        self, client, step_execution, ws_socket
+    ):
+        """The whole POSTed batch goes out as ONE step_log_batch frame,
+        lines newline-rstripped, with the StepRun's pipeline_run_id/
+        step_index - and no per-line step_log frames at all."""
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/logs",
+            json={
+                "lines": [
+                    {"content": "bridge line 1\n"},
+                    {"content": "bridge line 2\n"},
+                ],
+            },
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+
+        assert response.status_code == 200
+        assert ws_socket.of_type("step_log") == []
+        frames = ws_socket.of_type("step_log_batch")
+        assert frames == [
+            {
+                "pipeline_run_id": step_execution["pipeline_run_id"],
+                "step_index": 0,
+                "lines": ["bridge line 1", "bridge line 2"],
+            }
+        ]
+
+    async def test_single_content_broadcasts_one_batch_frame(
+        self, client, step_execution, ws_socket
+    ):
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/logs",
+            json={"content": "solo line\n"},
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+
+        assert response.status_code == 200
+        frames = ws_socket.of_type("step_log_batch")
+        assert [f["lines"] for f in frames] == [["solo line"]]
+
+    async def test_empty_post_broadcasts_nothing(
+        self, client, step_execution, ws_socket
+    ):
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/logs",
+            json={},
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["lines_appended"] == 0
+        assert ws_socket.of_type("step_log_batch") == []
+
+    async def test_logs_append_verbatim_no_newline_added(
+        self, client, db_session, step_execution
+    ):
+        """StepRun.logs concatenates the posted content VERBATIM - the wire
+        contract is that the control runtime sends lines WITH trailing
+        newlines; the router must not add its own."""
+        from app.models import StepRun
+
+        await client.post(
+            f"/api/steps/{step_execution['id']}/logs",
+            json={
+                "lines": [
+                    {"content": "a\n", "stream": "stdout"},
+                    {"content": "b\n", "stream": "stdout"},
+                ],
+            },
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+
+        step_run = await db_session.get(StepRun, step_execution["step_run_id"])
+        await db_session.refresh(step_run)
+        assert step_run.logs == "a\nb\n"
+
+
+class TestStatusBridge:
+    """/status owns StepExecution telemetry + the `running` step_update
+    frame - and NOTHING of StepRun's terminal state."""
+
+    async def test_running_broadcasts_step_update_frame(
+        self, client, step_execution, ws_socket
+    ):
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/status",
+            json={"status": "running"},
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+
+        assert response.status_code == 200
+        frames = ws_socket.of_type("step_update")
+        assert frames == [
+            {
+                "pipeline_run_id": step_execution["pipeline_run_id"],
+                "step_index": 0,
+                "status": "running",
+            }
+        ]
+
+    async def test_running_sets_step_run_started_at_only(
+        self, client, db_session, step_execution
+    ):
+        from app.models import StepRun
+
+        await client.post(
+            f"/api/steps/{step_execution['id']}/status",
+            json={"status": "running"},
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+
+        step_run = await db_session.get(StepRun, step_execution["step_run_id"])
+        await db_session.refresh(step_run)
+        assert step_run.started_at is not None
+        # status is NOT mirrored - _finish_local_step owns it
+        assert step_run.status == "pending"
+
+    async def test_terminal_status_never_touches_step_run(
+        self, client, db_session, step_execution, ws_socket
+    ):
+        """Terminal status updates StepExecution ONLY: StepRun keeps its
+        status/completed_at/error (the executor's result event drives them
+        through _finish_local_step in RunStatus vocabulary), and no
+        step_update frame goes out for terminal statuses."""
+        from app.models import StepExecution, StepRun
+
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/status",
+            json={"status": "failed", "exit_code": 1, "error": "boom"},
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+        assert response.status_code == 200
+
+        step_run = await db_session.get(StepRun, step_execution["step_run_id"])
+        await db_session.refresh(step_run)
+        assert step_run.status == "pending"  # untouched
+        assert step_run.completed_at is None
+        assert step_run.error is None
+
+        execution = await db_session.get(StepExecution, step_execution["id"])
+        await db_session.refresh(execution)
+        assert execution.status == "failed"
+        assert execution.error == "boom"
+        assert execution.completed_at is not None
+
+        assert ws_socket.of_type("step_update") == []
+
+
+# -----------------------------------------------------------------------------
+# Contract: terminal StepExecutions reject writes (zombie-token hardening)
+# -----------------------------------------------------------------------------
+
+class TestTerminalRejection:
+    """Once a StepExecution is terminal - runtime-reported or reconciled by
+    _finish_local_step - status/logs/heartbeat all answer 409. A leaked
+    token from a finished step can no longer smear later attempts."""
+
+    async def _make_terminal(self, client, step_execution, status="completed"):
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/status",
+            json={"status": status, "exit_code": 0},
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+        assert response.status_code == 200
+
+    async def test_status_write_rejected_after_terminal(
+        self, client, step_execution
+    ):
+        await self._make_terminal(client, step_execution)
+
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/status",
+            json={"status": "running"},
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+        assert response.status_code == 409
+        assert "terminal" in response.json()["detail"]
+
+    async def test_logs_write_rejected_after_terminal(
+        self, client, db_session, step_execution, ws_socket
+    ):
+        from app.models import StepRun
+
+        await self._make_terminal(client, step_execution, status="failed")
+
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/logs",
+            json={"content": "zombie line\n"},
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+        assert response.status_code == 409
+
+        step_run = await db_session.get(StepRun, step_execution["step_run_id"])
+        await db_session.refresh(step_run)
+        assert "zombie line" not in (step_run.logs or "")
+        assert ws_socket.of_type("step_log_batch") == []
+
+    async def test_heartbeat_rejected_after_terminal(self, client, step_execution):
+        await self._make_terminal(client, step_execution, status="timeout")
+
+        response = await client.post(
+            f"/api/steps/{step_execution['id']}/heartbeat",
+            json={"extend_seconds": 600},
+            headers={"Authorization": f"Bearer {step_execution['auth_token']}"},
+        )
+        assert response.status_code == 409
 
 
 # -----------------------------------------------------------------------------
@@ -385,6 +653,31 @@ async def db_session():
         yield session
 
     await engine.dispose()
+
+
+class CapturingSocket:
+    """Capturing transport attached to the REAL ConnectionManager (R6)."""
+
+    def __init__(self):
+        self.messages: list[dict] = []
+
+    async def send_text(self, text: str):
+        self.messages.append(json.loads(text))
+
+    def of_type(self, message_type: str) -> list[dict]:
+        return [m["payload"] for m in self.messages if m["type"] == message_type]
+
+
+@pytest.fixture
+async def ws_socket():
+    """Attach a capturing transport to the real WS manager singleton."""
+    from app.services.websocket import manager
+
+    socket = CapturingSocket()
+    manager.active_connections.append(socket)
+    yield socket
+    if socket in manager.active_connections:
+        manager.active_connections.remove(socket)
 
 
 @pytest.fixture
@@ -476,6 +769,7 @@ async def step_execution(client, db_session):
     return {
         "id": execution_id,
         "step_run_id": step_run_id,
+        "pipeline_run_id": pipeline_run_id,
         "execution_key": execution_key,
         "auth_token": token,
     }

@@ -48,11 +48,8 @@ pytestmark = [pytest.mark.integration, pytest.mark.local_exec]
 STEP_IMAGE = "python:3.12-slim"
 
 
-@pytest.fixture(scope="module")
-def docker_client():
-    client = docker_sdk.from_env()
-    client.ping()  # Fail loudly here if Docker is down (R4)
-    return client
+# docker_client comes from the shared tdd/integration/conftest.py (from_env
+# + ping: Docker down fails loudly there, R4).
 
 
 @pytest.fixture(scope="module", autouse=True)

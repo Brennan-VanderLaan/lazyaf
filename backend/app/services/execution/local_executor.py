@@ -27,10 +27,14 @@ Provides:
   container being gone - never dependent on generator GC (12.2-INT fix 6)
 """
 import asyncio
+import io
+import json
 import logging
 import re
 import shlex
+import tarfile
 import threading
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, AsyncGenerator, Iterable, Sequence, Union
@@ -61,6 +65,37 @@ DOCKER_SOCKET_SOURCE = "/var/run/docker.sock"
 # can assert cleanup synchronously with step completion.
 CONTAINER_LABEL_EXECUTION_KEY = "lazyaf.execution_key"
 CONTAINER_LABEL_PIPELINE_RUN = "lazyaf.pipeline_run_id"
+
+# ---------------------------------------------------------------------------
+# Control mode (Phase 12.3). An image DECLARES the in-container control
+# runtime by baking this label (lazyaf-base and children) - explicit
+# declaration by the image author, never inferred from path/name shape (R6).
+# ---------------------------------------------------------------------------
+CONTROL_LAYER_LABEL = "lazyaf.control-layer"
+
+# Where per-step config files land inside the workspace volume. The backend
+# writes ONE file per step execution - .control/<step_execution_id>.json -
+# via put_archive onto the created-but-not-started container and points the
+# runtime at it with the CONFIG_PATH env var (cross-agent contract #1: the
+# runtime honors CONFIG_PATH and unlinks exactly that path). Per-step naming
+# kills the fan-out collision where two parallel steps of one run clobbered
+# each other's step_config.json on the SHARED workspace volume.
+CONTROL_CONFIG_DIR = ".control"
+
+# In control mode the executor no longer ships per-line log events (the
+# router is the sole log writer, R3); it retains this many trailing stdout
+# lines in memory as a forensics tail, surfaced on the result event so the
+# finish path can persist them when the step fails or the router wrote
+# nothing.
+CONTROL_MODE_LOG_TAIL_LINES = 200
+
+# In control mode the runtime enforces `timeout_seconds` in-container
+# (graceful SIGTERM -> SIGKILL); the executor's own deadline moves out by
+# this grace so it stays purely the backstop for a dead/wedged runtime. Must
+# remain below the pipeline executor's LOCAL_STEP_HARD_TIMEOUT_GRACE (120s)
+# so the ordering is: in-container timeout < executor backstop < hard
+# deadline.
+CONTROL_MODE_TIMEOUT_GRACE = 30
 
 
 def make_docker_client() -> DockerClient:
@@ -260,6 +295,31 @@ def build_step_command(step_config: dict, home_dir: str) -> Union[list, str]:
     return [shell, "-c", script]
 
 
+def build_step_config_archive(config: dict, filename: str) -> bytes:
+    """Build the in-memory tar delivering `.control/<filename>`.
+
+    Extracted by `container.put_archive("/workspace", ...)` onto the
+    created-but-not-started step container, so the token never appears in
+    `docker inspect` env and nothing is written to the backend's CWD.
+    File mode 0600. Tar entries carry no uid/gid: the image entrypoint's
+    chown of /workspace/.control owns in-container readability (setting
+    uid/gid 1000 here was redundant with it).
+    """
+    payload = json.dumps(config, indent=2).encode("utf-8")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        dir_info = tarfile.TarInfo(CONTROL_CONFIG_DIR)
+        dir_info.type = tarfile.DIRTYPE
+        dir_info.mode = 0o700
+        tar.addfile(dir_info)
+
+        file_info = tarfile.TarInfo(f"{CONTROL_CONFIG_DIR}/{filename}")
+        file_info.size = len(payload)
+        file_info.mode = 0o600
+        tar.addfile(file_info, io.BytesIO(payload))
+    return buf.getvalue()
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     if isinstance(exc, TimeoutError):
         return True
@@ -291,14 +351,89 @@ class LocalExecutor:
         self._running_containers: dict[str, Any] = {}
         self._completed_executions: dict[str, dict] = {}  # For idempotency
         self._network_ready: set[str] = set()
+        # Control-layer capability cache keyed by resolved IMAGE ID (never
+        # by tag: a rebuilt tag gets a new ID and is re-evaluated fresh).
+        self._control_label_cache: dict[str, bool] = {}
 
     def reset(self) -> None:
-        """Test-mode reset hook: clear the idempotency cache and the
+        """Test-mode reset hook: clear the idempotency cache, the
         running-container registry (execution keys embed StepRun ids, which a
-        DB reset is about to delete). The docker client and network cache are
-        environment-level and survive."""
+        DB reset is about to delete), and the image-label capability cache
+        (images may be rebuilt between test runs). The docker client and
+        network cache are environment-level and survive."""
         self._completed_executions.clear()
         self._running_containers.clear()
+        self._control_label_cache.clear()
+
+    async def image_supports_control_layer(self, image: str) -> bool:
+        """Whether `image` bakes `lazyaf.control-layer=1` (label VALUE '1'
+        required - presence alone is not a declaration).
+
+        The mode decision input (12.3): label value "1" => control mode,
+        anything else => stdout mode. The tag is resolved with images.get on
+        EVERY dispatch (threadpooled, R5 - a local inspect is cheap) and the
+        verdict is cached by the resolved image ID, so a rebuilt tag (new
+        ID) is re-evaluated while repeat dispatches of the same build skip
+        the label check. A missing image returns False - the run then fails
+        loudly in execute_step's existing ImageNotFound handler. Other
+        inspection errors also return False (stdout mode keeps stock-image
+        behavior unchanged).
+        """
+        try:
+            img = await run_in_threadpool(self._docker.images.get, image)
+        except ImageNotFound:
+            return False
+        except Exception:
+            logger.warning(
+                "Label inspection failed for image %s; treating as stdout mode",
+                image,
+                exc_info=True,
+            )
+            return False
+        image_id = img.id
+        supports = self._control_label_cache.get(image_id)
+        if supports is None:
+            labels = img.labels or {}
+            supports = labels.get(CONTROL_LAYER_LABEL) == "1"
+            self._control_label_cache[image_id] = supports
+        if supports:
+            logger.info(
+                "Dispatching control-labeled image %s (%s=1): control mode "
+                "available",
+                image,
+                CONTROL_LAYER_LABEL,
+            )
+        elif image.startswith("lazyaf-"):
+            logger.info(
+                "Image %s is a lazyaf-* image WITHOUT %s=1; control mode NOT "
+                "engaged - it runs in stdout mode",
+                image,
+                CONTROL_LAYER_LABEL,
+            )
+        return supports
+
+    async def find_missing_images(self, images: Sequence[str]) -> list[str]:
+        """Resolve step image tags at run start (12.3 image preflight).
+
+        Returns the subset of `images` the daemon cannot resolve, so the
+        pipeline executor can fail the run with ONE message naming every
+        missing tag BEFORE dispatching step 0. Daemon hiccups are logged and
+        treated as present - dispatch will surface them loudly per-step.
+        """
+        missing: list[str] = []
+        for image in images:
+            try:
+                await run_in_threadpool(self._docker.images.get, image)
+            except ImageNotFound:
+                missing.append(image)
+            except Exception:
+                logger.warning(
+                    "Image preflight inspection failed for %s; leaving it to "
+                    "dispatch",
+                    image,
+                    exc_info=True,
+                )
+        return missing
 
     async def _ensure_network(self, network_name: str) -> None:
         """Ensure the step network exists (once per executor instance)."""
@@ -379,6 +514,15 @@ class LocalExecutor:
                 - step_index: Step index in pipeline
                 - execution_key: Unique key for idempotency
                 - workspace_volume: Docker NAMED VOLUME for the workspace
+                - control_mode: EXPLICIT reporting-mode flag, decided at
+                  dispatch time (12.3) - never inferred here. When true,
+                  step_execution_id and step_auth_token are REQUIRED: the
+                  step config file is delivered to the created container via
+                  put_archive and the in-container runtime reports through
+                  POST /api/steps/*; container stdout stays observable but
+                  is not the reporting path.
+                - step_execution_id: StepExecution row id (control mode)
+                - step_auth_token: per-step-execution JWT (control mode)
 
         Yields:
             Event dicts with "type" field:
@@ -407,12 +551,20 @@ class LocalExecutor:
         yield {"type": "status", "status": "preparing"}
 
         settings = get_settings()
+        control_mode = bool(execution_context.get("control_mode"))
         image = step_config.get("image", settings.step_default_image)
         timeout = step_config.get("timeout", 300)  # Default 5 minutes
         user_env = step_config.get("environment", {})
         memory_limit = step_config.get("memory_limit")  # e.g., "512m", "1g"
         working_dir = step_config.get("working_dir", settings.step_working_dir)
-        command = build_step_command(step_config, settings.step_home_dir)
+        # Control mode: the container runs the image's control entrypoint
+        # (command=None; the entrypoint ignores CMD when LAZYAF_CONTROL=1)
+        # and the RAW command string travels in the config file - the
+        # runtime shell-wraps it with the same `set -e` semantics as
+        # build_step_command, so scripts behave identically in both modes.
+        command = None if control_mode else build_step_command(
+            step_config, settings.step_home_dir
+        )
 
         # Build environment variables. HOME lives on the shared workspace
         # volume so tools installed in one step persist to the next; an
@@ -430,6 +582,11 @@ class LocalExecutor:
             "LAZYAF_BACKEND_URL": getattr(
                 settings, "container_backend_url", "http://backend:8000"
             ),
+            # The entrypoint's mode switch (images/base entrypoint contract):
+            # 1 => exec the control runtime; 0 => CMD passthrough (the image
+            # degrades to a stock image). Non-secret; the auth token travels
+            # ONLY in the config file, never in inspectable env.
+            "LAZYAF_CONTROL": "1" if control_mode else "0",
         }
 
         # Build mounts via explicit addressing (never inferred from path
@@ -438,6 +595,13 @@ class LocalExecutor:
         workspace_volume = execution_context["workspace_volume"]
         container = None
         final_result: dict | None = None
+        # Control mode ships NO per-line log events (the router is the sole
+        # log writer, R3 - shipping them too was pure double work); the pump
+        # keeps a bounded in-memory tail instead, surfaced on the result
+        # event for failure/zero-log forensics (12.3).
+        log_tail: deque[str] | None = (
+            deque(maxlen=CONTROL_MODE_LOG_TAIL_LINES) if control_mode else None
+        )
         try:
             mount_specs: list = [
                 MountSpec(
@@ -477,20 +641,95 @@ class LocalExecutor:
 
             await self._ensure_network(settings.container_network)
 
-            # Spawn container (blocking SDK call off the event loop, R5)
-            container = await run_in_threadpool(
-                self._docker.containers.run, image, **run_kwargs
-            )
+            if control_mode:
+                # Control mode (12.3): create -> put_archive the step config
+                # onto the workspace volume -> start. Mounts are bound at
+                # create, so the volume is addressable before the runtime
+                # boots; the token never appears in `docker inspect` env.
+                # Preconditions (string command, execution id + token) are
+                # the DISPATCHER's job (_prepare_control_mode is the single
+                # owner) - the executor trusts its dispatch; a broken
+                # context fails loudly via the generic error handler.
+                step_execution_id = execution_context["step_execution_id"]
+                raw_command = step_config.get("command", "")
+                # Producer stays the single source of the file shape (R3):
+                # verbatim generate_step_config output.
+                from app.services.control_layer.workspace import generate_step_config
 
-            self._running_containers[execution_key] = container
+                config_kwargs = dict(
+                    step_id=step_execution_id,
+                    step_run_id=execution_context["step_run_id"],
+                    execution_key=execution_key,
+                    command=raw_command,
+                    backend_url=getattr(
+                        settings, "container_backend_url", "http://backend:8000"
+                    ),
+                    auth_token=execution_context["step_auth_token"],
+                    environment=user_env,
+                    timeout_seconds=timeout,
+                    working_directory=working_dir,
+                )
+                try:
+                    # Cross-agent contract #2: the config carries a "shell"
+                    # key sourced from step config (default "bash"); the
+                    # producer (generate_step_config) owns the file shape.
+                    config_payload = generate_step_config(
+                        **config_kwargs, shell=step_config.get("shell", "bash")
+                    )
+                except TypeError:
+                    logger.error(
+                        "generate_step_config does not accept 'shell' yet "
+                        "(cross-agent contract #2 not landed); dispatching "
+                        "the step config without a shell key"
+                    )
+                    config_payload = generate_step_config(**config_kwargs)
+
+                # Per-step config path (cross-agent contract #1): one file
+                # per step execution on the SHARED workspace volume, and
+                # CONFIG_PATH pointing the runtime at exactly that file -
+                # parallel steps of one run can no longer clobber each
+                # other's config.
+                config_filename = f"{step_execution_id}.json"
+                create_kwargs = {
+                    k: v
+                    for k, v in run_kwargs.items()
+                    if k not in ("detach", "remove")
+                }
+                create_kwargs["environment"] = {
+                    **environment,
+                    "CONFIG_PATH": (
+                        f"/workspace/{CONTROL_CONFIG_DIR}/{config_filename}"
+                    ),
+                }
+                container = await run_in_threadpool(
+                    self._docker.containers.create, image, **create_kwargs
+                )
+                self._running_containers[execution_key] = container
+                await run_in_threadpool(
+                    container.put_archive,
+                    "/workspace",
+                    build_step_config_archive(config_payload, config_filename),
+                )
+                await run_in_threadpool(container.start)
+            else:
+                # Spawn container (blocking SDK call off the event loop, R5)
+                container = await run_in_threadpool(
+                    self._docker.containers.run, image, **run_kwargs
+                )
+                self._running_containers[execution_key] = container
 
             # Status: running
             yield {"type": "status", "status": "running"}
 
             # Stream logs from a pump thread through an asyncio queue so the
             # event loop never blocks and the deadline can fire mid-stream.
+            # In control mode the runtime enforces timeout_seconds
+            # in-container (graceful); this deadline moves out by a bounded
+            # grace and remains purely the backstop.
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
+            deadline = loop.time() + timeout + (
+                CONTROL_MODE_TIMEOUT_GRACE if control_mode else 0
+            )
             queue: asyncio.Queue = asyncio.Queue()
 
             def _put(item) -> None:
@@ -502,7 +741,13 @@ class LocalExecutor:
             def _pump() -> None:
                 try:
                     for raw_line in container.logs(stream=True, follow=True):
-                        _put(("log", raw_line))
+                        if log_tail is not None:
+                            line = raw_line
+                            if isinstance(line, bytes):
+                                line = line.decode("utf-8", errors="replace")
+                            log_tail.append(line.rstrip("\n"))
+                        else:
+                            _put(("log", raw_line))
                 except Exception as exc:  # Surface stream errors to the consumer
                     _put(("error", exc))
                 finally:
@@ -647,6 +892,10 @@ class LocalExecutor:
         # and the result. A consumer that stops at the result event therefore
         # observes the container already gone; nothing waits on generator GC.
         await self._cleanup_container(execution_key, container)
+        if log_tail:
+            # Forensics tail (12.3): the finish path persists it when the
+            # step failed or the router landed zero log bytes.
+            final_result["log_tail"] = list(log_tail)
         yield {"type": "status", "status": final_result["status"]}
         self._completed_executions[execution_key] = final_result
         yield final_result

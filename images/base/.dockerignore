@@ -1,0 +1,8 @@
+# Keep the build context byte-identical to what scripts/build_images.py
+# hashes (tree_hash skips __pycache__): stray host bytecode must never leak
+# into the image or make the content-hash label lie about image content.
+# NOTE: .dockerignore patterns anchor at the context root, so nested
+# directories need the **/ prefix (plain `__pycache__/` would only match a
+# top-level directory, not control/__pycache__).
+**/__pycache__
+**/*.pyc

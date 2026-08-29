@@ -1,0 +1,3 @@
+# Everything under images/ is COPY'd into Linux containers — force LF so a
+# CRLF-configured Windows checkout can't break shebangs or Dockerfile parsing.
+* text eol=lf

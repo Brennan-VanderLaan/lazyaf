@@ -55,9 +55,16 @@ def tree_hash(directory: Path, extra: str = "") -> str:
     """
     h = hashlib.sha256()
     h.update(extra.encode())
-    for path in sorted(directory.rglob("*")):
-        if path.is_dir() or "__pycache__" in path.parts:
-            continue
+    # Sort by the normalized POSIX relative path, NOT the native Path: on
+    # Windows the raw sort key contains backslashes (0x5C) which collate
+    # differently from '/' (0x2F) against dots and letters, so the same tree
+    # hashed in a different order on host vs container (dogfood run #8: host
+    # label 723a51a4 vs in-container 115b6472 for identical content).
+    entries = sorted(
+        (p for p in directory.rglob("*") if not p.is_dir() and "__pycache__" not in p.parts),
+        key=lambda p: str(p.relative_to(directory)).replace("\\", "/"),
+    )
+    for path in entries:
         h.update(str(path.relative_to(directory)).replace("\\", "/").encode())
         h.update(b"\0")
         # Normalize line endings so a CRLF checkout hashes like LF

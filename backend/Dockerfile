@@ -17,8 +17,10 @@ COPY pyproject.toml uv.lock ./
 # Install dependencies (include dev deps if INCLUDE_DEV=true)
 RUN if [ "$INCLUDE_DEV" = "true" ]; then uv sync --frozen --all-extras; else uv sync --frozen --no-dev; fi
 
-# Copy application code
+# Copy application code and migration scaffold (startup runs alembic upgrade)
 COPY app ./app
+COPY alembic.ini ./
+COPY alembic ./alembic
 
 # Expose port
 EXPOSE 8000

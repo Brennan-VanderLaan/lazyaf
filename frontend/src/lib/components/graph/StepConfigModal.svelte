@@ -76,10 +76,10 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="modal-backdrop" onclick={onCancel} role="presentation">
-  <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+  <div class="modal" data-testid="step-config-modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
     <div class="modal-header">
       <h2>{isNew ? 'Add New Step' : 'Edit Step'}</h2>
-      <button class="close-btn" onclick={onCancel} title="Close">&times;</button>
+      <button class="close-btn" data-testid="step-config-close-btn" onclick={onCancel} title="Close">&times;</button>
     </div>
 
     <div class="modal-body">
@@ -88,6 +88,8 @@
         <label for="step-name">Step Name</label>
         <input
           id="step-name"
+          name="step-name"
+          data-testid="step-name-input"
           type="text"
           bind:value={editedStep.name}
           placeholder="e.g., Build, Test, Deploy"
@@ -101,6 +103,7 @@
           {#each stepTypes as type}
             <button
               class="type-btn"
+              data-testid="step-type-{type.value}"
               class:selected={editedStep.type === type.value}
               onclick={() => onTypeChange(type.value)}
             >
@@ -117,6 +120,8 @@
           <label for="script-command">Command</label>
           <input
             id="script-command"
+            name="script-command"
+            data-testid="script-command-input"
             type="text"
             bind:value={editedStep.config.command}
             placeholder="e.g., npm run build"
@@ -141,6 +146,8 @@
           <label for="docker-image">Docker Image</label>
           <input
             id="docker-image"
+            name="docker-image"
+            data-testid="docker-image-input"
             type="text"
             bind:value={editedStep.config.image}
             placeholder="e.g., node:18, python:3.11"
@@ -152,6 +159,8 @@
           <label for="docker-command">Command</label>
           <input
             id="docker-command"
+            name="docker-command"
+            data-testid="docker-command-input"
             type="text"
             bind:value={editedStep.config.command}
             placeholder="e.g., npm test"
@@ -174,6 +183,8 @@
           <label for="agent-title">Task Title</label>
           <input
             id="agent-title"
+            name="agent-title"
+            data-testid="agent-title-input"
             type="text"
             bind:value={editedStep.config.title}
             placeholder="e.g., Fix failing tests"
@@ -184,6 +195,8 @@
           <label for="agent-desc">Task Description</label>
           <textarea
             id="agent-desc"
+            name="agent-desc"
+            data-testid="agent-desc-input"
             bind:value={editedStep.config.description}
             placeholder="Describe what the AI agent should do..."
             rows="3"
@@ -220,8 +233,8 @@
     </div>
 
     <div class="modal-footer">
-      <button class="btn secondary" onclick={onCancel}>Cancel</button>
-      <button class="btn primary" onclick={handleSave}>
+      <button class="btn secondary" data-testid="step-config-cancel-btn" onclick={onCancel}>Cancel</button>
+      <button class="btn primary" data-testid="step-config-save-btn" onclick={handleSave}>
         {isNew ? 'Add Step' : 'Save Changes'}
       </button>
     </div>

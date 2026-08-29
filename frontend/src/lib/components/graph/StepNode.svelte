@@ -63,6 +63,9 @@
 
 <div
   class="step-node"
+  data-testid="graph-node-{data.step.id}"
+  data-step-type={data.step.type}
+  data-status={data.status}
   class:selected
   class:active={data.isActive}
   class:completed={data.isCompleted}
@@ -92,6 +95,7 @@
     </div>
     <button
       class="expand-btn"
+      data-testid="node-expand-btn"
       onclick={(e) => { e.stopPropagation(); expanded = !expanded; }}
       title={expanded ? 'Collapse' : 'Expand'}
     >
@@ -124,10 +128,10 @@
 
     <!-- Action Buttons -->
     <div class="node-actions">
-      <button class="action-btn edit" onclick={() => data.onEdit?.()} title="Edit Step">
+      <button class="action-btn edit" data-testid="node-edit-btn" onclick={() => data.onEdit?.()} title="Edit Step">
         Edit
       </button>
-      <button class="action-btn delete" onclick={() => data.onDelete?.()} title="Delete Step">
+      <button class="action-btn delete" data-testid="node-delete-btn" onclick={() => data.onDelete?.()} title="Delete Step">
         Delete
       </button>
     </div>

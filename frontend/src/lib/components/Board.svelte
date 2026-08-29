@@ -60,7 +60,7 @@
   }
 </script>
 
-<div class="board-container">
+<div class="board-container" data-testid="board-container">
   {#if $selectedRepo}
     <div class="board-header">
       <div class="board-info">
@@ -71,16 +71,17 @@
         <input
           type="text"
           class="search-input"
+          data-testid="search-input"
           placeholder="Search cards..."
           bind:value={searchQuery}
         />
-        <button class="btn-create" on:click={() => showCreateModal = true}>
+        <button class="btn-create" data-testid="add-card" on:click={() => showCreateModal = true}>
           + New Card
         </button>
       </div>
     </div>
 
-    <div class="board">
+    <div class="board" data-testid="board">
       {#each columns as { status, title }}
         <Column
           {status}
@@ -107,7 +108,7 @@
       </div>
     {/if}
   {:else}
-    <div class="no-repo">
+    <div class="no-repo" data-testid="no-repo">
       <div class="no-repo-content">
         <span class="no-repo-icon">📁</span>
         <h2>No Repository Selected</h2>

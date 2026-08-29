@@ -47,7 +47,7 @@
   }
 </script>
 
-<div class="node-palette">
+<div class="node-palette" data-testid="node-palette">
   <div class="palette-header">
     <span class="palette-title">Add Steps</span>
     <span class="palette-hint">Drag to canvas</span>
@@ -57,6 +57,7 @@
     {#each nodeTypes as node}
       <div
         class="palette-item"
+        data-testid="palette-item-{node.type}"
         class:dragging={draggingType === node.type}
         style:--node-color={node.color}
         draggable="true"

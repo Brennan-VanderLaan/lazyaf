@@ -111,7 +111,7 @@
     {error}
   </div>
 {:else if diff}
-  <div class="diff-viewer">
+  <div class="diff-viewer" data-testid="diff-viewer">
     <div class="diff-header">
       <div class="diff-summary">
         <span class="branch-info">
@@ -131,9 +131,9 @@
     {#if diff.files.length === 0}
       <div class="no-changes">No file changes between these branches.</div>
     {:else}
-      <div class="file-list">
+      <div class="file-list" data-testid="file-list">
         {#each diff.files as file}
-          <div class="file-item">
+          <div class="file-item" data-testid="file-item" data-file-path={file.path}>
             <button
               type="button"
               class="file-header"

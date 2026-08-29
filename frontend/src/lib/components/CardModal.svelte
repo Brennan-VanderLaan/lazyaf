@@ -372,10 +372,10 @@
 <svelte:window on:keydown={handleKeydown} />
 
 <div class="modal-backdrop" on:click={handleBackdropClick} role="dialog" aria-modal="true">
-  <div class="modal" on:click|stopPropagation role="document">
+  <div class="modal" data-testid="card-modal" on:click|stopPropagation role="document">
     <div class="modal-header">
       <h2>{isEdit ? 'Edit Card' : 'New Card'}</h2>
-      <button class="btn-close" on:click={() => dispatch('close')}>✕</button>
+      <button class="btn-close" aria-label="Close" data-testid="close-btn" on:click={() => dispatch('close')}>✕</button>
     </div>
 
     <form on:submit|preventDefault={handleSubmit}>
@@ -383,6 +383,8 @@
         <label for="title">Title</label>
         <input
           id="title"
+          name="title"
+          data-testid="title-input"
           type="text"
           bind:value={title}
           placeholder="What needs to be done?"
@@ -394,6 +396,8 @@
         <label for="description">Description</label>
         <textarea
           id="description"
+          name="description"
+          data-testid="description-input"
           bind:value={description}
           placeholder="Describe the feature or task in detail..."
           rows="5"
@@ -550,7 +554,7 @@
         <div class="card-meta">
           <div class="meta-item">
             <span class="meta-label">Status:</span>
-            <span class="meta-value status-badge" data-status={card.status}>
+            <span class="meta-value status-badge" data-testid="status" data-status={card.status}>
               {statusLabels[card.status]}
             </span>
           </div>
@@ -709,6 +713,7 @@
               <button
                 type="button"
                 class="btn-action btn-start"
+                data-testid="start-btn"
                 on:click={handleStart}
                 disabled={submitting}
               >
@@ -719,6 +724,7 @@
               <button
                 type="button"
                 class="btn-action btn-approve"
+                data-testid="approve-btn"
                 on:click={handleApprove}
                 disabled={submitting}
               >
@@ -729,6 +735,7 @@
               <button
                 type="button"
                 class="btn-action btn-reject"
+                data-testid="reject-btn"
                 on:click={handleReject}
                 disabled={submitting}
               >
@@ -739,13 +746,14 @@
               <button
                 type="button"
                 class="btn-action btn-retry"
+                data-testid="retry-btn"
                 on:click={handleRetry}
                 disabled={submitting}
               >
                 🔄 Retry
               </button>
             {/if}
-            <button type="submit" class="btn-primary" disabled={submitting}>
+            <button type="submit" class="btn-primary" data-testid="save-card-btn" disabled={submitting}>
               {submitting ? 'Saving...' : 'Save'}
             </button>
           </div>
@@ -754,10 +762,10 @@
             <button type="button" class="btn-secondary" on:click={() => dispatch('close')}>
               Cancel
             </button>
-            <button type="submit" class="btn-primary" disabled={submitting}>
+            <button type="submit" class="btn-primary" data-testid="create-card-btn" disabled={submitting}>
               {submitting ? 'Creating...' : 'Create Card'}
             </button>
-            <button type="button" class="btn-action btn-start" on:click={() => handleSubmit(true)} disabled={submitting}>
+            <button type="button" class="btn-action btn-start" data-testid="create-submit-btn" on:click={() => handleSubmit(true)} disabled={submitting}>
               {submitting ? 'Creating...' : '🚀 Create & Submit'}
             </button>
           </div>

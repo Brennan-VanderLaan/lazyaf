@@ -331,6 +331,67 @@ class TestTriggerCleanup:
 
 
 # -----------------------------------------------------------------------------
+# Contract: Release + Clear
+# -----------------------------------------------------------------------------
+
+class TestReleaseAndClear:
+    """Tests for freeing dedup keys (failed starts) and full resets."""
+
+    async def test_release_allows_retry_within_window(self):
+        """Releasing a key lets the same trigger fire again immediately."""
+        from app.services.workspace.trigger_dedup import TriggerDeduplicator
+
+        dedup = TriggerDeduplicator()
+        key = "push:repo-123:pipe:main:abc"
+
+        assert await dedup.should_trigger(key, window_seconds=60) is True
+        assert await dedup.should_trigger(key, window_seconds=60) is False
+
+        dedup.release(key)
+
+        assert await dedup.should_trigger(key, window_seconds=60) is True
+
+    async def test_release_drops_the_record(self):
+        """release removes the stored record for the key."""
+        from app.services.workspace.trigger_dedup import TriggerDeduplicator
+
+        dedup = TriggerDeduplicator()
+        key = "push:repo-123:main"
+        await dedup.record_trigger(key, pipeline_run_id="run-1")
+
+        dedup.release(key)
+
+        assert await dedup.get_last_trigger(key) is None
+
+    async def test_release_unknown_key_is_a_noop(self):
+        """Releasing a never-recorded key must not raise or affect others."""
+        from app.services.workspace.trigger_dedup import TriggerDeduplicator
+
+        dedup = TriggerDeduplicator()
+        other = "push:repo-123:main"
+        await dedup.should_trigger(other, window_seconds=60)
+
+        dedup.release("push:repo-123:never-recorded")
+
+        assert await dedup.get_last_trigger(other) is not None
+
+    async def test_clear_empties_everything(self):
+        """clear drops all records so any key may fire again."""
+        from app.services.workspace.trigger_dedup import TriggerDeduplicator
+
+        dedup = TriggerDeduplicator()
+        await dedup.should_trigger("push:repo:main", window_seconds=60)
+        await dedup.record_trigger("card_complete:repo:card", "run-9")
+
+        dedup.clear()
+
+        assert await dedup.get_last_trigger("push:repo:main") is None
+        assert await dedup.get_last_trigger("card_complete:repo:card") is None
+        assert await dedup.get_recent_triggers() == []
+        assert await dedup.should_trigger("push:repo:main", window_seconds=60) is True
+
+
+# -----------------------------------------------------------------------------
 # Contract: Force Allow
 # -----------------------------------------------------------------------------
 

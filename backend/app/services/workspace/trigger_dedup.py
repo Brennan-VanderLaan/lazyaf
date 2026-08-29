@@ -121,6 +121,23 @@ class TriggerDeduplicator:
         }
         return True
 
+    def release(self, key: str) -> None:
+        """
+        Drop the record for a key (no error if the key is unknown).
+
+        Called when should_trigger admitted a trigger but the run it was
+        admitted for never started: releasing the key lets a retry within
+        the window fire instead of being deduplicated against a phantom run.
+
+        Synchronous on purpose - it is a plain dict operation and is called
+        from sync reset paths as well as async trigger handling.
+        """
+        self._triggers.pop(key, None)
+
+    def clear(self) -> None:
+        """Drop ALL trigger records (reset hook / test-mode API)."""
+        self._triggers.clear()
+
     async def record_trigger(
         self,
         key: str,

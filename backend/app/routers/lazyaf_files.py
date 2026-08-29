@@ -6,16 +6,16 @@ Reads pipelines and agents from the repository's .lazyaf/ directory:
 - .lazyaf/agents/*.yaml - Agent definitions
 """
 
-import json
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Repo, Pipeline, PipelineRun
+from app.models import Repo
 from app.services.git_server import git_repo_manager
 from app.services.pipeline_executor import pipeline_executor
+from app.services.trigger_service import upsert_materialized_pipeline
 from app.schemas.lazyaf_yaml import (
     AgentYaml,
     PipelineYaml,
@@ -171,6 +171,7 @@ async def list_repo_pipelines(
                 name=pipeline.name,
                 description=pipeline.description,
                 steps=[step.model_dump() for step in pipeline.steps],
+                triggers=[t.model_dump() for t in pipeline.triggers],
                 source="repo",
                 branch=target_branch,
                 filename=filename,
@@ -215,6 +216,7 @@ async def get_repo_pipeline(
                     name=pipeline.name,
                     description=pipeline.description,
                     steps=[step.model_dump() for step in pipeline.steps],
+                    triggers=[t.model_dump() for t in pipeline.triggers],
                     source="repo",
                     branch=target_branch,
                     filename=filename,
@@ -236,12 +238,30 @@ async def run_repo_pipeline(
     Run a repo-defined pipeline.
 
     Creates or updates a platform pipeline from the repo definition, then runs it.
+
+    Only the repo's default branch may (re)materialize the platform pipeline
+    row - the trunk owns the CI definition, same rule as sync-on-push.
+    Branch-scoped ephemeral runs (running a feature branch's definition
+    without touching the trunk's materialized row) are future work.
     """
     repo = await get_repo_or_404(db, repo_id)
     target_branch = branch or repo.default_branch
 
     if not target_branch:
         raise HTTPException(status_code=400, detail="No branch specified and repo has no default branch")
+
+    if target_branch != repo.default_branch:
+        # Never clobber the trunk-owned materialized row with a branch's
+        # definition (and never run a branch definition under the trunk's row)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot run repo pipeline from branch '{target_branch}': the "
+                f"repo's default branch '{repo.default_branch}' owns the CI "
+                f"definition, and a manual run materializes it into the "
+                f"platform pipeline row. Run from the default branch instead."
+            ),
+        )
 
     # Find and parse the pipeline
     pipeline_data = None
@@ -261,33 +281,9 @@ async def run_repo_pipeline(
     if not pipeline_data:
         raise HTTPException(status_code=404, detail="Pipeline not found in repo")
 
-    # Check if a platform pipeline with same name exists for this repo
-    result = await db.execute(
-        select(Pipeline)
-        .where(Pipeline.repo_id == repo_id)
-        .where(Pipeline.name == f"[repo] {pipeline_data.name}")
-    )
-    platform_pipeline = result.scalar_one_or_none()
-
-    # Convert steps to the format expected by Pipeline model
-    steps = [step.model_dump() for step in pipeline_data.steps]
-
-    if platform_pipeline:
-        # Update existing pipeline with latest definition
-        platform_pipeline.description = pipeline_data.description
-        platform_pipeline.steps = json.dumps(steps)
-    else:
-        # Create new platform pipeline from repo definition
-        import uuid
-        platform_pipeline = Pipeline(
-            id=str(uuid.uuid4()),
-            repo_id=repo_id,
-            name=f"[repo] {pipeline_data.name}",
-            description=pipeline_data.description,
-            steps=json.dumps(steps),
-            is_template=False,
-        )
-        db.add(platform_pipeline)
+    # Create/refresh the materialized platform pipeline (same upsert the
+    # push-event sync uses, so description/steps/triggers stay consistent)
+    platform_pipeline = await upsert_materialized_pipeline(db, repo_id, pipeline_data)
 
     await db.commit()
     await db.refresh(platform_pipeline)

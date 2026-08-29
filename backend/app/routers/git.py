@@ -111,8 +111,10 @@ async def git_receive_pack(repo_id: str, request: Request, db: AsyncSession = De
 
     POST /git/{repo_id}.git/git-receive-pack
 
-    After successfully processing the push, this triggers any matching
-    push-based pipeline triggers for the pushed branches.
+    After successfully processing the push, this fires the push event for
+    each pushed branch: trigger_service.on_push first re-syncs repo-defined
+    pipelines (.lazyaf/pipelines/) from the pushed commit, then matches push
+    triggers - so CI changes take effect on the push that introduces them.
     """
     if not git_repo_manager.repo_exists(repo_id):
         raise HTTPException(status_code=404, detail="Repository not found")
@@ -185,7 +187,13 @@ async def handle_push_event(
     Internal endpoint called after git push to trigger pipelines.
 
     This endpoint is called by the git server after successfully processing
-    a git push. It checks for matching push triggers and starts pipelines.
+    a git push. Like the receive-pack path, it syncs repo-defined pipeline
+    definitions from the pushed commit before matching push triggers.
+
+    Definition sync runs inside on_push in its OWN database session and any
+    sync failure is caught and logged there, so a broken sync can neither
+    poison this request's session nor turn the push event into a 500 -
+    trigger matching always still runs.
     """
     if not git_repo_manager.repo_exists(repo_id):
         raise HTTPException(status_code=404, detail="Repository not found")

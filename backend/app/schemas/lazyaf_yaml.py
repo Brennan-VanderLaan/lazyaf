@@ -9,6 +9,8 @@ These schemas define the structure for .lazyaf/ directory content:
 from typing import Any, Optional
 from pydantic import BaseModel, Field
 
+from app.schemas.pipeline import TriggerConfig
+
 
 class AgentYaml(BaseModel):
     """
@@ -64,6 +66,15 @@ class PipelineYaml(BaseModel):
     ```yaml
     name: "Test Suite"
     description: "Run tests on feature branches"
+    triggers:
+      - type: push
+        config:
+          branches: ["main"]
+      - type: card_complete
+        config:
+          status: in_review
+        on_pass: merge
+        on_fail: reject
     steps:
       - name: "Install & Test"
         type: script
@@ -83,6 +94,9 @@ class PipelineYaml(BaseModel):
     """
     name: str = Field(..., description="Display name of the pipeline")
     description: Optional[str] = Field(None, description="Brief description of the pipeline")
+    # Same shape as the platform Pipeline.triggers JSON (TriggerConfig) so
+    # materialized rows can store it verbatim and trigger matching just works.
+    triggers: list[TriggerConfig] = Field(default_factory=list, description="Trigger bindings synced onto the materialized platform pipeline")
     steps: list[PipelineStepYaml] = Field(default_factory=list, description="Ordered list of pipeline steps")
 
 
@@ -101,6 +115,7 @@ class RepoPipelineResponse(BaseModel):
     name: str
     description: Optional[str] = None
     steps: list[dict[str, Any]]
+    triggers: list[dict[str, Any]] = Field(default_factory=list)
     source: str = Field(..., description="'repo' or 'platform'")
     branch: Optional[str] = Field(None, description="Branch the pipeline was read from (if repo)")
     filename: Optional[str] = Field(None, description="Filename in .lazyaf/pipelines/ (if repo)")

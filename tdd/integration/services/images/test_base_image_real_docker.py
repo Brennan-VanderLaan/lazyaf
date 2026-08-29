@@ -274,10 +274,21 @@ class TestControlModeRoundTrip:
         }
 
         # 1. create (mounts bound at create; command irrelevant in control mode)
+        # network: under DooD the sibling must share the tier container's
+        # network to reach the advertised IP (run #10: default-bridge sibling
+        # retried the unreachable stub until it blew the wait budget); on the
+        # host, Docker Desktop resolves host.docker.internal on any network.
+        from app.config import get_settings
+        net_name = get_settings().container_network
+        try:
+            docker_client.networks.get(net_name)
+        except Exception:
+            docker_client.networks.create(net_name)
         container = docker_client.containers.create(
             BASE_IMAGE,
             volumes={named_volume: {"bind": "/workspace", "mode": "rw"}},
             environment={"LAZYAF_CONTROL": "1"},
+            network=net_name,
         )
         try:
             # 2. config into the volume through the created container

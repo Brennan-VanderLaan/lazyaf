@@ -9,9 +9,12 @@ by a SECOND container reading the volume, not by peeking at host paths).
 
 TEST SEAM (documented in population.py): the clone URL template on the
 cached settings instance is monkeypatched to a file:// URL served from a
-read-only bind mount passed via `extra_mounts` (addressing declared
-explicitly - the bind source is a real Windows/host path). This exercises
-the full clone-into-named-volume path without requiring a running backend.
+read-only NAMED-VOLUME mount passed via `extra_mounts`. The seed repo is
+built INSIDE that volume by a helper container - never on a host path -
+because this suite must pass identically on the host and inside dogfood
+CI's DooD step containers, where tmp_path bind sources do not exist on
+the daemon that interprets them (the exact landmine-2 seam this suite
+guards; run cccae257 caught the bind variant failing under DooD).
 
 The real http URL through the backend is covered by the e2e-lane test at
 the bottom, gated on ENV PRESENCE (E2E_BACKEND_URL / BACKEND_URL), never on
@@ -82,39 +85,62 @@ def volume_name(docker_client):
         pass
 
 
+_SEED_BUILD_SCRIPT = """
+set -e
+mkdir -p /tmp/work && cd /tmp/work
+git init -q -b main .
+git config user.email test@lazyaf.local
+git config user.name "LazyAF Test"
+printf 'first commit content\\n' > hello.txt
+git add . && git commit -qm first
+echo "SHA1=$(git rev-parse HEAD)"
+printf 'second commit content\\n' > hello.txt
+printf 'added later\\n' > extra.txt
+git add . && git commit -qm second
+echo "SHA2=$(git rev-parse HEAD)"
+git clone -q --bare /tmp/work "/seed/{repo_id}.git"
+"""
+
+
 @pytest.fixture
-def seed_repo(tmp_path):
-    """A bare seed repo on the host: (seed_dir, repo_id, [sha1, sha2]).
+def seed_repo(docker_client):
+    """A bare seed repo built INSIDE a named volume: (seed_volume, repo_id,
+    [sha1, sha2]).
 
-    seed_dir/<repo_id>.git is a bare clone with two commits on main.
+    A helper container (the clone image - it has git) writes
+    /seed/<repo_id>.git with two commits on main. No host paths are
+    involved anywhere, so the fixture behaves identically on the host and
+    under DooD, where the daemon cannot see this container's tmp_path.
     """
+    from app.config import get_settings
+
     repo_id = f"seed-{uuid.uuid4().hex[:8]}"
-    work = tmp_path / "work"
-    work.mkdir()
-    _git("init", "-b", "main", cwd=work)
-    _git("config", "user.email", "test@lazyaf.local", cwd=work)
-    _git("config", "user.name", "LazyAF Test", cwd=work)
-
-    (work / "hello.txt").write_text("first commit content\n")
-    _git("add", ".", cwd=work)
-    _git("commit", "-m", "first", cwd=work)
-    sha1 = _git("rev-parse", "HEAD", cwd=work)
-
-    (work / "hello.txt").write_text("second commit content\n")
-    (work / "extra.txt").write_text("added later\n")
-    _git("add", ".", cwd=work)
-    _git("commit", "-m", "second", cwd=work)
-    sha2 = _git("rev-parse", "HEAD", cwd=work)
-
-    seed_dir = tmp_path / "seed"
-    seed_dir.mkdir()
-    _git("clone", "--bare", str(work), str(seed_dir / f"{repo_id}.git"), cwd=tmp_path)
-    return seed_dir, repo_id, [sha1, sha2]
+    seed_volume = f"lazyaf-test-seed-{uuid.uuid4().hex[:8]}"
+    docker_client.volumes.create(name=seed_volume)
+    try:
+        output = docker_client.containers.run(
+            get_settings().workspace_clone_image,
+            command=["bash", "-c", _SEED_BUILD_SCRIPT.format(repo_id=repo_id)],
+            volumes={seed_volume: {"bind": "/seed", "mode": "rw"}},
+            remove=True,
+        ).decode("utf-8", errors="replace")
+        shas = {
+            key: value
+            for key, _, value in (
+                line.partition("=") for line in output.splitlines() if "=" in line
+            )
+        }
+        yield seed_volume, repo_id, [shas["SHA1"], shas["SHA2"]]
+    finally:
+        try:
+            docker_client.volumes.get(seed_volume).remove(force=True)
+        except Exception:
+            pass
 
 
 @pytest.fixture
 def file_url_template(seed_repo, monkeypatch):
-    """TEST SEAM: point the clone template at the bind-mounted seed dir."""
+    """TEST SEAM: point the clone template at the volume-mounted seed dir."""
     from app.config import get_settings
 
     monkeypatch.setattr(
@@ -123,14 +149,16 @@ def file_url_template(seed_repo, monkeypatch):
     return seed_repo
 
 
-def seed_mount(seed_dir: Path):
+def seed_mount(seed_volume: str):
     from app.services.execution.local_executor import MountAddressing, MountSpec
 
-    # Explicit BIND addressing of a real host path (on Windows a C:\ path) -
-    # the addressing enum, not the path shape, decides how this mounts.
+    # Explicit VOLUME addressing: the seed lives in a named volume, which the
+    # host daemon resolves identically whether this test runs on the host or
+    # inside a DooD step container. (BIND-with-Windows-path addressing is
+    # covered in the local_executor hardening unit tests.)
     return MountSpec(
-        addressing=MountAddressing.BIND,
-        source=str(seed_dir),
+        addressing=MountAddressing.VOLUME,
+        source=seed_volume,
         target="/seed",
         mode="ro",
     )
@@ -159,11 +187,11 @@ class TestPopulateNamedVolume:
         container sees /workspace/repo."""
         from app.services.workspace.population import populate_workspace
 
-        seed_dir, repo_id, _ = file_url_template
+        seed_vol, repo_id, _ = file_url_template
 
         await populate_workspace(
             volume_name, repo_id, "main", None,
-            extra_mounts=[seed_mount(seed_dir)],
+            extra_mounts=[seed_mount(seed_vol)],
         )
 
         listing = read_volume(docker_client, volume_name, "ls -1a /workspace/repo")
@@ -179,11 +207,11 @@ class TestPopulateNamedVolume:
     ):
         from app.services.workspace.population import populate_workspace
 
-        seed_dir, repo_id, (sha1, _sha2) = file_url_template
+        seed_vol, repo_id, (sha1, _sha2) = file_url_template
 
         await populate_workspace(
             volume_name, repo_id, "main", sha1,
-            extra_mounts=[seed_mount(seed_dir)],
+            extra_mounts=[seed_mount(seed_vol)],
         )
 
         content = read_volume(docker_client, volume_name, "cat /workspace/repo/hello.txt")
@@ -200,12 +228,12 @@ class TestPopulateNamedVolume:
             populate_workspace,
         )
 
-        seed_dir, _repo_id, _ = file_url_template
+        seed_vol, _repo_id, _ = file_url_template
 
         with pytest.raises(WorkspacePopulationError) as excinfo:
             await populate_workspace(
                 volume_name, "no-such-repo", "main", None,
-                extra_mounts=[seed_mount(seed_dir)],
+                extra_mounts=[seed_mount(seed_vol)],
             )
 
         message = str(excinfo.value)
@@ -222,16 +250,16 @@ class TestPopulateNamedVolume:
             populate_workspace,
         )
 
-        seed_dir, repo_id, _ = file_url_template
+        seed_vol, repo_id, _ = file_url_template
 
         await populate_workspace(
             volume_name, repo_id, "main", None,
-            extra_mounts=[seed_mount(seed_dir)],
+            extra_mounts=[seed_mount(seed_vol)],
         )
         with pytest.raises(WorkspacePopulationError):
             await populate_workspace(
                 volume_name, "no-such-repo", "main", None,
-                extra_mounts=[seed_mount(seed_dir)],
+                extra_mounts=[seed_mount(seed_vol)],
             )
 
         leftovers = docker_client.containers.list(

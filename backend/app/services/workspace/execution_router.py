@@ -1,34 +1,59 @@
 """
-Execution Router - Phase 12.2
+Execution Router - Phase 12.2-INT
 
-Routes steps to appropriate executors:
-- LocalExecutor: backend spawns containers directly (default)
-- Remote: delegates to remote runners (hardware, AI agents)
+Routes pipeline steps to an execution mode:
+- "local":  LocalExecutor - the backend spawns the step container directly
+            (default for script and docker steps, R1: default-ON).
+- "legacy": the pre-12.2 job_queue/polling-runner path. Agent steps stay
+            legacy until Phase 12.5; an explicit `executor: legacy` override
+            in the step config also routes here - logged at WARNING, never
+            silent (R1).
+
+Every decision carries a human-readable `reason` so routing is observable
+end-to-end (StepRun.executor records what actually ran it; the dogfood
+pipeline asserts on it via the API).
+
+"remote" (RemoteExecutor / runner agents) arrives at Phase 12.6.
 """
+import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
-# Default container image when not specified
-DEFAULT_IMAGE = "alpine:latest"
+# Step types the LocalExecutor handles today.
+LOCAL_STEP_TYPES = ("script", "docker")
+
+# Valid values for a step-level `executor:` override.
+_VALID_EXECUTOR_OVERRIDES = ("legacy",)
+
+# Step-config keys that pin a step to a specific runner (runner affinity /
+# hardware requirements). The local path cannot honor them - only the legacy
+# runner queue can today, and RemoteExecutor takes over at Phase 12.6 -
+# so their presence routes the step LEGACY, loudly (fix 9: never silently
+# strip a pin by running the step locally).
+_RUNNER_PIN_KEYS = ("runner_type", "requires")
 
 
 @dataclass
 class RoutingDecision:
-    """Result of routing decision for a step."""
-    executor_type: str  # "local" or "remote"
-    step_type: str
-    image: Optional[str] = None
-    runner_requirements: Optional[Dict[str, Any]] = None
-    runner_type: Optional[str] = None
-    required_runner_id: Optional[str] = None
-    fallback_reason: Optional[str] = None
-    runner_available: bool = True
+    """Result of a routing decision for a step.
+
+    mode:   "local" | "legacy"
+    reason: why this mode was chosen (persisted/logged - never silent).
+    """
+    mode: str
+    reason: str
 
 
 @dataclass
 class ExecutorHandle:
-    """Handle to an executor for step execution."""
+    """Handle to an executor for step execution.
+
+    Retained for import compatibility (app.services.workspace re-exports it);
+    the pipeline executor drives LocalExecutor's event stream directly.
+    """
     is_local: bool
     executor: Any = None
     job_id: Optional[str] = None
@@ -37,165 +62,74 @@ class ExecutorHandle:
 
 class ExecutionRouter:
     """
-    Routes pipeline steps to appropriate executors.
+    Routes pipeline steps to an execution mode.
 
-    Decision logic:
-    1. Agent steps -> remote (need AI runner)
-    2. Steps with hardware requirements -> remote
-    3. Steps with specific runner_type -> remote
-    4. Steps with required_runner_id -> remote
-    5. Default -> local (backend spawns containers)
+    Decision logic (in order):
+    1. step_config["executor"] == "legacy" -> legacy ("explicit-override",
+       logged at WARNING - an override is loud, never silent).
+    2. Agent steps -> legacy (need the AI runner path until 12.5).
+    3. step_config carrying a runner pin (runner_type / requires) -> legacy
+       ("pinned-runner-legacy-until-12.6", logged at WARNING): only the
+       legacy runner queue can honor pins until RemoteExecutor (12.6).
+    4. script / docker steps -> local (LocalExecutor, default-ON per R1).
+    5. Unknown step types -> legacy, logged at WARNING (observable fallback:
+       the reason names the unknown type).
 
-    Override modes:
-    - force_local: All steps run locally (for development)
-    - force_remote: All steps run remotely (for testing)
+    An `executor:` override with any value other than "legacy" is a
+    configuration error and raises ValueError (fail the run loudly rather
+    than guess).
     """
 
-    def __init__(
-        self,
-        force_local: bool = False,
-        force_remote: bool = False,
-    ):
-        self._force_local = force_local
-        self._force_remote = force_remote
-        self._local_executor: Any = None
-        self._local_executor_available = True
-        self._check_runner_availability = lambda: True
-
-    def decide(self, step_config: Dict[str, Any]) -> RoutingDecision:
-        """
-        Decide which executor should handle a step.
+    def decide(self, step_type: str, step_config: dict) -> RoutingDecision:
+        """Decide which execution mode should handle a step.
 
         Args:
-            step_config: Step configuration from pipeline
+            step_type: The step's type ("script" | "docker" | "agent" | ...)
+            step_config: Full step configuration from the pipeline definition.
 
         Returns:
-            RoutingDecision with executor_type and requirements
+            RoutingDecision with mode ("local" | "legacy") and reason.
         """
-        step_type = step_config.get("type", "script")
-        image = step_config.get("image", DEFAULT_IMAGE)
-        requires = step_config.get("requires", {})
-        runner_type = step_config.get("runner_type")
-        required_runner_id = step_config.get("required_runner_id")
-
-        # Extract runner requirements
-        runner_requirements = None
-        if requires:
-            runner_requirements = requires
-
-        # Force local mode overrides everything
-        if self._force_local:
-            return RoutingDecision(
-                executor_type="local",
-                step_type=step_type,
-                image=image,
+        override = step_config.get("executor")
+        if override is not None:
+            if override == "legacy":
+                logger.warning(
+                    "Step routed to LEGACY executor by explicit override "
+                    "(step_type=%s). Remove the 'executor: legacy' key to use "
+                    "the local execution path.",
+                    step_type,
+                )
+                return RoutingDecision(mode="legacy", reason="explicit-override")
+            raise ValueError(
+                f"Invalid executor override {override!r} (step_type={step_type!r}): "
+                f"valid values: {', '.join(_VALID_EXECUTOR_OVERRIDES)}"
             )
 
-        # Force remote mode overrides everything
-        if self._force_remote:
-            return RoutingDecision(
-                executor_type="remote",
-                step_type=step_type,
-                image=image,
-                runner_requirements=runner_requirements,
-                runner_type=runner_type,
-                required_runner_id=required_runner_id,
-            )
-
-        # Check for local executor unavailability
-        if not self._local_executor_available:
-            return RoutingDecision(
-                executor_type="remote",
-                step_type=step_type,
-                image=image,
-                runner_requirements=runner_requirements,
-                runner_type=runner_type,
-                required_runner_id=required_runner_id,
-                fallback_reason="local_executor_unavailable",
-            )
-
-        # Agent steps always go remote (need AI runner)
         if step_type == "agent":
-            runner_available = self._check_runner_availability()
-            return RoutingDecision(
-                executor_type="remote",
-                step_type=step_type,
-                image=image,
-                runner_requirements=runner_requirements,
-                runner_type=runner_type,
-                required_runner_id=required_runner_id,
-                runner_available=runner_available,
-            )
+            return RoutingDecision(mode="legacy", reason="agent-steps-legacy-until-12.5")
 
-        # Steps with specific runner ID go remote
-        if required_runner_id:
-            runner_available = self._check_runner_availability()
-            return RoutingDecision(
-                executor_type="remote",
-                step_type=step_type,
-                image=image,
-                runner_requirements=runner_requirements,
-                runner_type=runner_type,
-                required_runner_id=required_runner_id,
-                runner_available=runner_available,
+        pins = [key for key in _RUNNER_PIN_KEYS if key in step_config]
+        if pins:
+            logger.warning(
+                "Step routed to LEGACY executor: step_config carries runner "
+                "pin(s) %s which only the legacy runner queue can honor until "
+                "RemoteExecutor lands at Phase 12.6 (step_type=%s).",
+                pins,
+                step_type,
             )
+            return RoutingDecision(mode="legacy", reason="pinned-runner-legacy-until-12.6")
 
-        # Steps with specific runner type go remote
-        if runner_type:
-            runner_available = self._check_runner_availability()
-            return RoutingDecision(
-                executor_type="remote",
-                step_type=step_type,
-                image=image,
-                runner_requirements=runner_requirements,
-                runner_type=runner_type,
-                runner_available=runner_available,
-            )
+        if step_type in LOCAL_STEP_TYPES:
+            return RoutingDecision(mode="local", reason=f"{step_type}-default-local")
 
-        # Steps with hardware requirements go remote
-        if requires and requires.get("hardware"):
-            runner_available = self._check_runner_availability()
-            return RoutingDecision(
-                executor_type="remote",
-                step_type=step_type,
-                image=image,
-                runner_requirements=runner_requirements,
-                runner_available=runner_available,
-            )
-
-        # Default: local execution
-        return RoutingDecision(
-            executor_type="local",
-            step_type=step_type,
-            image=image,
+        logger.warning(
+            "Unknown step type %r routed to LEGACY executor - add it to the "
+            "router when it gains a local execution path.",
+            step_type,
         )
+        return RoutingDecision(mode="legacy", reason=f"unknown-step-type:{step_type}")
 
-    async def get_executor(
-        self,
-        step_config: Dict[str, Any],
-        execution_context: Dict[str, Any],
-    ) -> ExecutorHandle:
-        """
-        Get an executor handle for a step.
 
-        Args:
-            step_config: Step configuration from pipeline
-            execution_context: Context for execution (IDs, workspace volume, etc.)
-
-        Returns:
-            ExecutorHandle for executing the step
-        """
-        decision = self.decide(step_config)
-
-        if decision.executor_type == "local":
-            return ExecutorHandle(
-                is_local=True,
-                executor=self._local_executor,
-                execution_context=execution_context,
-            )
-        else:
-            # Remote execution - return handle for job enqueue
-            return ExecutorHandle(
-                is_local=False,
-                execution_context=execution_context,
-            )
+# Module singleton - the pipeline executor imports this (seam for 12.2-INT
+# rewiring; stateless, safe to share).
+execution_router = ExecutionRouter()

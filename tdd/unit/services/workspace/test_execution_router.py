@@ -1,373 +1,229 @@
 """
-Unit tests for Execution Router.
+Unit tests for the Execution Router (Phase 12.2-INT).
 
-These tests define the contract for routing steps to executors:
-- Default routes to LocalExecutor (backend spawns containers)
-- Routes to remote runner when hardware requirements specified
-- Returns async generator handle for streaming results
+Contract (pre-agreed interface #4):
+    decide(step_type: str, step_config: dict) -> RoutingDecision
+    RoutingDecision has mode: "local" | "legacy" and reason: str.
 
-Write these tests BEFORE implementing the execution router.
+Rules:
+- script / docker steps -> local (LocalExecutor default-ON, R1)
+- agent steps -> legacy (until Phase 12.5)
+- step_config["executor"] == "legacy" -> legacy with reason
+  "explicit-override", logged at WARNING (never silent)
+- unknown step types -> legacy, logged at WARNING with the type in the reason
+- any other executor override value -> ValueError (loud config error)
+
+This file replaces the pre-12.2-INT stub-contract tests (local/remote
+routing, force modes, runner requirements): that API was never wired into
+the live path and is superseded by the mode/reason contract above. Remote
+routing returns at Phase 12.6 through RemoteExecutor.
 """
+import logging
 import sys
 from pathlib import Path
-from uuid import uuid4
-from unittest.mock import Mock, AsyncMock
 
 import pytest
-
-# Tests enabled - execution router implemented
 
 # Add backend to path for imports
 backend_path = Path(__file__).parent.parent.parent.parent.parent / "backend"
 sys.path.insert(0, str(backend_path))
 
+from app.services.workspace.execution_router import (  # noqa: E402
+    ExecutionRouter,
+    RoutingDecision,
+    execution_router,
+)
+
+ROUTER_LOGGER = "app.services.workspace.execution_router"
+
+
+@pytest.fixture
+def router():
+    return ExecutionRouter()
+
 
 # -----------------------------------------------------------------------------
-# Contract: Routing Decisions
+# Contract: default routing per step type
 # -----------------------------------------------------------------------------
 
-class TestRoutingDecisions:
-    """Tests that verify routing decision logic."""
+class TestDefaultRouting:
+    def test_script_routes_local(self, router):
+        decision = router.decide("script", {"command": "pytest tests/"})
+        assert decision.mode == "local"
+        assert decision.reason
 
-    def test_routes_to_local_when_no_requirements(self):
-        """Steps with no hardware requirements route to LocalExecutor."""
-        from app.services.workspace.execution_router import ExecutionRouter
+    def test_docker_routes_local(self, router):
+        decision = router.decide(
+            "docker", {"command": "npm test", "image": "node:20"}
+        )
+        assert decision.mode == "local"
+        assert decision.reason
 
-        router = ExecutionRouter()
+    def test_agent_routes_legacy(self, router):
+        decision = router.decide("agent", {"prompt": "Fix the failing tests"})
+        assert decision.mode == "legacy"
+        assert "12.5" in decision.reason  # states WHY agent steps stay legacy
 
-        step_config = {
-            "type": "script",
-            "command": "echo hello",
-            "image": "alpine:latest",
-        }
+    def test_script_with_image_still_local(self, router):
+        decision = router.decide(
+            "script", {"command": "pytest", "image": "python:3.12"}
+        )
+        assert decision.mode == "local"
 
-        decision = router.decide(step_config)
-        assert decision.executor_type == "local"
-        assert decision.runner_requirements is None
+    def test_decision_is_routing_decision_dataclass(self, router):
+        decision = router.decide("script", {"command": "echo hi"})
+        assert isinstance(decision, RoutingDecision)
+        assert set(vars(decision)) == {"mode", "reason"}
 
-    def test_routes_to_local_for_script_steps(self):
-        """Script steps default to local execution."""
-        from app.services.workspace.execution_router import ExecutionRouter
 
-        router = ExecutionRouter()
+# -----------------------------------------------------------------------------
+# Contract: explicit legacy override - loud, never silent
+# -----------------------------------------------------------------------------
 
-        step_config = {
-            "type": "script",
-            "command": "pytest tests/",
-            "image": "python:3.12",
-        }
+class TestExplicitOverride:
+    def test_explicit_legacy_override_routes_legacy(self, router):
+        decision = router.decide(
+            "script", {"command": "pytest", "executor": "legacy"}
+        )
+        assert decision.mode == "legacy"
+        assert decision.reason == "explicit-override"
 
-        decision = router.decide(step_config)
-        assert decision.executor_type == "local"
+    def test_explicit_override_logged_at_warning(self, router, caplog):
+        with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
+            router.decide("script", {"command": "pytest", "executor": "legacy"})
 
-    def test_routes_to_local_for_docker_steps(self):
-        """Docker steps default to local execution."""
-        from app.services.workspace.execution_router import ExecutionRouter
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == ROUTER_LOGGER
+        ]
+        assert len(warnings) == 1
+        assert "legacy" in warnings[0].getMessage().lower()
+        assert "override" in warnings[0].getMessage().lower()
 
-        router = ExecutionRouter()
+    def test_override_on_agent_step_still_explicit_override_reason(self, router):
+        decision = router.decide(
+            "agent", {"prompt": "do it", "executor": "legacy"}
+        )
+        assert decision.mode == "legacy"
+        assert decision.reason == "explicit-override"
 
-        step_config = {
-            "type": "docker",
-            "command": "npm test",
-            "image": "node:20",
-        }
+    def test_no_warning_for_default_routing(self, router, caplog):
+        with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
+            router.decide("script", {"command": "pytest"})
+            router.decide("docker", {"command": "ls", "image": "node:20"})
+            router.decide("agent", {"prompt": "fix"})
+        assert not [r for r in caplog.records if r.name == ROUTER_LOGGER]
 
-        decision = router.decide(step_config)
-        assert decision.executor_type == "local"
+    def test_invalid_override_value_raises(self, router):
+        with pytest.raises(ValueError, match="executor override"):
+            router.decide("script", {"command": "pytest", "executor": "quantum"})
 
-    def test_routes_to_remote_when_hardware_required(self):
-        """Steps with hardware requirements route to remote runner."""
-        from app.services.workspace.execution_router import ExecutionRouter
+    def test_invalid_override_local_raises(self, router):
+        # "local" is the default, not an override value - misspelled intent
+        # fails loudly instead of being half-honored.
+        with pytest.raises(ValueError):
+            router.decide("script", {"command": "pytest", "executor": "local"})
 
-        router = ExecutionRouter()
 
-        step_config = {
-            "type": "script",
-            "command": "flash firmware.bin",
-            "image": "alpine:latest",
-            "requires": {
-                "hardware": ["gpio", "uart"],
+# -----------------------------------------------------------------------------
+# Contract: runner pins route legacy until 12.6 (fix 9)
+#
+# Restores the failure-era contract (git show HEAD:.../test_execution_router.py
+# had runner_type/requires routing to a runner-aware path): a step carrying a
+# runner pin must NOT lose it by running locally. Until RemoteExecutor (12.6)
+# honors pins, they route LEGACY - loudly.
+# -----------------------------------------------------------------------------
+
+class TestRunnerPins:
+    def test_script_with_runner_type_pins_legacy(self, router):
+        decision = router.decide(
+            "script", {"command": "flash firmware.bin", "runner_type": "claude-code"}
+        )
+        assert decision.mode == "legacy"
+        assert decision.reason == "pinned-runner-legacy-until-12.6"
+
+    def test_docker_with_requires_pins_legacy(self, router):
+        decision = router.decide(
+            "docker",
+            {
+                "command": "run-hw-tests",
+                "image": "alpine:latest",
+                "requires": {"hardware": ["gpio", "uart"]},
             },
-        }
+        )
+        assert decision.mode == "legacy"
+        assert decision.reason == "pinned-runner-legacy-until-12.6"
 
-        decision = router.decide(step_config)
-        assert decision.executor_type == "remote"
-        assert decision.runner_requirements == {"hardware": ["gpio", "uart"]}
+    def test_pin_logged_at_warning(self, router, caplog):
+        with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
+            router.decide("script", {"command": "x", "runner_type": "gemini"})
+        warnings = [r for r in caplog.records if r.name == ROUTER_LOGGER]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "runner_type" in message
+        assert "12.6" in message
 
-    def test_routes_to_remote_when_runner_type_specified(self):
-        """Steps with specific runner_type route to remote."""
-        from app.services.workspace.execution_router import ExecutionRouter
+    def test_agent_step_keeps_agent_reason_over_pin(self, router):
+        """Agent steps are legacy for their own (12.5) reason; a runner_type
+        on an agent step is normal config, not a warning-worthy pin."""
+        decision = router.decide(
+            "agent", {"prompt": "fix it", "runner_type": "claude-code"}
+        )
+        assert decision.mode == "legacy"
+        assert decision.reason == "agent-steps-legacy-until-12.5"
 
-        router = ExecutionRouter()
+    def test_explicit_override_wins_over_pin(self, router):
+        decision = router.decide(
+            "script",
+            {"command": "x", "runner_type": "any", "executor": "legacy"},
+        )
+        assert decision.mode == "legacy"
+        assert decision.reason == "explicit-override"
 
-        step_config = {
-            "type": "agent",
-            "command": "implement feature X",
-            "runner_type": "claude-code",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.executor_type == "remote"
-        assert decision.runner_type == "claude-code"
-
-    def test_routes_agent_steps_to_remote(self):
-        """Agent steps always route to remote (need AI runner)."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        step_config = {
-            "type": "agent",
-            "prompt": "Fix the failing tests",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.executor_type == "remote"
-
-    def test_routes_to_specific_runner_id(self):
-        """Steps can specify a specific runner ID for affinity."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        step_config = {
-            "type": "script",
-            "command": "echo hello",
-            "required_runner_id": "runner-abc123",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.executor_type == "remote"
-        assert decision.required_runner_id == "runner-abc123"
+    def test_unpinned_script_still_local(self, router):
+        decision = router.decide("script", {"command": "pytest"})
+        assert decision.mode == "local"
 
 
 # -----------------------------------------------------------------------------
-# Contract: Executor Handle
+# Contract: unknown step types - observable fallback
 # -----------------------------------------------------------------------------
 
-class TestExecutorHandle:
-    """Tests that verify executor handle creation."""
+class TestUnknownStepTypes:
+    def test_unknown_type_routes_legacy_with_named_reason(self, router):
+        decision = router.decide("teleport", {"command": "beam me up"})
+        assert decision.mode == "legacy"
+        assert decision.reason == "unknown-step-type:teleport"
 
-    async def test_returns_async_generator_for_local(self):
-        """Local execution returns async generator for streaming."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        step_config = {
-            "type": "script",
-            "command": "echo hello",
-            "image": "alpine:latest",
-        }
-
-        execution_context = {
-            "pipeline_run_id": str(uuid4()),
-            "step_run_id": str(uuid4()),
-            "step_index": 0,
-            "execution_key": f"{uuid4()}:0:1",
-            "workspace_volume": f"lazyaf-ws-{uuid4()}",
-        }
-
-        # Mock the LocalExecutor
-        mock_executor = Mock()
-        mock_generator = AsyncMock()
-        mock_executor.execute_step.return_value = mock_generator
-        router._local_executor = mock_executor
-
-        handle = await router.get_executor(step_config, execution_context)
-        assert handle is not None
-        assert handle.is_local
-
-    async def test_returns_job_enqueue_for_remote(self):
-        """Remote execution returns job enqueue handle."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        step_config = {
-            "type": "agent",
-            "prompt": "Fix tests",
-        }
-
-        execution_context = {
-            "pipeline_run_id": str(uuid4()),
-            "step_run_id": str(uuid4()),
-            "step_index": 0,
-            "execution_key": f"{uuid4()}:0:1",
-            "workspace_volume": f"lazyaf-ws-{uuid4()}",
-        }
-
-        handle = await router.get_executor(step_config, execution_context)
-        assert handle is not None
-        assert not handle.is_local
+    def test_unknown_type_logged_at_warning(self, router, caplog):
+        with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
+            router.decide("teleport", {})
+        warnings = [r for r in caplog.records if r.name == ROUTER_LOGGER]
+        assert len(warnings) == 1
+        assert "teleport" in warnings[0].getMessage()
 
 
 # -----------------------------------------------------------------------------
-# Contract: Router Configuration
+# Module singleton seam for the pipeline executor
 # -----------------------------------------------------------------------------
 
-class TestRouterConfiguration:
-    """Tests that verify router configuration options."""
+class TestModuleSingleton:
+    def test_singleton_exists_and_routes(self):
+        decision = execution_router.decide("script", {"command": "echo hi"})
+        assert decision.mode == "local"
 
-    def test_force_local_mode(self):
-        """Router can be configured to force local execution for all steps."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter(force_local=True)
-
-        # Even agent steps go local in force_local mode
-        step_config = {
-            "type": "agent",
-            "prompt": "Fix tests",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.executor_type == "local"
-
-    def test_force_remote_mode(self):
-        """Router can be configured to force remote execution for all steps."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter(force_remote=True)
-
-        # Even simple scripts go remote in force_remote mode
-        step_config = {
-            "type": "script",
-            "command": "echo hello",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.executor_type == "remote"
-
-    def test_local_executor_available_check(self):
-        """Router checks if LocalExecutor is available (Docker running)."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        # When local executor not available, fall back to remote
-        router._local_executor_available = False
-
-        step_config = {
-            "type": "script",
-            "command": "echo hello",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.executor_type == "remote"
-        assert decision.fallback_reason == "local_executor_unavailable"
+    def test_singleton_is_execution_router(self):
+        assert isinstance(execution_router, ExecutionRouter)
 
 
 # -----------------------------------------------------------------------------
-# Contract: Routing Metadata
+# Package re-export stays importable (app.services.workspace consumers)
 # -----------------------------------------------------------------------------
 
-class TestRoutingMetadata:
-    """Tests that verify routing decision metadata."""
+class TestPackageExports:
+    def test_workspace_package_reexports_router(self):
+        from app.services.workspace import ExecutionRouter as Reexported
+        from app.services.workspace import RoutingDecision as ReexportedDecision
 
-    def test_decision_includes_step_type(self):
-        """Routing decision includes the original step type."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        step_config = {
-            "type": "docker",
-            "command": "npm test",
-            "image": "node:20",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.step_type == "docker"
-
-    def test_decision_includes_image(self):
-        """Routing decision includes the container image."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        step_config = {
-            "type": "script",
-            "command": "pytest",
-            "image": "python:3.12-slim",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.image == "python:3.12-slim"
-
-    def test_decision_uses_default_image_when_not_specified(self):
-        """Routing decision uses default image when not specified."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        step_config = {
-            "type": "script",
-            "command": "echo hello",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.image is not None  # Uses default
-
-
-# -----------------------------------------------------------------------------
-# Contract: Runner Requirements Matching
-# -----------------------------------------------------------------------------
-
-class TestRunnerRequirements:
-    """Tests that verify runner requirement matching."""
-
-    def test_hardware_requirements_extracted(self):
-        """Hardware requirements are extracted for routing."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        step_config = {
-            "type": "script",
-            "command": "test hardware",
-            "requires": {
-                "hardware": ["gpio", "spi"],
-                "capabilities": ["arm64"],
-            },
-        }
-
-        decision = router.decide(step_config)
-        assert decision.runner_requirements["hardware"] == ["gpio", "spi"]
-        assert decision.runner_requirements["capabilities"] == ["arm64"]
-
-    def test_runner_type_extracted(self):
-        """Runner type is extracted for routing."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        step_config = {
-            "type": "agent",
-            "prompt": "Fix tests",
-            "runner_type": "gemini",
-        }
-
-        decision = router.decide(step_config)
-        assert decision.runner_type == "gemini"
-
-    def test_no_matching_runner_returns_none(self):
-        """When no runner matches requirements, decision indicates unavailable."""
-        from app.services.workspace.execution_router import ExecutionRouter
-
-        router = ExecutionRouter()
-
-        # Mock no matching runners available
-        router._check_runner_availability = Mock(return_value=False)
-
-        step_config = {
-            "type": "script",
-            "command": "special hardware",
-            "requires": {
-                "hardware": ["nonexistent-device"],
-            },
-        }
-
-        decision = router.decide(step_config)
-        assert decision.executor_type == "remote"
-        assert not decision.runner_available
+        assert Reexported is ExecutionRouter
+        assert ReexportedDecision is RoutingDecision

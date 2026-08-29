@@ -3,23 +3,268 @@ Local Executor - Docker-based step execution.
 
 Spawns Docker containers directly from the backend via Docker SDK.
 Provides:
-- Container spawning with proper configuration
-- Workspace volume mounting at /workspace
-- Real-time log streaming
-- Timeout handling (kills container after deadline)
+- Container spawning with proper configuration (image/working_dir/network from
+  settings - single-sourced HERE, not in the pipeline executor)
+- Workspace volume mounting at /workspace via EXPLICIT mount addressing
+  (MountAddressing enum: volume | bind - never inferred from path shape)
+- Bind-mount policy: raw bind mounts from pipeline step config are gated by a
+  settings-driven allowlist (default: the docker socket only); anything else
+  fails the step loudly at dispatch (12.2-INT fix 10)
+- Shell-wrapped script commands under `set -e` (docker-py shlex-splits raw
+  strings; multiline piped scripts break without a real shell, and without
+  set -e only the LAST line's exit code would decide the step)
+- HOME pinned to the shared workspace volume so tools installed in one step
+  survive to the next (12.3 persistence contract, pulled forward)
+- Real-time log streaming without blocking the event loop (R5): a pump thread
+  feeds an asyncio queue; all blocking docker SDK calls go through
+  run_in_threadpool
+- Timeout handling with a hard deadline that fires DURING log streaming
+  (kills container after deadline)
 - Crash detection
 - Idempotent execution (same key = cached result)
+- Deterministic container cleanup: the finished container is removed BEFORE
+  the result event is yielded, so step completion is synchronous with the
+  container being gone - never dependent on generator GC (12.2-INT fix 6)
 """
 import asyncio
-from datetime import datetime
-from typing import AsyncGenerator, Any
+import logging
+import re
+import shlex
+import threading
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, AsyncGenerator, Iterable, Sequence, Union
+
+import docker
 from docker import DockerClient
-from docker.errors import ContainerError, ImageNotFound, APIError, DockerException
+from docker.errors import APIError, ContainerError, DockerException, ImageNotFound, NotFound
+from docker.types import Mount
 import requests.exceptions
+from starlette.concurrency import run_in_threadpool
+
+from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
-# Default image for steps that don't specify one
-DEFAULT_STEP_IMAGE = "python:3.12-slim"
+# Default image for steps that don't specify one. Sourced from settings
+# (step_default_image); module constant kept for import compatibility.
+DEFAULT_STEP_IMAGE = get_settings().step_default_image
+
+# The one bind-mount source permitted from pipeline definitions by default
+# (12.2-INT fix 10). The `needs: [docker]` step-config sugar translates to
+# this mount; Phase 12.4 changes that one site while raw-bind-with-allowlist
+# stays the mechanism underneath.
+DOCKER_SOCKET_SOURCE = "/var/run/docker.sock"
+
+# Labels stamped on every step container so orphans are findable and tests
+# can assert cleanup synchronously with step completion.
+CONTAINER_LABEL_EXECUTION_KEY = "lazyaf.execution_key"
+CONTAINER_LABEL_PIPELINE_RUN = "lazyaf.pipeline_run_id"
+
+
+def make_docker_client() -> DockerClient:
+    """Build a docker client honoring settings.docker_host.
+
+    Cross-file contract #1 (12.2-INT): workspace population imports this so
+    every backend-spawned container speaks to the same daemon. Sync (the SDK
+    probes the daemon on construction) - call via run_in_threadpool.
+    """
+    settings = get_settings()
+    if settings.docker_host:
+        return docker.DockerClient(base_url=settings.docker_host)
+    return docker.from_env()
+
+
+def bind_mount_allowlist() -> tuple[str, ...]:
+    """Bind-mount sources pipeline step config may request (fix 10).
+
+    Settings-driven via ``step_bind_mount_allowlist`` when present (config.py
+    is owned by a parallel change - read defensively); default is the docker
+    socket only. The workspace volume mount is internal and unaffected.
+    """
+    settings = get_settings()
+    configured = getattr(settings, "step_bind_mount_allowlist", None)
+    if configured:
+        return tuple(configured)
+    return (DOCKER_SOCKET_SOURCE,)
+
+
+# -----------------------------------------------------------------------------
+# Explicit mount addressing (R6): volume vs bind is DECLARED, never inferred
+# from the shape of the source string. A Windows host path (C:\...) declared
+# as BIND goes through the typed docker Mount API; a named volume goes through
+# the volumes dict. A path-looking string declared VOLUME fails loudly.
+# -----------------------------------------------------------------------------
+
+class MountAddressing(str, Enum):
+    """How a mount source is addressed - explicit, never inferred."""
+    VOLUME = "volume"
+    BIND = "bind"
+
+
+# Docker named-volume grammar (local driver). Anything else declared VOLUME
+# is rejected loudly instead of letting the engine silently bind-mount it.
+_VOLUME_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+
+@dataclass(frozen=True)
+class MountSpec:
+    """One container mount with explicit addressing."""
+    addressing: MountAddressing
+    source: str
+    target: str
+    mode: str = "rw"  # "rw" | "ro"
+
+    @classmethod
+    def from_config(cls, raw: Union["MountSpec", dict]) -> "MountSpec":
+        """Parse a mount config dict. The 'addressing' key is REQUIRED."""
+        if isinstance(raw, MountSpec):
+            return raw
+        if not isinstance(raw, dict):
+            raise ValueError(f"mount config must be a dict or MountSpec, got {type(raw).__name__}")
+        if "addressing" not in raw:
+            raise ValueError(
+                "mount config requires explicit 'addressing' ('volume' | 'bind') - "
+                "addressing is never inferred from path shape"
+            )
+        try:
+            addressing = MountAddressing(raw["addressing"])
+        except ValueError:
+            raise ValueError(
+                f"invalid mount addressing {raw['addressing']!r}: must be 'volume' or 'bind'"
+            ) from None
+        if "source" not in raw or "target" not in raw:
+            raise ValueError("mount config requires 'source' and 'target'")
+        return cls(
+            addressing=addressing,
+            source=raw["source"],
+            target=raw["target"],
+            mode=raw.get("mode", "rw"),
+        )
+
+
+def validate_step_mounts(
+    specs: Sequence[Union[MountSpec, dict]],
+    allowlist: Iterable[str],
+) -> list[MountSpec]:
+    """Gate mounts requested by PIPELINE STEP CONFIG (12.2-INT fix 10).
+
+    Bind mounts are host-root-equivalent power; only sources on the
+    (settings-driven) allowlist may come from a pipeline definition. Named
+    volumes pass through - they carry no host paths. Raises ValueError with
+    a clear config error; the executor fails the step loudly on it.
+
+    The internal workspace volume mount never goes through here.
+    """
+    allowed = set(allowlist)
+    validated: list[MountSpec] = []
+    for raw in specs:
+        spec = MountSpec.from_config(raw)
+        if spec.addressing is MountAddressing.BIND and spec.source not in allowed:
+            raise ValueError(
+                f"bind mount source {spec.source!r} is not permitted from "
+                f"pipeline step config (allowed: {sorted(allowed)}). Use the "
+                "shared workspace volume for data, or 'needs: [docker]' for "
+                "the docker socket."
+            )
+        validated.append(spec)
+    return validated
+
+
+def build_container_mounts(
+    specs: Sequence[Union[MountSpec, dict]],
+) -> tuple[dict, list[Mount]]:
+    """Build docker-py mount kwargs from explicit MountSpecs.
+
+    Returns (volumes_dict, mounts_list):
+    - VOLUME specs land in the `volumes=` dict form (named volume -> bind spec);
+      sources are validated against docker's volume-name grammar so a host
+      path declared VOLUME raises instead of being silently bind-mounted.
+    - BIND specs become typed docker.types.Mount(type='bind') objects so the
+      engine never classifies the source by its shape (Windows C:\\ paths work).
+    """
+    volumes: dict = {}
+    mounts: list[Mount] = []
+    for raw in specs:
+        spec = MountSpec.from_config(raw)
+        if spec.addressing is MountAddressing.VOLUME:
+            if not _VOLUME_NAME_RE.match(spec.source):
+                raise ValueError(
+                    f"{spec.source!r} is not a valid docker volume name; "
+                    "declare addressing='bind' for host paths"
+                )
+            volumes[spec.source] = {"bind": spec.target, "mode": spec.mode}
+        else:
+            mounts.append(
+                Mount(
+                    target=spec.target,
+                    source=spec.source,
+                    type="bind",
+                    read_only=(spec.mode == "ro"),
+                )
+            )
+    return volumes, mounts
+
+
+def ensure_network(docker_client: DockerClient, network_name: str) -> None:
+    """Idempotently ensure the named docker network exists (sync - callers
+    wrap in run_in_threadpool).
+
+    Created with compose-compatible labels so a later `docker compose up`
+    (which declares the same network name) adopts it instead of erroring.
+    """
+    try:
+        docker_client.networks.get(network_name)
+        return
+    except NotFound:
+        pass
+    logger.info("Creating docker network %s", network_name)
+    try:
+        docker_client.networks.create(
+            network_name,
+            driver="bridge",
+            labels={
+                "com.docker.compose.network": network_name,
+                "com.docker.compose.project": "lazyaf",
+            },
+        )
+    except APIError:
+        # Lost a creation race - fine as long as it exists now.
+        docker_client.networks.get(network_name)
+
+
+def build_step_command(step_config: dict, home_dir: str) -> Union[list, str]:
+    """Build the container command for a step.
+
+    - String commands are shell-wrapped as [shell, "-c", script] (default
+      shell: bash) with a ``set -e`` prelude (12.2-INT fix 8): the step
+      fails at the FIRST failing line instead of reporting only the last
+      line's exit code - a multiline script whose middle command dies no
+      longer reads as green. docker-py shlex-splits raw strings, which
+      breaks multiline/piped scripts, hence the explicit shell. The wrapper
+      also ensures $HOME exists on the shared workspace volume before the
+      user script runs.
+    - List commands (exec form) pass through untouched - explicit opt-out
+      for images without a shell. List-form steps OWN their HOME: no shell
+      prelude is possible, so they must create/populate $HOME themselves
+      if they rely on it (documented contract, not inferred).
+    - Images without bash can declare `shell: "sh"` in the step config
+      (explicit, never inferred from the image).
+    """
+    command = step_config.get("command", "")
+    if isinstance(command, (list, tuple)):
+        return list(command)
+    shell = step_config.get("shell", "bash")
+    script = f"set -e\nmkdir -p {shlex.quote(home_dir)}\n{command}"
+    return [shell, "-c", script]
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    text = str(exc).lower()
+    return "timeout" in text or "timed out" in text
 
 
 class LocalExecutor:
@@ -45,6 +290,64 @@ class LocalExecutor:
         self._docker = docker_client
         self._running_containers: dict[str, Any] = {}
         self._completed_executions: dict[str, dict] = {}  # For idempotency
+        self._network_ready: set[str] = set()
+
+    def reset(self) -> None:
+        """Test-mode reset hook: clear the idempotency cache and the
+        running-container registry (execution keys embed StepRun ids, which a
+        DB reset is about to delete). The docker client and network cache are
+        environment-level and survive."""
+        self._completed_executions.clear()
+        self._running_containers.clear()
+
+    async def _ensure_network(self, network_name: str) -> None:
+        """Ensure the step network exists (once per executor instance)."""
+        if network_name in self._network_ready:
+            return
+        await run_in_threadpool(ensure_network, self._docker, network_name)
+        self._network_ready.add(network_name)
+
+    async def _cleanup_container(self, execution_key: str, container) -> None:
+        """Remove a finished step container BEFORE the result event goes out
+        (12.2-INT fix 6): step completion is synchronous with the container
+        being gone, never dependent on generator GC. Docker calls run in the
+        threadpool (R5); failures are logged, never raised."""
+        self._running_containers.pop(execution_key, None)
+        if container is None:
+            return
+        try:
+            await run_in_threadpool(container.remove, force=True)
+        except Exception:
+            logger.warning(
+                "Failed to remove step container for %s", execution_key, exc_info=True
+            )
+
+    def _schedule_orphan_container_removal(self, execution_key: str, container) -> None:
+        """Backstop for ABNORMAL generator exits only (consumer closed the
+        stream early / task cancelled): an async generator's finally cannot
+        await during GeneratorExit, so removal is scheduled as its own task
+        on the running loop (falling back to a blocking best-effort remove
+        when no loop is available)."""
+
+        async def _remove() -> None:
+            try:
+                await run_in_threadpool(container.remove, force=True)
+            except Exception:
+                logger.warning(
+                    "Backstop removal of step container for %s failed",
+                    execution_key,
+                    exc_info=True,
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+            return
+        loop.create_task(_remove())
 
     async def execute_step(
         self,
@@ -57,25 +360,34 @@ class LocalExecutor:
         Args:
             step_config: Step configuration including:
                 - type: Step type (script, docker, agent)
-                - command: Command to run
-                - image: Docker image (optional, uses default if not specified)
+                - command: Command to run (string -> shell-wrapped under
+                  `set -e`; list -> exec form, owns its own HOME)
+                - shell: Shell for wrapping string commands (default "bash")
+                - image: Docker image (optional, default from settings.step_default_image)
+                - working_dir: Working directory (optional, default from settings)
                 - timeout: Timeout in seconds (optional)
                 - environment: Additional environment variables (optional)
+                - memory_limit: e.g. "512m" (optional)
+                - mounts: extra mounts, each with EXPLICIT addressing:
+                  {"addressing": "volume"|"bind", "source": ..., "target": ..., "mode": "rw"|"ro"}
+                  Bind sources must be on the allowlist (default: the docker
+                  socket only) - anything else fails the step loudly (fix 10).
 
             execution_context: Execution context including:
                 - pipeline_run_id: Pipeline run UUID
                 - step_run_id: Step run UUID
                 - step_index: Step index in pipeline
                 - execution_key: Unique key for idempotency
-                - workspace_volume: Docker volume name for workspace
-                - repo_url: Git repository URL
-                - branch: Branch to checkout
+                - workspace_volume: Docker NAMED VOLUME for the workspace
 
         Yields:
             Event dicts with "type" field:
                 - {"type": "status", "status": "preparing"|"running"|etc}
                 - {"type": "log", "line": "..."}
-                - {"type": "result", "status": "completed"|"failed", "exit_code": int}
+                - {"type": "result", "status": "completed"|"failed"|"timeout", "exit_code": int|None}
+
+        By the time the "result" event is yielded, the step container has
+        already been removed (fix 6).
         """
         execution_key = execution_context["execution_key"]
 
@@ -94,178 +406,250 @@ class LocalExecutor:
         # Status: preparing
         yield {"type": "status", "status": "preparing"}
 
-        image = step_config.get("image", DEFAULT_STEP_IMAGE)
-        command = step_config.get("command", "")
+        settings = get_settings()
+        image = step_config.get("image", settings.step_default_image)
         timeout = step_config.get("timeout", 300)  # Default 5 minutes
         user_env = step_config.get("environment", {})
         memory_limit = step_config.get("memory_limit")  # e.g., "512m", "1g"
+        working_dir = step_config.get("working_dir", settings.step_working_dir)
+        command = build_step_command(step_config, settings.step_home_dir)
 
-        # Build environment variables
+        # Build environment variables. HOME lives on the shared workspace
+        # volume so tools installed in one step persist to the next; an
+        # explicit HOME in the step's environment wins. LAZYAF_BACKEND_URL
+        # (12.2-INT fix 12) lets in-container tooling reach the backend on
+        # the shared network; settings.container_backend_url is owned by a
+        # parallel change to config.py - read defensively.
         environment = {
+            "HOME": settings.step_home_dir,
             **user_env,
             "LAZYAF_PIPELINE_RUN_ID": execution_context["pipeline_run_id"],
             "LAZYAF_STEP_RUN_ID": execution_context["step_run_id"],
             "LAZYAF_STEP_INDEX": str(execution_context["step_index"]),
             "LAZYAF_EXECUTION_KEY": execution_key,
+            "LAZYAF_BACKEND_URL": getattr(
+                settings, "container_backend_url", "http://backend:8000"
+            ),
         }
 
-        # Build volume mounts
+        # Build mounts via explicit addressing (never inferred from path
+        # shape). The workspace volume is internal; step-config mounts go
+        # through the bind allowlist gate (fix 10).
         workspace_volume = execution_context["workspace_volume"]
-        volumes = {
-            workspace_volume: {"bind": "/workspace", "mode": "rw"},
-        }
-
         container = None
+        final_result: dict | None = None
         try:
+            mount_specs: list = [
+                MountSpec(
+                    addressing=MountAddressing.VOLUME,
+                    source=workspace_volume,
+                    target="/workspace",
+                    mode="rw",
+                )
+            ]
+            mount_specs.extend(
+                validate_step_mounts(
+                    step_config.get("mounts", []), bind_mount_allowlist()
+                )
+            )
+            volumes, extra_mounts = build_container_mounts(mount_specs)
+
             # Build container run kwargs
             run_kwargs = {
                 "command": command,
                 "detach": True,
                 "volumes": volumes,
-                "working_dir": "/workspace/repo",
+                "working_dir": working_dir,
                 "environment": environment,
+                "network": settings.container_network,
                 "remove": False,  # We'll remove it ourselves after getting logs
+                "labels": {
+                    CONTAINER_LABEL_EXECUTION_KEY: execution_key,
+                    CONTAINER_LABEL_PIPELINE_RUN: execution_context["pipeline_run_id"],
+                },
             }
+            if extra_mounts:
+                run_kwargs["mounts"] = extra_mounts
 
             # Add memory limit if specified
             if memory_limit:
                 run_kwargs["mem_limit"] = memory_limit
 
-            # Spawn container
-            container = self._docker.containers.run(image, **run_kwargs)
+            await self._ensure_network(settings.container_network)
+
+            # Spawn container (blocking SDK call off the event loop, R5)
+            container = await run_in_threadpool(
+                self._docker.containers.run, image, **run_kwargs
+            )
 
             self._running_containers[execution_key] = container
 
             # Status: running
             yield {"type": "status", "status": "running"}
 
-            # Stream logs
-            for log_line in container.logs(stream=True, follow=True):
+            # Stream logs from a pump thread through an asyncio queue so the
+            # event loop never blocks and the deadline can fire mid-stream.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            queue: asyncio.Queue = asyncio.Queue()
+
+            def _put(item) -> None:
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, item)
+                except RuntimeError:
+                    pass  # Event loop closed - consumer is gone
+
+            def _pump() -> None:
+                try:
+                    for raw_line in container.logs(stream=True, follow=True):
+                        _put(("log", raw_line))
+                except Exception as exc:  # Surface stream errors to the consumer
+                    _put(("error", exc))
+                finally:
+                    _put(("eof", None))
+
+            pump_thread = threading.Thread(
+                target=_pump, name=f"lazyaf-logs-{execution_key}", daemon=True
+            )
+            pump_thread.start()
+
+            timed_out = False
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    break
+                if kind == "eof":
+                    break
+                if kind == "error":
+                    raise payload
+                log_line = payload
                 if isinstance(log_line, bytes):
                     log_line = log_line.decode("utf-8", errors="replace")
                 yield {"type": "log", "line": log_line.rstrip("\n")}
 
-            # Wait for container to finish with timeout
-            try:
-                result = container.wait(timeout=timeout)
-                exit_code = result.get("StatusCode", -1)
-            except Exception as e:
-                # Timeout or other error
-                if "timeout" in str(e).lower() or isinstance(e, TimeoutError):
-                    # Kill the container
+            if timed_out:
+                try:
+                    await run_in_threadpool(container.kill)
+                except Exception:
+                    pass
+                final_result = {
+                    "type": "result",
+                    "status": "timeout",
+                    "exit_code": None,
+                    "timeout_seconds": timeout,
+                }
+            else:
+                # Wait for the container to finish within what's left of the
+                # deadline.
+                remaining = max(deadline - loop.time(), 0.001)
+                try:
+                    result = await run_in_threadpool(container.wait, timeout=remaining)
+                    exit_code = result.get("StatusCode", -1)
+                    final_result = {
+                        "type": "result",
+                        "status": "completed" if exit_code == 0 else "failed",
+                        "exit_code": exit_code,
+                    }
+                except Exception as e:
+                    if not _is_timeout_error(e):
+                        raise
+                    # Timed out waiting: kill the container
                     try:
-                        container.kill()
+                        await run_in_threadpool(container.kill)
                     except Exception:
                         pass
-
-                    yield {"type": "status", "status": "timeout"}
                     final_result = {
                         "type": "result",
                         "status": "timeout",
                         "exit_code": None,
                         "timeout_seconds": timeout,
                     }
-                    self._completed_executions[execution_key] = final_result
-                    yield final_result
-                    return
-                raise
 
-            # Determine final status based on exit code
-            if exit_code == 0:
-                status = "completed"
-            else:
-                status = "failed"
+        except (GeneratorExit, asyncio.CancelledError):
+            # Abnormal exit: the consumer closed the stream early or the
+            # consuming task was cancelled. Cleanup must not depend on GC
+            # (fix 6) and cannot be awaited here - schedule it.
+            self._running_containers.pop(execution_key, None)
+            if container is not None:
+                self._schedule_orphan_container_removal(execution_key, container)
+                container = None
+            raise
 
-            yield {"type": "status", "status": status}
-
-            final_result = {
-                "type": "result",
-                "status": status,
-                "exit_code": exit_code,
-            }
-            self._completed_executions[execution_key] = final_result
-            yield final_result
-
-        except ImageNotFound as e:
-            yield {"type": "status", "status": "failed"}
+        except ImageNotFound:
             final_result = {
                 "type": "result",
                 "status": "failed",
                 "exit_code": None,
                 "error": f"Image not found: {image}",
             }
-            self._completed_executions[execution_key] = final_result
-            yield final_result
 
         except ContainerError as e:
-            yield {"type": "status", "status": "failed"}
             final_result = {
                 "type": "result",
                 "status": "failed",
                 "exit_code": e.exit_status,
                 "error": str(e),
             }
-            self._completed_executions[execution_key] = final_result
-            yield final_result
 
         except APIError as e:
-            yield {"type": "status", "status": "failed"}
             final_result = {
                 "type": "result",
                 "status": "failed",
                 "exit_code": None,
                 "error": f"Docker API error: {str(e)}",
             }
-            self._completed_executions[execution_key] = final_result
-            yield final_result
 
         except DockerException as e:
             # Catch-all for Docker connection issues (connection refused, etc.)
-            yield {"type": "status", "status": "failed"}
             final_result = {
                 "type": "result",
                 "status": "failed",
                 "exit_code": None,
                 "error": f"Docker unavailable: {str(e)}",
             }
-            self._completed_executions[execution_key] = final_result
-            yield final_result
 
         except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
             # Handle request timeouts to Docker daemon
-            yield {"type": "status", "status": "failed"}
             final_result = {
                 "type": "result",
                 "status": "failed",
                 "exit_code": None,
                 "error": f"Docker connection timeout: {str(e)}",
             }
-            self._completed_executions[execution_key] = final_result
-            yield final_result
+
+        except ValueError as e:
+            # Step configuration errors (mount policy/addressing, ...) fail
+            # the step loudly with the config error verbatim (fix 10).
+            final_result = {
+                "type": "result",
+                "status": "failed",
+                "exit_code": None,
+                "error": f"step config error: {e}",
+            }
 
         except Exception as e:
             # Catch-all for unexpected errors
-            yield {"type": "status", "status": "failed"}
             final_result = {
                 "type": "result",
                 "status": "failed",
                 "exit_code": None,
                 "error": f"Unexpected error: {str(e)}",
             }
-            self._completed_executions[execution_key] = final_result
-            yield final_result
 
-        finally:
-            # Cleanup: remove from running containers
-            if execution_key in self._running_containers:
-                del self._running_containers[execution_key]
-
-            # Cleanup: remove container
-            if container:
-                try:
-                    container.remove(force=True)
-                except Exception:
-                    pass  # Best effort cleanup
+        # Terminal tail - ONE exit path (fix 6): remove the container and the
+        # registry entry FIRST (threadpooled), then emit the terminal status
+        # and the result. A consumer that stops at the result event therefore
+        # observes the container already gone; nothing waits on generator GC.
+        await self._cleanup_container(execution_key, container)
+        yield {"type": "status", "status": final_result["status"]}
+        self._completed_executions[execution_key] = final_result
+        yield final_result
 
     async def cancel_step(self, execution_key: str) -> bool:
         """
@@ -282,7 +666,25 @@ class LocalExecutor:
             return False
 
         try:
-            container.kill()
+            await run_in_threadpool(container.kill)
             return True
         except Exception:
             return False
+
+    async def cancel_all(self) -> int:
+        """Kill every tracked running container (safe-teardown hook for
+        test-mode reset / shutdown: killing the containers ends their event
+        streams naturally so consumers finish without being hard-cancelled
+        mid-commit). Returns the number killed; never raises."""
+        killed = 0
+        for execution_key, container in list(self._running_containers.items()):
+            try:
+                await run_in_threadpool(container.kill)
+                killed += 1
+            except Exception:
+                logger.warning(
+                    "cancel_all: failed to kill container for %s",
+                    execution_key,
+                    exc_info=True,
+                )
+        return killed

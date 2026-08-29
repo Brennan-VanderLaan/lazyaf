@@ -14,6 +14,25 @@ class Settings(BaseModel):
     default_prompt_template: str | None = None  # Global default prompt template for AI agents
     # Mounts the /api/test reset/seed endpoints (e2e harness only - never prod)
     test_mode: bool = False
+    # --- Execution plumbing (Phase 12.2-INT) ---
+    # Named docker network shared by backend, runners, and step/helper containers.
+    container_network: str = "lazyaf-network"
+    # Clone URL template used by workspace population helper containers.
+    # Resolved on the container network (backend service DNS name), not localhost.
+    container_git_url_template: str = "http://backend:8000/git/{repo_id}.git"
+    # Image for the short-lived workspace population (git clone) helper container.
+    workspace_clone_image: str = "python:3.12"
+    # Backend base URL as seen FROM step/helper containers on the container
+    # network (contract #2: injected into step env as LAZYAF_BACKEND_URL).
+    container_backend_url: str = "http://backend:8000"
+    # Default image for pipeline steps (moved here from LocalExecutor).
+    # Full python image (not slim) until 12.3's lazyaf-base: bash/curl/git needed.
+    step_default_image: str = "python:3.12"
+    # Default working directory for step containers.
+    step_working_dir: str = "/workspace/repo"
+    # HOME inside step containers - lives on the shared workspace volume so
+    # tools installed in one step survive to the next (12.3 persistence contract).
+    step_home_dir: str = "/workspace/home"
 
     class Config:
         env_file = ".env"
@@ -29,4 +48,13 @@ def get_settings() -> Settings:
         default_runner_type=os.getenv("DEFAULT_RUNNER_TYPE", "any"),
         default_prompt_template=os.getenv("DEFAULT_PROMPT_TEMPLATE"),
         test_mode=os.getenv("LAZYAF_TEST_MODE", "").lower() in ("1", "true", "yes"),
+        container_network=os.getenv("CONTAINER_NETWORK", "lazyaf-network"),
+        container_git_url_template=os.getenv(
+            "CONTAINER_GIT_URL_TEMPLATE", "http://backend:8000/git/{repo_id}.git"
+        ),
+        workspace_clone_image=os.getenv("WORKSPACE_CLONE_IMAGE", "python:3.12"),
+        container_backend_url=os.getenv("CONTAINER_BACKEND_URL", "http://backend:8000"),
+        step_default_image=os.getenv("STEP_DEFAULT_IMAGE", "python:3.12"),
+        step_working_dir=os.getenv("STEP_WORKING_DIR", "/workspace/repo"),
+        step_home_dir=os.getenv("STEP_HOME_DIR", "/workspace/home"),
     )

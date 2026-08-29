@@ -1,9 +1,9 @@
 # LazyAF Test Runner Script (PowerShell)
-# Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|slow|tier|all|coverage]
+# Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|slow|tier|images|all|coverage]
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("unit", "integration", "demo", "e2e", "graph", "slow", "tier", "all", "coverage", "help")]
+    [ValidateSet("unit", "integration", "demo", "e2e", "graph", "slow", "tier", "images", "all", "coverage", "help")]
     [string]$TestType = "all",
 
     [Parameter(ValueFromRemainingArguments=$true)]
@@ -160,7 +160,7 @@ function Run-E2ETests {
 }
 
 function Show-Help {
-    Write-Host "Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|slow|tier|all|coverage]" -ForegroundColor Cyan
+    Write-Host "Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|slow|tier|images|all|coverage]" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  unit        - Run fast isolated unit tests"
     Write-Host "  integration - Run API and database tests"
@@ -169,6 +169,7 @@ function Show-Help {
     Write-Host "  graph       - Run graph pipeline E2E tests (starts Docker backend only)"
     Write-Host "  slow        - Run the @slow full-stack e2e tests in the compose stack (no CI tier runs these)"
     Write-Host "  tier        - Run gated CI tier(s) via scripts/run_tier.py (e.g. 'tier T1')"
+    Write-Host "  images      - Build the 12.3 step images via scripts/build_images.py (--check lists stale)"
     Write-Host "  coverage    - Run tests with coverage report"
     Write-Host "  all         - Run the no-Docker CI tiers T1 + T3 (default; T2 needs Docker)"
     Write-Host ""
@@ -274,7 +275,7 @@ try {
             }
         }
         "slow" {
-            # The 21 @slow full-stack e2e tests (control layer, real card
+            # The @slow full-stack e2e tests (control layer, real card
             # execution, graph pipeline). They run in NO CI tier today
             # (stated exclusion per R4 - see tdd/README.md): they need this
             # compose stack, which the legacy runner cannot host. Dogfood CI
@@ -296,6 +297,20 @@ try {
                 throw "Usage: .\scripts\test.ps1 tier T1 [T2 T3 ...]"
             }
             Invoke-RunTier -Tiers $ExtraArgs
+        }
+        "images" {
+            # 12.3 step images (lazyaf-base:dev -> lazyaf-claude:dev /
+            # lazyaf-test-runner:dev). Single-sourced in
+            # scripts/build_images.py (dependency order, content-hash
+            # staleness skip, --check / --force). The dogfood pipeline and
+            # the control-layer/HOME-persistence tests need these tags on the
+            # local daemon; a missing tag fails a step loudly with
+            # "Image not found: lazyaf-base:dev" by design.
+            $python = Get-Python
+            & $python (Join-Path $ScriptDir "build_images.py") @ExtraArgs
+            if ($LASTEXITCODE -ne 0) {
+                throw "build_images.py failed (exit $LASTEXITCODE)"
+            }
         }
         "all" {
             # No-Docker lanes only: T1 + T3 via the single-sourced tier

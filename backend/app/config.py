@@ -33,6 +33,9 @@ class Settings(BaseModel):
     # HOME inside step containers - lives on the shared workspace volume so
     # tools installed in one step survive to the next (12.3 persistence contract).
     step_home_dir: str = "/workspace/home"
+    # Secret for step auth tokens (control layer <-> /api/steps/*). Default is
+    # the long-standing dev constant; override in real deployments.
+    step_auth_secret: str = "lazyaf-step-auth-secret-key-change-in-production"
 
     class Config:
         env_file = ".env"
@@ -57,4 +60,8 @@ def get_settings() -> Settings:
         step_default_image=os.getenv("STEP_DEFAULT_IMAGE", "python:3.12"),
         step_working_dir=os.getenv("STEP_WORKING_DIR", "/workspace/repo"),
         step_home_dir=os.getenv("STEP_HOME_DIR", "/workspace/home"),
+        step_auth_secret=os.getenv(
+            "LAZYAF_STEP_AUTH_SECRET",
+            "lazyaf-step-auth-secret-key-change-in-production",
+        ),
     )

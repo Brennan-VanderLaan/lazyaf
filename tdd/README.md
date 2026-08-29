@@ -189,22 +189,52 @@ local runs all invoke it — never a hand-copied pytest command:
 | Tier | Command | Covers | Needs |
 |------|---------|--------|-------|
 | T1 | `python3 scripts/run_tier.py T1` | unit + demos + non-Docker integration | nothing beyond the venv |
-| T2 | `python3 scripts/run_tier.py T2` | `tdd/integration/services/execution` (real-Docker executor + chaos tests) | a Docker socket |
+| T2 | `python3 scripts/run_tier.py T2` | `tdd/integration/services` (real-Docker executor, 12.2-INT workspace/local-execution suites, 12.3 HOME-persistence + base-image contracts) | a Docker socket **and** fresh `lazyaf-*:dev` images — preflighted via `build_images.py --check`, see below |
 | T3 | `python3 scripts/run_tier.py T3` | e2e quick tier (`tdd/e2e`, not slow) | nothing (spawns its own uvicorn on localhost) |
 
 Convention: any new Docker-dependent integration test goes under
-`tdd/integration/services/execution/` so it lands in T2 — T1 must stay
+`tdd/integration/services/` so it lands in T2 — T1 must stay
 runnable with no Docker socket.
+
+### Step images (Phase 12.3 build prerequisite)
+
+The dogfood pipeline steps and the control-layer/HOME-persistence tests run
+on the locally-built step images `lazyaf-base:dev` / `lazyaf-test-runner:dev`
+(`lazyaf-claude:dev` for agent work). **`:dev` tags are built, never
+pulled** — build them once (and after editing `images/**`) with:
+
+```bash
+python scripts/build_images.py        # builds base -> claude -> test-runner
+python scripts/build_images.py --check   # exits nonzero listing missing/stale
+./scripts/test.sh images              # same, via the test-script lane
+```
+
+The build script skips fresh images via their `lazyaf.content-hash` label.
+If an image is missing, a pipeline step fails loudly with
+`Image not found: lazyaf-base:dev` (the backend never auto-builds) and the
+control-layer e2e tests fail with the build hint. **`scripts/run_tier.py T2`
+preflights `python scripts/build_images.py --check`** before pytest: a
+missing/stale image is a loud tier failure printing the exact rebuild
+command — never a skip, so there is no `12.3-images:` entry in
+`tdd/skip_baseline.json` and the T2 floor counts every image-dependent test.
+Host devs running bare pytest without the images hit the same loud story
+(a failure or an *unbaselined* skip pointing at `build_images.py`).
 
 T2 runs on runner services with `/var/run/docker.sock` mounted (deliberate
 interim Docker-outside-of-Docker, see `docker-compose.yml`; retired at Phase
-12.4 when step containers get a socket option). If the socket is missing those
-tests skip with "Docker not available" — which is *not* baselined, so the gate
-turns a silently-skipped Docker tier into a hard failure.
+12.4 when step containers get a socket option). Docker being unreachable
+fails loudly in the shared `docker_client` fixture
+(`tdd/integration/conftest.py` — `from_env` + `ping`, never a skip). That
+conftest also owns the DooD-safe addressing helpers: a test that hosts a
+server (uvicorn, stub backend) binds it on `0.0.0.0:<free port>` and
+advertises the address a **sibling** container can reach — the test
+container's own IP when the suite runs inside a container (the CI path), or
+`host.docker.internal` on the host (Linux-Engine hosts may need
+`--add-host host.docker.internal:host-gateway`).
 
 ### Known exclusion: the slow e2e tests run in NO tier (stated per R4)
 
-The 21 `@pytest.mark.slow` e2e tests (control layer, real card execution,
+The `@pytest.mark.slow` e2e tests (control layer, real card execution,
 graph pipeline full-stack in `tdd/e2e/`) are **not run by any tier today** —
 this is a stated exclusion under standing rule R4, not a silent cap. They
 need the compose e2e stack (`backend-e2e` + `runner-mock-e2e`), which the
@@ -212,7 +242,10 @@ legacy runner hosting dogfood CI cannot start. They remain runnable on the
 host via the `scripts/test.ps1 slow` / `scripts/test.sh slow` lane (which
 brings the stack up, runs `pytest /tdd/e2e -m slow` inside the backend-e2e
 container, and tears the stack down), and they enter dogfood CI at Phase
-12.4/12.5 when ephemeral execution can host the stack.
+12.4/12.5 when ephemeral execution can host the stack. The control-layer
+e2e tests (`tdd/e2e/test_control_layer.py`) additionally require
+`lazyaf-base:dev` on the daemon (see "Step images" above) and FAIL loudly —
+never skip — when it is missing or unlabeled.
 
 ### The gate (`scripts/ci_gate.py`)
 

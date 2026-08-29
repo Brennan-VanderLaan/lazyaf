@@ -1,20 +1,20 @@
 {
   "T1": {
-    "floor": 1351,
-    "measured": 1379,
+    "floor": 1421,
+    "measured": 1450,
     "measured_on": "2026-08-29",
-    "note": "unit + demos + non-Docker integration (integration/services subtree excluded - it is Docker-real and runs in T2); floor = measured minus ~2% slack. Raise when suites grow (ratchet up, never down without a PLAN.md note)."
+    "note": "unit + demos + non-Docker integration (integration/services subtree excluded - it is Docker-real and runs in T2); floor = measured minus ~2% slack. Raised for 12.3 (control-runtime unit suites, steps-router bridge tests, dispatch tests). Raise when suites grow (ratchet up, never down without a PLAN.md note)."
   },
   "T2": {
-    "floor": 40,
-    "measured": 41,
+    "floor": 54,
+    "measured": 56,
     "measured_on": "2026-08-29",
-    "note": "Docker-dependent integration (tdd/integration/services: executor + 12.2-INT workspace lifecycle/local pipeline/WS round-trip suites). If Docker is unreachable these skip wholesale - the floor makes that a hard failure."
+    "note": "Docker-dependent integration (tdd/integration/services: executor + 12.2-INT workspace lifecycle/local pipeline/WS round-trip suites + 12.3 HOME-persistence + base-image contracts on lazyaf-base:dev). Docker down fails loudly in the shared docker_client fixture (tdd/integration/conftest.py). Step images are a PREFLIGHT: run_tier.py T2 runs `build_images.py --check` before pytest and exits loudly with the rebuild command, so the '12.3-images:' skip reason is gone from skip_baseline.json and image-dependent tests always execute under the gate - the floor counts them. Verifier re-measures after the 12.3 wiring wave."
   },
   "T3": {
     "floor": 16,
     "measured": 17,
     "measured_on": "2026-08-29",
-    "note": "e2e quick tier (tdd/e2e -m 'not slow'). Known exclusion (R4, stated not silent): the 21 @slow e2e tests (control layer, real card execution, graph pipeline full-stack) run in NO tier and have no floor here - they need the compose e2e stack, which a step container cannot host yet. Host-runnable via the scripts/test slow lane; they enter dogfood CI at Phase 12.4/12.5 when ephemeral execution can host them. Tier selections are single-sourced in scripts/run_tier.py."
+    "note": "e2e quick tier (tdd/e2e -m 'not slow'). Known exclusion (R4, stated not silent): the @slow e2e tests (control layer control-mode round trip, real card execution, graph pipeline full-stack) run in NO tier and have no floor here - they need the compose e2e stack, which a step container cannot host yet. Host-runnable via the scripts/test slow lane (control-layer tests additionally require lazyaf-base:dev built); they enter dogfood CI at Phase 12.4/12.5. Tier selections are single-sourced in scripts/run_tier.py."
   }
 }

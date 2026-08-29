@@ -32,6 +32,12 @@ async def lifespan(app: FastAPI):
     from app.services.execution import recover_orphaned_executions
     from app.services.workspace.population import pre_pull_images
     from app.services.workspace_service import start_orphan_audit
+    from app.services.control_layer import auth as step_auth
+
+    # Step auth secret is settings-driven (LAZYAF_STEP_AUTH_SECRET); the
+    # default equals the module's dev constant so tests without lifespan
+    # see identical behavior.
+    step_auth.set_secret_key(settings.step_auth_secret)
 
     await init_db()
 

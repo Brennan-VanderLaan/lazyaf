@@ -9,43 +9,12 @@
  * 5. Entry point management
  * 6. Execution visualization
  *
- * Prerequisites:
- *   - Backend running: cd backend && uvicorn app.main:app --reload
- *   - Frontend running: cd frontend && npm run dev
+ * Prerequisites: the compose e2e stack (see e2e/README.md). URLs come from
+ * BACKEND_URL/FRONTEND_URL env vars (defaults match the e2e profile).
  */
 
 import { test, expect, type Page } from '@playwright/test';
-
-// Test configuration
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
-
-// Helper: Create a test repo via API
-async function createTestRepo(page: Page): Promise<{ id: string; name: string }> {
-  const name = `e2e-graph-${Date.now()}`;
-  const response = await page.request.post(`${BACKEND_URL}/api/repos`, {
-    data: { name, default_branch: 'main' },
-  });
-  expect(response.ok()).toBeTruthy();
-  const repo = await response.json();
-  return { id: repo.id, name };
-}
-
-// Helper: Navigate to pipelines page with a repo selected
-async function goToPipelinesPage(page: Page, repoName: string) {
-  await page.goto('/#/pipelines');
-
-  // Wait for repo list to load
-  await expect(page.locator('.repo-list')).toBeVisible({ timeout: 5000 });
-
-  // Find and click the repo - it may be scrolled out of view
-  const repoItem = page.locator('.repo-item').filter({ hasText: repoName });
-  await expect(repoItem).toBeVisible({ timeout: 5000 });
-  await repoItem.scrollIntoViewIfNeeded();
-  await repoItem.click();
-
-  // Wait for the "New Pipeline" button to appear (indicates repo is selected)
-  await expect(page.locator('button:has-text("New Pipeline")')).toBeVisible({ timeout: 3000 });
-}
+import { BACKEND_URL, createTestRepo, goToPipelinesPage } from './helpers';
 
 // Helper: Wait for the graph editor to be ready
 async function waitForGraphEditor(page: Page) {
@@ -136,7 +105,7 @@ test.describe('Graph Pipeline Editor - Toolbar Node Creation', () => {
   let repo: { id: string; name: string };
 
   test.beforeEach(async ({ page }) => {
-    repo = await createTestRepo(page);
+    repo = await createTestRepo(page, 'e2e-graph');
   });
 
   test('can add a Script node via toolbar', async ({ page }) => {
@@ -197,7 +166,7 @@ test.describe('Graph Pipeline Editor - Palette Drag and Drop', () => {
   let repo: { id: string; name: string };
 
   test.beforeEach(async ({ page }) => {
-    repo = await createTestRepo(page);
+    repo = await createTestRepo(page, 'e2e-graph');
   });
 
   test('palette shows all node types', async ({ page }) => {
@@ -250,7 +219,7 @@ test.describe('Graph Pipeline Editor - Context Menu', () => {
   let repo: { id: string; name: string };
 
   test.beforeEach(async ({ page }) => {
-    repo = await createTestRepo(page);
+    repo = await createTestRepo(page, 'e2e-graph');
   });
 
   test('right-click on canvas shows context menu', async ({ page }) => {
@@ -352,7 +321,7 @@ test.describe('Graph Pipeline Editor - Node Configuration', () => {
   let repo: { id: string; name: string };
 
   test.beforeEach(async ({ page }) => {
-    repo = await createTestRepo(page);
+    repo = await createTestRepo(page, 'e2e-graph');
   });
 
   test('double-clicking node opens config modal', async ({ page }) => {
@@ -440,7 +409,7 @@ test.describe('Graph Pipeline Editor - Edge Connections', () => {
   let repo: { id: string; name: string };
 
   test.beforeEach(async ({ page }) => {
-    repo = await createTestRepo(page);
+    repo = await createTestRepo(page, 'e2e-graph');
   });
 
   test.skip('can connect two nodes by dragging', async ({ page }) => {
@@ -582,7 +551,7 @@ test.describe('Graph Pipeline Editor - Entry Points', () => {
   let repo: { id: string; name: string };
 
   test.beforeEach(async ({ page }) => {
-    repo = await createTestRepo(page);
+    repo = await createTestRepo(page, 'e2e-graph');
   });
 
   test('Start node is always present in new pipeline', async ({ page }) => {
@@ -661,7 +630,7 @@ test.describe('Graph Pipeline Editor - Save and Load', () => {
   let repo: { id: string; name: string };
 
   test.beforeEach(async ({ page }) => {
-    repo = await createTestRepo(page);
+    repo = await createTestRepo(page, 'e2e-graph');
   });
 
   // Skipped: Requires edge connection to Start node to create entry point

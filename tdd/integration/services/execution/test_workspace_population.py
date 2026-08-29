@@ -201,6 +201,30 @@ class TestPopulateNamedVolume:
         content = read_volume(docker_client, volume_name, "cat /workspace/repo/hello.txt")
         assert "second commit content" in content  # branch head by default
 
+    async def test_repo_is_writable_by_step_uid(
+        self, docker_client, volume_name, file_url_template
+    ):
+        """Regression for dogfood run 9b52ebbe: the lazyaf images run steps as
+        uid 1000, so the root-run clone helper must hand the repo tree over -
+        otherwise control-mode steps EACCES on their first build artifact."""
+        from app.services.workspace.population import populate_workspace
+
+        seed_vol, repo_id, _ = file_url_template
+
+        await populate_workspace(
+            volume_name, repo_id, "main", None,
+            extra_mounts=[seed_mount(seed_vol)],
+        )
+
+        output = docker_client.containers.run(
+            "alpine:latest",
+            command=["sh", "-c", "touch /workspace/repo/write-probe && echo WRITABLE"],
+            volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
+            user="1000:1000",
+            remove=True,
+        ).decode()
+        assert "WRITABLE" in output
+
     async def test_checks_out_requested_commit_sha(
         self, docker_client, volume_name, file_url_template
     ):

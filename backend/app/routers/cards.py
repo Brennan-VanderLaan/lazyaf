@@ -10,7 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import get_db
 from app.models import Card, Repo, Job, AgentFile
+from app.routers.spec import (
+    _create_feature,
+    _get_feature_or_404,
+    _get_story_or_404,
+)
 from app.schemas import CardCreate, CardRead, CardUpdate
+from app.schemas.spec import FeatureCreate, FeatureRead
 from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
@@ -69,6 +75,8 @@ def card_to_ws_dict(card: Card) -> dict:
         "pr_url": card.pr_url,
         "job_id": card.job_id,
         "completed_runner_type": card.completed_runner_type,
+        "feature_id": card.feature_id,
+        "user_story_id": card.user_story_id,
         "created_at": card.created_at.isoformat() if card.created_at else None,
         "updated_at": card.updated_at.isoformat() if card.updated_at else None,
     }
@@ -131,6 +139,13 @@ async def update_card(card_id: str, update: CardUpdate, db: AsyncSession = Depen
         raise HTTPException(status_code=404, detail="Card not found")
 
     update_data = update.model_dump(exclude_unset=True)
+
+    # Validate spec-layer links before applying (SQLite does not enforce FKs)
+    if update_data.get("feature_id") is not None:
+        await _get_feature_or_404(db, update_data["feature_id"])
+    if update_data.get("user_story_id") is not None:
+        await _get_story_or_404(db, update_data["user_story_id"])
+
     for key, value in update_data.items():
         if key == "status" and value is not None:
             value = value.value
@@ -165,6 +180,51 @@ async def delete_card(card_id: str, db: AsyncSession = Depends(get_db)):
 
     # Broadcast card deletion via WebSocket
     await manager.send_card_deleted(card_id)
+
+
+@router.post(
+    "/api/cards/{card_id}/promote-to-feature",
+    response_model=FeatureRead,
+    status_code=201,
+)
+async def promote_card_to_feature(card_id: str, db: AsyncSession = Depends(get_db)):
+    """Promote a card to a spec-layer Feature (Phase 12.2.5).
+
+    Creates a Feature from the card's title/description with the card's repo
+    in repo_ids, links the card to it, and returns the feature.
+    """
+    result = await db.execute(select(Card).where(Card.id == card_id))
+    card = result.scalar_one_or_none()
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    if card.feature_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Card is already linked to a feature",
+        )
+
+    # Reuse spec.py's create-feature logic (runs _validate_repo_ids);
+    # commit=False keeps feature creation + card link in one transaction.
+    feature = await _create_feature(
+        db,
+        FeatureCreate(
+            title=card.title,
+            description=card.description or "",
+            repo_ids=[card.repo_id],
+        ),
+        commit=False,
+    )
+
+    card.feature_id = feature.id
+    await db.commit()
+    await db.refresh(feature)
+    await db.refresh(card)
+
+    # Broadcast card update via WebSocket (link changed)
+    await manager.send_card_updated(card_to_ws_dict(card))
+
+    return feature
 
 
 @router.post("/api/cards/{card_id}/start", response_model=CardRead)

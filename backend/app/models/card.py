@@ -50,6 +50,9 @@ class Card(Base):
     # Pipeline association (Phase 9.1)
     pipeline_run_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("pipeline_runs.id"), nullable=True)
     pipeline_step_index: Mapped[int | None] = mapped_column(nullable=True)  # Step index in the pipeline
+    # Spec layer links (Phase 12.2.5)
+    feature_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("features.id"), nullable=True)
+    user_story_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("user_stories.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

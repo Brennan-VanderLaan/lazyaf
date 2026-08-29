@@ -28,6 +28,9 @@ class CardUpdate(BaseModel):
     step_config: dict[str, Any] | None = None
     prompt_template: str | None = None
     agent_file_ids: list[str] | None = None
+    # Spec layer links (Phase 12.2.5) — explicit None unlinks, absent leaves unchanged
+    feature_id: str | None = None
+    user_story_id: str | None = None
 
 
 class CardRead(CardBase):
@@ -46,6 +49,9 @@ class CardRead(CardBase):
     # Pipeline association
     pipeline_run_id: str | None = None
     pipeline_step_index: int | None = None
+    # Spec layer links (Phase 12.2.5)
+    feature_id: str | None = None
+    user_story_id: str | None = None
     created_at: datetime
     updated_at: datetime
 

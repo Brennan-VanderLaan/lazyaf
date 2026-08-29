@@ -52,6 +52,17 @@ class ConnectionManager:
     async def send_step_run_status(self, step_data: dict):
         await self.broadcast("step_run_status", step_data)
 
+    async def reset(self):
+        """Close and forget all connections. Test-mode reset hook; clients
+        (the e2e frontend) are expected to reconnect."""
+        connections = self.active_connections
+        self.active_connections = []
+        for connection in connections:
+            try:
+                await connection.close()
+            except Exception:
+                pass
+
     # Repo-related broadcasts
     async def send_repo_created(self, repo_data: dict):
         await self.broadcast("repo_created", repo_data)

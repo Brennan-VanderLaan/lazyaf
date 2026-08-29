@@ -106,6 +106,32 @@ class PlaygroundService:
                 del self._sessions[session_id]
                 logger.info(f"Cleaned up expired session {session_id[:8]}")
 
+    async def reset(self):
+        """Drop all sessions. Test-mode reset hook: live sessions are marked
+        cancelled and subscribers notified so open SSE streams terminate
+        instead of pinging forever against a forgotten session object."""
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+
+        for session in sessions:
+            if session.status in ("queued", "running"):
+                session.status = "cancelled"
+                session.completed_at = datetime.utcnow()
+                event = {
+                    "type": "status",
+                    "data": "cancelled",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+                for queue in session.log_subscribers:
+                    try:
+                        queue.put_nowait(event)
+                    except asyncio.QueueFull:
+                        pass
+
+        if sessions:
+            logger.info(f"Playground service reset ({len(sessions)} sessions dropped)")
+
     async def start_test(
         self,
         repo_id: str,

@@ -12,6 +12,8 @@ class Settings(BaseModel):
     gemini_api_key: str | None = None
     default_runner_type: str = "any"  # any, claude-code, gemini
     default_prompt_template: str | None = None  # Global default prompt template for AI agents
+    # Mounts the /api/test reset/seed endpoints (e2e harness only - never prod)
+    test_mode: bool = False
 
     class Config:
         env_file = ".env"
@@ -26,4 +28,5 @@ def get_settings() -> Settings:
         docker_host=os.getenv("DOCKER_HOST"),
         default_runner_type=os.getenv("DEFAULT_RUNNER_TYPE", "any"),
         default_prompt_template=os.getenv("DEFAULT_PROMPT_TEMPLATE"),
+        test_mode=os.getenv("LAZYAF_TEST_MODE", "").lower() in ("1", "true", "yes"),
     )

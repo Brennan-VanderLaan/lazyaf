@@ -377,6 +377,14 @@ card -> job -> in-memory queue -> long-lived polling runners.
 **Abandoned attempt**: branch `failure_01` (12.0 -> 12.7 in two days, 2026-01-03/04).
 Reference only — never merge it.
 
+**Phase 0: COMPLETE (2026-08-29).** LazyAF gates LazyAF: a push to the internal
+remote triggers the tiered dogfood pipeline (T1 1159 / T2 19 / T3 17 executed,
+all three ci_gate floors enforced, run `cda4ddce` PASSED via push trigger).
+Definition sync-on-push, trigger dedup, alembic migrations, test-mode API,
+12.6 contract suite (dormant), frontend testids + vitest layer, Playwright
+dogfood-live spec all landed; 10 confirmed review findings fixed pre-commit.
+Next: Phase 12.2-INT.
+
 Phase 12.1 deliverables (COMPLETE):
   - `StepExecution` model with unique `execution_key` for idempotency
   - `StepExecutionStatus` enum: pending → assigned → preparing → running → completing → completed/failed/timeout

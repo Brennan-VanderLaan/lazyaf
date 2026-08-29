@@ -132,8 +132,13 @@ def docker_client():
     """THE real Docker client for the Docker tier.
 
     from_env + ping: Docker being down fails LOUDLY here (R4) - never a
-    skip, and never a ping-less client that half-works until first use."""
-    client = docker_sdk.from_env()
+    skip, and never a ping-less client that half-works until first use.
+
+    timeout=180: the default 60s HTTP read timeout underruns
+    container.wait(timeout=90) under nested-DooD daemon load (dogfood run
+    #9: ReadTimeoutError inside the T2 step container while the daemon
+    was busy) - the client timeout must exceed the longest wait budget."""
+    client = docker_sdk.from_env(timeout=180)
     client.ping()  # Fail loudly here if Docker is down (R4)
     return client
 

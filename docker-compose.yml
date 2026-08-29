@@ -21,6 +21,8 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
+    networks:
+      - lazyaf-network
     restart: unless-stopped
 
   frontend:
@@ -29,6 +31,8 @@ services:
       - "5173:80"
     depends_on:
       - backend
+    networks:
+      - lazyaf-network
     restart: unless-stopped
 
   runner-claude:
@@ -39,6 +43,8 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     depends_on:
       - backend
+    networks:
+      - lazyaf-network
     restart: unless-stopped
     deploy:
       replicas: ${CLAUDE_RUNNERS:-1}
@@ -51,6 +57,8 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     depends_on:
       - backend
+    networks:
+      - lazyaf-network
     restart: unless-stopped
     deploy:
       replicas: ${GEMINI_RUNNERS:-1}
@@ -62,6 +70,8 @@ services:
       - BACKEND_URL=http://backend:8000
     depends_on:
       - backend
+    networks:
+      - lazyaf-network
     restart: unless-stopped
     deploy:
       replicas: ${MOCK_RUNNERS:-0}
@@ -78,8 +88,20 @@ services:
       - "8765:8000"
     environment:
       - DATABASE_URL=sqlite+aiosqlite:////tmp/e2e_test.db
+      - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
+      # This service is named backend-e2e on the shared network; the default
+      # template resolves "backend", which is a DIFFERENT (possibly absent)
+      # service. Step/population containers must clone from THIS backend.
+      - CONTAINER_GIT_URL_TEMPLATE=http://backend-e2e:8000/git/{repo_id}.git
+      # Same service-name reasoning: step containers must call back into THIS
+      # backend, not the (possibly absent) dev "backend" service.
+      - CONTAINER_BACKEND_URL=http://backend-e2e:8000
     volumes:
       - ./tdd:/tdd  # Mount test directory for running e2e tests
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker socket - e2e lane exercises LocalExecutor
+      - lazyaf-workspaces:/workspaces  # Shared workspace volumes
+    networks:
+      - lazyaf-network
     profiles:
       - e2e
     healthcheck:
@@ -96,10 +118,18 @@ services:
     depends_on:
       backend-e2e:
         condition: service_healthy
+    networks:
+      - lazyaf-network
     profiles:
       - e2e
     deploy:
       replicas: 2
+
+networks:
+  lazyaf-network:
+    # Stable, project-independent name: step/helper containers spawned by the
+    # backend (LocalExecutor, workspace population) attach to it by this name.
+    name: lazyaf-network
 
 volumes:
   lazyaf-data:

@@ -1,15 +1,23 @@
 name: "Test Suite"
-description: "Tiered dogfood CI: T1 unit/demos/integration, T2 Docker integration, T3 e2e quick - each tier gated by scripts/ci_gate.py (R4: skip baseline + executed-count floors)"
+description: "Tiered dogfood CI: T1 unit/demos/integration, T2 Docker integration, T3 e2e quick - each tier gated by scripts/ci_gate.py (R4: skip baseline + executed-count floors), then verify-executor asserts the local execution path ran every script step (12.2-INT exit gate)"
 triggers:
   - type: push
     config:
       branches: ["main"]
+
+# 12.2-INT: script steps run in EPHEMERAL containers via LocalExecutor on a
+# shared workspace volume (/workspace/repo checkout, HOME=/workspace/home).
+# Every step pins python:3.12 (full, not slim: bash/curl/git) so uv's venv
+# and $HOME/.local tooling built in one step remain valid in the next.
+# The pin dissolves into the lazyaf-base image at Phase 12.3.
 steps:
-  # Interim uv bootstrap - dissolves into the lazyaf-base image at Phase 12.3.
+  # Interim uv bootstrap - installs into $HOME/.local/bin on the workspace
+  # volume, so later steps inherit it. Dissolves into lazyaf-base at 12.3.
   - id: "install-uv"
     name: "Install uv"
     type: script
     config:
+      image: "python:3.12"
       command: |
         curl -LsSf https://astral.sh/uv/install.sh | sh
         export PATH="$HOME/.local/bin:$PATH"
@@ -23,6 +31,7 @@ steps:
     name: "Sync Dependencies"
     type: script
     config:
+      image: "python:3.12"
       command: |
         export PATH="$HOME/.local/bin:$PATH"
         cd backend
@@ -40,13 +49,14 @@ steps:
   #
   # KNOWN EXCLUSION (stated per R4, not a silent cap): the 21 @slow e2e tests
   # (control layer, real card execution, graph pipeline full-stack) run in NO
-  # tier - they need the compose e2e stack, which this legacy runner cannot
-  # host. They stay runnable on the host via the scripts/test slow lane and
-  # enter dogfood CI at Phase 12.4/12.5 when ephemeral execution can host them.
+  # tier - they need the compose e2e stack, which a step container cannot
+  # host yet. They stay runnable on the host via the scripts/test slow lane
+  # and enter dogfood CI at Phase 12.4/12.5.
   - id: "tier1"
     name: "T1: Unit + Demos + Integration (no Docker)"
     type: script
     config:
+      image: "python:3.12"
       command: |
         export PATH="$HOME/.local/bin:$PATH"
         python3 scripts/run_tier.py T1
@@ -55,13 +65,21 @@ steps:
     on_failure: stop
     timeout: 1800
 
-  # Requires the Docker socket mounted into the runner service (interim DooD,
-  # see docker-compose.yml; retired at Phase 12.4). If the socket is missing,
-  # these tests skip with "Docker not available" - out of baseline, gate fails.
+  # Interim DooD, step-container edition: the Docker tiers mount the host
+  # socket into their EPHEMERAL step container via an explicit bind mount
+  # (MountSpec addressing, R6). Same tradeoff as the retired runner-socket
+  # variant (host-root-equivalent for these two steps only); formalized and
+  # revisited at Phase 12.4. If the socket is missing, these tests skip with
+  # "Docker not available" - out of baseline, gate fails (R4).
   - id: "tier2"
     name: "T2: Docker-dependent integration"
     type: script
     config:
+      image: "python:3.12"
+      mounts:
+        - addressing: "bind"
+          source: "/var/run/docker.sock"
+          target: "/var/run/docker.sock"
       command: |
         export PATH="$HOME/.local/bin:$PATH"
         python3 scripts/run_tier.py T2
@@ -74,9 +92,29 @@ steps:
     name: "T3: E2E quick tier"
     type: script
     config:
+      image: "python:3.12"
+      mounts:
+        - addressing: "bind"
+          source: "/var/run/docker.sock"
+          target: "/var/run/docker.sock"
       command: |
         export PATH="$HOME/.local/bin:$PATH"
         python3 scripts/run_tier.py T3
     on_success: next
     on_failure: stop
     timeout: 1200
+
+  # 12.2-INT exit-gate ratchet (R1): every script step of THIS run must have
+  # been executed by the LocalExecutor. LAZYAF_PIPELINE_RUN_ID (and friends)
+  # are injected into every step container by LocalExecutor; the backend is
+  # reachable by service DNS name on the shared lazyaf-network.
+  - id: "verify-executor"
+    name: "Verify executor=local for script steps"
+    type: script
+    config:
+      image: "python:3.12"
+      command: |
+        python3 scripts/verify_executor.py
+    on_success: next
+    on_failure: stop
+    timeout: 120

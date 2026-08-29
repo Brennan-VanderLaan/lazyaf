@@ -1,6 +1,11 @@
 name: "Test Suite"
-description: "Install dependencies with uv and run the test suite"
+description: "Tiered dogfood CI: T1 unit/demos/integration, T2 Docker integration, T3 e2e quick - each tier gated by scripts/ci_gate.py (R4: skip baseline + executed-count floors)"
+triggers:
+  - type: push
+    config:
+      branches: ["main"]
 steps:
+  # Interim uv bootstrap - dissolves into the lazyaf-base image at Phase 12.3.
   - id: "install-uv"
     name: "Install uv"
     type: script
@@ -26,16 +31,52 @@ steps:
     continue_in_context: true
     on_success: next
     on_failure: stop
-    timeout: 300
+    timeout: 600
 
-  - id: "run-tests"
-    name: "Run Tests"
+  # Tier selections are SINGLE-SOURCED in scripts/run_tier.py (pytest args +
+  # junitxml + the R4 ci_gate call); floors live in tdd/tier_floors.json and
+  # allowed skip reasons in tdd/skip_baseline.json - see tdd/README.md.
+  # A red pytest exits run_tier.py red before the gate runs and stays red.
+  #
+  # KNOWN EXCLUSION (stated per R4, not a silent cap): the 21 @slow e2e tests
+  # (control layer, real card execution, graph pipeline full-stack) run in NO
+  # tier - they need the compose e2e stack, which this legacy runner cannot
+  # host. They stay runnable on the host via the scripts/test slow lane and
+  # enter dogfood CI at Phase 12.4/12.5 when ephemeral execution can host them.
+  - id: "tier1"
+    name: "T1: Unit + Demos + Integration (no Docker)"
     type: script
     config:
       command: |
         export PATH="$HOME/.local/bin:$PATH"
-        cd backend
-        uv run pytest ../tdd -v --tb=short
+        python3 scripts/run_tier.py T1
+    continue_in_context: true
     on_success: next
     on_failure: stop
-    timeout: 600
+    timeout: 1800
+
+  # Requires the Docker socket mounted into the runner service (interim DooD,
+  # see docker-compose.yml; retired at Phase 12.4). If the socket is missing,
+  # these tests skip with "Docker not available" - out of baseline, gate fails.
+  - id: "tier2"
+    name: "T2: Docker-dependent integration"
+    type: script
+    config:
+      command: |
+        export PATH="$HOME/.local/bin:$PATH"
+        python3 scripts/run_tier.py T2
+    continue_in_context: true
+    on_success: next
+    on_failure: stop
+    timeout: 900
+
+  - id: "tier3"
+    name: "T3: E2E quick tier"
+    type: script
+    config:
+      command: |
+        export PATH="$HOME/.local/bin:$PATH"
+        python3 scripts/run_tier.py T3
+    on_success: next
+    on_failure: stop
+    timeout: 1200

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Single source of truth for the tiered dogfood CI suite (T1/T2/T3).
+
+Encodes, per tier, the EXACT pytest selection, the junitxml artifact, and the
+scripts/ci_gate.py invocation (standing rule R4: no fake green). Every caller
+runs tiers through this script - .lazyaf/pipelines/test-suite.yaml, the
+scripts/test.sh and scripts/test.ps1 tier/all lanes, and developers by hand -
+so a selection change lands in one place and no lane can drift into running a
+different (or Docker-polluted) subset.
+
+Stdlib only: runs on the bare python3 of a Linux runner container and on a
+Windows host alike. Paths are derived from this file's location, so the
+current working directory does not matter.
+
+KNOWN EXCLUSION (stated per R4, not a silent cap): the 21 @slow e2e tests
+(control layer, real card execution, graph pipeline full-stack) run in NO
+tier - they need the compose e2e stack, which the legacy runner cannot host.
+Run them on the host via the scripts/test slow lane; they enter dogfood CI
+at Phase 12.4/12.5 when ephemeral execution can host the stack.
+
+Usage:
+    python3 scripts/run_tier.py T1 [T2 T3 ...] [-- extra pytest args]
+"""
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BACKEND_DIR = REPO_ROOT / "backend"
+CI_GATE = REPO_ROOT / "scripts" / "ci_gate.py"
+
+# Tier definitions. pytest paths are relative to backend/ (the cwd every
+# selection runs from, matching `cd backend && uv run pytest ...`).
+TIERS: dict[str, dict] = {
+    "T1": {
+        "name": "Unit + Demos + Integration (no Docker)",
+        "pytest_args": [
+            "../tdd/unit",
+            "../tdd/demos",
+            "../tdd/integration",
+            "--ignore=../tdd/integration/services/execution",
+            "-m",
+            "not slow",
+        ],
+        "junitxml": "junit-t1.xml",
+    },
+    "T2": {
+        "name": "Docker-dependent integration",
+        "pytest_args": [
+            "../tdd/integration/services/execution",
+        ],
+        "junitxml": "junit-t2.xml",
+    },
+    "T3": {
+        "name": "E2E quick tier",
+        "pytest_args": [
+            "../tdd/e2e",
+            "-m",
+            "not slow",
+        ],
+        "junitxml": "junit-t3.xml",
+    },
+}
+
+
+def run_tier(tier: str, extra_pytest_args: list[str]) -> int:
+    """Run one tier's pytest selection, then gate its junitxml. Returns rc."""
+    spec = TIERS[tier]
+    junit_path = REPO_ROOT / spec["junitxml"]
+
+    pytest_cmd = [
+        "uv",
+        "run",
+        "pytest",
+        *spec["pytest_args"],
+        "-rs",
+        f"--junitxml={junit_path}",
+        *extra_pytest_args,
+    ]
+    print(f"[run_tier] {tier}: {spec['name']}")
+    print(f"[run_tier] {tier}: {' '.join(pytest_cmd)} (cwd={BACKEND_DIR})")
+    rc = subprocess.run(pytest_cmd, cwd=BACKEND_DIR).returncode
+    if rc != 0:
+        # Red pytest stays red - the gate never launders a failing tier.
+        print(f"[run_tier] {tier}: pytest failed (rc={rc})", file=sys.stderr)
+        return rc
+
+    gate_cmd = [sys.executable, str(CI_GATE), "--tier", tier, str(junit_path)]
+    print(f"[run_tier] {tier}: {' '.join(gate_cmd)}")
+    return subprocess.run(gate_cmd, cwd=REPO_ROOT).returncode
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+
+    # Everything after a literal `--` is passed through to pytest verbatim.
+    extra_pytest_args: list[str] = []
+    if "--" in args:
+        split = args.index("--")
+        args, extra_pytest_args = args[:split], args[split + 1 :]
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "tiers",
+        nargs="+",
+        choices=sorted(TIERS),
+        metavar="TIER",
+        help=f"tier(s) to run, in order: {', '.join(sorted(TIERS))}",
+    )
+    parsed = parser.parse_args(args)
+
+    for tier in parsed.tiers:
+        rc = run_tier(tier, extra_pytest_args)
+        if rc != 0:
+            return rc
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

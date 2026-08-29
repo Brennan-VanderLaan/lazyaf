@@ -16,6 +16,19 @@ class RunStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class ExecutorMode(str, Enum):
+    """Which execution path runs a step (cross-file contract #3, 12.2-INT).
+
+    Recorded on StepRun.executor at dispatch time (R1: routing is observable,
+    never inferred). REMOTE arrives with Phase 12.6's runner agents; until
+    then the pipeline executor rejects it loudly.
+    """
+
+    LOCAL = "local"
+    LEGACY = "legacy"
+    REMOTE = "remote"
+
+
 class Pipeline(Base):
     __tablename__ = "pipelines"
 
@@ -71,6 +84,11 @@ class StepRun(Base):
     step_name: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default=RunStatus.PENDING.value)
     job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)  # Links to Job table when step creates a job
+    # Which execution path ran this step: "local" | "legacy" | "remote".
+    # Set at dispatch time (R1: routing must be observable, never inferred).
+    # No alembic revision here by design - the serialized migration stage
+    # authors it; tests rely on conftest's create_all.
+    executor: Mapped[str | None] = mapped_column(String(16), nullable=True)
     logs: Mapped[str] = mapped_column(Text, default="")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

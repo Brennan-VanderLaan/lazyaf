@@ -28,6 +28,112 @@ from app.database import Base, get_db
 from app.main import app
 
 
+def pytest_configure(config):
+    """Register the local_exec marker (12.2-INT fix 13)."""
+    config.addinivalue_line(
+        "markers",
+        "local_exec: test exercises the real local execution path (Docker); "
+        "exempt from the T1 no-docker guard and the legacy-by-default router "
+        "patch on the global pipeline executor",
+    )
+
+
+# -----------------------------------------------------------------------------
+# T1 isolation (12.2-INT fix 13): the no-Docker tier must stay no-Docker
+# -----------------------------------------------------------------------------
+
+def _is_t2_docker_tier(request) -> bool:
+    """The Docker-real T2 subtree (tdd/integration/services, per
+    scripts/run_tier.py) is exempt from the T1 guards by location."""
+    return "/integration/services" in str(request.fspath).replace("\\", "/")
+
+
+@pytest.fixture(autouse=True)
+def _t1_no_docker_guard(request, monkeypatch):
+    """T1 must pass with Docker STOPPED.
+
+    Any test that is neither marked ``local_exec`` nor part of the Docker
+    tier (tdd/integration/services) fails loudly the moment it tries to
+    construct a real docker client - the guard that catches the local
+    execution path leaking into the no-Docker tier.
+    """
+    if request.node.get_closest_marker("local_exec") or _is_t2_docker_tier(request):
+        yield
+        return
+
+    import docker as docker_sdk
+
+    def _no_docker_in_t1(*args, **kwargs):
+        raise AssertionError(
+            "A real docker client was constructed in a test that is not "
+            "marked 'local_exec' and is outside tdd/integration/services. "
+            "T1 must pass with Docker stopped: route the step legacy, inject "
+            "a fake client, or mark the test with @pytest.mark.local_exec."
+        )
+
+    monkeypatch.setattr(docker_sdk, "from_env", _no_docker_in_t1)
+    monkeypatch.setattr(docker_sdk, "DockerClient", _no_docker_in_t1)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _route_steps_legacy_by_default(request):
+    """Default the GLOBAL pipeline executor to legacy routing.
+
+    API-tier tests drive the app's global pipeline_executor; without this a
+    plain script step routes local and reaches for Docker/workspaces in the
+    middle of a no-Docker test. Steps go to the (in-memory) legacy job queue
+    instead. Tests that exercise real local execution opt in with
+    @pytest.mark.local_exec; unit tests that inject their own router onto
+    their OWN PipelineExecutor instances are untouched by design.
+    """
+    if request.node.get_closest_marker("local_exec"):
+        yield
+        return
+
+    from app.models.pipeline import ExecutorMode
+    from app.services.pipeline_executor import pipeline_executor
+    from app.services.workspace.execution_router import RoutingDecision
+
+    class _LegacyOnlyRouter:
+        def decide(self, step_type, step_config):
+            return RoutingDecision(
+                mode=ExecutorMode.LEGACY.value,
+                reason="t1-conftest-legacy-default",
+            )
+
+    previous = pipeline_executor._router
+    pipeline_executor._router = _LegacyOnlyRouter()
+    try:
+        yield
+    finally:
+        pipeline_executor._router = previous
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _drain_pipeline_executor():
+    """After EVERY test, drain and reset the global pipeline executor.
+
+    Uses the safe teardown from the executor itself (kill containers ->
+    bounded grace -> cancel stragglers as a last resort - never a
+    hard-cancel-mid-commit as the first move), so no asyncio task, state
+    machine, run lock, or session factory leaks into the next test
+    (12.2-INT fix 13). Cheap no-op when the executor was untouched.
+    """
+    yield
+    from app.services.pipeline_executor import pipeline_executor
+
+    if (
+        pipeline_executor._tasks
+        or pipeline_executor._state_machines
+        or pipeline_executor._run_locks
+        or pipeline_executor._session_factories
+    ):
+        await pipeline_executor.reset()
+    elif pipeline_executor._local_executor is not None:
+        pipeline_executor._local_executor.reset()
+
+
 # -----------------------------------------------------------------------------
 # Database Fixtures
 # -----------------------------------------------------------------------------

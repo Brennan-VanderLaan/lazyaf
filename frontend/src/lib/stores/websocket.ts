@@ -2,14 +2,162 @@ import { writable } from 'svelte/store';
 import type { Card, Pipeline, PipelineRun, StepRun, Repo } from '../api/types';
 import { cardsStore } from './cards';
 import { jobsStore, type JobStatusUpdate } from './jobs';
-import { pipelinesStore, activeRunsStore } from './pipelines';
+import { pipelinesStore, activeRunsStore, liveStepLogsStore } from './pipelines';
 import { reposStore } from './repos';
 
 export type WebSocketStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
-interface WebSocketMessage {
-  type: 'card_updated' | 'card_deleted' | 'job_status' | 'runner_status' | 'pipeline_updated' | 'pipeline_deleted' | 'pipeline_run_status' | 'step_run_status' | 'repo_created' | 'repo_updated' | 'repo_deleted';
+// -----------------------------------------------------------------------------
+// Server -> client message contract.
+//
+// EVERY message type the backend can broadcast (see
+// backend/app/services/websocket.py ConnectionManager) must appear in
+// ServerMessageType AND in the handleServerMessage switch below.
+// websocket.test.ts greps the backend source and fails loudly if the two
+// sides drift, so add new frames in both places.
+// -----------------------------------------------------------------------------
+
+export type ServerMessageType =
+  | 'card_updated'
+  | 'card_deleted'
+  | 'job_status'
+  | 'runner_status'
+  | 'pipeline_updated'
+  | 'pipeline_deleted'
+  | 'pipeline_run_status'
+  | 'step_run_status'
+  | 'step_update'
+  | 'step_log'
+  | 'step_log_batch'
+  | 'repo_created'
+  | 'repo_updated'
+  | 'repo_deleted';
+
+/**
+ * The full set of server message types the frontend handles. Exported for the
+ * backend/frontend contract test (websocket.test.ts) — keep in lockstep with
+ * ServerMessageType and the switch in handleServerMessage.
+ */
+export const HANDLED_MESSAGE_TYPES: readonly ServerMessageType[] = [
+  'card_updated',
+  'card_deleted',
+  'job_status',
+  'runner_status',
+  'pipeline_updated',
+  'pipeline_deleted',
+  'pipeline_run_status',
+  'step_run_status',
+  'step_update',
+  'step_log',
+  'step_log_batch',
+  'repo_created',
+  'repo_updated',
+  'repo_deleted',
+];
+
+/** step_update payload: a bare status transition for one step of a run. */
+export interface StepUpdatePayload {
+  pipeline_run_id: string;
+  step_index: number;
+  status: string;
+}
+
+/** step_log payload: a single live log line from a running local step. */
+export interface StepLogPayload {
+  pipeline_run_id: string;
+  step_index: number;
+  line: string;
+}
+
+/**
+ * step_log_batch payload: multiple live log lines coalesced into one frame
+ * (the local executor batches bursty output instead of one broadcast per
+ * line).
+ */
+export interface StepLogBatchPayload {
+  pipeline_run_id: string;
+  step_index: number;
+  lines: string[];
+}
+
+export interface WebSocketMessage {
+  type: ServerMessageType;
   payload: unknown;
+}
+
+/**
+ * Some step frames were specified with a `run_id` payload key while the
+ * backend's typed publish API emits `pipeline_run_id`. Accept both so a
+ * backend-side rename cannot silently drop live updates.
+ */
+function runIdOf(payload: { pipeline_run_id?: string; run_id?: string }): string | undefined {
+  return payload.pipeline_run_id ?? payload.run_id;
+}
+
+/**
+ * Dispatch one server message into the client stores. Exported (rather than
+ * closed over in the store) so unit tests can drive the full contract without
+ * a live socket.
+ */
+export function handleServerMessage(message: WebSocketMessage) {
+  switch (message.type) {
+    case 'card_updated':
+      cardsStore.updateLocal(message.payload as Card);
+      break;
+    case 'card_deleted':
+      cardsStore.deleteLocal((message.payload as { id: string }).id);
+      break;
+    case 'job_status':
+      jobsStore.updateFromWebSocket(message.payload as JobStatusUpdate);
+      break;
+    case 'runner_status':
+      // Runner status is handled by polling in runnersStore
+      break;
+    case 'pipeline_updated':
+      pipelinesStore.updateLocal(message.payload as Pipeline);
+      break;
+    case 'pipeline_deleted':
+      pipelinesStore.deleteLocal((message.payload as { id: string }).id);
+      break;
+    case 'pipeline_run_status':
+      activeRunsStore.updateRun(message.payload as PipelineRun);
+      break;
+    case 'step_run_status':
+      // Full StepRun snapshot (sans logs) — merge into the owning run.
+      activeRunsStore.updateStepRun(message.payload as StepRun);
+      break;
+    case 'step_update': {
+      const p = message.payload as StepUpdatePayload & { run_id?: string };
+      const runId = runIdOf(p);
+      if (runId !== undefined) {
+        activeRunsStore.updateStepStatus(runId, p.step_index, p.status);
+      }
+      break;
+    }
+    case 'step_log': {
+      const p = message.payload as StepLogPayload & { run_id?: string };
+      const runId = runIdOf(p);
+      if (runId !== undefined) {
+        liveStepLogsStore.appendLine(runId, p.step_index, p.line);
+      }
+      break;
+    }
+    case 'step_log_batch': {
+      const p = message.payload as StepLogBatchPayload & { run_id?: string };
+      const runId = runIdOf(p);
+      if (runId !== undefined && Array.isArray(p.lines)) {
+        liveStepLogsStore.appendLines(runId, p.step_index, p.lines);
+      }
+      break;
+    }
+    case 'repo_created':
+    case 'repo_updated':
+      reposStore.updateLocal(message.payload as Repo);
+      break;
+    case 'repo_deleted':
+      reposStore.deleteLocal((message.payload as { id: string }).id);
+      break;
+  }
 }
 
 function createWebSocketStore() {
@@ -38,7 +186,7 @@ function createWebSocketStore() {
     ws.onmessage = (event) => {
       try {
         const message: WebSocketMessage = JSON.parse(event.data);
-        handleMessage(message);
+        handleServerMessage(message);
       } catch (e) {
         console.error('Failed to parse WebSocket message:', e);
       }
@@ -54,43 +202,6 @@ function createWebSocketStore() {
       // Reconnect after 3 seconds
       reconnectTimeout = setTimeout(connect, 3000);
     };
-  }
-
-  function handleMessage(message: WebSocketMessage) {
-    switch (message.type) {
-      case 'card_updated':
-        cardsStore.updateLocal(message.payload as Card);
-        break;
-      case 'card_deleted':
-        cardsStore.deleteLocal((message.payload as { id: string }).id);
-        break;
-      case 'job_status':
-        jobsStore.updateFromWebSocket(message.payload as JobStatusUpdate);
-        break;
-      case 'runner_status':
-        // Runner status is handled by polling in runnersStore
-        break;
-      case 'pipeline_updated':
-        pipelinesStore.updateLocal(message.payload as Pipeline);
-        break;
-      case 'pipeline_deleted':
-        pipelinesStore.deleteLocal((message.payload as { id: string }).id);
-        break;
-      case 'pipeline_run_status':
-        activeRunsStore.updateRun(message.payload as PipelineRun);
-        break;
-      case 'step_run_status':
-        // Step status updates are included in pipeline_run_status
-        // This is for more granular updates if needed
-        break;
-      case 'repo_created':
-      case 'repo_updated':
-        reposStore.updateLocal(message.payload as Repo);
-        break;
-      case 'repo_deleted':
-        reposStore.deleteLocal((message.payload as { id: string }).id);
-        break;
-    }
   }
 
   function disconnect() {

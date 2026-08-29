@@ -71,6 +71,9 @@ export interface Card {
   // Pipeline association
   pipeline_run_id: string | null;
   pipeline_step_index: number | null;
+  // Spec layer links (Phase 12.2.5) - optional so older fixtures stay valid
+  feature_id?: string | null;
+  user_story_id?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -94,6 +97,9 @@ export interface CardUpdate {
   step_config?: StepConfig | null;
   prompt_template?: string | null;
   agent_file_ids?: string[] | null;
+  // Spec layer links (Phase 12.2.5)
+  feature_id?: string | null;
+  user_story_id?: string | null;
 }
 
 export interface Job {
@@ -311,6 +317,11 @@ export interface PipelineUpdate {
   is_template?: boolean;
 }
 
+// Which execution path ran a step (Phase 12.2-INT). Mirrors the backend's
+// ExecutorMode enum in models/pipeline.py: 'local' (ephemeral Docker container
+// driven by the backend), 'legacy' (runner job queue), 'remote' (reserved).
+export type ExecutorMode = 'local' | 'legacy' | 'remote';
+
 export interface StepRun {
   id: string;
   pipeline_run_id: string;
@@ -318,6 +329,8 @@ export interface StepRun {
   step_name: string;
   status: RunStatus;
   job_id: string | null;
+  // Optional so older fixtures stay valid; null until the step is dispatched.
+  executor?: ExecutorMode | null;
   logs: string;
   error: string | null;
   started_at: string | null;
@@ -514,4 +527,105 @@ export interface PipelineNodeData {
 export interface PipelineEdgeData {
   condition: EdgeCondition;
   isActive?: boolean;
+}
+
+// =============================================================================
+// Spec Layer Types (Phase 12.2.5)
+// Feature -> UserStory -> AcceptanceCriterion (deliberately shallow hierarchy)
+// =============================================================================
+
+export type FeatureStatus = 'draft' | 'active' | 'done';
+
+export interface Feature {
+  id: string;
+  title: string;
+  description: string;
+  status: FeatureStatus;
+  repo_ids: string[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface FeatureCreate {
+  title: string;
+  description?: string;
+  status?: FeatureStatus;
+  repo_ids?: string[];
+}
+
+export interface FeatureUpdate {
+  title?: string;
+  description?: string;
+  status?: FeatureStatus;
+  repo_ids?: string[];
+}
+
+export interface UserStory {
+  id: string;
+  feature_id: string;
+  title: string;
+  narrative: string;
+  status: string;
+  priority: number | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface UserStoryCreate {
+  feature_id: string;
+  title: string;
+  narrative?: string;
+  status?: string;
+  priority?: number | null;
+}
+
+export interface UserStoryUpdate {
+  title?: string;
+  narrative?: string;
+  status?: string;
+  priority?: number | null;
+}
+
+export interface AcceptanceCriterion {
+  id: string;
+  user_story_id: string;
+  text: string;
+  required: boolean;
+  notes: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AcceptanceCriterionCreate {
+  user_story_id: string;
+  text: string;
+  required?: boolean;
+  notes?: string | null;
+}
+
+export interface AcceptanceCriterionUpdate {
+  text?: string;
+  required?: boolean;
+  notes?: string | null;
+}
+
+export interface PromptTemplate {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface PromptTemplateCreate {
+  name: string;
+  description?: string;
+  content: string;
+}
+
+export interface PromptTemplateUpdate {
+  name?: string;
+  description?: string;
+  content?: string;
 }

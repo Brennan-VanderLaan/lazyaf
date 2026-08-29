@@ -88,10 +88,26 @@ class ConnectionManager:
         The batching lives in the flush cadence (the executor buffers ~200
         lines / 500ms before calling this); each line still goes out as its
         own step_log frame so the wire contract with existing UI consumers
-        is unchanged.
+        is unchanged. The stdout-mode path keeps using this publisher.
         """
         for line in lines:
             await self.publish_step_log(run_id, step_index, line)
+
+    async def publish_step_log_batch(
+        self, run_id: str, step_index: int, lines: list[str]
+    ) -> None:
+        """Broadcast one step_log_batch frame carrying many lines (12.3).
+
+        The control-mode /api/steps/{id}/logs router emits exactly ONE of
+        these per POST instead of a step_log frame per line - the frontend
+        already consumes step_log_batch (appendLines) alongside step_log.
+        """
+        if not lines:
+            return
+        await self.broadcast(
+            "step_log_batch",
+            {"pipeline_run_id": run_id, "step_index": step_index, "lines": lines},
+        )
 
     async def reset(self):
         """Close and forget all connections. Test-mode reset hook; clients

@@ -1,67 +1,31 @@
 # Control Layer services - Phase 12.3
-# Provides container-to-backend communication and step management
+#
+# What lives here after the wave2-123-wiring retirement:
+# - auth.py:      step token generation/validation (the /api/steps/* router
+#                 dependency; secret settings-driven via main.py startup)
+# - workspace.py: generate_step_config - the SINGLE producer of the step
+#                 config file contract consumed by the in-container runtime
+#                 at images/base/control/ (R3)
+#
+# Retired (see upcoming/wave2-123-wiring.md section 3): protocol.py /
+# docker.py / environment.py (superseded by the real images/ runtime,
+# LocalExecutor MountSpec machinery, and ENV baked into the base image) and
+# image.py's Dockerfile string generators (superseded by the images/ tree).
+# Also retired (12.3 dead-code sweep): workspace.py's WorkspaceLayout /
+# initialize_workspace / get_workspace_paths / write_step_config -
+# entrypoint.sh is the single HOME-skeleton owner.
 
 from app.services.control_layer.auth import (
     generate_step_token,
     validate_step_token,
 )
 
-from app.services.control_layer.protocol import (
-    StepConfig,
-    ControlLayerClient,
-    StepExecutor,
-    StepTimeoutError,
-)
-
-from app.services.control_layer.environment import (
-    get_step_environment,
-)
-
-from app.services.control_layer.workspace import (
-    WorkspaceLayout,
-    generate_step_config,
-    write_step_config,
-    initialize_workspace,
-)
-
-from app.services.control_layer.docker import (
-    get_volume_mounts,
-)
-
-from app.services.control_layer.image import (
-    IMAGE_NAMES,
-    BaseImageContract,
-    get_image_tag,
-    generate_base_dockerfile,
-    generate_claude_dockerfile,
-    generate_gemini_dockerfile,
-    get_control_layer_script,
-)
+from app.services.control_layer.workspace import generate_step_config
 
 __all__ = [
     # Auth
     "generate_step_token",
     "validate_step_token",
-    # Protocol
-    "StepConfig",
-    "ControlLayerClient",
-    "StepExecutor",
-    "StepTimeoutError",
-    # Environment
-    "get_step_environment",
     # Workspace
-    "WorkspaceLayout",
     "generate_step_config",
-    "write_step_config",
-    "initialize_workspace",
-    # Docker
-    "get_volume_mounts",
-    # Image
-    "IMAGE_NAMES",
-    "BaseImageContract",
-    "get_image_tag",
-    "generate_base_dockerfile",
-    "generate_claude_dockerfile",
-    "generate_gemini_dockerfile",
-    "get_control_layer_script",
 ]

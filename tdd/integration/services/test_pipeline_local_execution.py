@@ -53,11 +53,8 @@ STEP_IMAGE = "python:3.12-slim"
 # Fixtures
 # -----------------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
-def docker_client():
-    client = docker_sdk.from_env()
-    client.ping()  # Fail loudly here if Docker is down (R4)
-    return client
+# docker_client comes from the shared tdd/integration/conftest.py (from_env
+# + ping: Docker down fails loudly there, R4).
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -299,6 +296,35 @@ class TestContainerCleanup:
         run = await start_and_wait(env, pipeline, repo)
 
         assert run.status == RunStatus.FAILED.value
+        from app.services.execution.local_executor import (
+            CONTAINER_LABEL_PIPELINE_RUN,
+        )
+
+        leftovers = env.docker.containers.list(
+            all=True,
+            filters={"label": f"{CONTAINER_LABEL_PIPELINE_RUN}={run.id}"},
+        )
+        assert leftovers == []
+
+
+class TestImagePreflight:
+    async def test_missing_image_fails_run_before_any_container(self, env):
+        """(12.3 hardening) A run naming an unresolvable image tag fails at
+        preflight - ONE failure, no StepRun rows, no containers ever
+        spawned - instead of dribbling per-step ImageNotFound errors."""
+        missing_tag = f"lazyaf-preflight-missing:{uuid4().hex[:8]}"
+        repo, pipeline = await make_repo_and_pipeline(env.factory, [
+            {
+                "name": "Never",
+                "type": "script",
+                "config": {"command": "echo unreachable", "image": missing_tag},
+            },
+        ])
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.FAILED.value
+        assert run.step_runs == []  # failed BEFORE dispatching step 0
         from app.services.execution.local_executor import (
             CONTAINER_LABEL_PIPELINE_RUN,
         )

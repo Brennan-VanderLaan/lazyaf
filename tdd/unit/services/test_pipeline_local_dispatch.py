@@ -110,6 +110,22 @@ class FakeLocalExecutor:
         self.events = events  # None -> default success script
         self.gate = gate
         self.calls: list[tuple[dict, dict]] = []
+        self.label_queries: list[str] = []
+        # Image preflight contract (12.3): tags in `missing_images` are
+        # reported unresolvable; every preflight query is recorded.
+        self.missing_images: list[str] = []
+        self.preflight_queries: list[list[str]] = []
+
+    async def image_supports_control_layer(self, image: str) -> bool:
+        """Contract method (12.3): these fakes model STOCK images - no
+        control-layer capability label, so every step takes stdout mode."""
+        self.label_queries.append(image)
+        return False
+
+    async def find_missing_images(self, images) -> list[str]:
+        """Contract method (12.3 image preflight)."""
+        self.preflight_queries.append(list(images))
+        return [image for image in images if image in self.missing_images]
 
     async def execute_step(self, step_config, execution_context):
         self.calls.append((dict(step_config), dict(execution_context)))
@@ -976,6 +992,12 @@ class StuckExecutor:
         self.cancel_calls: list[str] = []
         self.calls: list[tuple[dict, dict]] = []
 
+    async def image_supports_control_layer(self, image: str) -> bool:
+        return False  # stock image: stdout mode (12.3 contract method)
+
+    async def find_missing_images(self, images) -> list[str]:
+        return []  # every image resolves (12.3 contract method)
+
     async def execute_step(self, step_config, execution_context):
         self.calls.append((dict(step_config), dict(execution_context)))
         yield {"type": "status", "status": "running"}
@@ -1214,3 +1236,104 @@ class TestTypedPublishApi:
             "payload": {"pipeline_run_id": "run-1", "step_index": 0,
                         "line": "a log line"},
         }]
+
+    async def test_publish_step_log_batch_shape(self):
+        """ONE step_log_batch frame per call (12.3: the control-mode /logs
+        router ships whole batches, matching the frontend's appendLines
+        consumer); empty batches produce no frame."""
+        socket = CapturingSocket()
+        manager.active_connections.append(socket)
+        try:
+            await manager.publish_step_log_batch("run-1", 2, ["one", "two"])
+            await manager.publish_step_log_batch("run-1", 2, [])
+        finally:
+            manager.active_connections.remove(socket)
+
+        assert socket.messages == [{
+            "type": "step_log_batch",
+            "payload": {"pipeline_run_id": "run-1", "step_index": 2,
+                        "lines": ["one", "two"]},
+        }]
+
+
+# -----------------------------------------------------------------------------
+# Image preflight (12.3 hardening): resolve all step images before step 0
+# -----------------------------------------------------------------------------
+
+class TestImagePreflight:
+    async def test_missing_images_fail_run_before_any_dispatch(
+        self, env, enqueue_spy, caplog
+    ):
+        """A run naming unresolvable images fails with ONE message listing
+        every missing tag - no StepRun is created, nothing dispatches."""
+        repo = await make_repo(env.factory)
+        env.local.missing_images = ["ghost:one", "ghost:two"]
+        pipeline = await make_linear_pipeline(env.factory, repo, [
+            script_step("A", "echo a", config={"command": "echo a", "image": "ghost:one"}),
+            script_step("B", "echo b", config={"command": "echo b", "image": "ghost:two"}),
+            script_step("C", "echo c"),
+        ])
+
+        with caplog.at_level(logging.ERROR, logger="app.services.pipeline_executor"):
+            run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.FAILED.value
+        assert run.step_runs == []  # failed BEFORE dispatching step 0
+        assert env.local.calls == []
+        assert enqueue_spy.calls == []
+        # Distinct images resolved ONCE, in one query
+        assert env.local.preflight_queries == [["ghost:one", "ghost:two"]]
+        # ONE message naming every missing tag
+        preflight_errors = [
+            r.message for r in caplog.records
+            if "missing step image(s)" in r.message
+        ]
+        assert len(preflight_errors) == 1
+        assert "ghost:one" in preflight_errors[0]
+        assert "ghost:two" in preflight_errors[0]
+
+    async def test_graph_run_preflights_all_step_images(self, env):
+        repo = await make_repo(env.factory)
+        env.local.missing_images = ["ghost:entry"]
+        pipeline = await make_graph_pipeline(env.factory, repo, {
+            "steps": {
+                "a": {"name": "A", "type": "script",
+                      "config": {"command": "echo a", "image": "ghost:entry"}},
+                "b": {"name": "B", "type": "script",
+                      "config": {"command": "echo b"}},
+            },
+            "edges": [{"from_step": "a", "to_step": "b", "condition": "success"}],
+            "entry_points": ["a"],
+        })
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.FAILED.value
+        assert run.step_runs == []
+        assert env.local.calls == []
+        assert env.local.preflight_queries == [["ghost:entry"]]
+
+    async def test_resolvable_images_run_normally(self, env):
+        repo = await make_repo(env.factory)
+        pipeline = await make_linear_pipeline(env.factory, repo, [
+            script_step("A", "echo a", config={"command": "echo a", "image": "python:3.12"}),
+        ])
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.PASSED.value
+        assert env.local.preflight_queries == [["python:3.12"]]
+
+    async def test_runs_without_explicit_images_skip_preflight(self, env):
+        """Steps on the default image never touch the resolver: the default
+        is pre-pulled at app startup, and reaching for a docker client here
+        would drag one into legacy-only runs."""
+        repo = await make_repo(env.factory)
+        pipeline = await make_linear_pipeline(
+            env.factory, repo, [script_step("A", "echo a")]
+        )
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.PASSED.value
+        assert env.local.preflight_queries == []

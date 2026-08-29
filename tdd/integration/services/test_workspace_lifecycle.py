@@ -393,10 +393,15 @@ class TestRealPopulation:
             assert ws.status == WorkspaceStatus.READY.value
 
             # The clone landed inside the NAMED VOLUME at /workspace/repo.
+            # Verify as uid 1000, the uid population chowns the repo to and
+            # the uid real steps run as - root would trip git's
+            # dubious-ownership refusal on the 1000-owned repo (run #9).
             output = docker_client.containers.run(
                 "python:3.12",
                 ["bash", "-c", "cat /workspace/repo/README.md && git -C /workspace/repo rev-parse --abbrev-ref HEAD"],
                 volumes={ws.volume_name: {"bind": "/workspace", "mode": "ro"}},
+                user="1000:1000",
+                environment={"HOME": "/tmp"},
                 remove=True,
             )
             assert b"workspace-population-proof" in output

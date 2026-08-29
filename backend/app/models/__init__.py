@@ -4,6 +4,8 @@ from app.models.job import Job, JobStatus
 from app.models.runner import Runner, RunnerStatus
 from app.models.agent_file import AgentFile
 from app.models.pipeline import Pipeline, PipelineRun, StepRun, RunStatus, StepExecution, StepExecutionStatus
+from app.models.spec import Feature, UserStory, AcceptanceCriterion, PromptTemplate, FeatureStatus, StoryStatus
+from app.models.workspace import Workspace
 
 __all__ = [
     "Repo",
@@ -22,4 +24,11 @@ __all__ = [
     "RunStatus",
     "StepExecution",
     "StepExecutionStatus",
+    "Feature",
+    "UserStory",
+    "AcceptanceCriterion",
+    "PromptTemplate",
+    "FeatureStatus",
+    "StoryStatus",
+    "Workspace",
 ]

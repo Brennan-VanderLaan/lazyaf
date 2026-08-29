@@ -39,7 +39,10 @@ TIERS: dict[str, dict] = {
             "../tdd/unit",
             "../tdd/demos",
             "../tdd/integration",
-            "--ignore=../tdd/integration/services/execution",
+            # The whole services/ subtree is Docker-real (12.2-INT: workspace
+            # lifecycle on named volumes, local pipeline execution, WS round
+            # trips) and runs in T2 - T1 stays the no-Docker tier.
+            "--ignore=../tdd/integration/services",
             "-m",
             "not slow",
         ],
@@ -48,7 +51,7 @@ TIERS: dict[str, dict] = {
     "T2": {
         "name": "Docker-dependent integration",
         "pytest_args": [
-            "../tdd/integration/services/execution",
+            "../tdd/integration/services",
         ],
         "junitxml": "junit-t2.xml",
     },

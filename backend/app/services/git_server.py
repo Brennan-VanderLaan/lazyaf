@@ -860,47 +860,71 @@ class GitRepoManager:
         repo.object_store.add_object(merged_tree)
         return merged_tree.id, conflicts
 
+    def _resolve_path_sha(self, repo, root_tree_sha, path: str):
+        """
+        Walk `path` (possibly nested; '' means the root tree itself) from a
+        root tree sha and return the sha of the object it names, or None
+        when a component is absent or a non-tree is traversed.
+
+        Raises KeyError when the object store lacks an object it should hold
+        (corrupt/partial repo) - callers decide how to report that.
+        """
+        from dulwich.objects import Tree
+
+        current_sha = root_tree_sha
+        parts = [p for p in path.strip('/').split('/') if p] if path else []
+
+        for part in parts:
+            obj = repo.object_store[current_sha]
+            if not isinstance(obj, Tree):
+                return None
+
+            part_bytes = part.encode('utf-8')
+            for entry in obj.items():
+                if entry.path == part_bytes:
+                    current_sha = entry.sha
+                    break
+            else:
+                return None
+
+        return current_sha
+
     def _get_blob_at_path(self, repo, tree_sha, path: str) -> bytes | None:
         """
         Get blob content at a nested path in a tree.
         Returns None if path doesn't exist or isn't a blob.
         """
-        from dulwich.objects import Blob, Tree
-        import stat
+        from dulwich.objects import Blob
 
-        parts = path.split('/')
-        current_sha = tree_sha
-
-        for i, part in enumerate(parts):
-            try:
-                obj = repo.object_store[current_sha]
-                if not isinstance(obj, Tree):
-                    return None
-
-                # Find the entry matching this part
-                part_bytes = part.encode('utf-8')
-                found = False
-                for entry in obj.items():
-                    if entry.path == part_bytes:
-                        current_sha = entry.sha
-                        found = True
-                        break
-
-                if not found:
-                    return None
-
-            except KeyError:
-                return None
-
-        # current_sha should now point to the blob
         try:
-            obj = repo.object_store[current_sha]
+            blob_sha = self._resolve_path_sha(repo, tree_sha, path)
+            if blob_sha is None:
+                return None
+            obj = repo.object_store[blob_sha]
             if isinstance(obj, Blob):
                 return obj.data
         except KeyError:
             pass
 
         return None
+
+    def _list_tree_at_path(self, repo, root_tree_sha, path: str) -> list[str] | None:
+        """
+        List entry names of the tree at `path` under a root tree sha.
+
+        Returns None when the path is absent or does not name a tree.
+        Raises KeyError when the object store is missing objects - callers
+        map that to their own "unreadable" signal.
+        """
+        from dulwich.objects import Tree
+
+        tree_sha = self._resolve_path_sha(repo, root_tree_sha, path)
+        if tree_sha is None:
+            return None
+        obj = repo.object_store[tree_sha]
+        if not isinstance(obj, Tree):
+            return None
+        return [entry.path.decode('utf-8', errors='replace') for entry in obj.items()]
 
     def _get_conflict_details(self, repo, base_tree_sha, ours_tree_sha, theirs_tree_sha, conflict_paths: list[str]) -> list[dict]:
         """
@@ -1434,11 +1458,28 @@ class GitRepoManager:
             traceback.print_exc()
             return {"error": str(e), "files": [], "diff": ""}
 
+    def _get_commit_tree_sha(self, repo, commit_sha: str):
+        """
+        Resolve a hex commit sha to its root tree sha, or None when the sha
+        is unknown/malformed or does not name a commit.
+        """
+        from dulwich.objects import Commit
+
+        try:
+            commit = repo.object_store[commit_sha.encode('ascii')]
+        except (KeyError, ValueError):
+            # Unknown sha, malformed hex, or non-ascii input
+            return None
+        if not isinstance(commit, Commit):
+            return None
+        return commit.tree
+
     def get_file_content(self, repo_id: str, branch: str, path: str) -> bytes | None:
         """
         Get file content from a specific branch.
 
         Public API for reading files from git tree (used for .lazyaf/ directory).
+        Thin delegate: resolves the branch tip, then reads at that commit.
 
         Args:
             repo_id: Repository ID
@@ -1448,25 +1489,17 @@ class GitRepoManager:
         Returns:
             File content as bytes, or None if not found
         """
-        repo = self.get_repo(repo_id)
-        if not repo:
-            return None
-
         branch_sha = self.get_branch_commit(repo_id, branch)
         if not branch_sha:
             return None
-
-        try:
-            commit = repo.object_store[branch_sha.encode('ascii')]
-            return self._get_blob_at_path(repo, commit.tree, path)
-        except (KeyError, Exception):
-            return None
+        return self.get_file_content_at_commit(repo_id, branch_sha, path)
 
     def list_directory(self, repo_id: str, branch: str, path: str) -> list[str] | None:
         """
         List files in a directory from a specific branch.
 
         Public API for reading directory contents from git tree.
+        Thin delegate: resolves the branch tip, then lists at that commit.
 
         Args:
             repo_id: Repository ID
@@ -1476,51 +1509,97 @@ class GitRepoManager:
         Returns:
             List of filenames (not full paths), or None if directory not found
         """
+        branch_sha = self.get_branch_commit(repo_id, branch)
+        if not branch_sha:
+            return None
+        names = self.list_directory_at_commit(repo_id, branch_sha, path)
+        # The at-commit variant reports "commit readable, directory absent"
+        # as []; this branch-level API reports a missing directory as None.
+        return names or None
+
+    def get_file_content_at_commit(self, repo_id: str, commit_sha: str, path: str) -> bytes | None:
+        """
+        Get file content at a specific commit (rather than a branch tip).
+
+        Used by pipeline-definition sync-on-push to read .lazyaf/ files from
+        the exact pushed commit.
+
+        Returns:
+            File content as bytes, or None if the repo/commit/file is unreadable
+        """
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return None
+
+        tree_sha = self._get_commit_tree_sha(repo, commit_sha)
+        if tree_sha is None:
+            return None
+        return self._get_blob_at_path(repo, tree_sha, path)
+
+    def list_directory_at_commit(self, repo_id: str, commit_sha: str, path: str) -> list[str] | None:
+        """
+        List files in a directory at a specific commit (rather than a branch tip).
+
+        Return semantics (deliberately different from list_directory, so callers
+        can distinguish "tree unknown" from "directory removed"):
+        - None: the repo or commit cannot be read - caller should treat the
+          tree as unknown and change nothing.
+        - []: the commit is readable but the directory does not exist (or is
+          empty) - caller can treat the directory contents as removed.
+
+        Args:
+            repo_id: Repository ID
+            commit_sha: Full commit SHA (hex string)
+            path: Directory path (e.g., ".lazyaf/pipelines")
+        """
+        repo = self.get_repo(repo_id)
+        if not repo:
+            return None
+
+        tree_sha = self._get_commit_tree_sha(repo, commit_sha)
+        if tree_sha is None:
+            return None
+
+        try:
+            names = self._list_tree_at_path(repo, tree_sha, path)
+        except KeyError:
+            # Object store is missing objects: tree unknown, not "removed"
+            return None
+        return names if names is not None else []
+
+    def get_tree_sha_at_commit(self, repo_id: str, commit_sha: str, path: str) -> str | None:
+        """
+        Tree sha of `path` at a specific commit.
+
+        Backs the sync-on-push short-circuit: two commits whose
+        .lazyaf/pipelines subtree shas match define identical pipeline files.
+
+        Returns:
+        - hex sha string of the subtree when the path names a tree
+        - "" (empty string) when the commit is readable but the path is
+          absent or does not name a tree
+        - None when the repo/commit cannot be read (tree unknown)
+        """
         from dulwich.objects import Tree
 
         repo = self.get_repo(repo_id)
         if not repo:
             return None
 
-        branch_sha = self.get_branch_commit(repo_id, branch)
-        if not branch_sha:
+        root_tree_sha = self._get_commit_tree_sha(repo, commit_sha)
+        if root_tree_sha is None:
             return None
 
         try:
-            commit = repo.object_store[branch_sha.encode('ascii')]
-
-            # Navigate to the target directory
-            parts = path.strip('/').split('/') if path else []
-            current_sha = commit.tree
-
-            for part in parts:
-                if not part:
-                    continue
-                obj = repo.object_store[current_sha]
-                if not isinstance(obj, Tree):
-                    return None
-
-                part_bytes = part.encode('utf-8')
-                found = False
-                for entry in obj.items():
-                    if entry.path == part_bytes:
-                        current_sha = entry.sha
-                        found = True
-                        break
-
-                if not found:
-                    return None
-
-            # current_sha should now point to the target directory
-            obj = repo.object_store[current_sha]
-            if not isinstance(obj, Tree):
-                return None
-
-            # Return list of filenames
-            return [entry.path.decode('utf-8', errors='replace') for entry in obj.items()]
-
-        except (KeyError, Exception):
+            sub_sha = self._resolve_path_sha(repo, root_tree_sha, path)
+            if sub_sha is None:
+                return ""
+            obj = repo.object_store[sub_sha]
+        except KeyError:
             return None
+        if not isinstance(obj, Tree):
+            return ""
+        return sub_sha.decode('ascii') if isinstance(sub_sha, bytes) else sub_sha
 
     def delete_directory_from_branch(self, repo_id: str, branch: str, directory: str,
                                       author: str = "LazyAF <lazyaf@localhost>") -> dict:

@@ -352,18 +352,30 @@ Detailed documentation for completed phases is in `historical-documents/`.
 
 ## Current Status
 
-**Completed**: Phases 1-11, Phase 12.0, Phase 12.1
-**In Progress**: Phase 12.2 (Workspace State Machine & Pipeline Integration)
-**Next (in order)**:
-1. **Phase 12.2.5** — Specification Data Model (Feature / UserStory / AcceptanceCriterion / PromptTemplate). NEW. Foundation for spec-driven workflow.
-2. **Phase 12.2.6** — Test Result Tie-Back. NEW. Tests in repos report back to LazyAF and join to acceptance criteria.
-3. **Phase 12.3** — Control Layer & Step Images. UPDATED to carry test-result manifests as a first-class channel.
-4. Phases 12.4 → 12.6 — runner architecture refactor continues.
-5. **Phase 12.6.5** — Experiments & Leaderboards. NEW. Matrix runs of (model × prompt) with aggregated pass-rates per criterion.
-6. **Phase 12.6.6** — Spec-Curated Agent Context. NEW. Platform builds a per-card context bundle from the spec layer.
-7. Phases 12.7 → 12.9 — debug, cleanup, K8s.
+> Corrected 2026-08-29. See "Milestone 12 — Attempt #3 Roadmap" below for the plan of
+> record; `upcoming/failure_01-salvage-audit.md` for the salvage map + post-mortem of
+> the abandoned first attempt.
 
-> **Why this order:** The spec layer (12.2.5 / 12.2.6) goes in *before* 12.3 so the Control Layer protocol can carry test results natively rather than be retrofitted. The evaluation layer (12.6.5 / 12.6.6) goes in *after* remote execution so experiment fan-out can use the new RemoteExecutor.
+**Live and complete**: Phases 1-11 (the shipping product: cards/board, agents, internal
+git server, pipelines incl. the v2 graph editor, playground, MCP, CLI) plus Phase 12.1's
+execution substrate (StepExecution + state machine + LocalExecutor + crash recovery).
+1,130 tests green as of 2026-08-29.
+
+**Built but NOT wired** (tested libraries, zero production callers):
+- Phase 12.0 runner-common — the three runner images still ship monolithic entrypoints
+  and do not import it (the COMPLETE mark in the phase table is aspirational).
+- Phase 12.2 workspace package — no DB model, ExecutionRouter is a stub,
+  pipeline_executor still dispatches via the in-memory job queue.
+- Phase 12.3 control layer — the /api/steps/* endpoints ARE live and tested; the step
+  images exist only as Python string-generators, nothing builds them.
+
+**Not started**: 12.2.5, 12.2.6, 12.4, 12.5, 12.6, 12.6.5, 12.6.6, 12.7, 12.8.
+
+**Execution today** still flows the legacy path end to end:
+card -> job -> in-memory queue -> long-lived polling runners.
+
+**Abandoned attempt**: branch `failure_01` (12.0 -> 12.7 in two days, 2026-01-03/04).
+Reference only — never merge it.
 
 Phase 12.1 deliverables (COMPLETE):
   - `StepExecution` model with unique `execution_key` for idempotency
@@ -385,6 +397,328 @@ The target workflow is now fully functional:
 6. Pipeline runs tests/validation steps
 7. **On pass**: Card auto-merged and marked done
 8. **On fail**: Card marked failed (user can retry)
+
+---
+
+## Milestone 12 — Attempt #3 Roadmap (2026-08-29)
+
+> Scope decision (owner, 2026-08-29): finish EVERYTHING numbered 12.x — the runner
+> architecture arc AND the spec/eval layer (12.2.5, 12.2.6, 12.6.5, 12.6.6).
+> 12.9 (Kubernetes) stays future. No external CI, ever: LazyAF gates LazyAF,
+> starting on the legacy execution path and ratcheting onto the new architecture
+> as it lands. This section supersedes the old "Why this order" note (12.2.6 now
+> deliberately follows 12.3 — the protocol froze in January; the retrofit is planned,
+> not accidental).
+
+### History (why this is attempt #3)
+
+- Attempt #1 (`failure_01`, 2026-01-03/04): 12.0 -> 12.7 in two days. Collapsed.
+  Post-mortem + salvage map: `upcoming/failure_01-salvage-audit.md`.
+- Attempt #2 (main, 2026-01-09/13): test infra first, 12.0-12.3 built as clean
+  libraries — never wired into the live path.
+- Attempt #3 (now): wire the dark libraries, finish the arc, with the platform
+  gating its own development the whole way.
+
+### North-star user stories (the e2e layer encodes these; 12.2.5 stores them)
+
+US-1 "Commits land, AI workflows run" (self-hosted CI / dogfood)
+     Given a repo ingested into LazyAF with a pipeline bound to a push trigger,
+     when I push to the internal remote, the pipeline runs my steps (tests,
+     builds, agent steps) in isolated containers, live status/logs stream to the
+     UI, and the outcome gates the branch. Milestone acceptance bar: LazyAF runs
+     LazyAF's own tdd suite this way — with the execution tiers ACTUALLY
+     EXECUTING (see R4; a green run that skipped the Docker tier is a failure).
+
+US-2 "Card dev loop"
+     Given a card describing a feature, when I start it, an agent implements it
+     on a branch; completion triggers the gating pipeline; on pass the card
+     reaches review with a diff; approve merges to target. Continuously covered
+     from 12.5 on by a zero-cost mock-agent e2e inside the dogfood suite.
+
+US-3 "Compare bench"
+     Given a workflow/card and a set of (model x prompt) variants, when I launch
+     a comparison, each variant runs in isolation and I get a side-by-side of
+     outcomes (pass-rates per criterion, diffs, cost/time). Named artifact:
+     tdd/e2e/test_experiment_matrix.py (12.6.5's exit gate).
+
+Standing note: the owner's remote ambition is runpod.io-style nodes hosting
+cheap models (hybrid agentic programming). Such pods often run AS containers
+with no Docker socket — so the 12.6 runner-agent protocol must NOT assume
+Docker; the agent's executor seam stays pluggable (LocalExecutor today, native
+or OpenAI-compatible agents later) without protocol changes.
+
+### Standing rules (distilled from the failure_01 post-mortem — non-negotiable)
+
+R1 NOTHING GOES DARK. New execution code is wired into the default dev compose
+   path the day it lands, and the e2e suite runs through it. Routing is
+   OBSERVABLE: StepRun records which executor ran it (local|legacy|remote), the
+   dogfood pipeline asserts the expected executor per phase via the API, and a
+   spy test proves locally-routed steps never enter job_queue. A silent
+   fallback to legacy is indistinguishable from success without this.
+R2 DELETE ONLY AFTER ACCEPTANCE. The legacy path stays callable until the
+   replacement passes the ported contract suites end-to-end; removal is its own
+   commit with every consumer (frontend, playground) migrated in it.
+R3 ONE SOURCE OF TRUTH PER WIRE CONTRACT. Control-layer payloads, WS runner
+   protocol, test manifests: shared pydantic schemas or contract tests pinning
+   both sides, plus at least one real round-trip test per contract
+   (container -> API -> DB row).
+R4 NO FAKE GREEN. No `pass # architecture ensures this` tests. Skip budget is
+   a committed baseline (`tdd/skip_baseline.json`: per-file skip reasons);
+   the CI gate runs pytest with skip reporting and FAILS if (a) any
+   environment-dependent skip appears that is not in the baseline, or (b) a
+   tier's executed-test count drops below its committed floor. Un-skipping
+   requires shrinking the baseline in the same commit (the ratchet — the 137
+   dormant 12.6 contract tests must hit zero skips by 12.6's gate).
+   xfail(strict=True) where a target is known-missing.
+R5 ASYNC-FIRST. Pipeline runs execute as asyncio tasks with their own session
+   scope; HTTP/git-push handlers return a run id immediately. No awaiting
+   containers inside request handlers. selectinload every relationship touched
+   in async services; typed publish API on the WS manager.
+R6 REAL SEAMS IN TESTS. At least one integration test per phase uses named
+   volumes (not tmp_path bind mounts). Workspace/mount addressing is an
+   explicit enum (volume | bind) — never inferred from path shape; unit test
+   feeds a Windows path (C:\...) to prove no misclassification. E2e
+   real-backend tier runs workers=1 or per-worker namespaces; the test-reset
+   endpoint resets in-memory singletons too. Tests covering broadcast paths
+   use the real WS manager with a capturing transport — never an AsyncMock.
+R7 SELF-HOSTING RATCHET. The dogfood pipeline definition lives in-repo and
+   syncs on push (see Phase 0a); it is upgraded to consume each phase as it
+   lands and is the standing acceptance test for the whole arc.
+R8 UI SHIPS WITH ITS SPEC. Every phase that ships or rebuilds a UI surface
+   ships a Playwright spec for it in the same phase, named in the deliverables.
+   "UI shows it live" in an exit gate always means a named spec, never vibes.
+   Pure store logic gets vitest coverage (first frontend unit layer).
+
+### Sequencing
+
+Track A = execution arc (risky, strictly ordered).
+Track B = spec/eval layer (additive; interleaves, sync points labeled).
+Migration policy: alembic migrations land serialized on main only; Track B
+rebases before generating. Startup runs `alembic upgrade head`; existing
+unversioned dev DBs are stamped at baseline first.
+
+#### Phase 0 — Self-hosting bootstrap + salvage quick wins  [prologue]
+
+0a DOGFOOD CI LIVE (US-1 minimal form, on the legacy path):
+   - Pipeline-definition sync on push: the receive-pack handler re-reads
+     `.lazyaf/pipelines/` from the pushed commit and creates/refreshes the
+     materialized platform pipeline (including a new `triggers:` binding in the
+     yaml schema) BEFORE trigger matching. Without this, repo-defined pipelines
+     are invisible to push triggers and CI changes take effect one push late —
+     unacceptable for self-hosted CI.
+   - Tiered dogfood suite (one step per tier, not one pytest invocation):
+     T1 unit + non-Docker integration (runs in any runner);
+     T2 Docker-dependent integration (runs on a dedicated CI runner service
+        with the Docker socket mounted — deliberate interim DooD, retired when
+        step containers get a socket option in 12.4);
+     T3 e2e quick tier with compose-network URLs (not localhost).
+   - Gate step: parse junitxml/-rs output; fail on out-of-baseline skips or
+     executed-count below committed per-tier floors (R4 mechanism).
+   - Wire trigger_dedup into trigger_service (two rapid pushes = one run).
+0b SALVAGE QUICK WINS (audit order): sprawl.md (done); data-testid sweep +
+   vite proxy env var (hand-apply equivalents in the graph editor); 12.6
+   contract suite + RunnerStateMachine ported dormant (baseline'd per R4) with
+   IDLE->DEAD and DEAD->DISCONNECTED added; alembic scaffold + clean
+   regenerated baseline + upgrade-at-startup + stamp-if-existing, replacing
+   database.py's PRAGMA/except-pass hacks. (Before 12.2-INT adds tables.)
+0c TEST-HARNESS HARDENING: env-gated test-mode API rebuilt (reset/seed + an
+   in-memory singleton reset hook); Playwright harness fixed (workers=1 real
+   tier or per-worker namespacing); skip-baseline gate implemented (R4);
+   minimal vitest harness for stores; dogfood-live Playwright spec (push ->
+   run appears -> status transitions + log lines stream over WS) per R8.
+0d HYGIENE: delete stale .pyc ghosts (images/, backend/alembic/versions/);
+   retire graph-creep.txt to historical-documents/; delete dead
+   PipelinesPanel.svelte; PLAN.md status corrected (done — this document).
+
+   EXIT GATE: a push to the internal remote runs all three tiers through
+   LazyAF itself, green, with per-tier executed counts >= committed floors;
+   two rapid pushes produce one run; dogfood-live spec passes.
+
+#### Phase 12.2-INT — Workspace persistence + wiring the dark libraries [A]
+
+The step both prior attempts died before/at. Deliverables:
+   - Alembic-born Workspace model (ADAPT failure_01 schema onto main's
+     WorkspaceStatus vocabulary; full run id in volume names).
+   - WorkspaceService rebuilt on main's tested locking + state machines
+     (failure_01's service is the shape, not the code). Lifecycle includes
+     cleanup on completion AND failure, plus a periodic orphan audit task.
+   - NETWORK PLUMBING (pulled forward from 12.3 — the clone needs it): named
+     network declared in compose; settings-driven network name + backend/git
+     URL; LocalExecutor gains a network kwarg.
+   - WORKSPACE POPULATION (net-new; no attempt ever built it): helper/init
+     container on the named network clones from the internal git server into
+     the named volume at /workspace/repo (matching LocalExecutor's
+     working_dir, which becomes config-driven).
+   - LocalExecutor hardening: shell-wrap script commands (['bash','-c',...] —
+     docker-py shlex-splits raw strings); run the ported migration-compat
+     matrix (old YAML, missing image, multiline commands, all step types)
+     against it; addressing enum per R6.
+   - pipeline_executor rewiring per R5: asyncio task per run driving main's
+     pipeline_state_machine; ExecutionRouter -> LocalExecutor for script/
+     docker steps, default-ON (R1); legacy retained for agent steps (R2).
+   - OBSERVABILITY (R1): StepRun.executor field; LocalExecutor status/log
+     events persisted incrementally to StepRun + typed WS broadcast; the
+     container-logs->StepRun-row round-trip test lands HERE (12.3 re-runs it
+     over the control-layer POST path); spy test: locally-routed steps never
+     touch job_queue.
+   - Until 12.3's base image exists, test-suite.yaml pins a stock image with
+     bash/curl/git (python:3.12 full, not slim).
+
+   EXIT GATE: dogfood script steps run through LocalExecutor by default and a
+   dogfood step asserts executor='local' for them via the API; named-volume
+   clone test passes through the network path; volume create/cleanup balanced
+   across success, failure, and backend-restart orphan-sweep scenarios; tier
+   floors hold.
+
+#### Phase 12.2.5 — Specification data model  [B, parallelizable now]
+
+Feature / UserStory / AcceptanceCriterion / PromptTemplate + card links +
+promote-to-feature; CRUD routers + minimal UI + MCP spec tools; serialized
+alembic migration. The required-criterion-blocks-done rule ships stubbed
+(criterion with no TestRuns = not blocking; xfail(strict) marks the real
+check) and activates in 12.2.6. Seed with THIS ROADMAP's three user stories.
+   EXIT GATE: spec CRUD API tests + spec-UI Playwright spec (R8); the three
+   north-star stories queryable via API and MCP.
+
+#### Phase 12.3 — Real step images + control layer  [A]
+
+Port failure_01's images/ tree (base + control runtime + backend client +
+claude + test-runner) with the audit's contract fixes: LogLine payload
+wrapping; token->auth_token / working_dir->working_directory renames; enforce
+timeout_seconds; quote the pytest pin; chown-at-entrypoint for volume
+ownership; settings-driven backend URL. Build story: compose build targets +
+script — no phantom :latest. HOME=/workspace/home persistence contract + the
+cross-step tool-persistence test (agent installs tool, script step uses it).
+Retire BOTH half-baked variants on main (control_layer/image.py generators,
+backend/docker/ copies). Gemini image deferred to 12.5 (failure_01's is
+fiction). Dogfood ratchet: test-suite.yaml moves to lazyaf-base (the
+install-uv step dissolves into the image).
+   EXIT GATE: dogfood steps run in lazyaf-base with control-layer status/
+   logs/heartbeat feeding the UI (round-trip test over the POST path); tier
+   floors hold.
+
+#### Phase 12.2.6 — Test result tie-back  [B, needs 12.3]
+
+Manifest channel `/workspace/.control/test_results.json` picked up at step
+end -> POST /api/test-results/ingest -> TestRef/TestRun joined to criterion +
+commit + model + prompt. Full PLAN 12.2.6 scope: reconcile endpoint + `lazyaf
+tests reconcile` CLI + background reconciliation on successful pipelines +
+orphan-TestRef lifecycle + GET /api/criteria/{id}/history. pytest plugin in
+runner-common (`lazyaf_test_id` marker). Sparkline/history UI deferred to
+12.6.5 (stated, not dropped). Activates 12.2.5's blocks-done rule.
+   EXIT GATE: LazyAF's own suite annotates a starter set of tests against the
+   US-1/2/3 criteria; a dogfood run produces TestRuns joined to criteria; the
+   history endpoint returns the series.
+
+#### Phase 12.4 — Script/docker steps fully ephemeral  [A]
+
+All script/docker steps through LocalExecutor + step images by default; step
+config gains a socket/volume option so the T2 Docker tier runs in ephemeral
+containers (retiring the 0a interim DooD runner); THEN remove script/docker
+execution from runner entrypoints (own commit, R2).
+   EXIT GATE: migration-compat matrix green against the ephemeral path;
+   dogfood asserts executor='local' for every script/docker step; removal
+   commit contains the entrypoint deletions and nothing else; tier floors.
+
+#### Phase 12.5 — Agent steps via control layer  [A]
+
+agent_wrapper rebuilt as a thin shim over runner-common baked into agent
+images (failure_01's monolith is reference); config-file contract from the
+salvaged agent-step contract test re-targeted at main's protocol; Claude
+image, then Gemini + mock images derived from runner-common executors.
+Playground migrates off job_queue HERE (resolved from OPEN — it is agent
+execution). Polling runners remain only as unused fallback (deletion at 12.6).
+   EXIT GATE: US-2 e2e (mock agent: card -> agent -> gate -> review -> merge)
+   green on ephemeral containers AND added to the dogfood suite; the dogfood
+   pipeline DOES include a mock-agent step from now on (zero-cost, every
+   push); playground works with job_queue idle.
+
+#### Phase 12.6 — RemoteExecutor + runner agents (loopback first)  [A]
+
+The ported 137-test contract suite is the spec. RunnerStateMachine (ported in
+0b) wired to a DB-backed runner registry with labels + matches_requirements
+(re-authored migration); runner_protocol ADAPTed (+auth via step-token
+pattern, protocol version, cancel, real execute_step.config schema);
+RemoteExecutor rebuilt on the salvaged skeleton (connection registry,
+ACK-future, death monitor) with persistence, heartbeat-death reassignment,
+double-assign guard, and a real dispatcher for requeued steps; /ws/runner
+endpoint with per-message session scope + auth; runner-agent package rebuilt
+embedding runner-common/LocalExecutor behind a pluggable executor seam.
+NativeOrchestrator explicitly DEFERRED to the manual remote-hardware lane —
+the seam and protocol stay Docker-agnostic so runpod-style socketless pods
+and OpenAI-compatible agents slot in without protocol changes. Runner panel
+rebuilt (snapshot fetch + WS deltas) with a Playwright spec asserting
+snapshot-then-delta after reload (R8). Loopback lane: a runner-agent process
+on the same host over WS is the tested path; real remote is manual.
+THEN, in its own commit, after the contract suite passes end-to-end against
+the push path: delete the polling stack (runner_pool, polling entrypoints,
+job pull endpoints, job_queue) with frontend + all consumers migrated in the
+same commit, and land test_no_legacy_code assertions in that commit (R2).
+   EXIT GATE: dogfood suite (incl. the US-2 mock-agent step) runs through a
+   loopback runner agent; 137-test contract suite at zero skips (R4 ratchet
+   complete); polling stack deleted; runner-panel spec green; tier floors.
+
+#### Phase 12.6.5 — Experiments & leaderboards  [B, needs 12.6 + 12.2.6 + 12.2.5]
+
+Matrix runs (model x prompt x repeat) fanned out through the executor layer;
+aggregated pass-rate per AcceptanceCriterion; leaderboard + experiment UI
+(with the criterion-history sparklines deferred from 12.2.6); MCP
+launch_experiment tool; guardrails: dry-run cost/run-count estimate + per-
+experiment cap before launch (upgraded from confirm-only per PLAN's open
+question — owner veto welcome). Completes US-3.
+   EXIT GATE: tdd/e2e/test_experiment_matrix.py green (2 models x 2 prompts
+   on mock-model runners, asserts per-variant aggregation); leaderboard +
+   experiment-launch Playwright spec (R8).
+
+#### Phase 12.6.6 — Spec-curated agent context  [B, needs 12.2.5 + 12.2.6 + 12.5; measured via 12.6.5]
+
+Per-card context bundle from linked feature/story/criteria INCLUDING related
+TestRef file paths ("these tests already cover related criteria — read, don't
+duplicate"), token-budget truncation, {spec_context} PromptTemplate
+placeholder -> /workspace/.control/spec_context.md via the control layer;
+agent wrapper injects it. Measure the effect with a 12.6.5 experiment.
+   EXIT GATE: bundle-content tests (incl. TestRef paths + truncation);
+   wrapper-injection test; one experiment comparing with/without curation.
+
+#### Phase 12.7 — Debug re-run mode  [A, after 12.5]
+
+Rebuild from spec against the 12.2-INT executor. failure_01 contributes
+shelf-ready leaves (debug state machine + tests, schemas, sidecar image) and
+UX reference (DebugRerunModal, breakpoint checkboxes, join command). New
+work: session-service lifecycle (create actually starts the run; resume
+does not end multi-breakpoint sessions), terminal I/O bridge, breakpoint =
+pre-step gate in the executor. Sidecar-vs-shell split per the audit.
+   EXIT GATE: e2e — failed dogfood-style run re-run with a breakpoint,
+   terminal attach, resume to completion; debug UI Playwright spec (R8).
+
+#### Phase 12.8 — Cleanup & polish  [epilogue]
+
+v1 array pipeline format decision (recommend: execution goes graph-only, v1
+auto-converts at the API/YAML boundary via array_to_graph; OWNER CONFIRMS
+before removal); dogfood pipeline converted to v2 graph; runner-common
+adopted everywhere (12.0 finally true); audit PLAN 12.8's regression matrix
+against the dogfood suite and backfill gaps (the suite absorbs its intent —
+stated, not silent); dead-code sweep; docs; retire completed phase sections
+to historical-documents/.
+
+### Decision log (attempt #3)
+
+- 2026-08-29 Scope: all of 12.x; K8s stays future. (Owner)
+- 2026-08-29 No external CI ever; self-host ASAP. (Owner)
+- 2026-08-29 12.6 loopback-first; remote hardware manual. (Owner)
+- 2026-08-29 12.2.6 re-sequenced AFTER 12.3 (protocol froze in January;
+  retrofit is deliberate). (Claude, from audit)
+- 2026-08-29 Workspace population: helper-container clone over a named
+  compose network into /workspace/repo. (Claude — veto welcome)
+- 2026-08-29 Interim DooD: dedicated CI runner with Docker socket for the T2
+  tier until 12.4's step-container socket option. (Claude — veto welcome)
+- 2026-08-29 Playground migrates off job_queue in 12.5. (Claude)
+- 2026-08-29 NativeOrchestrator deferred; runner-agent executor seam stays
+  pluggable/Docker-agnostic for runpod-style + OpenAI-compatible agents.
+  (Claude, honoring owner's hybrid-model ambition)
+- 2026-08-29 12.6.5 guardrails: dry-run estimate + per-experiment cap, not
+  confirm-only. (Claude — veto welcome)
+- OPEN: v1 pipeline retirement shape (12.8, owner confirms).
 
 ---
 

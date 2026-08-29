@@ -53,3 +53,6 @@ frontend/test-results/
 htmlcov/
 coverage.xml
 .coverage
+
+# CI gate transient junit outputs (local tier runs)
+junit-t*.xml

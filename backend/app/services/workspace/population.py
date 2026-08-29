@@ -134,6 +134,16 @@ async def pre_pull_images(client=None) -> None:
         logger.exception("Image pre-pull task failed")
 
 
+# The uid/gid the lazyaf images pin for their non-root step user (see
+# images/base/Dockerfile: useradd lazyaf -u 1000). The clone helper runs as
+# root, so the repo must be handed to that user or control-mode steps cannot
+# write build artifacts into it (dogfood run 9b52ebbe: uv sync -> EACCES on
+# /workspace/repo/backend/.venv). Root-running stock-image steps are
+# unaffected either way.
+WORKSPACE_STEP_UID = 1000
+WORKSPACE_STEP_GID = 1000
+
+
 def _build_clone_script(clone_url: str, branch: str, commit_sha: str | None) -> str:
     """Build the bash script the helper container runs."""
     lines = [
@@ -143,6 +153,9 @@ def _build_clone_script(clone_url: str, branch: str, commit_sha: str | None) -> 
     ]
     if commit_sha:
         lines.append(f"git checkout --detach {shlex.quote(commit_sha)}")
+    lines.append(
+        f"chown -R {WORKSPACE_STEP_UID}:{WORKSPACE_STEP_GID} /workspace/repo"
+    )
     return "\n".join(lines)
 
 

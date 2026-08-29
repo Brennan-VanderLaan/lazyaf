@@ -4,8 +4,8 @@
     "note": "Ported 12.6 contract suites (tdd/unit/execution/) held dormant behind importorskip until their targets land. R4 ratchet: these must hit zero skips by 12.6's exit gate; each module that wakes up shrinks this to eventually nothing."
   },
   {
-    "reason_prefix": "Requires async log streaming implementation",
-    "note": "test_local_executor_real_docker.py::TestRealTimeout - timeout cannot fire while log reading blocks; unskip when LocalExecutor gains async log streaming (12.2-INT hardening)."
+    "reason_prefix": "e2e-lane: ",
+    "note": "Tests that need a live backend URL reachable from the container network (workspace-population real-http clone). Gated on ENV PRESENCE (E2E_BACKEND_URL/BACKEND_URL), never availability: env set + backend unreachable = loud failure. They execute in the compose e2e lane where the env is set; skipping there is out-of-baseline by definition (reason changes when env is set - it cannot skip)."
   },
   {
     "reason_prefix": "Legacy pipeline format removed",

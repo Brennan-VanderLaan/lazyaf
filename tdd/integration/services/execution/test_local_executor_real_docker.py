@@ -95,7 +95,9 @@ class TestRealContainerSpawning:
         config = {
             "type": "script",
             "command": "echo 'hello from container'",
-            "image": "alpine:latest",
+            # String commands are bash-wrapped (12.2-INT hardening) - needs an
+            # image with bash; list-command tests below still cover alpine.
+            "image": "python:3.12-slim",
             "timeout": 30,
         }
 
@@ -194,7 +196,8 @@ class TestRealVolumeMounting:
         config = {
             "type": "script",
             "command": "cat /workspace/repo/testfile.txt",
-            "image": "alpine:latest",
+            # bash-wrapped string command (12.2-INT hardening) - image needs bash
+            "image": "python:3.12-slim",
             "timeout": 30,
         }
 
@@ -225,7 +228,8 @@ class TestRealVolumeMounting:
         config = {
             "type": "script",
             "command": "pwd",
-            "image": "alpine:latest",
+            # bash-wrapped string command (12.2-INT hardening) - image needs bash
+            "image": "python:3.12-slim",
             "timeout": 30,
         }
 
@@ -319,18 +323,13 @@ class TestRealEnvironmentVariables:
 class TestRealTimeout:
     """Tests that verify real timeout handling."""
 
-    @pytest.mark.skip(reason="Requires async log streaming implementation - timeout not triggered when logs block")
     @pytest.mark.timeout(15)
     async def test_timeout_kills_real_container(self, docker_client, execution_context, cleanup_volume):
         """Timeout kills a long-running container.
 
-        NOTE: This test is skipped because the current LocalExecutor implementation
-        uses blocking log streaming (container.logs(stream=True, follow=True)).
-        The timeout is applied to container.wait(), but we never reach that call
-        because log streaming blocks until container exits.
-
-        TODO: Implement async log streaming with concurrent timeout handling.
-        The unit tests verify timeout behavior using mocks.
+        Un-skipped at 12.2-INT (R4 ratchet): LocalExecutor now streams logs
+        through a pump thread + asyncio queue, so the deadline fires DURING
+        log streaming instead of waiting for container.wait().
         """
         from app.services.execution.local_executor import LocalExecutor
 

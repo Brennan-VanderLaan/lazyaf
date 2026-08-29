@@ -1155,3 +1155,229 @@ def list_repo_pipelines(repo_id: str, branch: str = "") -> dict:
         if response.status_code != 200:
             return {"error": f"Failed to list repo pipelines: {response.text}"}
         return {"pipelines": response.json()}
+
+
+# =============================================================================
+# Specification Layer (Phase 12.2.5) Tools
+# =============================================================================
+
+@mcp.tool()
+def list_features() -> dict:
+    """
+    List all spec-layer features.
+
+    Returns features in {"features": [...]} format with title, status
+    (draft|active|done), and the repo IDs each feature touches.
+    """
+    with _get_client() as client:
+        response = client.get("/api/features")
+        if response.status_code != 200:
+            return {"error": f"Failed to list features: {response.text}"}
+        return {"features": response.json()}
+
+
+@mcp.tool()
+def get_feature(feature_id: str) -> dict:
+    """
+    Get a feature with its user stories.
+
+    Args:
+        feature_id: The feature ID (UUID string)
+
+    Returns the feature details plus its user stories in
+    {"feature": {...}, "stories": [...]} format.
+    """
+    with _get_client() as client:
+        response = client.get(f"/api/features/{feature_id}")
+        if response.status_code == 404:
+            return {"error": f"Feature {feature_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to get feature: {response.text}"}
+        feature = response.json()
+
+        stories_response = client.get(f"/api/features/{feature_id}/stories")
+        stories = stories_response.json() if stories_response.status_code == 200 else []
+        return {"feature": feature, "stories": stories}
+
+
+@mcp.tool()
+def create_feature(
+    title: str,
+    description: str = "",
+    status: str = "draft",
+    repo_ids: list[str] | None = None,
+) -> dict:
+    """
+    Create a spec-layer feature (a product capability, cross-repo by design).
+
+    Args:
+        title: Feature title
+        description: Free-form markdown product narrative
+        status: One of "draft" (default), "active", "done"
+        repo_ids: Optional list of repo IDs this feature touches
+
+    Returns the created feature details.
+    """
+    with _get_client() as client:
+        payload = {
+            "title": title,
+            "description": description,
+            "status": status,
+            "repo_ids": repo_ids or [],
+        }
+        response = client.post("/api/features", json=payload)
+        if response.status_code not in (200, 201):
+            return {"error": f"Failed to create feature: {response.text}"}
+        feature = response.json()
+        feature["message"] = "Feature created successfully"
+        return feature
+
+
+@mcp.tool()
+def create_user_story(
+    feature_id: str,
+    title: str,
+    narrative: str = "",
+    status: str = "draft",
+    priority: int | None = None,
+) -> dict:
+    """
+    Create a user story under a feature.
+
+    Args:
+        feature_id: Parent feature ID
+        title: Story title, e.g. "User can revoke an API key"
+        narrative: Free-form narrative ("When X, then Y, so that Z") — markdown OK
+        status: One of "draft" (default), "accepted", "in_progress", "done", "blocked"
+        priority: Optional plain integer priority (not story points)
+
+    Returns the created user story details.
+    """
+    with _get_client() as client:
+        payload = {
+            "feature_id": feature_id,
+            "title": title,
+            "narrative": narrative,
+            "status": status,
+            "priority": priority,
+        }
+        response = client.post("/api/user-stories", json=payload)
+        if response.status_code == 404:
+            return {"error": f"Feature {feature_id} not found"}
+        if response.status_code not in (200, 201):
+            return {"error": f"Failed to create user story: {response.text}"}
+        story = response.json()
+        story["message"] = "User story created successfully"
+        return story
+
+
+@mcp.tool()
+def create_criterion(
+    user_story_id: str,
+    text: str,
+    required: bool = True,
+    notes: str = "",
+) -> dict:
+    """
+    Create an acceptance criterion under a user story.
+
+    Args:
+        user_story_id: Parent user story ID
+        text: The criterion text (what must be true for the story to hold)
+        required: Whether this criterion is required for the story to be done
+            (default True). The blocks-done rule activates in Phase 12.2.6.
+        notes: Optional free-form notes
+
+    Returns the created criterion details.
+    """
+    with _get_client() as client:
+        payload = {
+            "user_story_id": user_story_id,
+            "text": text,
+            "required": required,
+            "notes": notes or None,
+        }
+        response = client.post("/api/criteria", json=payload)
+        if response.status_code == 404:
+            return {"error": f"User story {user_story_id} not found"}
+        if response.status_code not in (200, 201):
+            return {"error": f"Failed to create criterion: {response.text}"}
+        criterion = response.json()
+        criterion["message"] = "Criterion created successfully"
+        return criterion
+
+
+@mcp.tool()
+def list_prompt_templates() -> dict:
+    """
+    List all spec-layer prompt templates.
+
+    Returns templates in {"prompt_templates": [...]} format with name
+    (unique), description, and content.
+    """
+    with _get_client() as client:
+        response = client.get("/api/prompt-templates")
+        if response.status_code != 200:
+            return {"error": f"Failed to list prompt templates: {response.text}"}
+        return {"prompt_templates": response.json()}
+
+
+@mcp.tool()
+def create_prompt_template(name: str, description: str = "", content: str = "") -> dict:
+    """
+    Create a spec-layer prompt template.
+
+    Args:
+        name: Unique template name
+        description: What this template is for
+        content: The template body
+
+    Returns the created template details. Fails with an error if the name
+    is already taken.
+    """
+    with _get_client() as client:
+        payload = {"name": name, "description": description, "content": content}
+        response = client.post("/api/prompt-templates", json=payload)
+        if response.status_code == 409:
+            return {"error": f"Prompt template named '{name}' already exists"}
+        if response.status_code not in (200, 201):
+            return {"error": f"Failed to create prompt template: {response.text}"}
+        template = response.json()
+        template["message"] = "Prompt template created successfully"
+        return template
+
+
+@mcp.tool()
+def link_card_to_story(card_id: str, user_story_id: str) -> dict:
+    """
+    Link a card to a user story (and its parent feature).
+
+    Args:
+        card_id: The card ID
+        user_story_id: The user story ID to link the card to
+
+    Sets both user_story_id and feature_id (derived from the story) on the
+    card. Returns the updated card details.
+    """
+    with _get_client() as client:
+        story_response = client.get(f"/api/user-stories/{user_story_id}")
+        if story_response.status_code == 404:
+            return {"error": f"User story {user_story_id} not found"}
+        if story_response.status_code != 200:
+            return {"error": f"Failed to get user story: {story_response.text}"}
+        story = story_response.json()
+
+        response = client.patch(
+            f"/api/cards/{card_id}",
+            json={
+                "user_story_id": user_story_id,
+                "feature_id": story["feature_id"],
+            },
+        )
+        if response.status_code == 404:
+            return {"error": f"Card {card_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to link card: {response.text}"}
+        card = response.json()
+        card["message"] = "Card linked to user story successfully"
+        return card

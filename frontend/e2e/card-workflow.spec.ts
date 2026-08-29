@@ -8,48 +8,17 @@
  * 4. Watch status updates in real-time
  * 5. View diff when complete
  *
- * Prerequisites:
- *   - Backend running: cd backend && uvicorn app.main:app --reload
- *   - Frontend running: cd frontend && npm run dev
- *   - For full tests: Mock runner: docker-compose --profile testing up runner-mock
+ * Prerequisites: the compose e2e stack (see e2e/README.md). URLs come from
+ * BACKEND_URL/FRONTEND_URL env vars (defaults match the e2e profile).
  */
 
 import { test, expect, type Page } from '@playwright/test';
-
-// Test configuration
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
-
-// Helper: Create a test repo via API (faster than UI for setup)
-async function createTestRepo(page: Page): Promise<string> {
-  const response = await page.request.post(`${BACKEND_URL}/api/repos`, {
-    data: {
-      name: `e2e-test-${Date.now()}`,
-      default_branch: 'main',
-    },
-  });
-  expect(response.ok()).toBeTruthy();
-  const repo = await response.json();
-  return repo.id;
-}
+import { BACKEND_URL, createTestRepo, selectRepo } from './helpers';
 
 // Helper: Wait for WebSocket connection
 async function waitForWebSocket(page: Page) {
   // The app connects to WebSocket on load - wait for it to establish
   await page.waitForTimeout(1000);
-}
-
-// Helper: Select a repo in the sidebar
-async function selectRepo(page: Page, repoName: string) {
-  // Wait for repo list to load
-  await page.waitForSelector('.repo-item', { timeout: 5000 });
-
-  // Find and click the specific repo
-  const repoItem = page.locator('.repo-item').filter({ hasText: repoName });
-  await expect(repoItem).toBeVisible({ timeout: 5000 });
-  await repoItem.click();
-
-  // Wait for board to show the selected repo
-  await expect(page.locator('.board-header h1')).toContainText(repoName, { timeout: 5000 });
 }
 
 
@@ -64,7 +33,7 @@ test.describe('Board Page - Basic UI', () => {
 
   test('repo selector shows list of repositories', async ({ page }) => {
     // Create a repo first
-    const repoId = await createTestRepo(page);
+    await createTestRepo(page);
 
     await page.goto('/');
     await page.reload(); // Refresh to load repos
@@ -81,12 +50,7 @@ test.describe('Card Creation - UI Flow', () => {
 
   test.beforeEach(async ({ page }) => {
     // Create a test repo via API
-    repoName = `e2e-card-test-${Date.now()}`;
-    const response = await page.request.post(`${BACKEND_URL}/api/repos`, {
-      data: { name: repoName, default_branch: 'main' },
-    });
-    const repo = await response.json();
-    repoId = repo.id;
+    ({ id: repoId, name: repoName } = await createTestRepo(page, 'e2e-card-test'));
   });
 
   test('can create a new card via UI', async ({ page }) => {
@@ -161,12 +125,7 @@ test.describe('Card Status Updates - UI Flow', () => {
   let repoName: string;
 
   test.beforeEach(async ({ page }) => {
-    repoName = `e2e-status-test-${Date.now()}`;
-    const response = await page.request.post(`${BACKEND_URL}/api/repos`, {
-      data: { name: repoName, default_branch: 'main' },
-    });
-    const repo = await response.json();
-    repoId = repo.id;
+    ({ id: repoId, name: repoName } = await createTestRepo(page, 'e2e-status-test'));
 
     // Initialize repo with git data for testing (required for starting cards)
     const setupResponse = await page.request.post(`${BACKEND_URL}/api/repos/${repoId}/test-setup`);
@@ -245,12 +204,7 @@ test.describe('Real-time Updates via WebSocket', () => {
   let repoName: string;
 
   test.beforeEach(async ({ page }) => {
-    repoName = `e2e-ws-test-${Date.now()}`;
-    const response = await page.request.post(`${BACKEND_URL}/api/repos`, {
-      data: { name: repoName, default_branch: 'main' },
-    });
-    const repo = await response.json();
-    repoId = repo.id;
+    ({ id: repoId, name: repoName } = await createTestRepo(page, 'e2e-ws-test'));
   });
 
   test('UI updates when card status changes via API', async ({ page }) => {
@@ -303,13 +257,8 @@ test.describe('Full E2E with Mock Runner', () => {
   let repoName: string;
 
   test.beforeEach(async ({ page }) => {
-    repoName = `e2e-runner-test-${Date.now()}`;
     // Need an ingested repo for real execution
-    const response = await page.request.post(`${BACKEND_URL}/api/repos`, {
-      data: { name: repoName, default_branch: 'main' },
-    });
-    const repo = await response.json();
-    repoId = repo.id;
+    ({ id: repoId, name: repoName } = await createTestRepo(page, 'e2e-runner-test'));
 
     // Initialize repo with git data for testing
     const setupResponse = await page.request.post(`${BACKEND_URL}/api/repos/${repoId}/test-setup`);

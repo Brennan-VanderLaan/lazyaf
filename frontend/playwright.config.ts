@@ -1,55 +1,52 @@
 import { defineConfig, devices } from '@playwright/test';
 
 /**
- * Playwright E2E Test Configuration for LazyAF Frontend
+ * Playwright E2E configuration for the LazyAF frontend.
  *
- * These tests verify the full user workflow through the actual UI:
- * - Browser interactions with Svelte components
- * - Real-time updates via WebSocket
- * - Integration with backend API
+ * This is the REAL-BACKEND tier: every spec talks to a live backend
+ * (docker compose "e2e" profile) through a vite dev server. See e2e/README.md
+ * for the full startup/teardown flow.
  *
- * Prerequisites:
- *   1. Backend running: cd backend && uvicorn app.main:app --reload
- *   2. Frontend running: cd frontend && npm run dev
- *   3. Mock runner (for full tests): docker-compose --profile testing up runner-mock
+ * URLs are env-var driven; the defaults match the compose e2e profile
+ * (backend-e2e on :8765) and a dedicated e2e frontend port (:5174) so this
+ * lane never collides with a developer's normal `npm run dev` on :5173
+ * proxying to the dev backend on :8000.
  */
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5174';
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8765';
+const FRONTEND_PORT = new URL(FRONTEND_URL).port || '5174';
+
 export default defineConfig({
   testDir: './e2e',
 
-  // Run tests in parallel
-  fullyParallel: true,
+  // WORKERS MUST STAY AT 1 FOR THIS TIER. All specs share one backend, one
+  // SQLite DB, and a global /api/test/reset that also wipes in-memory
+  // singletons (standing rule R6). Parallel workers reset state out from
+  // under each other - attempt #1 raised workers against a shared-DB global
+  // reset an hour before the branch was abandoned (post-mortem landmine 8).
+  // If parallelism is ever needed, it requires per-worker namespacing first.
+  workers: 1,
+  fullyParallel: false,
 
-  // Fail the build on CI if you accidentally left test.only in the source code
   forbidOnly: !!process.env.CI,
-
-  // Retry on CI only
   retries: process.env.CI ? 2 : 0,
 
-  // Opt out of parallel tests on CI
-  workers: process.env.CI ? 1 : undefined,
+  // Real pipeline runs (runner polling + container script execution) take
+  // tens of seconds; specs use bounded expect timeouts within this budget.
+  timeout: 120_000,
 
-  // Reporter to use
   reporter: [
     ['html', { open: 'never' }],
     ['list'],
   ],
 
-  // Shared settings for all projects
   use: {
-    // Base URL for the frontend
-    baseURL: process.env.FRONTEND_URL || 'http://localhost:5173',
-
-    // Collect trace when retrying the failed test
+    baseURL: FRONTEND_URL,
     trace: 'on-first-retry',
-
-    // Screenshot on failure
     screenshot: 'only-on-failure',
-
-    // Video on failure
     video: 'on-first-retry',
   },
 
-  // Configure projects for major browsers
   projects: [
     {
       name: 'chromium',
@@ -57,20 +54,26 @@ export default defineConfig({
     },
   ],
 
-  // Run your local dev server before starting the tests (optional)
-  // Uncomment if you want Playwright to start the servers automatically
-  // webServer: [
-  //   {
-  //     command: 'cd ../backend && uvicorn app.main:app --port 8000',
-  //     url: 'http://localhost:8000/health',
-  //     reuseExistingServer: !process.env.CI,
-  //     timeout: 30000,
-  //   },
-  //   {
-  //     command: 'npm run dev',
-  //     url: 'http://localhost:5173',
-  //     reuseExistingServer: !process.env.CI,
-  //     timeout: 30000,
-  //   },
-  // ],
+  // Startup choice (documented in e2e/README.md):
+  //  - Frontend: Playwright OWNS it, exclusively. The vite dev server is
+  //    started here on the dedicated e2e port, proxying /api and /ws to
+  //    BACKEND_URL. reuseExistingServer is deliberately false and the
+  //    command uses --strictPort: a stray process already squatting on the
+  //    e2e port (a forgotten dev server, possibly pointed at the WRONG
+  //    backend) fails the run LOUDLY instead of being silently reused.
+  //    Nothing else may pre-start this server - scripts/test.ps1|test.sh
+  //    only manage the compose stack.
+  //  - Backend: started EXTERNALLY (docker compose --profile e2e, plus the
+  //    frontend/e2e/compose.test-mode.yml override for the test-mode API).
+  //    Playwright's webServer has no teardown story for compose stacks, and
+  //    owning half a stack's lifecycle from here would hide failures - the
+  //    helpers fail loudly with the exact startup command when the backend
+  //    is missing or lacks LAZYAF_TEST_MODE.
+  webServer: {
+    command: `npm run dev -- --port ${FRONTEND_PORT} --strictPort`,
+    url: FRONTEND_URL,
+    reuseExistingServer: false,
+    timeout: 60_000,
+    env: { VITE_BACKEND_URL: BACKEND_URL },
+  },
 });

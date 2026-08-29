@@ -1,9 +1,9 @@
 # LazyAF Test Runner Script (PowerShell)
-# Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|all|coverage]
+# Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|slow|tier|all|coverage]
 
 param(
     [Parameter(Position=0)]
-    [ValidateSet("unit", "integration", "demo", "e2e", "graph", "all", "coverage", "help")]
+    [ValidateSet("unit", "integration", "demo", "e2e", "graph", "slow", "tier", "all", "coverage", "help")]
     [string]$TestType = "all",
 
     [Parameter(ValueFromRemainingArguments=$true)]
@@ -23,13 +23,35 @@ $FrontendPort = 5174
 $BackendUrl = "http://localhost:$BackendPort"
 $FrontendUrl = "http://localhost:$FrontendPort"
 
-# Process handles for cleanup
-$script:FrontendProcess = $null
+function Get-Python {
+    # `python` is the Windows convention; fall back to `py`/`python3`.
+    foreach ($candidate in @("python", "py", "python3")) {
+        if (Get-Command $candidate -ErrorAction SilentlyContinue) {
+            return $candidate
+        }
+    }
+    throw "No Python interpreter found (tried python, py, python3)"
+}
+
+function Invoke-RunTier {
+    # Single-sourced CI tiers: selection + junitxml + R4 gate all live in
+    # scripts/run_tier.py (same script the dogfood pipeline runs).
+    param([string[]]$Tiers)
+
+    $python = Get-Python
+    & $python (Join-Path $ScriptDir "run_tier.py") @Tiers
+    if ($LASTEXITCODE -ne 0) {
+        throw "run_tier.py failed (exit $LASTEXITCODE)"
+    }
+}
 
 function Cleanup {
     Write-Host "Cleaning up..." -ForegroundColor Yellow
 
-    # Stop Docker backend - only stop specific e2e containers, not all containers
+    # Stop Docker backend - only stop specific e2e containers, not all
+    # containers. The vite dev server is Playwright-owned (see
+    # playwright.config.ts) and torn down by Playwright itself - this script
+    # only manages the compose stack.
     Write-Host "Stopping E2E backend containers..."
     Push-Location $ProjectRoot
     try {
@@ -38,19 +60,6 @@ function Cleanup {
     }
     catch { }
     Pop-Location
-
-    # Kill frontend process tree (cmd.exe + node/vite child processes)
-    if ($script:FrontendProcess) {
-        try {
-            if (!$script:FrontendProcess.HasExited) {
-                Write-Host "Stopping frontend (PID: $($script:FrontendProcess.Id)) and child processes..."
-                # Kill the entire process tree using taskkill /T
-                & cmd.exe /c "taskkill /PID $($script:FrontendProcess.Id) /T /F" 2>$null
-            }
-        }
-        catch { }
-    }
-
 }
 
 function Wait-ForService {
@@ -88,12 +97,15 @@ function Start-E2EBackend {
     Push-Location $ProjectRoot
 
     try {
-        # Rebuild and start e2e containers to ensure latest code
+        # Rebuild and start e2e containers to ensure latest code.
+        # The compose override enables the env-gated test-mode API
+        # (LAZYAF_TEST_MODE) that the Playwright specs reset/seed through.
+        $ComposeFiles = "-f docker-compose.yml -f frontend/e2e/compose.test-mode.yml"
         Write-Host "Building e2e containers..."
-        & cmd.exe /c "docker compose --profile e2e build"
+        & cmd.exe /c "docker compose $ComposeFiles --profile e2e build"
 
         # Start backend container with e2e profile
-        & cmd.exe /c "docker compose --profile e2e up -d backend-e2e runner-mock-e2e"
+        & cmd.exe /c "docker compose $ComposeFiles --profile e2e up -d backend-e2e runner-mock-e2e"
 
         # Wait for container health check
         Write-Host "Waiting for backend container to be healthy..."
@@ -124,28 +136,10 @@ function Start-E2EBackend {
     }
 }
 
-function Start-E2EFrontend {
-    Write-Host "Starting E2E frontend on port $FrontendPort..." -ForegroundColor Cyan
-    Push-Location $FrontendDir
-
-    try {
-        $env:VITE_BACKEND_URL = $BackendUrl
-
-        # Start frontend in a separate minimized window to avoid terminal issues
-        $script:FrontendProcess = Start-Process -FilePath "cmd.exe" `
-            -ArgumentList "/c", "npm run dev -- --port $FrontendPort" `
-            -WindowStyle Minimized -PassThru
-
-        if (-not (Wait-ForService -Url $FrontendUrl -Name "Frontend")) {
-            throw "Frontend failed to start"
-        }
-    }
-    finally {
-        Pop-Location
-    }
-}
-
 function Run-E2ETests {
+    # Playwright OWNS the vite dev server (reuseExistingServer: false,
+    # --strictPort): it starts it on $FrontendUrl's port and fails loudly if
+    # a stray process is already squatting there. Do not pre-start vite here.
     param(
         [string[]]$Args
     )
@@ -166,15 +160,17 @@ function Run-E2ETests {
 }
 
 function Show-Help {
-    Write-Host "Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|all|coverage]" -ForegroundColor Cyan
+    Write-Host "Usage: .\scripts\test.ps1 [unit|integration|demo|e2e|graph|slow|tier|all|coverage]" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  unit        - Run fast isolated unit tests"
     Write-Host "  integration - Run API and database tests"
     Write-Host "  demo        - Run workflow demonstrations"
-    Write-Host "  e2e         - Run full E2E tests (starts Docker backend + frontend)"
+    Write-Host "  e2e         - Run full E2E tests (starts Docker backend; Playwright owns vite)"
     Write-Host "  graph       - Run graph pipeline E2E tests (starts Docker backend only)"
+    Write-Host "  slow        - Run the @slow full-stack e2e tests in the compose stack (no CI tier runs these)"
+    Write-Host "  tier        - Run gated CI tier(s) via scripts/run_tier.py (e.g. 'tier T1')"
     Write-Host "  coverage    - Run tests with coverage report"
-    Write-Host "  all         - Run unit, integration, and demo tests (default, no Docker)"
+    Write-Host "  all         - Run the no-Docker CI tiers T1 + T3 (default; T2 needs Docker)"
     Write-Host ""
     Write-Host "E2E options (after 'e2e'):" -ForegroundColor Cyan
     Write-Host "  --headed    - Run with visible browser"
@@ -185,8 +181,8 @@ function Show-Help {
     Write-Host "  -k 'pattern'  - Run tests matching pattern"
     Write-Host "  --tb=long     - Show full tracebacks"
     Write-Host ""
-    Write-Host "Note: 'all' runs fast tests only (no Docker required)." -ForegroundColor Yellow
-    Write-Host "      Use 'e2e' or 'graph' for full E2E tests with Docker."
+    Write-Host "Note: 'all' runs the no-Docker gated tiers only." -ForegroundColor Yellow
+    Write-Host "      Use 'tier T2' for Docker integration, 'e2e'/'graph' for full E2E."
 }
 
 # Register cleanup handler
@@ -229,9 +225,8 @@ try {
 
             try {
                 Start-E2EBackend
-                Start-E2EFrontend
 
-                # Run Playwright browser tests
+                # Run Playwright browser tests (Playwright starts + owns vite)
                 Write-Host "Running Playwright browser tests..." -ForegroundColor Yellow
                 Run-E2ETests -Args $ExtraArgs
 
@@ -278,16 +273,37 @@ try {
                 Pop-Location
             }
         }
-        "all" {
-            Push-Location $BackendDir
+        "slow" {
+            # The 21 @slow full-stack e2e tests (control layer, real card
+            # execution, graph pipeline). They run in NO CI tier today
+            # (stated exclusion per R4 - see tdd/README.md): they need this
+            # compose stack, which the legacy runner cannot host. Dogfood CI
+            # picks them up at Phase 12.4/12.5.
+            Write-Host "Running slow full-stack e2e tests (compose stack, in-container)..." -ForegroundColor Cyan
+
             try {
-                Write-Host "Running all tests (unit, integration, demos)..." -ForegroundColor Cyan
-                Write-Host "Note: E2E tests excluded - run 'test.ps1 e2e' or 'test.ps1 graph' for full E2E testing" -ForegroundColor Yellow
-                uv run pytest ../tdd/unit ../tdd/integration ../tdd/demos -v --tb=short
+                Start-E2EBackend
+
+                $argsString = ($ExtraArgs -join " ")
+                & cmd.exe /c "docker exec -w /app -e PYTHONPATH=/app -e E2E_BACKEND_URL=http://localhost:8000 lazyaf-backend-e2e-1 uv run pytest /tdd/e2e -m slow -v --tb=short $argsString"
             }
             finally {
-                Pop-Location
+                Cleanup
             }
+        }
+        "tier" {
+            if (-not $ExtraArgs -or $ExtraArgs.Count -eq 0) {
+                throw "Usage: .\scripts\test.ps1 tier T1 [T2 T3 ...]"
+            }
+            Invoke-RunTier -Tiers $ExtraArgs
+        }
+        "all" {
+            # No-Docker lanes only: T1 + T3 via the single-sourced tier
+            # script. T2 (Docker-dependent) is deliberately excluded - run
+            # '.\scripts\test.ps1 tier T2' with Docker up, or the pipeline.
+            Write-Host "Running all no-Docker tiers (T1 + T3)..." -ForegroundColor Cyan
+            Write-Host "Note: T2 (Docker) and slow E2E excluded - see 'tier T2' / 'e2e' / 'graph'" -ForegroundColor Yellow
+            Invoke-RunTier -Tiers @("T1", "T3")
         }
         "help" {
             Show-Help

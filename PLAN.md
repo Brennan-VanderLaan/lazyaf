@@ -383,7 +383,16 @@ all three ci_gate floors enforced, run `cda4ddce` PASSED via push trigger).
 Definition sync-on-push, trigger dedup, alembic migrations, test-mode API,
 12.6 contract suite (dormant), frontend testids + vitest layer, Playwright
 dogfood-live spec all landed; 10 confirmed review findings fixed pre-commit.
-Next: Phase 12.2-INT.
+
+**Phase 12.2-INT + 12.2.5: COMPLETE (2026-08-29).** Dogfood CI runs end-to-end
+on the new architecture: run 71d56980 (push-triggered) executed every step in
+ephemeral containers on a persistent workspace volume, verify_executor
+confirmed executor='local' for all 6 steps, all tier gates green (T1 1379 /
+T2 41 / T3 17), workspace created+cleaned (0 leaked). Spec layer live with
+the three north-star stories seeded; live WS step streaming in the UI with a
+contract-pinning test. Ten more confirmed review findings fixed pre-commit;
+dogfood run cccae257 caught a DooD landmine-2 seam the review missed (fixed).
+Next: Phase 12.3 (real step images + control layer).
 
 Phase 12.1 deliverables (COMPLETE):
   - `StepExecution` model with unique `execution_key` for idempotency

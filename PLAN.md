@@ -392,7 +392,17 @@ T2 41 / T3 17), workspace created+cleaned (0 leaked). Spec layer live with
 the three north-star stories seeded; live WS step streaming in the UI with a
 contract-pinning test. Ten more confirmed review findings fixed pre-commit;
 dogfood run cccae257 caught a DooD landmine-2 seam the review missed (fixed).
-Next: Phase 12.3 (real step images + control layer).
+**Phase 12.3: COMPLETE (2026-08-29).** Real images (lazyaf-{base,claude,
+test-runner}:dev, reproducible content-hash builds), in-container control
+runtime reporting to the live steps API, one reporting path with terminal
+reconciliation, dogfood CI fully on the new stack. Exit gate: run #11 passed
+with all tier gates green in control-mode containers and verify_executor
+confirming executor='local' + delivered logs. Six dogfood iterations (#5-#11)
+each caught a real environment seam host testing could not: repo uid
+ownership, async completion timing, socket group across gosu, platform-
+dependent tree-hash collation, cross-uid git trust, docker client timeout
+under DooD load, sibling-network reachability — all regression-tested now.
+Next: Phase 12.2.6 (test tie-back) + Phase 12.4 (runner slimming).
 
 Phase 12.1 deliverables (COMPLETE):
   - `StepExecution` model with unique `execution_key` for idempotency

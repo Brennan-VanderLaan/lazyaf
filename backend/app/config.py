@@ -67,6 +67,14 @@ class Settings(BaseModel):
     # Secret for step auth tokens (control layer <-> /api/steps/*). Default is
     # the long-standing dev constant; override in real deployments.
     step_auth_secret: str = "lazyaf-step-auth-secret-key-change-in-production"
+    # --- Runner socket (Phase 12.6) ---
+    # Shared ENROLLMENT secret checked at the /ws/runner HTTP upgrade, before
+    # accept(). Same house pattern as step_auth_secret: a dev constant that a
+    # real deployment overrides. It authenticates the FLEET, not an identity -
+    # a runner_id is client-asserted, and the real per-runner guards are
+    # duplicate-connection rejection and the step gate. The per-runner JWT
+    # upgrade (services/execution/runner_token.py) signs with this same secret.
+    runner_auth_secret: str = "lazyaf-runner-auth-secret-key-change-in-production"
     # --- Usage channel (Phase 12.5) ---
     # Self-hosted node hourly rates, addressed by node id (api-surface 2.5):
     #   {"runpod-a100-80g": {"rate_usd_hour": "1.89", "note": "..."}}
@@ -101,6 +109,10 @@ def get_settings() -> Settings:
         step_auth_secret=os.getenv(
             "LAZYAF_STEP_AUTH_SECRET",
             "lazyaf-step-auth-secret-key-change-in-production",
+        ),
+        runner_auth_secret=os.getenv(
+            "LAZYAF_RUNNER_AUTH_SECRET",
+            "lazyaf-runner-auth-secret-key-change-in-production",
         ),
         gpu_node_rates=_parse_gpu_node_rates(os.getenv("LAZYAF_GPU_NODE_RATES")),
     )

@@ -236,7 +236,7 @@ class TestCardDeletionWebSocketBroadcast:
 class TestCardActionWebSocketBroadcasts:
     """Tests for WebSocket broadcasts on card lifecycle actions."""
 
-    async def test_start_card_broadcasts_with_timestamps(self, client, ingested_repo, clean_job_queue, mock_ws):
+    async def test_start_card_broadcasts_with_timestamps(self, client, ingested_repo, clean_runner_registry, mock_ws):
         """Starting a card broadcasts update with timestamps."""
         create_response = await client.post(
             f"/api/repos/{ingested_repo['id']}/cards",
@@ -348,7 +348,7 @@ class TestCardActionWebSocketBroadcasts:
         assert payload["created_at"] == rejected_card["created_at"]
         assert payload["updated_at"] == rejected_card["updated_at"]
 
-    async def test_retry_card_broadcasts_with_timestamps(self, client, ingested_repo, clean_job_queue, mock_ws):
+    async def test_retry_card_broadcasts_with_timestamps(self, client, ingested_repo, clean_runner_registry, mock_ws):
         """Retrying a card broadcasts update with timestamps."""
         create_response = await client.post(
             f"/api/repos/{ingested_repo['id']}/cards",

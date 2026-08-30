@@ -1,6 +1,24 @@
 export type CardStatus = 'todo' | 'in_progress' | 'in_review' | 'done' | 'failed';
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed';
-export type RunnerStatus = 'idle' | 'busy' | 'offline';
+// Phase 12.6 cross-agent contract #4: `RunnerState` is the SINGLE status
+// vocabulary shared by the state machine, the `runners.status` column, the
+// API and this UI. The old `RunnerStatus` ('idle' | 'busy' | 'offline') was
+// the polling pool's vocabulary and is gone with it - 'offline' in
+// particular has no counterpart: a runner is `disconnected` (we lost the
+// socket) or `dead` (it stopped heartbeating), and those are different
+// facts an operator needs to tell apart.
+export type RunnerState =
+  | 'disconnected'
+  | 'connecting'
+  | 'idle'
+  | 'assigned'
+  | 'busy'
+  | 'dead';
+
+// `RunnerType` is a DIFFERENT axis and deliberately survives: it names the AI
+// flavor a card/job wants ('claude-code' | 'gemini' | 'mock'), not a runner's
+// lifecycle. A 12.6 runner-agent reports its own free-form `runner_type`
+// (default 'generic'), so `Runner.runner_type` below is a plain string.
 export type RunnerType = 'any' | 'claude-code' | 'gemini' | 'mock';
 export type StepType = 'agent' | 'script' | 'docker';
 
@@ -125,38 +143,38 @@ export interface Job {
   test_output: string | null;
 }
 
+/**
+ * One row of `GET /api/runners`, and — byte for byte — one `runner_status`
+ * WebSocket delta. The backend produces both from
+ * `RunnerRegistry._as_dict`, so the snapshot and the delta cannot drift into
+ * two shapes the store would have to reconcile.
+ *
+ * Mirrors `backend/app/schemas/runner.py::RunnerRead`.
+ */
 export interface Runner {
   id: string;
-  name: string;
+  name: string | null;
+  /** Free-form, agent-reported. 'generic' by default; NOT a `RunnerType`. */
   runner_type: string;
-  status: RunnerStatus;
-  current_job_id: string | null;
-  current_job_title: string | null;
-  last_heartbeat: string;
-  registered_at: string;
-  log_count: number;
-}
-
-export interface PoolStatus {
-  total_runners: number;
-  idle_runners: number;
-  busy_runners: number;
-  offline_runners: number;
-  queued_jobs: number;
-  pending_jobs: number;
-}
-
-export interface RunnerLogs {
-  logs: string[];
-  total: number;
-}
-
-export interface DockerCommand {
-  command: string;
-  command_with_secrets: string;
-  image: string;
-  runner_type: string;
-  env_vars: Record<string, string>;
+  status: RunnerState;
+  /** Free-form capability labels, e.g. `{arch: 'amd64', has: ['docker']}`. */
+  labels: Record<string, unknown>;
+  current_step_execution_id: string | null;
+  /** Step the in-memory machine believes it is running, when connected. */
+  current_step_id?: string | null;
+  protocol_version: number | null;
+  agent_version: string | null;
+  connected_at: string | null;
+  last_heartbeat: string | null;
+  created_at: string | null;
+  /**
+   * 'websocket' when THIS backend process holds a live socket for the row,
+   * 'none' otherwise. The row alone cannot answer it - an 'idle' status left
+   * behind by a crashed process looks identical - so the registry stamps it
+   * at snapshot time. The panel renders a stale row as unreachable rather
+   * than as an available runner.
+   */
+  connection: 'websocket' | 'none';
 }
 
 export interface JobLogs {

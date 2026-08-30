@@ -107,7 +107,7 @@ async def _sync_sessions_use_test_db(async_engine, monkeypatch):
 
 
 @pytest_asyncio.fixture
-async def pushed_ci_repo(client, clean_git_repos, clean_job_queue):
+async def pushed_ci_repo(client, clean_git_repos, clean_runner_registry):
     """Ingest a repo whose first commit carries a triggered CI yaml.
 
     Yields (repo dict, local repo path, default branch). The local working

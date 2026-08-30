@@ -32,7 +32,7 @@ from app.database import ALEMBIC_BASELINE_REVISION, Base, _alembic_config, _run_
 
 # Tip of the migration chain. Every startup path (fresh upgrade, legacy
 # adoption stamp-then-upgrade) must end here.
-ALEMBIC_HEAD_REVISION = "0005"
+ALEMBIC_HEAD_REVISION = "0007"
 
 EXPECTED_TABLES = {
     "repos",
@@ -56,6 +56,7 @@ EXPECTED_TABLES = {
     "test_runs",
     # 0005 (Phase 12.5 usage channel)
     "step_usages",
+    # 0006 (Phase 12.6 runner registry) adds columns/indexes only - no tables
 }
 
 SPEC_TABLES = {"features", "user_stories", "acceptance_criteria", "prompt_templates"}
@@ -828,3 +829,136 @@ class TestLoggingIsUntouched:
 
         assert root.level == level_before
         assert root.handlers == handlers_before
+
+
+class TestRunnerRegistryMigration:
+    """0006 (Phase 12.6): the runners table stops being dead.
+
+    ADD ONLY - `container_id` and `current_job_id` survive until 0007, in the
+    deletion commit. The data migration is the load-bearing half: the old
+    RunnerStatus vocabulary ('offline') has to become the RunnerState one
+    ('disconnected'), and no connection may appear to survive a migration.
+    """
+
+    async def _seed_runners_at_0005(self, engine):
+        await _upgrade_to(engine, "0005")
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO runners (id, container_id, status, current_job_id, "
+                    "last_heartbeat) VALUES "
+                    "('r-offline', 'abc123456789', 'offline', NULL, '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO runners (id, container_id, status, current_job_id, "
+                    "last_heartbeat) VALUES "
+                    "('r-busy', 'def456789012', 'busy', 'job-1', '2026-01-01 00:00:00')"
+                )
+            )
+
+    async def _runner_rows(self, engine):
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT id, status, websocket_id, current_step_execution_id, "
+                    "runner_type, container_id FROM runners ORDER BY id"
+                )
+            )
+            return {row[0]: row for row in result.all()}
+
+    async def test_offline_becomes_disconnected(self, engine_factory):
+        engine = engine_factory("runner_0006_status.db")
+        await self._seed_runners_at_0005(engine)
+
+        await _upgrade_to(engine, "0006")
+
+        rows = await self._runner_rows(engine)
+        assert rows["r-offline"][1] == "disconnected"
+
+    async def test_every_row_lands_disconnected_with_no_socket(self, engine_factory):
+        """No connection survives a migration; pretending one did is how a
+        fresh backend hands work to a ghost."""
+        engine = engine_factory("runner_0006_ghost.db")
+        await self._seed_runners_at_0005(engine)
+
+        await _upgrade_to(engine, "0006")
+
+        rows = await self._runner_rows(engine)
+        assert {row[1] for row in rows.values()} == {"disconnected"}
+        assert all(row[2] is None for row in rows.values())  # websocket_id
+        assert all(row[3] is None for row in rows.values())  # current_step_execution_id
+
+    async def test_rows_and_polling_columns_survive_the_rebuild(self, engine_factory):
+        """The runners table is rebuilt in batch mode (SQLite cannot ALTER a
+        FK into place); the data has to come through it."""
+        engine = engine_factory("runner_0006_data.db")
+        await self._seed_runners_at_0005(engine)
+
+        await _upgrade_to(engine, "0006")
+
+        rows = await self._runner_rows(engine)
+        assert set(rows) == {"r-offline", "r-busy"}
+        assert rows["r-busy"][4] == "claude-code"  # runner_type server_default
+        assert rows["r-busy"][5] == "def456789012"  # container_id, dropped in 0007
+
+    async def test_new_columns_and_indexes_exist(self, engine_factory):
+        engine = engine_factory("runner_0006_schema.db")
+        await _migrate(engine)
+
+        snapshot = await _snapshot(engine)
+        columns = snapshot["runners"]["columns"]
+        for name in (
+            "name",
+            "runner_type",
+            "labels",
+            "current_step_execution_id",
+            "websocket_id",
+            "protocol_version",
+            "agent_version",
+            "connected_at",
+            "created_at",
+        ):
+            assert name in columns, name
+        indexes = snapshot["runners"]["indexes"]
+        assert indexes["ix_runners_websocket_id"] == (("websocket_id",), True)
+        assert indexes["ix_runners_status"] == (("status",), False)
+
+    async def test_step_executions_gained_the_dispatcher_columns(self, engine_factory):
+        """A requeued step must be re-matchable AFTER a backend restart, so
+        the requires: block has to be durable, not held in a dispatch
+        closure."""
+        engine = engine_factory("runner_0006_steps.db")
+        await _migrate(engine)
+
+        snapshot = await _snapshot(engine)
+        assert "runner_requirements" in snapshot["step_executions"]["columns"]
+        assert "assigned_at" in snapshot["step_executions"]["columns"]
+        assert "ix_step_executions_status" in snapshot["step_executions"]["indexes"]
+
+    async def test_upgrade_is_idempotent_over_a_healed_schema(self, engine_factory):
+        """The adopt path: create_all builds the CURRENT model schema, the DB
+        is stamped behind head, and 0006 then runs over objects that already
+        exist. Every add is guarded, so this must not raise."""
+        engine = engine_factory("runner_0006_idem.db")
+        await _create_all(engine)
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda c: command.stamp(_alembic_config(c), "0005"))
+
+        await _upgrade_to(engine, "0006")
+
+        assert await _alembic_versions(engine) == ["0006"]
+
+    async def test_downgrade_restores_the_0005_runners_shape(self, engine_factory):
+        engine = engine_factory("runner_0006_down.db")
+        reference = engine_factory("runner_0005_ref.db")
+        await _migrate(engine)
+        await _upgrade_to(reference, "0005")
+
+        await _downgrade_to(engine, "0005")
+
+        after = await _snapshot(engine)
+        expected = await _snapshot(reference)
+        assert after["runners"] == expected["runners"]
+        assert after["step_executions"] == expected["step_executions"]

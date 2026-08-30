@@ -169,22 +169,6 @@ async def api_client(client) -> AsyncGenerator:
         yield client
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def clear_job_queue_before_test(api_client):
-    """Clear the job queue before each test to prevent job accumulation."""
-    try:
-        response = await api_client.post("/api/runners/clear-queue")
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("cleared", 0) > 0:
-                import logging
-                logging.info(f"Cleared {data['cleared']} jobs from queue before test")
-    except Exception:
-        # Ignore errors if endpoint doesn't exist or backend not ready
-        pass
-    yield
-
-
 # -----------------------------------------------------------------------------
 # WebSocket Client Fixture
 # -----------------------------------------------------------------------------

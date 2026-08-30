@@ -50,7 +50,7 @@ class TestPipelineWorkflowDemo:
         print(f"\n[Setup] Created repo: {repo['name']} (ID: {repo['id'][:8]}...)")
         return repo
 
-    async def test_complete_pipeline_workflow(self, client, demo_repo, clean_job_queue):
+    async def test_complete_pipeline_workflow(self, client, demo_repo, clean_runner_registry):
         """
         Demo: Complete pipeline creation and execution workflow.
 
@@ -266,7 +266,7 @@ class TestPipelineWithBranchingDemo:
         )
         return response.json()
 
-    async def test_pipeline_with_branching_actions(self, client, demo_repo, clean_job_queue):
+    async def test_pipeline_with_branching_actions(self, client, demo_repo, clean_runner_registry):
         """
         Demo: Pipeline with conditional branching.
 

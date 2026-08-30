@@ -133,7 +133,7 @@ class TestAPISmokeTests:
         response = await client.get(f"/api/cards/{card_id}")
         assert response.status_code == 200
 
-    async def test_cards_lifecycle_actions(self, client, clean_git_repos, clean_job_queue):
+    async def test_cards_lifecycle_actions(self, client, clean_git_repos, clean_runner_registry):
         """Card lifecycle actions respond correctly."""
         # Must use ingested repo to start cards
         repo_response = await client.post(
@@ -173,16 +173,28 @@ class TestAPISmokeTests:
         assert response.status_code == 200
         assert isinstance(response.json(), list)
 
-    async def test_runners_register(self, client):
-        """Runners register endpoint accepts request."""
-        response = await client.post(
-            "/api/runners/register",
-            json={"name": "test-runner"},
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert "runner_id" in data
-        assert "name" in data
+    async def test_runners_list_is_the_whole_surface(self):
+        """12.6: the runners API is READ-ONLY over the registry.
+
+        `POST /register` (and heartbeat / job / complete / logs /
+        docker-command) belonged to the polling stack. A runner enrols over
+        `/ws/runner` now, so the only HTTP left is the snapshot the panel
+        renders - and asserting the register route is GONE is what stops it
+        being quietly re-added as "just a convenience".
+        """
+        from app.routers import runners as runners_router
+
+        paths = {
+            route.path
+            for route in runners_router.router.routes
+        }
+        assert paths == {"/api/runners", "/api/runners/{runner_id}"}, paths
+        methods = {
+            method
+            for route in runners_router.router.routes
+            for method in route.methods
+        }
+        assert methods == {"GET"}, methods
 
 
 @pytest.mark.demo

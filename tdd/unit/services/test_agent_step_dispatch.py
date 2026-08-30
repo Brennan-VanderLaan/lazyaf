@@ -80,23 +80,40 @@ class TestAgentRouting:
         assert decision.mode == "local"
         assert decision.reason == "agent-default-local"
 
-    def test_explicit_legacy_override_still_honored_at_warning(
-        self, router, caplog
-    ):
-        """R2: the escape hatch must stay CALLABLE until the 12.6 deletion
-        commit, and an override is never silent (R1)."""
-        with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
-            decision = router.decide(
+    def test_the_legacy_escape_hatch_is_closed(self):
+        """R2's other half.
+
+        12.5 required `executor: legacy` on an agent step to stay CALLABLE -
+        a phase that moves work off a path must leave the old path usable
+        until the path itself is deleted, or "we moved it" and "we broke it"
+        look the same. 12.6 deleted the path, so the hatch closes here, and
+        it closes LOUDLY: the value names something that no longer exists,
+        and the error says so rather than quietly routing local.
+        """
+        with pytest.raises(ValueError) as exc:
+            self.router_instance().decide(
                 "agent", {"agent": "claude-code", "executor": "legacy"}
             )
+        message = str(exc.value)
+        assert "legacy" in message
+        assert "no longer exists" in message
 
-        assert decision.mode == "legacy"
-        assert decision.reason == "explicit-override"
-        assert any(r.levelno == logging.WARNING for r in caplog.records)
+    @staticmethod
+    def router_instance():
+        from app.services.workspace.execution_router import ExecutionRouter
+
+        return ExecutionRouter()
 
     def test_invalid_executor_override_raises(self, router):
         with pytest.raises(ValueError, match="Invalid executor override"):
-            router.decide("agent", {"agent": "mock", "executor": "remote"})
+            router.decide("agent", {"agent": "mock", "executor": "quantum"})
+
+    def test_remote_override_on_an_agent_step_is_valid_at_12_6(self, router):
+        """`executor: remote` used to be the canonical INVALID value here.
+        RemoteExecutor exists as of 12.6, so it is now a real route."""
+        decision = router.decide("agent", {"agent": "mock", "executor": "remote"})
+        assert decision.mode == "remote"
+        assert decision.reason == "explicit-override"
 
     def test_runner_type_on_agent_step_is_not_a_pin_warning(
         self, router, caplog

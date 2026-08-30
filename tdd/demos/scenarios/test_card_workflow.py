@@ -34,7 +34,7 @@ class TestCardWorkflowDemo:
     This test documents the happy path for feature development.
     """
 
-    async def test_complete_card_lifecycle(self, client, clean_git_repos, clean_job_queue):
+    async def test_complete_card_lifecycle(self, client, clean_git_repos, clean_runner_registry):
         """
         SCENARIO: Feature Development Lifecycle
 

@@ -1,21 +1,22 @@
 """
 Unit tests for the backend-side prompt renderer (Phase 12.5, design 2.5).
 
-12.5 moves prompt rendering from the container
-(`runner_common.entrypoint.build_prompt`) to the backend, because the backend
-already owns PromptTemplate, the card fields, the resolved AgentFiles and (at
-12.6.6) the spec bundle - a container that re-templates would be a second
-source of truth for the most important string in the system.
+12.5 moved prompt rendering from the container to the backend, because the
+backend already owns PromptTemplate, the card fields, the resolved AgentFiles
+and (at 12.6.6) the spec bundle - a container that re-templates would be a
+second source of truth for the most important string in the system.
 
-Two live renderers is a KNOWN, time-boxed duplication: the runner one is
-legacy-only and is named in the 12.6 deletion list. What must not drift while
-both exist is the PLACEHOLDER VOCABULARY, so it is pinned here on the backend
-side AND checked against the legacy renderer's actual behaviour in one
-process (the conftest of this tree already puts runner-common on sys.path via
-the control-runtime package; this module adds it defensively).
+12.6 DELETED the container-side renderer along with the polling entrypoint
+that held it. The two parity tests that used to run both renderers in one
+process and compare are now shape assertions against FROZEN literals copied
+from that renderer's last behaviour. That is the honest replacement: the
+contract those tests protected was never "the two agree", it was "the
+placeholder vocabulary and the previous-step section keep this exact shape",
+and the second renderer was only the most convenient way to state it. Deleting
+them instead would have retired the contract along with the duplicate.
 
 One deliberate DIVERGENCE is asserted rather than hidden: the control path
-DROPS the README-scraping branch of the legacy default prompt. The agent can
+DROPS the README-scraping branch of the old default prompt. The agent can
 read the repository itself, and 12.6.6 replaces that slot with curated spec
 context.
 """
@@ -45,24 +46,18 @@ class TestPlaceholderVocabulary:
         for placeholder in PLACEHOLDERS:
             assert placeholder in DEFAULT_PROMPT_TEMPLATE
 
-    def test_legacy_renderer_substitutes_the_same_vocabulary(self):
-        """The one thing the two live renderers must agree on while both
-        exist (the legacy one dies in the 12.6 deletion commit)."""
-        from runner_common.entrypoint import build_prompt
+    def test_substitution_matches_the_retired_container_renderer(self):
+        """FROZEN from `runner_common.entrypoint.build_prompt`, which did
+        exactly two `str.replace` calls and nothing else.
 
+        That renderer was deleted in 12.6. The literal below is what it
+        produced, so the surviving renderer is still held to the shape rather
+        than to a counterpart that no longer exists to disagree with it.
+        """
         template = "T={{title}} D={{description}}"
-        legacy = build_prompt(
-            {
-                "card_title": "Add pagination",
-                "card_description": "GET /items returns every row",
-                "prompt_template": template,
-            },
-            Path("."),
-        )
-        ours = render_placeholders(
+        assert render_placeholders(
             template, "Add pagination", "GET /items returns every row"
-        )
-        assert legacy == ours
+        ) == "T=Add pagination D=GET /items returns every row"
 
     def test_substitution_is_plain_string_replacement(self):
         """A prompt template is USER content: no format spec, no expression
@@ -119,21 +114,30 @@ class TestPreviousStepSection:
         assert "plan output here" in prompt
         assert "Use this context when completing the current task." in prompt
 
-    def test_section_matches_the_legacy_renderer_byte_for_byte(self):
-        from runner_common.entrypoint import build_prompt
+    def test_section_matches_the_retired_container_renderer_byte_for_byte(self):
+        """FROZEN from the deleted `build_prompt`, whitespace included.
 
-        template = "BODY"
-        legacy = build_prompt(
-            {"card_title": "t", "card_description": "d",
-             "prompt_template": template},
-            Path("."),
-            previous_logs="LOGS",
+        The blank line after the body, the fenced block, and the trailing
+        newline are all part of what an agent actually reads, and every one of
+        them was in the string that renderer appended.
+        """
+        expected = (
+            "BODY\n"
+            "\n"
+            "## Previous Step Output\n"
+            "The previous pipeline step produced the following output:\n"
+            "```\n"
+            "LOGS\n"
+            "```\n"
+            "\n"
+            "Use this context when completing the current task.\n"
         )
-        ours = render_agent_prompt(
-            card_title="t", card_description="d",
-            prompt_template=template, previous_step_logs="LOGS",
-        )
-        assert legacy == ours
+        assert render_agent_prompt(
+            card_title="t",
+            card_description="d",
+            prompt_template="BODY",
+            previous_step_logs="LOGS",
+        ) == expected
 
     def test_absent_logs_add_no_section(self):
         for value in (None, ""):

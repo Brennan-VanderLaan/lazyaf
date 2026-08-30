@@ -82,7 +82,7 @@ async def empty_pipeline(client, ingested_repo):
 class TestRunPipeline:
     """Tests for POST /api/pipelines/{pipeline_id}/run endpoint."""
 
-    async def test_run_pipeline_creates_run(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_run_pipeline_creates_run(self, client, pipeline_with_steps, clean_runner_registry):
         """Running a pipeline creates a pipeline run."""
         response = await client.post(
             f"/api/pipelines/{pipeline_with_steps['id']}/run",
@@ -97,7 +97,7 @@ class TestRunPipeline:
         assert result["trigger_type"] == "manual"
         assert result["steps_total"] == 2
 
-    async def test_run_pipeline_with_trigger_params(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_run_pipeline_with_trigger_params(self, client, pipeline_with_steps, clean_runner_registry):
         """Running a pipeline with custom trigger parameters."""
         payload = pipeline_run_create_payload(
             trigger_type="webhook",
@@ -164,7 +164,7 @@ class TestListPipelineRuns:
         assert_status_code(response, 200)
         assert_json_list_length(response, 0)
 
-    async def test_list_pipeline_runs_with_data(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_list_pipeline_runs_with_data(self, client, pipeline_with_steps, clean_runner_registry):
         """Returns all runs for a pipeline."""
         # Create runs
         await client.post(f"/api/pipelines/{pipeline_with_steps['id']}/run", json={})
@@ -179,7 +179,7 @@ class TestListPipelineRuns:
         response = await client.get("/api/pipelines/nonexistent/runs")
         assert_not_found(response, "Pipeline")
 
-    async def test_list_all_pipeline_runs(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_list_all_pipeline_runs(self, client, pipeline_with_steps, clean_runner_registry):
         """GET /api/pipeline-runs returns all runs."""
         await client.post(f"/api/pipelines/{pipeline_with_steps['id']}/run", json={})
 
@@ -188,7 +188,7 @@ class TestListPipelineRuns:
         runs = response.json()
         assert len(runs) >= 1
 
-    async def test_list_pipeline_runs_filter_by_pipeline(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_list_pipeline_runs_filter_by_pipeline(self, client, pipeline_with_steps, clean_runner_registry):
         """GET /api/pipeline-runs with pipeline_id filter."""
         await client.post(f"/api/pipelines/{pipeline_with_steps['id']}/run", json={})
 
@@ -197,7 +197,7 @@ class TestListPipelineRuns:
         runs = response.json()
         assert all(r["pipeline_id"] == pipeline_with_steps["id"] for r in runs)
 
-    async def test_list_pipeline_runs_filter_by_status(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_list_pipeline_runs_filter_by_status(self, client, pipeline_with_steps, clean_runner_registry):
         """GET /api/pipeline-runs with status filter."""
         await client.post(f"/api/pipelines/{pipeline_with_steps['id']}/run", json={})
 
@@ -207,7 +207,7 @@ class TestListPipelineRuns:
         # All returned runs should have the requested status
         assert all(r["status"] == "running" for r in runs)
 
-    async def test_list_pipeline_runs_with_limit(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_list_pipeline_runs_with_limit(self, client, pipeline_with_steps, clean_runner_registry):
         """GET /api/pipeline-runs respects limit parameter."""
         # Create multiple runs
         for _ in range(3):
@@ -222,7 +222,7 @@ class TestListPipelineRuns:
 class TestGetPipelineRun:
     """Tests for GET /api/pipeline-runs/{run_id} endpoint."""
 
-    async def test_get_pipeline_run_exists(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_get_pipeline_run_exists(self, client, pipeline_with_steps, clean_runner_registry):
         """Returns pipeline run when it exists."""
         # Create a run
         run_response = await client.post(
@@ -243,7 +243,7 @@ class TestGetPipelineRun:
         response = await client.get("/api/pipeline-runs/nonexistent-run-id")
         assert_not_found(response, "Pipeline run")
 
-    async def test_get_pipeline_run_includes_step_runs(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_get_pipeline_run_includes_step_runs(self, client, pipeline_with_steps, clean_runner_registry):
         """Pipeline run response includes step_runs."""
         run_response = await client.post(
             f"/api/pipelines/{pipeline_with_steps['id']}/run",
@@ -257,7 +257,7 @@ class TestGetPipelineRun:
         assert "step_runs" in result
         assert isinstance(result["step_runs"], list)
 
-    async def test_get_pipeline_run_has_all_fields(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_get_pipeline_run_has_all_fields(self, client, pipeline_with_steps, clean_runner_registry):
         """Pipeline run response includes all expected fields."""
         run_response = await client.post(
             f"/api/pipelines/{pipeline_with_steps['id']}/run",
@@ -285,7 +285,7 @@ class TestGetPipelineRun:
 class TestCancelPipelineRun:
     """Tests for POST /api/pipeline-runs/{run_id}/cancel endpoint."""
 
-    async def test_cancel_running_pipeline(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_cancel_running_pipeline(self, client, pipeline_with_steps, clean_runner_registry):
         """Cancelling a running pipeline marks it as cancelled."""
         # Create a run
         run_response = await client.post(
@@ -307,7 +307,7 @@ class TestCancelPipelineRun:
         response = await client.post("/api/pipeline-runs/nonexistent/cancel")
         assert_not_found(response, "Pipeline run")
 
-    async def test_cancel_completed_pipeline_fails(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_cancel_completed_pipeline_fails(self, client, pipeline_with_steps, clean_runner_registry):
         """Cancelling a completed pipeline returns error."""
         # Create and cancel a run
         run_response = await client.post(
@@ -328,7 +328,7 @@ class TestCancelPipelineRun:
 class TestGetStepLogs:
     """Tests for GET /api/pipeline-runs/{run_id}/steps/{step_index}/logs endpoint."""
 
-    async def test_get_step_logs_exists(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_get_step_logs_exists(self, client, pipeline_with_steps, clean_runner_registry):
         """Returns logs for an existing step run."""
         # Create a run (this will create step runs)
         run_response = await client.post(
@@ -347,7 +347,7 @@ class TestGetStepLogs:
         assert "status" in result
         assert result["step_index"] == 0
 
-    async def test_get_step_logs_not_found(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_get_step_logs_not_found(self, client, pipeline_with_steps, clean_runner_registry):
         """Returns 404 for non-existent step run."""
         # Create a run
         run_response = await client.post(
@@ -369,7 +369,7 @@ class TestGetStepLogs:
 class TestPipelineRunStateTransitions:
     """Tests for pipeline run state transitions."""
 
-    async def test_new_run_starts_in_running_state(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_new_run_starts_in_running_state(self, client, pipeline_with_steps, clean_runner_registry):
         """New pipeline run starts in 'running' state."""
         response = await client.post(
             f"/api/pipelines/{pipeline_with_steps['id']}/run",
@@ -379,7 +379,7 @@ class TestPipelineRunStateTransitions:
         assert result["status"] == "running"
         assert result["started_at"] is not None
 
-    async def test_cancelled_run_has_completed_at(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_cancelled_run_has_completed_at(self, client, pipeline_with_steps, clean_runner_registry):
         """Cancelled pipeline run has completed_at timestamp."""
         run_response = await client.post(
             f"/api/pipelines/{pipeline_with_steps['id']}/run",
@@ -397,7 +397,7 @@ class TestPipelineRunStateTransitions:
 class TestPipelineRunOrdering:
     """Tests for pipeline run ordering."""
 
-    async def test_runs_ordered_by_created_at_desc(self, client, pipeline_with_steps, clean_job_queue):
+    async def test_runs_ordered_by_created_at_desc(self, client, pipeline_with_steps, clean_runner_registry):
         """Pipeline runs are returned in descending order by created_at."""
         # Create multiple runs
         run_ids = []
@@ -453,7 +453,7 @@ class TestTriggerTypeIsValidated:
         DISPATCHED_ADHOC_TRIGGER_TYPES,
     )
     async def test_adhoc_trigger_types_are_refused(
-        self, client, pipeline_with_steps, trigger_type, clean_job_queue
+        self, client, pipeline_with_steps, trigger_type, clean_runner_registry
     ):
         response = await client.post(
             f"/api/pipelines/{pipeline_with_steps['id']}/run",
@@ -463,7 +463,7 @@ class TestTriggerTypeIsValidated:
         assert "internal" in response.text or "reserved" in response.text
 
     async def test_a_refused_run_mutates_nothing(
-        self, client, pipeline_with_steps, clean_job_queue
+        self, client, pipeline_with_steps, clean_runner_registry
     ):
         before = await client.get(
             f"/api/pipelines/{pipeline_with_steps['id']}/runs"
@@ -485,7 +485,7 @@ class TestTriggerTypeIsValidated:
         )
 
     async def test_unknown_trigger_type_is_refused_by_the_schema(
-        self, client, pipeline_with_steps, clean_job_queue
+        self, client, pipeline_with_steps, clean_runner_registry
     ):
         response = await client.post(
             f"/api/pipelines/{pipeline_with_steps['id']}/run",
@@ -497,7 +497,7 @@ class TestTriggerTypeIsValidated:
         "trigger_type", ["manual", "webhook", "push", "schedule", "pipeline"]
     )
     async def test_public_trigger_types_still_run(
-        self, client, pipeline_with_steps, trigger_type, clean_job_queue
+        self, client, pipeline_with_steps, trigger_type, clean_runner_registry
     ):
         response = await client.post(
             f"/api/pipelines/{pipeline_with_steps['id']}/run",

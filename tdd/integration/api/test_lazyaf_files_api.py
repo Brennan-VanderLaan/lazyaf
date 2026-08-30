@@ -227,7 +227,7 @@ class TestRunRepoPipeline:
     """Tests for POST /api/repos/{repo_id}/lazyaf/pipelines/{pipeline_name}/run endpoint."""
 
     async def test_run_repo_pipeline_creates_platform_pipeline_and_run(
-        self, client, repo_with_pipeline_definition, clean_job_queue
+        self, client, repo_with_pipeline_definition, clean_runner_registry
     ):
         """Running a repo pipeline creates/updates platform pipeline and starts a run."""
         repo_id = repo_with_pipeline_definition['id']
@@ -262,7 +262,7 @@ class TestRunRepoPipeline:
         assert run["status"] == "running"
 
     async def test_run_repo_pipeline_updates_existing_platform_pipeline(
-        self, client, repo_with_pipeline_definition, clean_job_queue
+        self, client, repo_with_pipeline_definition, clean_runner_registry
     ):
         """Running a repo pipeline twice updates the existing platform pipeline."""
         repo_id = repo_with_pipeline_definition['id']
@@ -288,7 +288,7 @@ class TestRunRepoPipeline:
         assert result1["run_id"] != result2["run_id"]
 
     async def test_run_repo_pipeline_with_custom_branch(
-        self, client, repo_with_pipeline_definition, clean_job_queue
+        self, client, repo_with_pipeline_definition, clean_runner_registry
     ):
         """Running a repo pipeline with custom branch parameter."""
         repo_id = repo_with_pipeline_definition['id']
@@ -315,7 +315,7 @@ class TestRunRepoPipeline:
         )
         assert_not_found(response, "Repo")
 
-    async def test_run_repo_pipeline_not_ingested(self, client, clean_git_repos, clean_job_queue):
+    async def test_run_repo_pipeline_not_ingested(self, client, clean_git_repos, clean_runner_registry):
         """Returns 404 when repo is not ingested (no git storage)."""
         # Create a repo without ingesting (no git storage)
         response = await client.post(
@@ -335,7 +335,7 @@ class TestRepoPipelineAndPlatformPipelineDrift:
     """Tests for verifying no drift between repo and platform pipelines."""
 
     async def test_platform_pipeline_syncs_with_repo_changes(
-        self, client, repo_with_pipeline_definition, clean_job_queue
+        self, client, repo_with_pipeline_definition, clean_runner_registry
     ):
         """Platform pipeline updates when repo pipeline definition changes."""
         repo_id = repo_with_pipeline_definition['id']

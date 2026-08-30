@@ -55,8 +55,8 @@ function Cleanup {
     Write-Host "Stopping E2E backend containers..."
     Push-Location $ProjectRoot
     try {
-        & cmd.exe /c "docker compose stop backend-e2e runner-mock-e2e" 2>$null
-        & cmd.exe /c "docker compose rm -f backend-e2e runner-mock-e2e" 2>$null
+        & cmd.exe /c "docker compose stop backend-e2e runner-agent-e2e" 2>$null
+        & cmd.exe /c "docker compose rm -f backend-e2e runner-agent-e2e" 2>$null
     }
     catch { }
     Pop-Location
@@ -105,7 +105,7 @@ function Start-E2EBackend {
         & cmd.exe /c "docker compose $ComposeFiles --profile e2e build"
 
         # Start backend container with e2e profile
-        & cmd.exe /c "docker compose $ComposeFiles --profile e2e up -d backend-e2e runner-mock-e2e"
+        & cmd.exe /c "docker compose $ComposeFiles --profile e2e up -d backend-e2e runner-agent-e2e"
 
         # Wait for container health check
         Write-Host "Waiting for backend container to be healthy..."

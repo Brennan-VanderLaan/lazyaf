@@ -1,0 +1,215 @@
+# =============================================================================
+# LazyAF - release-please: the thing that decides what the next version IS
+# =============================================================================
+#
+# THIS WORKFLOW DOES NOT PACKAGE, AND IT CERTAINLY DOES NOT GATE.
+#
+#   LazyAF gates LazyAF. Whether a revision deserves to ship is decided by
+#   LazyAF's own dogfood pipeline (PLAN.md: "no external CI ever"). release.yml
+#   and images.yml then PACKAGE what the dogfood pipeline blessed. This file
+#   adds exactly one thing on top of that: it works out the next semantic
+#   version from the commit log, writes CHANGELOG.md, and - once a human
+#   merges the release PR - creates the `v*` tag that the two packaging
+#   workflows already know how to react to.
+#
+#   So: no pytest here either. The only opinion this workflow has is
+#   "0.1.0 + these commits = 0.2.0".
+#
+# THE FLOW
+#   1. Conventional commits land on `main`.
+#   2. This workflow (on every push to main) opens/refreshes ONE release PR
+#      titled `chore(main): release <next version>`. That PR carries the
+#      CHANGELOG entry and the bumped `__version__`. Nothing is tagged yet -
+#      the open PR is a standing, always-current answer to "what would the
+#      next release look like?"
+#   3. A human merges that PR. That is the release decision, and it is the
+#      same human act that `git tag` used to be.
+#   4. This workflow runs again on the merge commit, sees the release PR was
+#      merged, and creates the tag `vX.Y.Z` plus a GitHub Release holding the
+#      changelog notes.
+#   5. The `package` job below fans that tag out to release.yml (wheel +
+#      onboarding assets) and images.yml (GHCR images).
+#
+# >>> WHY STEP 5 IS A JOB HERE AND NOT "the tag push triggers them" <<<
+#
+#   This is the one genuinely non-obvious thing in this file, so it is
+#   spelled out rather than assumed.
+#
+#   GitHub deliberately refuses to start a workflow run from an event that
+#   was itself produced by the automatic GITHUB_TOKEN - that is the loop
+#   breaker that stops a workflow from re-triggering itself forever. The tag
+#   and Release that release-please creates above are created WITH that
+#   token. Therefore:
+#
+#       release.yml's  `on: push: tags: ['v*']`   will NOT fire.
+#       images.yml's   `on: push: tags: ['v*']`   will NOT fire.
+#
+#   Those triggers are still correct and still used - a human pushing a tag
+#   by hand (the old path, still supported) fires both. They are simply not
+#   reachable from an automated tag.
+#
+#   The documented exceptions to that rule are `workflow_dispatch` and
+#   `repository_dispatch`: those two API calls DO create a run even when made
+#   with GITHUB_TOKEN. So the `package` job dispatches both workflows
+#   explicitly, targeting the new tag as the ref. Both already expose
+#   `workflow_dispatch` and both already derive everything they need from
+#   `github.ref` / `GITHUB_REF_NAME`, so running them at a tag ref is
+#   indistinguishable from a tag push - no duplication, no fork in their
+#   logic, and neither file had to change.
+#
+#   The alternative fix is a personal access token, so the tag push looks
+#   like it came from a person. Rejected: it would put the first long-lived
+#   credential into a repository whose entire security posture (see
+#   WORKFLOWS.md) is "the only credential that exists is the per-run
+#   GITHUB_TOKEN". A dispatch call costs one `actions: write` scope on one
+#   job; a PAT costs a secret that has to be stored, rotated and trusted.
+#
+# CONVENTIONAL COMMITS START NOW
+#   This repository's history predates the convention (see `git log`), which
+#   is why release-please-config.json pins `bootstrap-sha` to the last commit
+#   of the old regime. Everything at or before that sha is invisible to the
+#   version calculation; everything after it must use a conventional prefix
+#   or it will not appear in the changelog and will not move the version.
+#   CONTRIBUTING.md is the contract.
+#
+# SECURITY POSTURE
+#   * Top-level `permissions: contents: read`. Two jobs widen it, in opposite
+#     directions, and neither holds the other's scope:
+#       - `release-please` gets `contents: write` (commit the changelog, cut
+#         the tag and Release) + `pull-requests: write` (open/refresh the
+#         release PR). It has NO `actions:` scope.
+#       - `package` gets `actions: write` (dispatch two workflows) and
+#         nothing else. It has NO write access to repository contents.
+#   * The automatic per-run GITHUB_TOKEN. No PAT, no organisation secret.
+#   * Never triggered by `pull_request` / `pull_request_target`, so fork code
+#     can never reach a job holding a write token.
+#   * The action is pinned to a commit SHA.
+# =============================================================================
+
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  # Manual re-run, for when the release PR needs to be rebuilt without waiting
+  # for another commit (e.g. after fixing the config).
+  workflow_dispatch:
+
+# Least privilege. Widened per job, upward, only where required.
+permissions:
+  contents: read
+
+# Two runs must never race: the loser could reopen a release PR that the
+# winner just merged, or try to create a tag that already exists. Never
+# cancel in flight either - a run cancelled between "tag created" and
+# "workflows dispatched" leaves a tag with no artifacts behind it.
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Maintain the release PR; on a merged one, cut the tag + GitHub Release.
+  # ---------------------------------------------------------------------------
+  release-please:
+    name: release PR / tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Commit CHANGELOG.md + the version bump onto the release branch, and
+      # create the tag and the GitHub Release.
+      contents: write
+      # Open, refresh and label the release PR.
+      pull-requests: write
+    outputs:
+      released: ${{ steps.release.outputs.releases_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      # No actions/checkout. release-please talks to the GitHub API and reads
+      # the tree through it; a working copy would be dead weight and one more
+      # place for a credential to be persisted.
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          # The automatic per-run token. Explicit rather than defaulted so
+          # the absence of a PAT is visible at the call site.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Config kept under .github/ with the workflows it drives, rather
+          # than adding two more dotfiles to an already busy repo root.
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+
+  # ---------------------------------------------------------------------------
+  # Fan the new tag out to the packaging workflows that already work.
+  #
+  # Separate job, not a step above, purely for least privilege: this is the
+  # only place that needs `actions: write`, and it must not also be able to
+  # write repository contents.
+  # ---------------------------------------------------------------------------
+  package:
+    name: dispatch wheel + images
+    needs: release-please
+    # `releases_created` is the string 'true' when a release PR was merged on
+    # this run. On an ordinary push (release PR merely refreshed) it is
+    # 'false' and this job is skipped.
+    if: ${{ needs.release-please.outputs.released == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Start a workflow_dispatch run. Nothing else - this job cannot write
+      # to the repository, cannot push a package, cannot touch a release.
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch release.yml and images.yml at the new tag
+        # `--ref "$TAG"` is what makes this equivalent to a tag push: both
+        # workflows read github.ref / GITHUB_REF_NAME, so at a tag ref
+        # release.yml runs its tag-vs-wheel version check and publishes the
+        # Release assets, and images.yml computes the v0.2.0 / 0.2.0 /
+        # latest tag set instead of main / edge.
+        #
+        # release.yml's `pypi` job stays skipped: it additionally requires
+        # `inputs.publish_to_pypi == true`, and no input is passed here. PyPI
+        # remains an explicit human act, exactly as before.
+        #
+        # release.yml is also safe to run against a tag release-please has
+        # already created a GitHub Release for: its publish step checks
+        # `gh release view` first and uploads with --clobber rather than
+        # failing. release-please writes the notes; release.yml attaches the
+        # wheel and the onboarding files to the same Release.
+        #
+        # KNOWN COST: merging the release PR is also a push to main, which
+        # fires images.yml on its own for the main/edge tags. The same commit
+        # is therefore built twice, a few minutes apart. Correct but
+        # wasteful; if it ever matters the fix belongs in images.yml (skip
+        # main builds for a release commit), not here.
+        run: |
+          set -euo pipefail
+          if [ -z "${TAG}" ]; then
+            echo "::error::release-please reported a release but produced no tag_name"
+            exit 1
+          fi
+          echo "Dispatching packaging workflows at ${TAG}"
+          gh workflow run release.yml --ref "${TAG}"
+          gh workflow run images.yml  --ref "${TAG}"
+        env:
+          TAG: ${{ needs.release-please.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+      - name: Summarise
+        run: |
+          set -euo pipefail
+          {
+            echo "### Released \`${TAG}\`"
+            echo
+            echo "Dispatched \`release.yml\` (CLI wheel + onboarding assets) and \`images.yml\` (GHCR images) at that tag."
+            echo
+            echo "[Watch them run](${SERVER}/${REPO}/actions)"
+          } >> "${GITHUB_STEP_SUMMARY}"
+        env:
+          TAG: ${{ needs.release-please.outputs.tag }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}

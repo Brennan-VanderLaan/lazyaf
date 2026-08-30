@@ -33,22 +33,68 @@ cd lazyaf
 You only strictly need `docker-compose.release.yml` and `.env.example`, but
 the clone also gets you the CLI source and the preflight script.
 
-## 2. Make your `.env`
+## 2. Make your `.env` and generate your secrets
 
 ```bash
-cp .env.example .env          # Windows: copy .env.example .env
+python scripts/bootstrap_secrets.py
 ```
 
-Open `.env` and paste in whichever API keys you have. Every other variable is
-optional — the defaults are correct for this compose file.
+That one command creates `.env` from `.env.example` if you do not have one, and
+fills in the two shared secrets the backend refuses to start without. It prints
+none of them, and it is safe to re-run — it never overwrites a value you set.
+
+Then open `.env` and paste in whichever API keys you have. Every other variable
+is optional; the defaults are correct for this compose file.
 
 `.env` is gitignored. Never commit it, and never put a real key in
 `.env.example`.
 
+### Why there are secrets to generate
+
+Two variables authenticate LazyAF's own internals:
+
+| Variable | What it does |
+|---|---|
+| `LAZYAF_STEP_AUTH_SECRET` | Signs the short-lived JWT a step container uses to call `/api/steps/*` — how a running step reports its logs, status and results. |
+| `LAZYAF_RUNNER_AUTH_SECRET` | The shared enrollment secret a runner agent presents at `/ws/runner`. |
+
+Earlier versions fell back to constants written into the source. A constant in a
+public repository is not a secret: anyone could read it and mint credentials any
+LazyAF backend would trust. There is no default now. Start the stack without
+these and compose stops with a message pointing at the command above; if a value
+is still one of the old constants, it is treated as unset.
+
+You do not need to think about them again unless you deploy somewhere real.
+
+### Deploying somewhere real
+
+Each secret also has a `_FILE` form holding a **path** whose contents are the
+value — which is how docker secrets and Kubernetes mounted Secrets deliver one:
+
+```bash
+LAZYAF_STEP_AUTH_SECRET_FILE=/run/secrets/lazyaf_step_auth_secret
+LAZYAF_RUNNER_AUTH_SECRET_FILE=/run/secrets/lazyaf_runner_auth_secret
+```
+
+The `_FILE` form **takes precedence** over the inline variable. A `_FILE` that is
+set but unreadable or empty is a hard startup error, never a silent fallback — a
+broken mount should stop the backend, not sign tokens with a stale key.
+
+A runner agent takes its half from `LAZYAF_RUNNER_TOKEN_FILE`,
+`LAZYAF_RUNNER_TOKEN`, `LAZYAF_RUNNER_AUTH_SECRET_FILE` or
+`LAZYAF_RUNNER_AUTH_SECRET`, in that order, and it must **equal** the backend's
+value. Example manifests: [`deploy/k8s/`](deploy/k8s/README.md).
+
+> There is one escape hatch, `LAZYAF_DEV_EPHEMERAL_SECRETS=1`, which generates a
+> value per process and warns loudly. It is for a throwaway single-process run
+> only. Tokens minted under it stop verifying the moment the backend restarts,
+> and a runner agent in another container can never authenticate against it.
+
 > **Careful what you paste in public.** `docker compose config` and
-> `docker inspect` print the *interpolated* environment — your API keys in
-> plain text. Redact before sharing either one in an issue. `docker compose
-> logs` is safe; `scripts/preflight.py` never prints a value at all.
+> `docker inspect` print the *interpolated* environment — your API keys **and
+> these secrets** in plain text. Redact before sharing either one in an issue.
+> `docker compose logs` is safe; `scripts/preflight.py` and
+> `scripts/bootstrap_secrets.py` never print a value at all.
 
 ## 3. Preflight (optional, recommended)
 
@@ -57,9 +103,9 @@ python scripts/preflight.py
 ```
 
 It checks Docker, free ports, disk space, whether your `.env` has usable keys
-(it inspects shape only and never prints a value), and whether the images it
-needs are available. Every failure it reports comes with the command that
-fixes it. It changes nothing.
+and the shared secrets set (it inspects shape only and never prints a value),
+and whether the images it needs are available. Every failure it reports comes
+with the command that fixes it. It changes nothing.
 
 ## 4. Pull and start
 
@@ -273,7 +319,7 @@ working on LazyAF itself, build locally — the dev stack is the same topology
 with live source mounts:
 
 ```bash
-cp .env.example .env      # then edit
+python scripts/bootstrap_secrets.py   # creates .env + the shared secrets
 docker compose up -d --build
 python scripts/build_images.py     # the lazyaf-*:dev step images
 python scripts/preflight.py --dev  # checks the source-build path

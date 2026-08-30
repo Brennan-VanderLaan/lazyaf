@@ -143,7 +143,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           cp dist/* release-assets/
-          for asset in docker-compose.release.yml .env.example scripts/preflight.py; do
+          for asset in docker-compose.release.yml .env.example scripts/preflight.py scripts/bootstrap_secrets.py; do
             if [ -f "$asset" ]; then
               cp "$asset" release-assets/
             else
@@ -177,11 +177,12 @@ jobs:
             echo
             echo "## Run the stack"
             echo
-            echo 'Download `docker-compose.release.yml` and `.env.example` from the assets below, then:'
+            echo 'Download `docker-compose.release.yml`, `.env.example` and `bootstrap_secrets.py` from the assets below, then:'
             echo
             echo '```bash'
-            echo 'cp .env.example .env       # add your ANTHROPIC_API_KEY / GEMINI_API_KEY'
+            echo 'python bootstrap_secrets.py   # makes .env and generates the two required auth secrets'
             echo "echo LAZYAF_VERSION=${TAG} >> .env"
+            echo '# then edit .env to add your ANTHROPIC_API_KEY / GEMINI_API_KEY'
             echo 'docker compose -f docker-compose.release.yml pull'
             echo 'docker compose -f docker-compose.release.yml up -d'
             echo '```'

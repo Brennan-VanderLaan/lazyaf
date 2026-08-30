@@ -1,0 +1,53 @@
+# Isolated QA stack — a destructive-testing sandbox.
+#
+# Brought up as its OWN compose project so a QA pass can abuse the platform
+# (fuzzing, state-machine violations, resource exhaustion, deliberate
+# corruption) without touching the dev stack on :8000 or the e2e lane on
+# :8765, both of which other work depends on.
+#
+#   docker compose -p lazyaf-qa -f docker-compose.qa.yml up -d --build
+#   docker compose -p lazyaf-qa -f docker-compose.qa.yml down -v
+#
+# Its own network and volumes: nothing here is shared with dev or e2e.
+services:
+  backend-qa:
+    build:
+      context: ./backend
+      args:
+        INCLUDE_DEV: "true"   # test-mode reset/seed endpoints
+    ports:
+      - "8790:8000"
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////tmp/qa.db
+      - LAZYAF_TEST_MODE=true
+      - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
+      - CONTAINER_GIT_URL_TEMPLATE=http://backend-qa:8000/git/{repo_id}.git
+      - CONTAINER_BACKEND_URL=http://backend-qa:8000
+      - CONTAINER_NETWORK=lazyaf-qa-network
+      # Same required shared secrets as every other stack (12.7): there is no
+      # default in the source any more. This project shares the repo's .env, so
+      # one `python scripts/bootstrap_secrets.py` covers dev, e2e and QA.
+      # Deliberately NOT the LAZYAF_DEV_EPHEMERAL_SECRETS shortcut: a sandbox
+      # that re-keys itself on every restart turns "my step token stopped
+      # verifying" into a QA finding about LazyAF rather than about the harness.
+      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/alembic:/app/alembic
+      - /var/run/docker.sock:/var/run/docker.sock
+      - lazyaf-qa-workspaces:/workspaces
+    networks:
+      - lazyaf-qa-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+networks:
+  lazyaf-qa-network:
+    name: lazyaf-qa-network
+
+volumes:
+  lazyaf-qa-workspaces:

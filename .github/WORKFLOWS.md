@@ -29,7 +29,13 @@ workflow file so nobody has to find this document to learn them:
 | `workflows/images.yml` | push to `main`, tag `v*`, manual | Builds and **pushes** every image to GHCR. |
 | `workflows/release.yml` | tag `v*`, manual | Builds the CLI wheel, attaches it (plus the onboarding files) to a GitHub Release. Optional, opt-in PyPI publish. |
 | `workflows/secret-scan.yml` | called by the three above; also manual | The leak gate. Reusable, so there is one definition and no drift. |
+| `workflows/release-please.yml` | push to `main`, manual | Works out the next version from the commit log, keeps a standing release PR, and on merge cuts the `v*` tag &mdash; then dispatches `release.yml` + `images.yml` at it. Publishes nothing itself. |
 | `dependabot.yml` | monthly | Keeps the pinned action SHAs current. `github-actions` only. |
+
+| Config | Purpose |
+|---|---|
+| `release-please-config.json` | One root package, `release-type: simple`, `bootstrap-sha` at the pre-conventional-commits boundary, changelog sections. |
+| `.release-please-manifest.json` | The current version. release-please reads it to know where to bump from and rewrites it on release. |
 
 | Script | Purpose |
 |---|---|
@@ -235,6 +241,13 @@ docker tag  ghcr.io/brennan-vanderlaan/lazyaf/base:latest lazyaf-base:dev
 
 ## Cutting a release
 
+> **This is the manual path, and it is now the fallback.** The normal way to
+> release is to merge the release PR that `release-please.yml` maintains — see
+> [release-please owns the version number](#release-please-owns-the-version-number)
+> below. Everything here still works and is still what a hand-pushed tag does;
+> read it as the description of *what a `v*` tag causes*, which the automated
+> path reuses rather than replaces.
+
 1. Let the dogfood pipeline go green on the revision you want to ship.
 2. Bump `__version__` in `cli/lazyaf/__init__.py` (the single source of the CLI
    version; `cli/pyproject.toml` reads it via `[tool.setuptools.dynamic]`).
@@ -394,3 +407,216 @@ image and none of the three had a filter.
 just installed — a Windows dependency tree, native binaries and all, landing on
 top of the Linux one. Excluding `node_modules` is what makes that `npm ci`
 actually count.
+
+---
+
+## release-please owns the version number
+
+Before this, the version was whatever a human typed into
+`cli/lazyaf/__init__.py` and then again into `git tag`, and the changelog was
+`git log`. `release-please.yml` replaces the typing. It does **not** replace
+`release.yml` or `images.yml` — those still do all the packaging, unchanged, and
+still fire on a `v*` tag. release-please's whole job is to decide what that tag
+should be called and to create it.
+
+The framing at the top of this document is untouched: **LazyAF's dogfood
+pipeline decides whether the code is good; GitHub packages what it blessed.**
+release-please adds a third, narrower role — *naming* — and it has no opinion
+about correctness either.
+
+### The flow, end to end
+
+```
+  conventional commit lands on main
+            |
+            v
+  release-please.yml  (job: release-please)
+    reads commits since bootstrap-sha / the last tag
+    opens or refreshes ONE release PR:
+      "chore(main): release 0.2.0"
+      - CHANGELOG.md entry
+      - cli/lazyaf/__init__.py  __version__ = "0.2.0"
+      - .github/.release-please-manifest.json  -> 0.2.0
+            |
+            |   ... the PR sits there, always current,
+            |   ... rewritten on every further push to main
+            v
+  a human MERGES the release PR         <-- this is the release decision
+            |
+            v
+  release-please.yml runs again on the merge commit
+    creates tag  v0.2.0
+    creates the GitHub Release with the changelog notes
+            |
+            v
+  release-please.yml  (job: package)
+    gh workflow run release.yml --ref v0.2.0
+    gh workflow run images.yml  --ref v0.2.0
+            |
+            +--> release.yml : wheel + sdist + docker-compose.release.yml
+            |                  + .env.example + preflight.py, uploaded onto
+            |                  the Release release-please just made
+            |
+            +--> images.yml  : every service and step image to GHCR, tagged
+                               v0.2.0 / 0.2.0 / latest / sha-<short>
+```
+
+### Why the `package` job exists (the one real gotcha)
+
+GitHub will not start a workflow run from an event that the automatic
+`GITHUB_TOKEN` produced. That is the loop breaker, and it is not configurable.
+The tag release-please creates is created with that token, so:
+
+> `release.yml`'s and `images.yml`'s `on: push: tags: ['v*']` **do not fire**
+> for an automated tag.
+
+Those triggers are still right — a human pushing a tag by hand still fires
+both — they are just unreachable from automation. `workflow_dispatch` and
+`repository_dispatch` are the two documented exceptions, so the `package` job
+dispatches both workflows with `--ref` set to the new tag. Both already read
+`github.ref` / `GITHUB_REF_NAME`, so a dispatch *at a tag ref* is
+indistinguishable from a tag push: `release.yml` still runs
+`check_release_version.py`, `images.yml` still computes the `latest` tag set.
+Neither file needed a change.
+
+The other way to solve this is a personal access token, so the tag push looks
+like it came from a person. Rejected — it would introduce the first long-lived
+credential into a repository whose stated posture is "the only credential that
+exists is the per-run `GITHUB_TOKEN`". One `actions: write` scope on one job is
+cheaper than a secret to store, rotate and trust.
+
+`release.yml` is safe to run against a tag that already has a GitHub Release:
+its publish step does `gh release view` first and falls back to
+`gh release upload --clobber`. release-please writes the notes; `release.yml`
+attaches the files.
+
+### The decisions, and why
+
+**One package, rooted at the repo, not components.** `packages: { ".": ... }`
+with `include-component-in-tag: false`, which produces plain `v0.2.0` tags. The
+alternative — a component per publishable thing — would produce `cli-v0.2.0`,
+which matches neither existing workflow's `v*` filter and would need
+`publish_image.py`'s tag policy rewritten too. And it would be modelling
+something that is not true: the CLI wheel and the container images are not
+independently versioned here, they are two renderings of *one* revision, and
+the compose file pins them with a single `LAZYAF_VERSION`. One number, one tag.
+
+**`release-type: simple`, not `python`.** The `python` strategy tries to find
+and update `setup.py`, `setup.cfg` and `pyproject.toml` relative to the package
+root. At the repo root none of those exist, and the one that does exist
+(`cli/pyproject.toml`) declares `dynamic = ["version"]` — there is deliberately
+no version string in it to update. `simple` adds only a `version.txt` updater,
+and that updater is `createIfMissing: false`, so with no `version.txt` in the
+tree it is a no-op and nothing unwanted gets created. The actual version bump
+is then done explicitly, by an `extra-files` generic updater pointed at
+`cli/lazyaf/__init__.py`, which keys on a pair of release-please block-marker
+comments now bracketing the `__version__` assignment. Explicit beats a
+strategy's file-discovery magic when the layout is non-standard, and this
+layout is non-standard on purpose.
+
+The markers bracket the line rather than sitting on the end of it: release-please
+also supports an end-of-line marker, but `tdd/unit/packaging` parses that line as
+text (`line.split("=", 1)[1].strip().strip("\"'")`), so a trailing comment lands
+inside the version string it extracts and seven packaging tests go red. Bracketing
+keeps the assignment byte-for-byte plain and both contracts hold.
+
+**`bootstrap-sha: 8b567e5ad34203ce552451cb82eeb6a9d2144b36`.** This project has
+not been using conventional commits — `git log` is full of `12.3: ...` and
+`PLAN: ...`. Without a boundary, release-please would try to interpret all of
+it, find nothing it recognises, and either propose nothing or propose something
+arbitrary. `bootstrap-sha` pins the last commit of the old regime ("release CI:
+publish the wheel and images"); nothing at or before it is ever read. The
+starting version comes from `.release-please-manifest.json`, set to `0.1.0` to
+match what `cli/lazyaf/__init__.py` declares today, so the first automated
+release is a bump *from* the version already shipped rather than a reset.
+
+**Pre-1.0: `bump-minor-pre-major: true`.** Under release-please's *defaults*, a
+breaking change below 1.0 bumps the major — `0.1.0` to `1.0.0` — so the first
+`feat!` would declare 1.0 by accident. With this flag on, a breaking change at
+`0.x` bumps the minor instead (`0.1.0` to `0.2.0`), the same as a plain `feat`.
+`bump-patch-for-minor-pre-major` is left at its default `false`, so a `feat`
+still gets `0.2.0` rather than being demoted to a patch. The consequence, stated
+plainly: **below 1.0 a breaking change is indistinguishable from a feature in
+the version number** — the distinction lives in the "BREAKING CHANGES" section
+of the changelog, and pinning an exact version is the caller's job. `1.0.0` is
+reached deliberately, with a `Release-As: 1.0.0` footer, not by tripping over a
+`!`. The full table is in [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+**Permissions.** Top-level `contents: read`. Two jobs widen it in opposite
+directions and neither holds the other's scope:
+
+| Job | Scope | Why |
+|---|---|---|
+| `release-please` | `contents: write` | commit the changelog and version bump; create the tag and Release |
+| `release-please` | `pull-requests: write` | open, refresh and label the release PR |
+| `package` | `actions: write` | `gh workflow run` — the only thing it can do |
+
+Splitting the dispatch into its own job is the whole reason there are two jobs:
+the job that can write to the repository cannot start workflows, and the job
+that starts workflows cannot write to the repository. Both use the automatic
+per-run `GITHUB_TOKEN`; there is still no PAT and no organisation secret in this
+repository.
+
+**Action pinning.**
+`googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7` is
+**v5.0.0** (released 2026-04-22; v5 moved the action to node24). The SHA was
+verified against the GitHub tags API rather than copied from a README, and
+Dependabot's existing `github-actions` config will keep it current.
+
+### Cutting the FIRST release
+
+There are no tags in this repository yet, so the first one has a couple of
+one-time wrinkles. In order:
+
+1. **Turn on the repo setting release-please needs.** Settings, Actions,
+   General, Workflow permissions, tick **"Allow GitHub Actions to create and
+   approve pull requests"**. Without it the job's `pull-requests: write` is not
+   enough and release-please fails trying to open its PR. This is the single
+   most common first-run failure.
+2. **Land this change on `main`.** The commit that adds
+   `release-please.yml`, the two config files and `CONTRIBUTING.md`.
+3. **Land at least one conventional commit after it.** Until one exists,
+   release-please correctly proposes nothing and opens no PR — an empty Actions
+   run with no release PR is the *expected* outcome at this point, not a
+   failure. `bootstrap-sha` means it can see no releasable history yet.
+4. **Check the release PR when it appears.** Titled
+   `chore(main): release 0.1.1` (or `0.2.0` after a `feat`). It must change
+   three files:
+   - `CHANGELOG.md` — created for the first time
+   - `.github/.release-please-manifest.json` — `0.1.0` to the new version
+   - `cli/lazyaf/__init__.py` — the `__version__` line
+
+   **If `cli/lazyaf/__init__.py` is not in the diff, stop and fix the
+   `extra-files` wiring before merging.** A release whose wheel still says
+   `0.1.0` under a `v0.1.1` tag is caught later by
+   `check_release_version.py`, but catching it in the PR is free.
+5. **Merge it.** release-please creates `v0.1.1` and a GitHub Release, then the
+   `package` job dispatches `release.yml` and `images.yml` at that tag.
+6. **Verify the fan-out.** Two runs should appear in the Actions tab within
+   seconds of the release-please run finishing, both showing the tag as their
+   ref. When they are done the Release should carry the wheel, the sdist,
+   `docker-compose.release.yml`, `.env.example` and `preflight.py`, and GHCR
+   should have `latest` for the first time.
+
+Note that `0.1.0` itself is never tagged: the manifest declares it as the
+current version, i.e. already shipped. If the first tag really must be
+`v0.1.0`, put `Release-As: 0.1.0` in the footer of the commit from step 3.
+
+### What could not be validated locally
+
+Actions cannot be run on this machine. What *was* checked: both JSON files
+parse; `release-please-config.json` validates clean against release-please
+v17.6.0's published `schemas/config.json`; the workflow YAML parses and its
+job graph and `needs:` references resolve; the pinned SHA was confirmed to be
+v5.0.0 via the GitHub API; the strategy behaviour relied on above (`simple`'s
+`version.txt` updater being `createIfMissing: false`, and a bare-string vs
+`type: generic` extra-file both routing to the generic updater) was read out of
+the release-please v17.6.0 source rather than assumed from documentation; that
+updater's block-marker logic was ported to Python and run against the real
+`cli/lazyaf/__init__.py`, confirming that bumping to `0.1.1` / `0.2.0` /
+`1.0.0` changes exactly one line and that it is the `__version__` assignment;
+and `tdd/unit/packaging` (33 tests, including a real wheel build and a fresh
+venv install) is green with the markers in place.
+
+What genuinely cannot be known until the first run: whether the repo setting in
+step 1 is on, and whether branch protection on `main` lets the release PR merge.

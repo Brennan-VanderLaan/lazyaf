@@ -4,7 +4,8 @@
 #   The fastest way to run LazyAF without building anything. Every service
 #   here uses a PREBUILT image from GHCR; there is not a single `build:`
 #   stanza and not a single source bind-mount. Clone (or just download this
-#   one file plus .env.example), fill in a .env, `pull`, `up`. That is it.
+#   one file plus .env.example), run `scripts/bootstrap_secrets.py` to make
+#   a .env with real auth secrets in it, `pull`, `up`. That is it.
 #
 # WHAT THIS IS NOT
 #   This is not the development stack and it is not a test harness. Use
@@ -23,8 +24,9 @@
 #   share a database.
 #
 # USAGE
-#   cp .env.example .env          # then edit: put your API keys in
-#   python scripts/preflight.py   # optional but recommended
+#   python scripts/bootstrap_secrets.py   # creates .env AND generates the
+#                                         # shared secrets; then add API keys
+#   python scripts/preflight.py           # optional but recommended
 #   docker compose -f docker-compose.release.yml pull
 #   docker compose -f docker-compose.release.yml up -d
 #   open http://localhost:5173
@@ -67,12 +69,23 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
-      # These two are NOT secrets today: the values below are the same public
-      # defaults already compiled into backend/app/config.py, repeated here
-      # only so you can override them from .env without editing this file.
-      # Any deployment reachable from outside your machine MUST override both.
-      - LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:-lazyaf-step-auth-secret-key-change-in-production}
-      - LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:-lazyaf-runner-auth-secret-key-change-in-production}
+      # SHARED SECRETS - REQUIRED, and there is no default anywhere.
+      #
+      # These two used to fall back to constants compiled into
+      # backend/app/config.py. A constant in a public repository is not a
+      # secret: LAZYAF_STEP_AUTH_SECRET signs the JWTs step containers present
+      # to /api/steps/*, and LAZYAF_RUNNER_AUTH_SECRET is what a runner agent
+      # presents to enrol. Anyone who could read GitHub could mint both.
+      #
+      # Compose cannot generate a value for you, so it stops here instead of
+      # starting something insecure. Either:
+      #   python scripts/bootstrap_secrets.py       (writes fresh random values
+      #                                              into .env; safe to re-run)
+      # or, if you deliver secrets by mounted file, drop these two lines and use
+      # LAZYAF_STEP_AUTH_SECRET_FILE / LAZYAF_RUNNER_AUTH_SECRET_FILE instead -
+      # the _FILE form takes precedence. See deploy/k8s/README.md.
+      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py (or set LAZYAF_STEP_AUTH_SECRET_FILE)}'
+      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py (or set LAZYAF_RUNNER_AUTH_SECRET_FILE)}'
     networks:
       - lazyaf-network
     healthcheck:
@@ -129,8 +142,11 @@ services:
       # internal git server by service DNS, so they join the shared network.
       - LAZYAF_STEP_NETWORK=lazyaf-network
       - LAZYAF_STEP_BACKEND_URL=http://backend:8000
-      # Must match the backend's LAZYAF_RUNNER_AUTH_SECRET above.
-      - LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:-lazyaf-runner-auth-secret-key-change-in-production}
+      # Must EQUAL the backend's LAZYAF_RUNNER_AUTH_SECRET above - the /ws/runner
+      # upgrade is rejected before accept() otherwise, and this host simply
+      # never appears in the runner list. Sharing one .env variable is what
+      # keeps the two halves from drifting.
+      - 'LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
       # The agent REFUSES plaintext ws:// to a non-loopback host by default,
       # because the execute_step frame carries the step JWT and the step's
       # secret environment. `backend` is a compose service name, not

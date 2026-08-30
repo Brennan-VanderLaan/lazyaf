@@ -1181,6 +1181,23 @@ CUDA/torch/vLLM compatibility forever. We add a thin layer - the runner agent,
 an entrypoint that supervises two processes, and the endpoint declaration - and
 inherit their release engineering.
 
+**Windows desktops with idle RTX cards (owner, 2026-08-30).** The target is a
+Windows box running Docker Desktop on the WSL2 backend, using the SAME image as
+runpod with `--gpus all` (NVIDIA's CUDA-on-WSL driver makes this work), so there
+is nothing Windows-specific to maintain. Two decisions attach to it:
+
+- **Dual role, selected per endpoint.** The box can serve models AND execute
+  steps; the difference is advertised as labels, not as two deployment shapes.
+- **Yield on GPU busy.** LazyAF must not fight the owner for his own GPU. This
+  is genuinely new mechanism: the node samples GPU utilization and DRAINS -
+  stops accepting new assignments while letting an in-flight step finish - then
+  resumes, with hysteresis so a transient spike cannot flap it. The naive
+  version (disconnect when busy) is wrong precisely because 14.5 establishes
+  that the connection IS the advertisement, so disconnecting would orphan
+  running work. Expect a small backend availability flag; silently dropping the
+  connection is not acceptable. The UI must show WHY a node is not taking work,
+  and a manual force-drain / force-available override is required.
+
 Design points the wiring doc must settle:
 - **Two processes, one container.** The entrypoint starts the inference server,
   waits for it to be healthy, then starts the runner agent, and propagates

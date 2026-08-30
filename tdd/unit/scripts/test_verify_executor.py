@@ -283,3 +283,54 @@ class TestMain:
 
         verify_executor.main()
         assert calls[0].startswith("http://backend:8000/")
+
+
+class TestManifestDeliveryGate:
+    """12.2.6 ratchet: manifest delivery is non-fatal to the STEP by design,
+    so the GATE is the only place its silence gets broken. A dogfood run
+    once shipped three manifests into 404s and still gated clean."""
+
+    def _run(self, logs: str) -> dict:
+        return {
+            "pipeline_id": "p1",
+            "step_runs": [
+                {
+                    "step_index": 0,
+                    "step_name": "T1",
+                    "executor": "local",
+                    "status": "passed",
+                    "logs": logs,
+                }
+            ],
+        }
+
+    def _pipeline(self) -> dict:
+        return {"steps": [{"type": "script"}]}
+
+    def test_manifest_delivery_failure_fails_the_gate(self, monkeypatch):
+        import scripts.verify_executor as ve
+
+        run = self._run(
+            "real log line\n"
+            "[control] WARNING: test results manifest failed to reach backend "
+            "after 3 attempts\n"
+        )
+        monkeypatch.setattr(
+            ve, "fetch_json",
+            lambda base, path: run if "pipeline-runs" in path else self._pipeline(),
+        )
+        with pytest.raises(SystemExit) as exc:
+            ve.verify_run("http://backend:8000", "r1")
+        assert "tie-back is dark" in str(exc.value)
+
+    def test_clean_run_passes_the_gate(self, monkeypatch):
+        import scripts.verify_executor as ve
+
+        run = self._run("real log line\n[lazyaf] exit code: 0\n")
+        monkeypatch.setattr(
+            ve, "fetch_json",
+            lambda base, path: run if "pipeline-runs" in path else self._pipeline(),
+        )
+        assert "no manifest delivery problems" in ve.verify_run(
+            "http://backend:8000", "r1"
+        )

@@ -113,9 +113,29 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
             "FAIL: control-layer reporting path delivered no logs "
             "(POST /api/steps/*/logs never landed?):\n  " + "\n  ".join(silent)
         )
+    # 12.2.6 ratchet (R7): manifest delivery is deliberately non-fatal to the
+    # STEP - a test-results POST that 404s must never fail a green suite. That
+    # is correct, and it is exactly why it can rot unnoticed: a dogfood run
+    # once shipped three manifests into 404s and still reported a clean gate,
+    # because nothing here looked. The runtime announces every delivery
+    # problem on stdout with a stable marker, so the GATE breaks that silence.
+    manifest_problems = []
+    for sr in run["step_runs"]:
+        for line in (sr.get("logs") or "").splitlines():
+            if "[control] WARNING: test results manifest" in line:
+                manifest_problems.append(
+                    f"step {sr.get('step_index')} '{sr.get('step_name')}': {line.strip()}"
+                )
+    if manifest_problems:
+        raise SystemExit(
+            "FAIL: test-result manifests did not reach the backend (12.2.6 "
+            "tie-back is dark - check the /api/steps/*/test-results route and "
+            "that migrations are applied):\n  " + "\n  ".join(manifest_problems)
+        )
+
     return (
-        f"OK: {checked} script step run(s) all have executor='local' "
-        f"and passed steps delivered logs"
+        f"OK: {checked} script step run(s) all have executor='local', "
+        f"passed steps delivered logs, and no manifest delivery problems"
     )
 
 

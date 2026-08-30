@@ -5,6 +5,11 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/app:/app/app
+      # Migrations live in the IMAGE (12.3: production boots self-sufficiently),
+      # so dev must mount them too or a new revision is invisible until the
+      # image is rebuilt - the container would sit at an older head and report
+      # itself current. Mirrors the ./backend/app mount above.
+      - ./backend/alembic:/app/alembic
       - lazyaf-data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock  # Docker socket for LocalExecutor
       - lazyaf-workspaces:/workspaces  # Shared workspace volumes

@@ -88,6 +88,40 @@ class MockExecutor(AgentExecutor):
         """Mock executor doesn't use a CLI command."""
         return ["echo", "mock-executor"]
 
+    @staticmethod
+    def _usage(prompt: str, output_events: list) -> dict:
+        """Deterministic usage for the mock agent (Phase 12.5).
+
+        DELIBERATE: ``cost_source="cli-reported"``, not ``"unknown"``. The
+        mock's cost is genuinely KNOWN to be zero — ``provider="self-hosted"``
+        + ``model="mock"`` + ``raw.mock`` make that unambiguous — and a
+        dogfood ratchet that only ever exercised the ``unknown`` branch would
+        leave the real branch untested on every push.
+
+        Tokens are a 4-chars-per-token approximation of the real prompt and
+        the configured output events, so the dogfood assertion "non-null,
+        non-zero input_tokens and output_tokens" has something real to bite
+        on while staying byte-deterministic.
+        """
+        output_chars = 0
+        for event in output_events or []:
+            if isinstance(event, dict):
+                text = event.get("text")
+                if isinstance(text, str):
+                    output_chars += len(text)
+        return {
+            "provider": "self-hosted",
+            "model": "mock",
+            "model_version": None,
+            "input_tokens": len(prompt or "") // 4,
+            "output_tokens": output_chars // 4,
+            "cache_read_tokens": None,
+            "cache_write_tokens": None,
+            "cost_usd": "0.000000",
+            "cost_source": "cli-reported",
+            "raw": {"mock": True},
+        }
+
     def execute(
         self,
         config: ExecutorConfig,
@@ -114,6 +148,7 @@ class MockExecutor(AgentExecutor):
                 mc = self._load_mock_config(config.workspace, log_callback)
 
             mock = self._parse_mock_config(mc)
+            usage = self._usage(config.prompt, mock.output_events)
 
             if log_callback:
                 log_callback("[mock] Starting mock execution")
@@ -143,6 +178,7 @@ class MockExecutor(AgentExecutor):
                     success=False,
                     exit_code=mock.exit_code,
                     error=error,
+                    usage=usage,
                 )
 
             if log_callback:
@@ -151,6 +187,7 @@ class MockExecutor(AgentExecutor):
             return ExecutorResult(
                 success=True,
                 exit_code=0,
+                usage=usage,
             )
 
         except Exception as e:

@@ -472,6 +472,24 @@ class TestRunnerIdlenessGate:
 
 
 class TestMain:
+    @pytest.fixture(autouse=True)
+    def _clear_injected_env(self, monkeypatch):
+        """The runtime injects the whole LAZYAF_* contract into every step
+        container, so these tests inherit REAL values when the suite runs
+        inside the dogfood tier - LAZYAF_STEP_INDEX in particular made
+        main() skip a step the fixture data does not have, and the tests
+        passed on the host while failing in CI. Start from a clean
+        contract and let each test declare exactly what it needs.
+        """
+        for name in (
+            "LAZYAF_BACKEND_URL",
+            "LAZYAF_PIPELINE_RUN_ID",
+            "LAZYAF_STEP_INDEX",
+            "LAZYAF_STEP_RUN_ID",
+            "LAZYAF_EXECUTION_KEY",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
     def test_missing_run_id_fails(self, monkeypatch, capsys):
         monkeypatch.delenv("LAZYAF_PIPELINE_RUN_ID", raising=False)
         monkeypatch.delenv("LAZYAF_BACKEND_URL", raising=False)

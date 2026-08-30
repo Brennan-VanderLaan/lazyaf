@@ -283,12 +283,62 @@ class PipelineRunRead(BaseModel):
         from_attributes = True
 
 
+# =============================================================================
+# Trigger vocabulary
+# =============================================================================
+#
+# `PipelineRun.trigger_type` stopped being a free-text label in 12.5: it is
+# the DURABLE ROUTING KEY `agent_run.on_run_complete` dispatches on when a run
+# finishes. A run stamped `card_work` makes run completion write a Card's
+# status, and `trigger_ref` names the card - so an unvalidated string on the
+# public run endpoint let any caller drive an arbitrary card to in_review or
+# failed by starting a pipeline of their own.
+#
+# Hence: a closed vocabulary here, and the ad-hoc subset refused by the public
+# endpoint (routers/pipelines.run_pipeline) because only the internal ad-hoc
+# path may stamp it.
+
+#: Trigger types a caller may ask for on POST /api/pipelines/{id}/run.
+PUBLIC_TRIGGER_TYPES = (
+    "manual",
+    "webhook",
+    "card",
+    "card_complete",
+    "push",
+    "schedule",
+    "pipeline",
+)
+
+#: Trigger types owned by app.services.agent_run (kept in sync with its
+#: ADHOC_TRIGGER_TYPES). Settable ONLY by the internal ad-hoc run path.
+ADHOC_TRIGGER_TYPES = ("card_work", "playground")
+
+#: Everything PipelineRun.trigger_type is allowed to hold.
+KNOWN_TRIGGER_TYPES = PUBLIC_TRIGGER_TYPES + ADHOC_TRIGGER_TYPES
+
+
 class PipelineRunCreate(BaseModel):
     """Parameters for starting a pipeline run."""
     trigger_type: str = "manual"
     trigger_ref: str | None = None
     trigger_context: dict[str, Any] | None = None  # {branch, commit_sha, card_id, etc.}
     params: dict[str, Any] | None = None  # Optional parameters passed to steps as env vars
+
+    @field_validator("trigger_type")
+    @classmethod
+    def known_trigger_type(cls, v: str) -> str:
+        """Reject anything outside the vocabulary (422).
+
+        A typo used to be persisted verbatim and silently routed nowhere;
+        now it is refused at the edge, and the message names the vocabulary
+        so the caller does not have to go read the model.
+        """
+        if v not in KNOWN_TRIGGER_TYPES:
+            raise ValueError(
+                f"unknown trigger_type {v!r}; valid values are "
+                + ", ".join(KNOWN_TRIGGER_TYPES)
+            )
+        return v
 
 
 # =============================================================================

@@ -39,7 +39,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
-from app.models import Pipeline, PipelineRun, StepRun, RunStatus, Job, Card, Repo
+from app.models import (
+    Card,
+    Job,
+    Pipeline,
+    PipelineRun,
+    Repo,
+    RunStatus,
+    StepRun,
+    TestRun,
+    TestRunStatus,
+)
 from app.models.pipeline import ExecutorMode, StepExecution, StepExecutionStatus
 from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
@@ -94,6 +104,237 @@ NEVER_REPORTED_STEP_EXECUTION_STATUSES = frozenset({
     StepExecutionStatus.ASSIGNED.value,
     StepExecutionStatus.PREPARING.value,
 })
+
+
+# -----------------------------------------------------------------------------
+# Agent steps on the control layer (Phase 12.5)
+# -----------------------------------------------------------------------------
+
+# The fixed command an agent step runs. Users NEVER write it: the wrapper is
+# a module of the tested runner-common package installed in the agent images,
+# and run.py executes it exactly as it executes a script - same watchdog, same
+# log pump, same exit code semantics.
+AGENT_WRAPPER_COMMAND = "python3 -m runner_common.agent_wrapper"
+
+# Agent vocabulary -> default image (cross-agent contract #5). `mock` resolves
+# to agent-base because the mock executor needs python + runner-common and
+# that is precisely what agent-base is; a fourth image would be rebuild cost
+# with no payload.
+DEFAULT_AGENT_IMAGE = {
+    "claude-code": "lazyaf-claude:dev",
+    "gemini": "lazyaf-gemini:dev",
+    "mock": "lazyaf-agent-base:dev",
+}
+
+# Agent vocabulary -> the settings key holding its API key, and the env var
+# name the CLI reads. `mock` needs neither.
+AGENT_SECRET_ENV = {
+    "claude-code": ("ANTHROPIC_API_KEY", "anthropic_api_key"),
+    "gemini": ("GEMINI_API_KEY", "gemini_api_key"),
+    "mock": None,
+}
+
+# Agent vocabulary -> UsageManifest.provider, so even a step that produces no
+# usage manifest (killed before the wrapper wrote one) is attributed to the
+# right provider by run.py's fallback record.
+AGENT_USAGE_PROVIDER = {
+    "claude-code": "anthropic",
+    "gemini": "google",
+    "mock": "self-hosted",
+}
+
+# The image label an agent image DECLARES (baked by images/agent-base). Used
+# by ONE preflight assertion - never by mode selection - so a user pointing
+# an agent step at lazyaf-test-runner:dev gets one clear message instead of
+# `ModuleNotFoundError: runner_common` thirty seconds into the container.
+AGENT_RUNTIME_LABEL = "lazyaf.agent-runtime"
+
+# A capability label is DECLARED only when its value is exactly "1". Presence
+# alone is not a declaration - `LABEL lazyaf.agent-runtime=0` is an image
+# author saying NO, and a presence-only check reads it as yes.
+LABEL_DECLARED_VALUE = "1"
+
+# Prefix of the ISOLATED branch an agent step gets when nothing declared one.
+# See resolve_agent_work_branch: an agent step that names no branch must never
+# inherit the branch the run was triggered on, because committing and pushing
+# there is what re-fires the push trigger that started the run.
+AGENT_WORK_BRANCH_PREFIX = "lazyaf/agent-"
+
+# Default timeouts. 300s is a rounding error for an agent; 1800s is the
+# agent-step default, and the in-container watchdog remains the ONE timeout
+# owner (the executor's backstop is timeout + grace on top of that).
+DEFAULT_STEP_TIMEOUT = 300
+DEFAULT_AGENT_STEP_TIMEOUT = 1800
+
+
+def default_timeout_for(step_type: str) -> int:
+    """The timeout a step of this type gets when it declares none."""
+    if step_type == "agent":
+        return DEFAULT_AGENT_STEP_TIMEOUT
+    return DEFAULT_STEP_TIMEOUT
+
+
+def resolve_agent_work_branch(
+    step_config: dict,
+    context: dict,
+    base_branch: str,
+    fallback_id: str,
+) -> tuple[str, bool]:
+    """Which branch an agent step commits and pushes to, and whether the
+    step CONFIG declared it.
+
+    THE LOOP THIS EXISTS TO STOP. Before this, an agent step that named no
+    branch fell through to the run's base branch - which for a push-triggered
+    run is the branch that was just pushed. The step then committed and
+    PUSHED there, the push fired the same push trigger, and the pipeline
+    re-ran itself with a real provider bill attached to every lap. Nothing
+    in the loop was rate-limited or depth-capped: it stopped when the budget
+    did.
+
+    The rule, in one line: **only an explicit `branch:` in the step config
+    may resolve to the run's trigger/base branch.**
+
+    Resolution order:
+
+    1. ``step_config["branch"]`` - the EXPLICIT declaration. It may name the
+       trigger branch: a pipeline author who writes ``branch: main`` on an
+       agent step has said so out loud, and that is the one way to get a
+       push to the branch the run was triggered on.
+    2. ``context["work_branch"]`` - set by the internal ad-hoc path
+       (``agent_run.start_adhoc_agent_run``) for card work and the
+       playground, which know their own throwaway branch. It is honored
+       ONLY while it differs from the base branch; if an ad-hoc caller ever
+       passes the base branch, it is dropped rather than pushed to.
+    3. Otherwise an ISOLATED branch derived from ``fallback_id`` (the
+       StepRun id): ``lazyaf/agent-<8 hex>``. Unique per StepRun, so a
+       re-run gets a fresh branch, and never equal to a real branch name a
+       trigger watches.
+
+    Returns:
+        (work_branch, declared_in_step_config)
+    """
+    declared = (step_config.get("branch") or "").strip()
+    if declared:
+        return declared, True
+
+    inherited = (context.get("work_branch") or "").strip()
+    if inherited and inherited != base_branch:
+        return inherited, False
+    if inherited:
+        logger.warning(
+            "Agent step inherited work_branch %r, which IS the run's base "
+            "branch; using an isolated branch instead - pushing to the "
+            "trigger branch requires an explicit `branch:` in the step config",
+            inherited,
+        )
+
+    return f"{AGENT_WORK_BRANCH_PREFIX}{(fallback_id or uuid4().hex)[:8]}", False
+
+
+def build_verification_step(
+    command: str,
+    *,
+    name: str = "Verify",
+    step_id: str = "verify",
+    image: str | None = None,
+    timeout: int = DEFAULT_STEP_TIMEOUT,
+    working_dir: str | None = None,
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """The POST-AGENT VERIFICATION STEP of an ad-hoc agent run (12.5 seam).
+
+    The legacy card path ran the repo's test suite after the agent and
+    demoted the card when it came back red. The control-layer path lost that
+    gate: the agent's own exit code became the card's verdict, so a card
+    whose agent exited 0 over a broken tree was offered for merge green.
+
+    This is the pipeline-side half of putting the gate back. The ad-hoc
+    pipeline gets a SECOND step - an ordinary script step running the repo's
+    test command - and everything else already works:
+
+    - it runs in the SAME workspace volume (keyed by pipeline_run_id), so it
+      sees the tree the agent just committed, on the agent's work branch;
+    - ``on_failure: "stop"`` makes a red suite fail the RUN, and the run's
+      success is what ``agent_run.on_run_complete`` routes on, so the card
+      lands in ``failed`` instead of ``in_review``;
+    - in control mode its ingested test results also gate the step itself
+      (see ``_apply_test_result_gate``), so a test command that swallows a
+      failing suite and exits 0 still fails.
+
+    The results themselves are read back off the RUN by
+    ``agent_run.run_test_summary`` - one reader, owned by the module that
+    puts the numbers on the card, so there is no second summary here.
+
+    Args:
+        command: the repo's test command, as a shell string.
+        name/step_id: how the step shows up in the run's step list.
+        image: pin the test image; omit for the platform default.
+        timeout: seconds; the in-container watchdog owns it.
+        working_dir: defaults to the image's repo checkout.
+        environment: extra non-secret env for the test command.
+    """
+    config: dict[str, Any] = {"command": command}
+    if image:
+        config["image"] = image
+    if working_dir:
+        config["working_dir"] = working_dir
+    if environment:
+        config["environment"] = dict(environment)
+    return {
+        "id": step_id,
+        "name": name,
+        "type": "script",
+        "config": config,
+        "timeout": timeout,
+        "on_success": "next",
+        "on_failure": "stop",
+    }
+
+
+def resolve_agent_type(step_config: dict) -> str:
+    """The agent an agent step selects, validated against the vocabulary.
+
+    Accepts the historical `runner_type` spelling as well as `agent` (the
+    legacy queue keyed on runner_type; pipelines in the wild carry it).
+    Raises ValueError on anything unknown - there is NO default agent, and
+    guessing one is how a step silently bills the wrong provider.
+    """
+    agent = step_config.get("agent") or step_config.get("runner_type")
+    if not agent or agent == "any":
+        raise ValueError(
+            "agent step is missing an `agent:` key - valid agents are "
+            f"{', '.join(sorted(DEFAULT_AGENT_IMAGE))} (there is no default)"
+        )
+    if agent not in DEFAULT_AGENT_IMAGE:
+        raise ValueError(
+            f"unknown agent {agent!r}: valid agents are "
+            f"{', '.join(sorted(DEFAULT_AGENT_IMAGE))}"
+        )
+    return agent
+
+
+def agent_secret_environment(agent: str, step_name: str = "") -> dict[str, str]:
+    """API keys for one agent, read from settings at DISPATCH time.
+
+    Returned as `secret_environment`, which the LocalExecutor delivers ONLY
+    through the step config file - never through inspectable container env.
+
+    A missing key fails the step HERE rather than thirty seconds later
+    inside an opaque CLI auth error, and the message names the variable
+    without ever putting its value in the logs.
+    """
+    mapping = AGENT_SECRET_ENV.get(agent)
+    if mapping is None:
+        return {}
+    env_var, settings_key = mapping
+    value = getattr(get_settings(), settings_key, None)
+    if not value:
+        raise ValueError(
+            f"agent step {step_name!r} needs {env_var} to run the {agent!r} "
+            f"CLI, but no key is configured - set {env_var} in the backend's "
+            "environment"
+        )
+    return {env_var: value}
 
 
 class LocalStepContextError(RuntimeError):
@@ -251,6 +492,9 @@ class PipelineExecutor:
         # ever exists (fix 5).
         self._local_executor_init_lock = asyncio.Lock()
         self._continue_in_context_logged = False
+        # (resolved image ID, label) -> declared?  Mirrors LocalExecutor's
+        # control-layer cache: keyed by ID so a rebuilt tag is re-evaluated.
+        self._image_label_cache: dict[tuple[str, str], bool] = {}
 
     # -------------------------------------------------------------------------
     # Seams (lazy imports against the 12.2-INT contracts; failures are loud)
@@ -365,6 +609,8 @@ class PipelineExecutor:
         self._state_machines.clear()
         self._session_factories.clear()
         self._run_locks.clear()
+        # Images may be rebuilt between test runs (same tag, new ID).
+        self._image_label_cache.clear()
         # Recreate the init lock: asyncio primitives bind to the loop that
         # first awaits them, and reset() is the boundary where the test
         # harness may hand us a fresh loop.
@@ -590,8 +836,42 @@ class PipelineExecutor:
             except Exception as e:
                 logger.error(f"Failed to execute trigger action: {e}")
 
+        # Ad-hoc agent runs (12.5, cross-agent contract #7): card work and
+        # playground sessions ARE pipeline runs now, so their completion
+        # bookkeeping hangs off the one place every run ends. Durable by
+        # construction - it routes on the persisted trigger_type/trigger_ref
+        # columns, never an in-memory registry a restart would lose - and a
+        # no-op for every other trigger type.
+        await self._notify_agent_run_complete(db, pipeline_run, success)
+
         await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
         logger.info(f"Pipeline run {pipeline_run.id[:8]} completed with status {pipeline_run.status}")
+
+    async def _notify_agent_run_complete(
+        self, db: AsyncSession, pipeline_run: PipelineRun, success: bool
+    ) -> None:
+        """Call agent_run.on_run_complete, loudly but never fatally.
+
+        Imported lazily so pipeline_executor keeps no import-time dependency
+        on the ad-hoc run module. A failure here is logged with a traceback:
+        the pipeline run itself is already terminal and committed, and losing
+        that fact to a card-status bug would be worse than the bug.
+        """
+        try:
+            from app.services import agent_run
+        except ImportError:  # pragma: no cover - module lands with 12.5
+            return
+        hook = getattr(agent_run, "on_run_complete", None)
+        if hook is None:  # pragma: no cover - defensive
+            return
+        try:
+            await hook(db, pipeline_run, success)
+        except Exception:
+            logger.exception(
+                "agent_run.on_run_complete failed for run %s (the run is "
+                "already terminal; card/playground state may be stale)",
+                pipeline_run.id[:8],
+            )
 
     async def _cleanup_workspace(self, db: AsyncSession, run_id: str) -> None:
         """Remove the run's workspace volume via WorkspaceService.cleanup.
@@ -881,18 +1161,48 @@ class PipelineExecutor:
         BEFORE dispatching step 0, instead of dribbling per-step
         ImageNotFound failures across a partially-executed run.
 
-        Scope: only images named in step configs. Steps without an explicit
-        image use settings.step_default_image, which app startup pre-pulls;
-        resolving it here would force a docker client into runs that route
-        entirely legacy (and into the no-Docker test tier). Preflight
-        infrastructure failures (docker down, guard-blocked client) are
-        logged and non-fatal - per-step dispatch surfaces them loudly.
+        Scope: images named in step configs, PLUS (12.5) the default image of
+        every agent step, because an agent step cannot fall back to
+        settings.step_default_image - it needs the runner-common runtime.
+        Steps without an explicit image use settings.step_default_image,
+        which app startup pre-pulls; resolving it here would force a docker
+        client into runs that route entirely legacy (and into the no-Docker
+        test tier). Preflight infrastructure failures (docker down,
+        guard-blocked client) are logged and non-fatal - per-step dispatch
+        surfaces them loudly.
+
+        Agent images get ONE extra assertion: they must DECLARE
+        `lazyaf.agent-runtime=1`. A user pointing an agent step at
+        lazyaf-test-runner:dev gets that message instead of
+        `ModuleNotFoundError: runner_common` thirty seconds in.
         """
-        images = sorted({
-            (step.get("config") or {}).get("image")
-            for step in step_defs
-            if (step.get("config") or {}).get("image")
-        })
+        agent_images: set[str] = set()
+        for step in step_defs:
+            if step.get("type") != "agent":
+                continue
+            config = step.get("config") or {}
+            if config.get("executor") == "legacy":
+                continue  # R2 escape hatch: no local image is involved
+            if config.get("image"):
+                agent_images.add(config["image"])
+                continue
+            try:
+                agent_images.add(DEFAULT_AGENT_IMAGE[resolve_agent_type(config)])
+            except ValueError:
+                # Vocabulary errors belong to the STEP, not the run: dispatch
+                # fails exactly that step with the message naming the bad
+                # value, so a good step 0 still runs. Preflight only answers
+                # "can these images be spawned at all".
+                continue
+
+        images = sorted(
+            {
+                (step.get("config") or {}).get("image")
+                for step in step_defs
+                if (step.get("config") or {}).get("image")
+            }
+            | agent_images
+        )
         if not images:
             return None
         try:
@@ -910,7 +1220,127 @@ class PipelineExecutor:
                 + ", ".join(sorted(missing))
                 + " - build or pull them before running this pipeline"
             )
+        if agent_images:
+            unlabeled = await self._agent_images_without_runtime_label(
+                sorted(agent_images)
+            )
+            if unlabeled:
+                return (
+                    "image(s) "
+                    + ", ".join(unlabeled)
+                    + f" do not declare {AGENT_RUNTIME_LABEL}=1 and cannot run "
+                    "an agent step - use an agent image "
+                    f"({', '.join(sorted(set(DEFAULT_AGENT_IMAGE.values())))})"
+                )
         return None
+
+    async def _agent_images_without_runtime_label(
+        self, images: list[str]
+    ) -> list[str]:
+        """Agent images that do not DECLARE `lazyaf.agent-runtime=1`.
+
+        Three things this got wrong before (12.5 hardening):
+
+        (a) It tested for the label's PRESENCE. `LABEL lazyaf.agent-runtime=0`
+            is an image author saying "not an agent image" and it passed the
+            preflight. The rule is the same one `image_supports_control_layer`
+            already uses: the VALUE must be exactly "1".
+        (b) It re-inspected every image on every run start with no cache,
+            while the control-layer check next to it caches by resolved image
+            ID.
+        (c) It reached through `executor._docker`, so a seam that is not a
+            real LocalExecutor (test stubs, any future remote executor)
+            silently turned the preflight OFF and shipped a green "nothing to
+            report" - the loudest possible thing to be quiet about.
+
+        Inspection failures are still NOT reported as unlabeled: an
+        unreachable daemon is an infrastructure problem, and turning it into
+        "your image is wrong" would be a lie that sends the operator the
+        wrong way. But every skip now says so.
+        """
+        try:
+            executor = await self._get_local_executor()
+        except Exception as e:
+            logger.warning(
+                f"Agent-runtime label preflight could not run ({e!r}); "
+                "dispatch will surface a bad agent image per-step"
+            )
+            return []
+
+        unlabeled: list[str] = []
+        for image in images:
+            declared = await self._image_declares_label(
+                executor, image, AGENT_RUNTIME_LABEL
+            )
+            if declared is None:
+                continue  # inspection failed / no seam - already logged
+            if not declared:
+                unlabeled.append(image)
+        return unlabeled
+
+    async def _image_declares_label(
+        self, executor, image: str, label: str
+    ) -> bool | None:
+        """Does `image` declare `label=1`? None = could not tell.
+
+        The real seam is `LocalExecutor.image_declares_label(image, label)`,
+        which sits beside `image_supports_control_layer` and shares its
+        cache-by-resolved-image-ID discipline; that is what runs in
+        production and it is what the delegate branch below calls.
+
+        The inline fallback under it is kept for executor seams that predate
+        the method (test stubs, any future remote executor): same VALUE ==
+        "1" rule, same cache discipline, and - the part that matters - a LOUD
+        skip rather than a silent pass when there is nothing to inspect with.
+        A preflight that quietly turns itself off reports "nothing to report".
+        """
+        delegate = getattr(executor, "image_declares_label", None)
+        if delegate is not None:
+            try:
+                declared = await delegate(image, label)
+                # None from the delegate means "could not tell" and must NOT
+                # collapse to "unlabeled" - a daemon hiccup is not a claim
+                # about the image.
+                return None if declared is None else bool(declared)
+            except Exception:
+                logger.warning(
+                    "Could not inspect image %s for the %s label",
+                    image,
+                    label,
+                    exc_info=True,
+                )
+                return None
+
+        docker_client = getattr(executor, "_docker", None)
+        if docker_client is None:
+            logger.warning(
+                "Agent-runtime label preflight SKIPPED: %s exposes neither "
+                "image_declares_label() nor a docker client, so no image can "
+                "be checked for %s=%s. A mis-pinned agent image will only "
+                "surface per-step at dispatch.",
+                type(executor).__name__,
+                label,
+                LABEL_DECLARED_VALUE,
+            )
+            return None
+
+        from fastapi.concurrency import run_in_threadpool
+
+        try:
+            inspected = await run_in_threadpool(docker_client.images.get, image)
+        except Exception:
+            logger.warning(
+                "Could not inspect image %s for the %s label", image, label
+            )
+            return None
+
+        image_id = getattr(inspected, "id", None) or image
+        cache_key = (image_id, label)
+        cached = self._image_label_cache.get(cache_key)
+        if cached is None:
+            cached = (inspected.labels or {}).get(label) == LABEL_DECLARED_VALUE
+            self._image_label_cache[cache_key] = cached
+        return cached
 
     def _init_state_machine(self, run_id: str, total_steps: int) -> None:
         """Create the run's state machine and drive it to RUNNING."""
@@ -1374,7 +1804,10 @@ class PipelineExecutor:
 
             step_type = step.get("type", "script")
             step_config = step.get("config", {}) or {}
-            timeout = step.get("timeout", 300)
+            # Agent steps default to 1800s: 300 is a rounding error for an
+            # agent, and the in-container watchdog stays the ONE timeout
+            # owner regardless.
+            timeout = step.get("timeout") or default_timeout_for(step_type)
             hard_deadline = timeout + LOCAL_STEP_HARD_TIMEOUT_GRACE
 
             success = False
@@ -1409,6 +1842,11 @@ class PipelineExecutor:
                 exec_config, exec_context = self._build_local_execution_config(
                     pipeline_run, step_run, step_type, step_config, timeout, params,
                 )
+                if step_type == "agent":
+                    await self._attach_agent_payload(
+                        db, pipeline_run, pipeline, repo, step_run,
+                        step_config, exec_config,
+                    )
                 await self._prepare_control_mode(
                     db, executor, step_run, step_config, exec_config,
                     exec_context, timeout,
@@ -1734,20 +2172,45 @@ class PipelineExecutor:
         network defaults are single-sourced in the LocalExecutor itself
         (settings-driven there, fix 11). Raises ValueError on unknown
         `needs:` capabilities - the caller fails the step loudly.
+
+        Agent steps (12.5) additionally get: the fixed wrapper command (users
+        never write it), the agent's default image, and `secret_environment`
+        carrying the provider API key. The DB-sourced half of the agent
+        payload is attached afterwards by `_attach_agent_payload`, which can
+        await the session this synchronous builder does not have.
         """
         environment = dict(step_config.get("environment") or {})
         if params:
             environment.update({str(k): str(v) for k, v in params.items()})
 
+        is_agent = step_type == "agent"
+        agent = resolve_agent_type(step_config) if is_agent else None
+
         exec_step_config: dict[str, Any] = {
             "type": step_type,
-            "command": step_config.get("command", ""),
+            "command": (
+                AGENT_WRAPPER_COMMAND if is_agent
+                else step_config.get("command", "")
+            ),
             "timeout": timeout,
         }
+        if is_agent:
+            # Secrets travel in the config FILE only; a missing key raises
+            # HERE, at dispatch, with the variable named.
+            exec_step_config["secret_environment"] = agent_secret_environment(
+                agent, step_run.step_name or ""
+            )
+            exec_step_config["usage_provider"] = AGENT_USAGE_PROVIDER.get(
+                agent, "self-hosted"
+            )
+            if step_config.get("role"):
+                exec_step_config["role"] = step_config["role"]
         if environment:
             exec_step_config["environment"] = environment
         if step_config.get("image"):
             exec_step_config["image"] = step_config["image"]
+        elif is_agent:
+            exec_step_config["image"] = DEFAULT_AGENT_IMAGE[agent]
         if step_config.get("working_dir"):
             exec_step_config["working_dir"] = step_config["working_dir"]
         if step_config.get("memory_limit"):
@@ -1792,6 +2255,252 @@ class PipelineExecutor:
         }
         return exec_step_config, exec_context
 
+    async def _attach_agent_payload(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        pipeline: Pipeline,
+        repo: Repo,
+        step_run: StepRun,
+        step_config: dict,
+        exec_config: dict,
+    ) -> None:
+        """Fill `exec_config["agent"]` with the DB-sourced half of the payload.
+
+        Split from `_build_local_execution_config` for one reason: this half
+        needs the session (previous-step logs, AgentFile resolution) and that
+        builder is synchronous and widely called. The LocalExecutor feeds the
+        result straight to `generate_agent_config`, which stays the single
+        producer of the file shape (R3) - this method supplies FIELDS, never
+        a hand-built file.
+
+        Everything the container would otherwise have to look up itself is
+        resolved HERE, because the container has no DB: the prompt is
+        rendered backend-side (agent_prompt.py), agent_file_ids become one
+        `agents_json` string, and the previous step's logs come from the
+        StepRun row rather than the legacy `.lazyaf-context/` directory.
+        """
+        from app.services.agent_prompt import render_agent_prompt
+        from app.services.control_layer.workspace import (
+            truncate_previous_step_logs,
+        )
+
+        agent = resolve_agent_type(step_config)
+        settings = get_settings()
+        backend_url = getattr(
+            settings, "container_backend_url", "http://backend:8000"
+        )
+
+        context = {}
+        if pipeline_run.trigger_context:
+            try:
+                context = json.loads(pipeline_run.trigger_context) or {}
+            except (json.JSONDecodeError, TypeError):
+                context = {}
+
+        base_branch = context.get("branch") or repo.default_branch or "main"
+        work_branch, branch_declared = resolve_agent_work_branch(
+            step_config, context, base_branch, step_run.id
+        )
+
+        # `task:` is the pipeline-YAML spelling of a one-line instruction
+        # (the dogfood ratchet's mock-agent step uses it); `title` is the
+        # card-shaped one. Both feed {{title}} - an agent step that states
+        # what to do must not have that string silently dropped.
+        card_title = (
+            step_config.get("title")
+            or step_config.get("task")
+            or context.get("card_title")
+            or (step_run.step_name or "")
+        )
+        card_description = (
+            step_config.get("description")
+            or context.get("card_description")
+            or ""
+        )
+
+        previous_name, previous_logs = await self._load_previous_step_output(
+            db, pipeline_run, step_run
+        )
+        # Cap BEFORE rendering: the prompt carries the same text, so an
+        # uncapped log would blow the prompt as well as the wire payload.
+        capped_logs, _ = truncate_previous_step_logs(previous_logs)
+
+        prompt = render_agent_prompt(
+            card_title=card_title,
+            card_description=card_description,
+            prompt_template=step_config.get("prompt_template"),
+            previous_step_logs=capped_logs,
+        )
+
+        agents_json = await self._resolve_agents_json(
+            db, repo, base_branch, step_config.get("agent_file_ids") or []
+        )
+
+        commit = step_config.get("commit")
+        if isinstance(commit, dict):
+            commit_enabled = bool(commit.get("enabled", True))
+            commit_message = commit.get("message")
+            push = bool(commit.get("push", True))
+            allow_empty = bool(commit.get("allow_empty", False))
+        else:
+            # `commit: false` is the dogfood ratchet's spelling: a real agent
+            # step through the real runtime that must never push to its own
+            # repo.
+            commit_enabled = bool(commit) if commit is not None else True
+            commit_message = None
+            push = commit_enabled
+            allow_empty = False
+
+        # Post-condition of resolve_agent_work_branch, asserted rather than
+        # assumed: the ONE way to push to the run's own trigger/base branch is
+        # an explicit `branch:` in the step config. If this ever fires, the
+        # resolver regressed and the self-triggering push loop is back.
+        if push and not branch_declared and work_branch == base_branch:
+            raise ValueError(  # pragma: no cover - unreachable by construction
+                f"agent step {step_run.step_name!r} would push to the run's "
+                f"own branch {base_branch!r} without declaring it; pushing to "
+                "the trigger branch requires an explicit `branch:` in the "
+                "step config"
+            )
+
+        exec_config["agent"] = {
+            "agent": agent,
+            "prompt": prompt,
+            "model": step_config.get("model"),
+            "agents_json": agents_json,
+            "stream": bool(step_config.get("stream", True)),
+            "card_id": context.get("card_id"),
+            "card_title": card_title,
+            "card_description": card_description,
+            "step_index": step_run.step_index,
+            "step_name": step_run.step_name or "",
+            "previous_step_name": previous_name,
+            "previous_step_logs": previous_logs,
+            "repo_id": repo.id,
+            "workdir": self._agent_repo_workdir(exec_config, settings),
+            "base_branch": base_branch,
+            "branch": work_branch,
+            "remote_url": f"{backend_url}/git/{repo.id}.git",
+            "commit_enabled": commit_enabled,
+            "commit_message": commit_message,
+            "push": push,
+            "allow_empty": allow_empty,
+            "mock_config": step_config.get("mock_config"),
+            # M13 seam: on the wire NOW, null everywhere in 12.5.
+            "role": step_config.get("role"),
+        }
+
+    @staticmethod
+    def _agent_repo_workdir(exec_config: dict, settings) -> str:
+        """Where the agent runs AND where its commit is staged.
+
+        COMMIT SCOPE (12.5 hardening). The workspace volume is shared by
+        every step of a run, so by the time an agent step runs it can already
+        contain artifacts an earlier step dropped there - caches, build
+        output, downloaded fixtures. The wrapper stages with `git add -A`,
+        which is bounded by the git worktree it runs in and by nothing else,
+        so the ONE thing that keeps a shared-workspace artifact out of a
+        pushed commit is running that staging inside the REPO CHECKOUT.
+
+        This pins that: the agent payload's workdir is the repo checkout
+        (`settings.step_working_dir`, `/workspace/repo`) or a directory
+        underneath it, never a `working_dir` override that points elsewhere
+        in the volume. An override outside the checkout is honored for
+        nothing - it is dropped with a warning rather than silently turning
+        the whole workspace into the commit's staging area.
+
+        The remaining gap is artifacts written INTO the checkout by an
+        earlier step; narrowing that needs the wrapper to diff the tree
+        before/after the agent, which is runner-common's side of the seam
+        (see the requested edit to runner_common/agent_wrapper.py).
+        """
+        checkout = settings.step_working_dir
+        declared = exec_config.get("working_dir")
+        if not declared:
+            return checkout
+        if declared == checkout or declared.startswith(
+            checkout.rstrip("/") + "/"
+        ):
+            return declared
+        logger.warning(
+            "Agent step declares working_dir %r, which is outside the repo "
+            "checkout %r; the agent runs (and commits) in the checkout - a "
+            "commit staged from the shared workspace root would carry earlier "
+            "steps' artifacts",
+            declared,
+            checkout,
+        )
+        return checkout
+
+    async def _load_previous_step_output(
+        self, db: AsyncSession, pipeline_run: PipelineRun, step_run: StepRun
+    ) -> tuple[str | None, str | None]:
+        """(name, logs) of the step before this one, or (None, None).
+
+        Replaces the legacy `.lazyaf-context/step_N.log` channel with the
+        DB row that is already the single source of a step's logs (R3).
+        """
+        if step_run.step_index <= 0:
+            return None, None
+        result = await db.execute(
+            select(StepRun)
+            .where(StepRun.pipeline_run_id == pipeline_run.id)
+            .where(StepRun.step_index == step_run.step_index - 1)
+        )
+        previous = result.scalars().first()
+        if previous is None:
+            return None, None
+        return previous.step_name, (previous.logs or None)
+
+    async def _resolve_agents_json(
+        self, db: AsyncSession, repo: Repo, branch: str, agent_file_ids: list
+    ) -> str | None:
+        """Resolve agent_file_ids to the `claude --agents` JSON string.
+
+        The backend owns AgentFile and the repo-agent overlay; the container
+        has no DB, so resolution happens HERE and travels as one string.
+        A file that cannot be resolved is skipped with a WARNING rather than
+        failing the step: a missing optional sub-agent is not a reason to
+        lose the work.
+        """
+        if not agent_file_ids:
+            return None
+        try:
+            from app.models import AgentFile
+            from app.services.agent_resolver import AgentResolver
+
+            result = await db.execute(
+                select(AgentFile).where(AgentFile.id.in_(list(agent_file_ids)))
+            )
+            files = list(result.scalars().all())
+            missing = set(agent_file_ids) - {f.id for f in files}
+            if missing:
+                logger.warning(
+                    "agent step references unknown agent_file_ids %s "
+                    "(skipped)",
+                    sorted(missing),
+                )
+            resolver = AgentResolver()
+            resolved = await resolver.resolve_agents(
+                db, repo.id, branch, [f.name for f in files]
+            )
+            if not resolved:
+                return None
+            return json.dumps({
+                entry["name"]: {
+                    "description": entry.get("description") or "",
+                    "prompt": entry.get("prompt_template") or "",
+                }
+                for entry in resolved
+            })
+        except Exception:
+            logger.exception(
+                "agent file resolution failed; dispatching the step without "
+                "sub-agents"
+            )
+            return None
+
     async def _prepare_control_mode(
         self,
         db: AsyncSession,
@@ -1826,21 +2535,48 @@ class PipelineExecutor:
 
         Stock/unlabeled images take the stdout path with ZERO behavior
         change.
+
+        AGENT STEPS (12.5) are the one exception: for them control mode is
+        MANDATORY, so every escape hatch RAISES instead of downgrading. An
+        agent step in stdout mode would run the wrapper with no config file
+        (and the API key would have to travel in inspectable container env),
+        so it fails loudly at dispatch instead.
         """
         exec_context["control_mode"] = False
+        is_agent = exec_config.get("type") == "agent"
 
         if step_config.get("control") is False:
+            if is_agent:
+                raise ValueError(
+                    f"agent step {step_run.step_name!r} cannot run with "
+                    "`control: false`: the wrapper is configured through the "
+                    "step config FILE, which only control mode delivers, and "
+                    "the provider API key must never travel in inspectable "
+                    "container environment"
+                )
             logger.info(
                 f"Step {step_run.step_index} ({step_run.step_name}): control "
                 f"mode disabled by step config (control: false) - stdout mode"
             )
             return
         if not isinstance(exec_config.get("command", ""), str):
+            if is_agent:  # pragma: no cover - the builder always emits a str
+                raise ValueError(
+                    f"agent step {step_run.step_name!r} has a non-string "
+                    "command; the wrapper command is platform-owned"
+                )
             return  # exec-form list command: explicit stdout-mode opt-out
 
         settings = get_settings()
         image = exec_config.get("image") or settings.step_default_image
         if not await executor.image_supports_control_layer(image):
+            if is_agent:
+                raise ValueError(
+                    f"agent step {step_run.step_name!r} is pinned to image "
+                    f"{image!r}, which does not declare the control-layer "
+                    "capability label. Agent steps require an agent image "
+                    f"({', '.join(sorted(set(DEFAULT_AGENT_IMAGE.values())))})."
+                )
             return
 
         from app.services.execution.idempotency import ExecutionService
@@ -2124,6 +2860,71 @@ class PipelineExecutor:
             execution.exit_code = exit_code
         return success, error
 
+    async def _apply_test_result_gate(
+        self,
+        db: AsyncSession,
+        step_run: StepRun,
+        success: bool,
+        error: str | None,
+        warning_lines: list[str],
+    ) -> tuple[bool, str | None]:
+        """Demote a green step whose ingested test results are RED.
+
+        THE LOST GATE. The legacy runner path had exactly one line of this
+        (`on_step_complete`: ``if step_success and job.tests_run and not
+        job.tests_passed: step_success = False``). Local steps have no Job
+        row, so the control-layer path shipped without it and the step's exit
+        code became the only verdict - a test command that swallows a failing
+        suite (a wrapper script, a `|| true`, a runner that reports results
+        and still exits 0) read as a PASSING step, which for an ad-hoc card
+        run means the card is offered for merge red.
+
+        The equivalent datum on the control layer is the TestRun rows the
+        step posted to ``/api/steps/{id}/test-results``. This only ever
+        DEMOTES: an already-failed step stays failed, and a step that
+        ingested nothing is untouched (no results is not a pass, but it is
+        also not evidence of failure - that judgement belongs to whoever
+        required the tests, see ``run_test_summary``).
+
+        Never fatal: a broken count must not turn a finished step into a
+        crash, so an inspection failure leaves the executor's verdict alone
+        and says so loudly.
+        """
+        if not success:
+            return success, error
+        try:
+            result = await db.execute(
+                select(func.count())
+                .select_from(TestRun)
+                .where(TestRun.step_run_id == step_run.id)
+                .where(TestRun.status == TestRunStatus.FAILED.value)
+            )
+            failed = int(result.scalar() or 0)
+        except Exception:
+            logger.exception(
+                "Test-result gate could not read results for step %s; keeping "
+                "the executor's verdict",
+                step_run.id[:8],
+            )
+            return success, error
+
+        if not failed:
+            return success, error
+
+        message = (
+            f"{failed} test(s) reported FAILED by this step - the step is red "
+            "regardless of its exit code"
+        )
+        logger.warning(
+            "Step %s (%s) exited successfully but reported %d failing "
+            "test(s); demoting to FAILED",
+            step_run.step_index,
+            step_run.step_name,
+            failed,
+        )
+        warning_lines.append(f"[lazyaf] {message}\n")
+        return False, message if not error else f"{message}; {error}"
+
     async def _finish_local_step_locked(
         self,
         db: AsyncSession,
@@ -2158,6 +2959,12 @@ class PipelineExecutor:
             success, error = self._reconcile_control_execution(
                 execution, step, success, exit_code, error, warning_lines
             )
+
+        # The test gate the legacy path had and the local path lost: exit code
+        # 0 does not outrank a RED ingested suite.
+        success, error = await self._apply_test_result_gate(
+            db, step_run, success, error, warning_lines
+        )
 
         step_run.status = RunStatus.PASSED.value if success else RunStatus.FAILED.value
         step_run.completed_at = datetime.utcnow()
@@ -2584,10 +3391,37 @@ class PipelineExecutor:
         current_step: int,
         template_card_id: str,
     ) -> None:
-        """
-        Clone a card as template and run it to fix issues.
+        """Clone a card as template and run it, on the control layer, to fix
+        issues.
 
-        The triggered card runs as an additional step, then continues to next step.
+        12.5: this used to be the last caller of ``job_queue.enqueue`` on the
+        card path. Card START and card RETRY moved to the ad-hoc agent run
+        (``agent_run.start_card_work``); the ``trigger:{card_id}`` action did
+        not, so "nothing enqueues any more" was true of the paths people look
+        at and false of this one - and a queue with one live caller is a
+        queue nobody notices has stopped being polled. It now takes exactly
+        the same path card start does.
+
+        CONTINUATION. The legacy shape blocked the parent run: the fix job's
+        runner callback re-entered ``on_step_complete`` for a StepRun parked
+        at the SAME index, which then re-applied that index's action - so a
+        fix that failed re-fired ``trigger:{card_id}`` and looped. An ad-hoc
+        run has no such callback into this run, so the parent continues
+        immediately, exactly like the sibling ``trigger:pipeline:`` action
+        (fire-and-forget). That is the legacy SUCCESS path's destination
+        (``on_success: next`` -> ``current_step + 1``) minus the wait, and it
+        has no re-trigger lap.
+
+        A marker StepRun records that the fix was dispatched and names the
+        run that carries it; it is terminal on creation, because the work it
+        points at is not in this run.
+
+        KNOWN LIMITATION, inherited verbatim from ``trigger:pipeline:`` and
+        deliberately not changed here: when the triggering step is the LAST
+        one, continuing past it completes the run PASSED even though the
+        action fired from ``on_failure``. Fixing that means threading the
+        step's own verdict through ``_handle_action``, which is a wider
+        change than this finding.
         """
         # Get the template card
         result = await db.execute(select(Card).where(Card.id == template_card_id))
@@ -2600,19 +3434,10 @@ class PipelineExecutor:
 
         logger.info(f"Triggering card template {template_card_id} to fix step {current_step}")
 
-        # Create step run for the triggered card (always the legacy runner path)
-        step_run = StepRun(
-            id=str(uuid4()),
-            pipeline_run_id=pipeline_run.id,
-            step_index=current_step,  # Same step index (sub-step)
-            step_name=f"[Fix] {template_card.title}",
-            status=RunStatus.RUNNING.value,
-            executor=ExecutorMode.LEGACY.value,
-            started_at=datetime.utcnow(),
-        )
-        db.add(step_run)
-
-        # Clone the template card
+        # The cards router owns Job creation + branch naming on the card-start
+        # path; this is that path's other entry point, so it does the same
+        # here and hands ownership of every later transition to agent_run.
+        job_id = str(uuid4())
         cloned_card = Card(
             id=str(uuid4()),
             repo_id=repo.id,
@@ -2622,64 +3447,95 @@ class PipelineExecutor:
             runner_type=template_card.runner_type,
             step_type=template_card.step_type,
             step_config=template_card.step_config,
+            job_id=job_id,
+            branch_name=f"lazyaf/{job_id[:8]}",
         )
         db.add(cloned_card)
-
-        # Create job for the cloned card
-        job_id = str(uuid4())
         job = Job(
             id=job_id,
             card_id=cloned_card.id,
             status="queued",
             step_type=cloned_card.step_type,
             step_config=cloned_card.step_config,
-            step_run_id=step_run.id,
         )
         db.add(job)
 
-        # Update references
-        cloned_card.job_id = job_id
-        cloned_card.branch_name = f"lazyaf/{job_id[:8]}"
-        step_run.job_id = job_id
-
+        # Marker StepRun: terminal on creation (the work lives in the ad-hoc
+        # run named in its logs), and deliberately carrying NO job_id - a
+        # second row at this index claiming the step's job would poison
+        # _resolve_merge_source_branch for a later `merge:` action.
+        step_run = StepRun(
+            id=str(uuid4()),
+            pipeline_run_id=pipeline_run.id,
+            step_index=current_step,  # Same step index (sub-step)
+            step_name=f"[Fix] {template_card.title}",
+            status=RunStatus.RUNNING.value,
+            executor=ExecutorMode.LOCAL.value,
+            started_at=datetime.utcnow(),
+        )
+        db.add(step_run)
         await db.commit()
 
-        # Parse step_config for the queued job
         step_config = None
         if cloned_card.step_config:
             try:
                 step_config = json.loads(cloned_card.step_config)
             except (json.JSONDecodeError, TypeError):
-                pass
+                step_config = None
 
-        # Queue the job
-        queued_job = QueuedJob(
-            id=job_id,
-            card_id=cloned_card.id,
-            repo_id=repo.id,
-            repo_url=repo.remote_url or "",
-            base_branch=repo.default_branch,
-            card_title=cloned_card.title,
-            card_description=cloned_card.description,
-            runner_type=cloned_card.runner_type,
-            use_internal_git=True,
-            step_type=cloned_card.step_type,
-            step_config=step_config,
+        from app.services import agent_run
+
+        fix_run_id: str | None = None
+        error: str | None = None
+        try:
+            fix_run = await agent_run.start_card_work(
+                db,
+                cloned_card,
+                repo,
+                job_id=job_id,
+                step_config=step_config,
+            )
+            fix_run_id = fix_run.id
+        except Exception as e:
+            error = f"could not start the fix card's agent run: {e}"
+            logger.exception(
+                "Fix card %s for run %s could not be started",
+                cloned_card.id[:8],
+                pipeline_run.id[:8],
+            )
+            cloned_card.status = "failed"
+            job.status = "failed"
+            job.error = error
+            job.completed_at = datetime.utcnow()
+
+        step_run.status = (
+            RunStatus.FAILED.value if error else RunStatus.PASSED.value
         )
-        await job_queue.enqueue(queued_job)
+        step_run.completed_at = datetime.utcnow()
+        step_run.error = error
+        step_run.logs = (
+            f"[lazyaf] fix card {cloned_card.id[:8]} dispatched as ad-hoc "
+            f"card-work run {fix_run_id[:8]}\n"
+            if fix_run_id
+            else f"[lazyaf] {error}\n"
+        )
+        await db.commit()
+        await db.refresh(step_run)
+        await db.refresh(job)
 
-        logger.info(f"Enqueued triggered job {job_id[:8]} for fix card")
-
-        # Broadcast updates
         await manager.send_step_run_status(step_run_to_ws_dict(step_run))
         await manager.send_job_status({
-            "id": job_id,
+            "id": job.id,
             "card_id": cloned_card.id,
-            "status": "queued",
-            "error": None,
-            "started_at": None,
-            "completed_at": None,
+            "status": job.status,
+            "error": job.error,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "completed_at": (
+                job.completed_at.isoformat() if job.completed_at else None
+            ),
         })
+
+        await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
 
     async def _trigger_pipeline(
         self,

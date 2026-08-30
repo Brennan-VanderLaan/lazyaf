@@ -18,7 +18,14 @@ from app.schemas import (
     PipelineRunCreate,
     StepRunRead,
 )
+from app.schemas.pipeline import ADHOC_TRIGGER_TYPES
+from app.services.agent_run import ADHOC_PREFIX
 from app.services.websocket import manager
+
+# Usage channel (Phase 12.5) — separate import lines on purpose: the run
+# rollup below is the only thing in this module that needs them.
+from app.models import StepUsage
+from app.schemas.usage import RunUsageRollup
 
 router = APIRouter(tags=["pipelines"])
 
@@ -120,27 +127,48 @@ def step_run_to_ws_dict(step_run: StepRun) -> dict:
 # Pipeline CRUD
 # ============================================================================
 
+def _visible_pipelines(query):
+    """Hide the ephemeral pipelines behind ad-hoc agent runs (12.5).
+
+    Starting a card or a playground test creates a one-step Pipeline row so
+    the work gets a real PipelineRun (workspace, StepRun, control mode, usage
+    - see app/services/agent_run.py). Those rows are plumbing, one per card
+    start, and they would bury a repo's real pipelines within a day. Their
+    RUNS stay listed and readable: that is the point of using a run at all.
+
+    Filtering is by the writer's own prefix helper, so the hide rule and the
+    name rule cannot drift apart.
+    """
+    return query.where(~Pipeline.name.startswith(ADHOC_PREFIX))
+
+
 @router.get("/api/pipelines", response_model=list[PipelineRead])
 async def list_all_pipelines(
     repo_id: Optional[str] = Query(None, description="Filter by repo ID"),
     db: AsyncSession = Depends(get_db)
 ):
-    """List all pipelines, optionally filtered by repo_id."""
+    """List all pipelines, optionally filtered by repo_id.
+
+    Ad-hoc agent-run pipelines (12.5) are never listed - see
+    _visible_pipelines.
+    """
+    query = select(Pipeline)
     if repo_id:
-        result = await db.execute(select(Pipeline).where(Pipeline.repo_id == repo_id))
-    else:
-        result = await db.execute(select(Pipeline))
+        query = query.where(Pipeline.repo_id == repo_id)
+    result = await db.execute(_visible_pipelines(query))
     return result.scalars().all()
 
 
 @router.get("/api/repos/{repo_id}/pipelines", response_model=list[PipelineRead])
 async def list_pipelines_for_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
-    """List all pipelines for a specific repo."""
+    """List all pipelines for a specific repo (ad-hoc runs excluded)."""
     result = await db.execute(select(Repo).where(Repo.id == repo_id))
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Repo not found")
 
-    result = await db.execute(select(Pipeline).where(Pipeline.repo_id == repo_id))
+    result = await db.execute(
+        _visible_pipelines(select(Pipeline).where(Pipeline.repo_id == repo_id))
+    )
     return result.scalars().all()
 
 
@@ -241,6 +269,26 @@ async def run_pipeline(
     """Start a new run of a pipeline."""
     if request is None:
         request = PipelineRunCreate()
+
+    # trigger_type is a ROUTING KEY, not a label (12.5): a run stamped
+    # `card_work` makes `agent_run.on_run_complete` write the Card named by
+    # trigger_ref - status, Job row, and the card_complete triggers that fire
+    # off it. Accepting it here would let any caller drive an arbitrary card
+    # to in_review/failed by starting a pipeline. Only the internal ad-hoc
+    # path may stamp these; the schema validator rejects everything outside
+    # the known vocabulary, and this rejects the ad-hoc subset of it.
+    #
+    # Checked FIRST, before any lookup or write, so a refused request cannot
+    # have touched anything.
+    if request.trigger_type in ADHOC_TRIGGER_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"trigger_type {request.trigger_type!r} is reserved for "
+                "internal ad-hoc agent runs (card work / playground) and "
+                "cannot be set on this endpoint"
+            ),
+        )
 
     result = await db.execute(select(Pipeline).where(Pipeline.id == pipeline_id))
     pipeline = result.scalar_one_or_none()
@@ -519,4 +567,72 @@ async def export_pipeline_yaml(pipeline_id: str, db: AsyncSession = Depends(get_
         content=yaml_content,
         media_type="application/x-yaml",
         headers={"Content-Disposition": f"attachment; filename={pipeline.name.replace(' ', '_')}.yaml"}
+    )
+
+
+# -----------------------------------------------------------------------------
+# Usage rollup (Phase 12.5, api-surface 2.7) — appended at the bottom of this
+# module by design: the ad-hoc list filter above and this read endpoint are
+# the two 12.5 edits to this file and they must not collide.
+# -----------------------------------------------------------------------------
+
+@router.get("/api/pipeline-runs/{run_id}/usage", response_model=RunUsageRollup)
+async def get_pipeline_run_usage(run_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Cost/token rollup for one pipeline run, grouped by role.
+
+    [read-heavy] — served by ix_step_usages_pipeline_run_id_role: the
+    pipeline_run_id is DENORMALIZED onto StepUsage precisely so this scan
+    never has to join back to reach the run.
+
+    The per-step listing is what makes a dropped usage channel VISIBLE: the
+    dogfood gate compares it against the run's StepRuns, so a step that
+    silently reported nothing fails the push instead of quietly lowering the
+    median. A NULL role aggregates under "unattributed" and is never dropped
+    from the total; `cost_coverage` below 1.0 means some rows carry
+    cost_source="unknown" — "we could not price this", which is a different
+    fact from "this was free".
+
+    An unknown run id is a 404, not an empty rollup (api-surface 0).
+    """
+    run = (
+        await db.execute(select(PipelineRun).where(PipelineRun.id == run_id))
+    ).scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Pipeline run not found")
+
+    # COLUMNS, not entities. `RunUsageRollup.build` reads exactly the
+    # attributes named here; selecting the whole StepUsage also dragged back
+    # `raw` (capped at 8 KiB) and `determinism` per row, which this response
+    # never looks at — a run with 30 steps was fetching a quarter of a
+    # megabyte of TEXT to render numbers. A SQLAlchemy Row answers attribute
+    # access by label, so `from_model` needs no change.
+    rows = (
+        await db.execute(
+            select(
+                StepUsage.id,
+                StepUsage.step_execution_id,
+                StepUsage.step_run_id,
+                StepUsage.provider,
+                StepUsage.model,
+                StepUsage.role,
+                StepUsage.input_tokens,
+                StepUsage.output_tokens,
+                StepUsage.cache_read_tokens,
+                StepUsage.cache_write_tokens,
+                StepUsage.cost_usd,
+                StepUsage.cost_source,
+                StepUsage.wall_clock_ms,
+                StepUsage.container_seconds,
+                StepRun.step_index,
+                StepRun.step_name,
+            )
+            .outerjoin(StepRun, StepRun.id == StepUsage.step_run_id)
+            .where(StepUsage.pipeline_run_id == run_id)
+            .order_by(StepRun.step_index, StepUsage.created_at)
+        )
+    ).all()
+
+    return RunUsageRollup.build(
+        run_id, [(row, row.step_index, row.step_name) for row in rows]
     )

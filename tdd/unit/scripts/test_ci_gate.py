@@ -46,6 +46,13 @@ def failed(name: str) -> str:
     )
 
 
+def errored(name: str) -> str:
+    return (
+        f'<testcase classname="tdd.fake" name="{name}" time="0.01">'
+        f'<error message="kaboom">kaboom</error></testcase>'
+    )
+
+
 def skipped(name: str, reason: str) -> str:
     return (
         f'<testcase classname="tdd.fake" name="{name}" time="0">'
@@ -113,11 +120,16 @@ class TestGatePasses:
         ])
         assert result.returncode == 0, result.stderr
 
-    def test_failures_count_toward_floor_but_not_gate(self, gate_env):
-        """The gate polices skips/floors; pytest's own exit code polices failures."""
+    def test_failures_still_count_toward_the_floor(self, gate_env):
+        """A failed test DID run, so it counts as executed - the floor exists
+        to catch tests that silently stop running, not tests that fail.
+
+        The gate refuses red input as well (see TestGateRefusesRedInput); this
+        test pins only the counting rule, using a floor low enough that the
+        count is not what rejects it.
+        """
         result = gate_env([passed("a"), failed("b"), failed("c")])
-        assert result.returncode == 0, result.stderr
-        assert "executed=3" in result.stdout
+        assert "executed=3" in result.stderr + result.stdout
 
     def test_xfail_is_not_gated_as_skip(self, gate_env):
         result = gate_env([passed("a"), passed("b"), passed("c"), xfailed("d")])
@@ -212,7 +224,43 @@ class TestCommittedConfig:
             assert isinstance(spec["floor"], int) and spec["floor"] > 0, tier
             assert spec["floor"] <= spec["measured"], f"{tier} floor above measured count"
 
-    def test_dormant_12_6_prefix_is_baselined(self):
-        """The 12.6 contract suites stay dormant behind this exact prefix (R4)."""
+    def test_the_dormant_12_6_prefix_is_gone(self):
+        """The inverse of the assertion this replaces, and the point of R4.
+
+        The 12.6 contract suites were parked behind a `12.6-dormant:`
+        importorskip since Phase 0, and that prefix was baselined so the gate
+        would tolerate the skips. Their target modules exist now, the suites
+        run, and a baseline entry that can no longer match is a standing
+        permission to skip that nothing would ever notice being used again.
+        It was removed in the deletion commit; this keeps it removed.
+        """
         baseline = json.loads(COMMITTED_BASELINE.read_text(encoding="utf-8"))
-        assert any(e["reason_prefix"] == "12.6-dormant:" for e in baseline)
+        assert not [e for e in baseline if e["reason_prefix"] == "12.6-dormant:"], (
+            "the 12.6-dormant skip baseline entry is back. Its suites are "
+            "awake - a baseline entry for them can only ever hide a "
+            "regression now."
+        )
+
+
+class TestGateRefusesRedInput:
+    """A gate must never print OK on a red junitxml.
+
+    run_tier.py returns before invoking the gate when pytest is red, so the
+    pipeline was never at risk - but a DIRECT invocation printed
+    "CI GATE [T1]: OK" on a summary line that also said "failed=3", and a
+    verifier read that as a pass. A tool built to prevent fake green must not
+    be capable of producing it, however it is called.
+    """
+
+    def test_failures_fail_the_gate(self, gate_env):
+        result = gate_env([passed("a"), failed("b")])
+        assert result.returncode == 1
+        assert "never report OK on a red suite" in result.stderr
+
+    def test_errors_fail_the_gate(self, gate_env):
+        result = gate_env([passed("a"), errored("b")])
+        assert result.returncode == 1
+
+    def test_a_green_suite_still_passes(self, gate_env):
+        result = gate_env([passed("a"), passed("b"), passed("c")])
+        assert result.returncode == 0, result.stderr

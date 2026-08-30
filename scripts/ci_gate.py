@@ -107,6 +107,20 @@ def main(argv=None) -> int:
     )
 
     failed = False
+    # Defense in depth. run_tier.py returns before invoking the gate when
+    # pytest is red, so in the pipeline a failure never reaches here - but a
+    # human or an agent invoking ci_gate directly on a junitxml used to read
+    # "GATE OK" while the summary line said failed=3, which is exactly the
+    # fake-green this tool exists to prevent. The gate now refuses red input
+    # itself, so no caller can mistake it for a pass.
+    if counts["failed"] or counts["errors"]:
+        failed = True
+        print(
+            f"CI GATE [{args.tier}]: FAIL - {counts['failed']} failed / "
+            f"{counts['errors']} error(s) in the junitxml. A gate can never "
+            f"report OK on a red suite, however it was invoked.",
+            file=sys.stderr,
+        )
     if violations:
         failed = True
         print(f"CI GATE [{args.tier}]: FAIL - {len(violations)} skip(s) not in tdd/skip_baseline.json:", file=sys.stderr)

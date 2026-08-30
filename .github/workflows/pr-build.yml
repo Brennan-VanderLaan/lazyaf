@@ -1,0 +1,220 @@
+# =============================================================================
+# LazyAF - build check (pull requests)
+# =============================================================================
+#
+# THIS WORKFLOW DOES NOT TEST LAZYAF. READ THIS BEFORE ADDING A TEST STEP.
+#
+#   LazyAF gates LazyAF. Correctness is decided by LazyAF's own dogfood
+#   pipeline running against this repo - that is the standing decision in
+#   PLAN.md ("no external CI ever; self-host ASAP") and it has not changed.
+#   If you add `pytest` here you have quietly moved the quality gate to
+#   GitHub, which is exactly the thing the project decided not to do.
+#
+#   What this workflow answers is a narrower question that the dogfood
+#   pipeline does not: "can the RELEASE ARTIFACTS still be produced?" A
+#   Dockerfile that no longer builds, a wheel whose entry point is broken, a
+#   base image whose content-hash chain has drifted - none of those show up
+#   in a green test suite, and all of them turn a version tag into a failed
+#   release at the worst possible moment. Catching them at review time is
+#   the entire purpose here.
+#
+# WHAT IT BUILDS
+#   * the lazyaf CLI wheel, installed into a clean venv and smoke-run
+#   * every step image in scripts/build_images.py's IMAGES table, built
+#     by that script so the content-hash chain is exercised
+#   * the backend, frontend and runner-agent service images
+#   ... and then scans every one of those images for credentials.
+#
+# WHAT IT PUSHES: nothing. Not one registry write. Publishing lives in
+# images.yml and release.yml, which run only off main or a tag - so this
+# workflow deliberately does NOT also run on main, or every merge would build
+# the whole image set twice.
+#
+# SECURITY POSTURE
+#   * trigger is `pull_request`, never `pull_request_target`. A fork PR
+#     therefore runs with the FORK's read-only token, in a context with no
+#     access to this repository's secrets, and cannot escalate by editing
+#     this file - GitHub evaluates permissions from the base branch's
+#     definition for the token, and there is nothing here to steal anyway.
+#   * `permissions: contents: read` at the top level. No job widens it.
+#   * NO secrets are referenced. The builds must not need any: an image that
+#     requires an AI key to build would be an image that bakes one.
+#   * every action is pinned to a commit SHA.
+# =============================================================================
+
+name: build
+
+on:
+  pull_request:
+    branches: [main]
+  # Deliberately NOT `push: branches: [main]`. images.yml already builds every
+  # image on a push to main (it has to, in order to publish them), so adding
+  # main here would build the whole set twice for every merge. The PR run is
+  # where a broken artifact needs to be caught; the main run is images.yml's.
+  workflow_dispatch:
+
+# One in-flight run per PR. Pushing three times in a row should not occupy the
+# runner pool with two obsolete image builds.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege for every job in this file. Nothing here writes anything.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The leak gate, shared with release.yml and images.yml. Runs alongside the
+  # builds rather than blocking them: on a PR nothing is published, so the
+  # useful behaviour is "report every problem in one run", not "stop at the
+  # first". The publishing workflows DO block on it.
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    uses: ./.github/workflows/secret-scan.yml
+
+  # ---------------------------------------------------------------------------
+  # The wheel a user pip-installs. Built the same way release.yml builds it,
+  # so a packaging break surfaces here rather than mid-release.
+  # ---------------------------------------------------------------------------
+  cli-wheel:
+    name: cli wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          # The floor declared by cli/pyproject.toml (requires-python
+          # >=3.10). Building on the OLDEST supported interpreter is what
+          # keeps the pure-python wheel honestly installable on all of them.
+          python-version: '3.10'
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --outdir dist cli/
+
+      - name: Smoke test the built wheel
+        # Installing into a THROWAWAY venv, not the job's python: this is the
+        # only way to prove the wheel carries its own dependencies and its
+        # console-script entry point, rather than accidentally borrowing
+        # something the build step left behind.
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --no-cache-dir dist/*.whl
+          /tmp/smoke/bin/lazyaf --version
+          /tmp/smoke/bin/lazyaf --help
+
+      - name: Upload wheel for inspection
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lazyaf-cli-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # The step images, built the ONLY supported way: scripts/build_images.py.
+  # Which images those are is read from its IMAGES table, never listed here.
+  #
+  # Do not replace this with `docker build` calls. The script owns three
+  # things a hand-rolled build would silently break:
+  #   * the STAGED build context (runner-common is copied in from the repo
+  #     root; it is deliberately not vendored under images/),
+  #   * the multi-level content-hash chain (a child folds its parent's hash
+  #     in, so a base change makes grandchildren stale), and
+  #   * the `lazyaf.content-hash` label those hashes are stamped into, which
+  #     images.yml turns into a published provenance tag.
+  # ---------------------------------------------------------------------------
+  step-images:
+    name: step images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the docker SDK
+        # build_images.py drives the daemon through the SDK rather than
+        # shelling out (it has to run on a Windows host too).
+        run: python -m pip install --upgrade pip docker
+
+      - name: Build step images
+        run: python scripts/build_images.py
+
+      - name: Assert the content-hash chain is stable
+        # A second pass must report every image FRESH. If it does not, the
+        # hash of a just-built tree does not match the label just stamped on
+        # it - i.e. tree_hash is not deterministic on this platform, which is
+        # the exact class of bug that produced two different hashes for
+        # identical content on host vs container. Cheap to check, miserable
+        # to debug later.
+        run: python scripts/build_images.py --check
+
+      - name: Scan step images for credentials
+        # The list comes from scripts/build_images.py's IMAGES table (via
+        # step_images.py), so an image added there is scanned automatically
+        # instead of being quietly skipped by a stale list in this file.
+        # Unquoted on purpose: the helper prints space-separated refs and
+        # word splitting is what turns them into arguments.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          python .github/scripts/scan_image_secrets.py $(python .github/scripts/step_images.py --refs)
+
+  # ---------------------------------------------------------------------------
+  # The three compose service images. Independent of each other, so a matrix
+  # gives three parallel jobs and three separate red/green signals.
+  # ---------------------------------------------------------------------------
+  service-images:
+    name: service image (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # A broken frontend must not hide the state of the backend.
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            context: ./backend
+          - name: frontend
+            context: ./frontend
+          - name: runner-agent
+            context: ./runner-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build ${{ matrix.name }}
+        # Matrix values reach the shell through the environment, never
+        # spliced into the command line. They are static literals from this
+        # file today; routing them through env is what keeps that true if
+        # someone later makes the matrix dynamic.
+        #
+        # NO --build-arg carrying anything secret, and no `secrets:` mount.
+        # The builds need nothing, which is what makes "the images never bake
+        # an AI key" a structural property rather than a promise.
+        run: docker build --pull -t "lazyaf-ci/${IMAGE_NAME}:pr" "${IMAGE_CONTEXT}"
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+          IMAGE_CONTEXT: ${{ matrix.context }}
+
+      - name: Scan ${{ matrix.name }} for credentials
+        run: python3 .github/scripts/scan_image_secrets.py "lazyaf-ci/${IMAGE_NAME}:pr"
+        env:
+          IMAGE_NAME: ${{ matrix.name }}

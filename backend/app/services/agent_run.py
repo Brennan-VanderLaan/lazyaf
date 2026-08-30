@@ -116,7 +116,11 @@ ADHOC_PREFIX = "__lazyaf_adhoc__"
 # PipelineRun.trigger_type values this module owns (cross-agent contract #7).
 TRIGGER_CARD_WORK = "card_work"
 TRIGGER_PLAYGROUND = "playground"
-ADHOC_TRIGGER_TYPES = (TRIGGER_CARD_WORK, TRIGGER_PLAYGROUND)
+# 12.6.5: one experiment cell is an ad-hoc agent run like any other; the
+# literal is defined in app.models.experiment and mirrored here so this
+# module keeps no import-time dependency on the experiment package.
+TRIGGER_EXPERIMENT = "experiment"
+ADHOC_TRIGGER_TYPES = (TRIGGER_CARD_WORK, TRIGGER_PLAYGROUND, TRIGGER_EXPERIMENT)
 
 # An agent step is not a script step: 300s is a rounding error for an agent.
 DEFAULT_AGENT_TIMEOUT = 1800
@@ -697,6 +701,12 @@ async def on_run_complete(
     try:
         if trigger_type == TRIGGER_CARD_WORK:
             await _complete_card_work(db, pipeline_run, success)
+        elif trigger_type == TRIGGER_EXPERIMENT:
+            # Local import for the same reason pipeline_executor's is:
+            # no import-time dependency between the two modules.
+            from app.services.experiment_service import on_cell_complete
+
+            await on_cell_complete(db, pipeline_run, success)
         else:
             await _complete_playground(db, pipeline_run, success)
     except Exception:

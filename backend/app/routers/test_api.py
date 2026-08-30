@@ -87,6 +87,13 @@ register_resettable("trigger_dedup", _reset_trigger_dedup)
 # DB reset deletes.
 register_resettable("pipeline_executor", pipeline_executor.reset)
 register_resettable("workspace_service", _reset_workspace_service)
+# 12.7: a paused debug gate is an in-process future and a sidecar is a live
+# container - both outlive the DB reset unless they are wiped with it.
+from app.services.execution.debug_session_service import debug_session_service
+from app.services.execution.debug_terminal import debug_terminal_service
+
+register_resettable("debug_sessions", debug_session_service.reset)
+register_resettable("debug_terminals", debug_terminal_service.reset)
 
 
 def require_test_mode():

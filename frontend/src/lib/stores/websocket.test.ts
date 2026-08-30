@@ -24,15 +24,43 @@ const BACKEND_SOURCES = import.meta.glob('../../../../backend/app/**/*.py', {
   eager: true,
 }) as Record<string, string>;
 
-/** Every literal message type the backend can broadcast, with its source file. */
+/**
+ * Every message type the backend can broadcast, with its source file.
+ *
+ * TWO SPELLINGS, because the backend uses both. A literal at the call site
+ * (`broadcast("step_update", ...)`) is the common one; a module constant
+ * (`WS_DEBUG_SESSION_STATUS = "debug_session_status"` then
+ * `broadcast(WS_DEBUG_SESSION_STATUS, ...)`) is the 12.7 debug idiom. Reading
+ * only literals is how `debug_session_status` reached the frontend union as a
+ * silent hole: the guard below passed because the extraction never saw the
+ * frame at all. Resolving constants is what makes "no backend frame goes
+ * unhandled" true rather than true-for-the-frames-we-happened-to-match.
+ */
 function backendBroadcastTypes(): Map<string, string[]> {
   const types = new Map<string, string[]>();
-  // Matches `.broadcast("type_string"` / `.broadcast('type_string'` including
-  // multi-line calls (`broadcast(\n    "step_update",`).
-  const pattern = /\.broadcast\(\s*["']([a-z0-9_]+)["']/g;
+
+  // Module-level `NAME = "value"` / `NAME: str = "value"` across every backend
+  // source, so a constant defined in one module and imported into another
+  // still resolves.
+  const constants = new Map<string, string>();
+  const constantPattern = /^([A-Z][A-Z0-9_]*)\s*(?::\s*[A-Za-z_[\]. ]+\s*)?=\s*["']([a-z0-9_]+)["']/gm;
+  for (const source of Object.values(BACKEND_SOURCES)) {
+    for (const match of source.matchAll(constantPattern)) {
+      constants.set(match[1], match[2]);
+    }
+  }
+
+  // Matches `.broadcast("type_string"` / `.broadcast('type_string'` and
+  // `.broadcast(CONSTANT_NAME`, including multi-line calls
+  // (a `broadcast(` whose first argument sits on the next line).
+  const pattern = /\.broadcast\(\s*(?:["']([a-z0-9_]+)["']|([A-Za-z_][A-Za-z0-9_]*))/g;
   for (const [file, source] of Object.entries(BACKEND_SOURCES)) {
     for (const match of source.matchAll(pattern)) {
-      const type = match[1];
+      const type = match[1] ?? (match[2] ? constants.get(match[2]) : undefined);
+      // An unresolved identifier is a local variable holding a runtime value,
+      // not a frame name; skipping it is correct, and the arity/coverage
+      // assertions below still fail loudly if the extraction rots wholesale.
+      if (!type) continue;
       const files = types.get(type) ?? [];
       if (!files.includes(file)) files.push(file);
       types.set(type, files);

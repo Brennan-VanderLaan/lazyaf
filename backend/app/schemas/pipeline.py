@@ -364,10 +364,16 @@ PUBLIC_TRIGGER_TYPES = (
 
 #: Trigger types owned by app.services.agent_run (kept in sync with its
 #: ADHOC_TRIGGER_TYPES). Settable ONLY by the internal ad-hoc run path.
-ADHOC_TRIGGER_TYPES = ("card_work", "playground")
+ADHOC_TRIGGER_TYPES = ("card_work", "playground", "experiment")
+
+#: Stamped ONLY by routers/debug.create_debug_rerun (12.7). Not settable on
+#: the public run endpoint: a debug re-run deliberately drops on_pass/on_fail
+#: and card routing, so letting a caller stamp it would be a way to launder a
+#: run past its own trigger actions.
+DEBUG_TRIGGER_TYPES = ("debug_rerun",)
 
 #: Everything PipelineRun.trigger_type is allowed to hold.
-KNOWN_TRIGGER_TYPES = PUBLIC_TRIGGER_TYPES + ADHOC_TRIGGER_TYPES
+KNOWN_TRIGGER_TYPES = PUBLIC_TRIGGER_TYPES + ADHOC_TRIGGER_TYPES + DEBUG_TRIGGER_TYPES
 
 
 class PipelineRunCreate(BaseModel):

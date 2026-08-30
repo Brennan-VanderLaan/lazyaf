@@ -1,8 +1,12 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, onDestroy } from 'svelte';
-  import type { PipelineRun, StepRun, RunStatus, StepLogsResponse } from '../api/types';
+  import type { Pipeline, PipelineRun, StepRun, RunStatus, StepLogsResponse } from '../api/types';
   import { activeRunsStore, liveStepLogsStore, stepLogKey } from '../stores/pipelines';
-  import { pipelineRuns as runsApi } from '../api/client';
+  import { pipelineRuns as runsApi, pipelines as pipelinesApi } from '../api/client';
+  // 12.7 debug re-run. Both components are self-hiding - the panel renders
+  // nothing without a session - so the viewer stays exactly what it was for
+  // every run that is not being debugged.
+  import { DebugPanel, DebugRerunModal } from './debug';
 
   export let run: PipelineRun;
 
@@ -14,6 +18,13 @@
   let stepLogs: StepLogsResponse | null = null;
   let loadingLogs = false;
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
+
+  // The launcher needs the PIPELINE, not just the run: breakpoints are step
+  // keys read off the step list. Fetched on demand, so an ordinary viewer
+  // open costs no extra request.
+  let showDebugRerun = false;
+  let debugPipeline: Pipeline | null = null;
+  let debugLaunchError: string | null = null;
 
   // Live view of the run: WS frames (pipeline_run_status / step_run_status /
   // step_update) land in activeRunsStore, so prefer the store's copy over the
@@ -87,6 +98,38 @@
       run = cancelled;
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Failed to cancel pipeline');
+    }
+  }
+
+  async function openDebugRerun() {
+    debugLaunchError = null;
+    try {
+      debugPipeline = await pipelinesApi.get(liveRun.pipeline_id);
+      showDebugRerun = true;
+    } catch (e) {
+      // R1: a launcher that silently does nothing is worse than one that
+      // says it could not read the pipeline.
+      debugLaunchError =
+        e instanceof Error ? e.message : 'Could not load the pipeline definition';
+    }
+  }
+
+  async function handleDebugStarted(
+    event: CustomEvent<{ sessionId: string; runId: string; joinCommand: string }>
+  ) {
+    showDebugRerun = false;
+    // The viewer FOLLOWS the new run. The session gates THAT run, so
+    // leaving the viewer on the original would show a panel describing a
+    // different pipeline run than the steps underneath it.
+    selectedStepIndex = null;
+    stepLogs = null;
+    try {
+      const started = await runsApi.get(event.detail.runId);
+      activeRunsStore.updateRun(started);
+      run = started;
+    } catch (e) {
+      debugLaunchError =
+        e instanceof Error ? e.message : 'The debug run started but could not be loaded';
     }
   }
 
@@ -164,6 +207,12 @@
         <span>Duration: {formatDuration(liveRun.started_at, liveRun.completed_at)}</span>
       </div>
 
+      {#if debugLaunchError}
+        <div class="error-message" data-testid="debug-launch-error">{debugLaunchError}</div>
+      {/if}
+
+      <DebugPanel run={liveRun} />
+
       <div class="steps-timeline" data-testid="steps">
         {#each liveRun.step_runs || [] as stepRun, index}
           <button
@@ -216,12 +265,33 @@
       {#if liveRun.status === 'running' || liveRun.status === 'pending'}
         <button type="button" class="btn-cancel" on:click={handleCancel}>Cancel Pipeline</button>
       {/if}
+      {#if liveRun.status === 'failed'}
+        <!-- 12.7: offered on a FAILED run only. A debug re-run exists to
+             reproduce a failure under a breakpoint. -->
+        <button
+          type="button"
+          class="btn-secondary"
+          data-testid="debug-rerun-btn"
+          on:click={openDebugRerun}
+        >
+          Debug Re-run
+        </button>
+      {/if}
       <button type="button" class="btn-secondary" on:click={() => dispatch('close')}>
         Close
       </button>
     </footer>
   </div>
 </div>
+
+{#if showDebugRerun && debugPipeline}
+  <DebugRerunModal
+    run={liveRun}
+    pipeline={debugPipeline}
+    on:close={() => (showDebugRerun = false)}
+    on:started={handleDebugStarted}
+  />
+{/if}
 
 <style>
   .modal-backdrop {

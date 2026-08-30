@@ -73,6 +73,10 @@ HASH_LABEL = "lazyaf.content-hash"
 # extra_context entries are (absolute source path, name inside the context).
 IMAGES = [
     ("base",        "lazyaf-base",        None,        []),
+    # 12.7 debug sidecar: a child of base like test-runner, so a base change
+    # restamps it. It is the ONLY image declaring lazyaf.control-layer=0 - it
+    # runs no steps, it is the shell a developer attaches to at a breakpoint.
+    ("debug-sidecar", "lazyaf-debug-sidecar", "base",  []),
     ("agent-base",  "lazyaf-agent-base",  "base",      [(REPO_ROOT / "runner-common", "runner-common")]),
     ("claude",      "lazyaf-claude",      "agent-base", []),
     ("gemini",      "lazyaf-gemini",      "agent-base", []),

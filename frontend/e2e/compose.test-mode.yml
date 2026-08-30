@@ -2,7 +2,7 @@
 # test-mode API (/api/test/reset, /api/test/seed) on the e2e backend only.
 # Usage:
 #   docker compose -f docker-compose.yml -f frontend/e2e/compose.test-mode.yml \
-#     --profile e2e up -d backend-e2e runner-mock-e2e
+#     --profile e2e up -d backend-e2e runner-agent-e2e
 # Lives under frontend/e2e/ because the browser suite is its only consumer;
 # never apply it to the default (non-e2e) profile.
 services:

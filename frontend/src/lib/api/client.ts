@@ -1,19 +1,139 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, Feature, FeatureCreate, FeatureUpdate, UserStory, UserStoryCreate, UserStoryUpdate, AcceptanceCriterion, AcceptanceCriterionCreate, AcceptanceCriterionUpdate, PromptTemplate, PromptTemplateCreate, PromptTemplateUpdate, DebugSessionInfo, DebugRerunRequest, DebugRerunResponse, DebugJoinToken, DebugResumeRequest, DebugResumeResponse, DebugAbortResponse, DebugExtendRequest, DebugExtendResponse, Experiment, ExperimentSummary, ExperimentDetail, ExperimentCreate, ExperimentUpdate, ExperimentEstimate, ExperimentLaunchResponse, ExperimentAbortResponse, ExperimentResumeResponse, ExperimentCell, Leaderboard } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, Feature, FeatureCreate, FeatureUpdate, UserStory, UserStoryCreate, UserStoryUpdate, AcceptanceCriterion, AcceptanceCriterionCreate, AcceptanceCriterionUpdate, PromptTemplate, PromptTemplateCreate, PromptTemplateUpdate, DebugSessionInfo, DebugRerunRequest, DebugRerunResponse, DebugJoinToken, DebugResumeRequest, DebugResumeResponse, DebugAbortResponse, DebugExtendRequest, DebugExtendResponse, Experiment, ExperimentSummary, ExperimentDetail, ExperimentCreate, ExperimentUpdate, ExperimentEstimate, ExperimentLaunchResponse, ExperimentAbortResponse, ExperimentResumeResponse, ExperimentCell, Leaderboard, ModelEndpoint, ModelEndpointCreate, ModelEndpointUpdate, EndpointProbeResponse, EndpointUsageRollup } from './types';
 
 const BASE_URL = '/api';
 
+/**
+ * Status code 0 means the request never reached a server at all - DNS,
+ * connection refused, the backend container stopped. It is NOT an HTTP status,
+ * and it is the one every "is the backend alive?" caller cares about.
+ */
+export const NETWORK_ERROR_STATUS = 0;
+
+/**
+ * A failed API call, carrying the status the old code threw away.
+ *
+ * QA triage T7: `response.json().catch(() => ({ detail: 'Unknown error' }))`
+ * discarded the status code, collapsed FastAPI's 422 array into
+ * `[object Object]`, turned any non-JSON body (a proxy's HTML 502, a
+ * plain-text 500) into the literal string "Unknown error", and reported a
+ * dead backend as a bare `TypeError: Failed to fetch`. Every one of those
+ * reached the user as `alert("Unknown error")` with nothing to act on.
+ */
+export class ApiError extends Error {
+  /** HTTP status, or `NETWORK_ERROR_STATUS` when the request never landed. */
+  readonly status: number;
+  /** The parsed `detail` when the body was JSON; the raw text otherwise. */
+  readonly detail: unknown;
+
+  constructor(status: number, message: string, detail: unknown = null) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.detail = detail;
+  }
+
+  /** True when the backend could not be reached at all (as opposed to refusing). */
+  get isNetworkError(): boolean {
+    return this.status === NETWORK_ERROR_STATUS;
+  }
+}
+
+/** FastAPI 422 bodies are `[{loc: [...], msg: "..."}]`, not a string. */
+function describeDetail(detail: unknown): string | null {
+  if (typeof detail === 'string' && detail.trim() !== '') return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          const entry = item as { loc?: unknown[]; msg?: string };
+          const where = Array.isArray(entry.loc)
+            ? entry.loc.filter((p) => p !== 'body').join('.')
+            : '';
+          if (entry.msg) return where ? `${where}: ${entry.msg}` : entry.msg;
+        }
+        return null;
+      })
+      .filter((p): p is string => !!p);
+    if (parts.length) return parts.join('; ');
+  }
+  if (detail && typeof detail === 'object') {
+    const asRecord = detail as Record<string, unknown>;
+    if (typeof asRecord.message === 'string') return asRecord.message;
+  }
+  return null;
+}
+
+/** Non-JSON error bodies (HTML 502s, plain-text 500s) shown, not swallowed. */
+function summarizeBody(text: string): string | null {
+  const trimmed = text.trim();
+  if (trimmed === '') return null;
+  const oneLine = trimmed.replace(/\s+/g, ' ');
+  return oneLine.length > 200 ? `${oneLine.slice(0, 200)}…` : oneLine;
+}
+
+/**
+ * Read an error response once and turn it into the most specific sentence
+ * available: the server's own `detail`, else the raw body, else the status.
+ *
+ * The body is consumed EXACTLY once - `text()` then `JSON.parse` - because a
+ * real `Response` body cannot be read twice and a `json()` that throws
+ * mid-parse leaves nothing for a follow-up `text()`.
+ */
+async function errorFromResponse(response: Response): Promise<ApiError> {
+  const statusLine = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`;
+
+  let raw = '';
+  try {
+    raw = typeof response.text === 'function' ? await response.text() : '';
+  } catch {
+    raw = '';
+  }
+
+  let parsed: unknown = null;
+  if (raw !== '') {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = null;
+    }
+  }
+
+  const detail =
+    parsed && typeof parsed === 'object' && 'detail' in (parsed as object)
+      ? (parsed as { detail: unknown }).detail
+      : null;
+
+  const described = describeDetail(detail) ?? (parsed === null ? summarizeBody(raw) : null);
+  return new ApiError(
+    response.status,
+    described ? `${described} (${statusLine})` : statusLine,
+    detail ?? (parsed === null && raw !== '' ? raw : parsed),
+  );
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${BASE_URL}${path}`, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
-    ...options,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${BASE_URL}${path}`, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...options?.headers,
+      },
+      ...options,
+    });
+  } catch (e) {
+    // fetch only rejects when the request never completed. Saying so is the
+    // difference between "the backend is down" and "Unknown error".
+    throw new ApiError(
+      NETWORK_ERROR_STATUS,
+      `Cannot reach the LazyAF backend (${e instanceof Error ? e.message : 'network error'})`,
+      e,
+    );
+  }
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
-    throw new Error(error.detail || `HTTP ${response.status}`);
+    throw await errorFromResponse(response);
   }
 
   if (response.status === 204) {
@@ -488,4 +608,73 @@ export const leaderboards = {
     const qs = params.toString();
     return request<Leaderboard>(`/leaderboards/feature/${featureId}${qs ? `?${qs}` : ''}`);
   },
+};
+
+// =============================================================================
+// Model endpoints (Milestone 14.1) — self-hosted OpenAI-compatible servers
+//
+// `create` PROBES SYNCHRONOUSLY by default and that is the point: the
+// operator learns "this model cannot tool-call" at the moment of
+// registration rather than at the first thirty-minute agent step. It
+// therefore returns an `EndpointProbeResponse` (the row PLUS the probe
+// record), not a bare row — the two 201/200 bodies are the same shape on
+// purpose.
+//
+// `probe` returns 200 WITH THE RECORD even when the endpoint is down. Do not
+// "fix" a red endpoint into a request error: a probe is an observation, and
+// "it is down" is a successful observation the page must render as a red row
+// rather than as a failed fetch.
+//
+// There is deliberately no polling helper. The Endpoints page is
+// snapshot-then-delta over the `model_endpoint_status` frame, the same
+// pattern `runners` uses.
+// =============================================================================
+
+export const modelEndpoints = {
+  list: () => request<ModelEndpoint[]>('/model-endpoints'),
+
+  get: (reference: string) =>
+    request<ModelEndpoint>(`/model-endpoints/${encodeURIComponent(reference)}`),
+
+  /**
+   * Register an endpoint. `probe: false` skips the synchronous probe — only
+   * for an endpoint known to be down, because an UNPROBED endpoint refuses
+   * dispatch until it is probed (which is the honest outcome, not a silent
+   * downgrade).
+   */
+  create: (data: ModelEndpointCreate, probe: boolean = true) =>
+    request<EndpointProbeResponse>(`/model-endpoints${probe ? '' : '?probe=false'}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  /**
+   * Editing `base_url` / `model` / `server_kind` / `auth_*` RESETS the
+   * capability record to `unprobed` server-side. A capability observed
+   * against a different model is not evidence about this one.
+   */
+  update: (reference: string, data: ModelEndpointUpdate) =>
+    request<ModelEndpoint>(`/model-endpoints/${encodeURIComponent(reference)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+
+  /** 409 while any step holds one of the endpoint's slots, naming them. */
+  delete: (reference: string) =>
+    request<void>(`/model-endpoints/${encodeURIComponent(reference)}`, { method: 'DELETE' }),
+
+  /**
+   * Re-probe. `force` bypasses the PROBE_MIN_INTERVAL_SECONDS floor that
+   * exists to protect the model server from a spinner-clicking operator;
+   * without it a call inside the window returns the cached record with
+   * `cached: true`, which the page states rather than hides.
+   */
+  probe: (reference: string, force: boolean = false) =>
+    request<EndpointProbeResponse>(
+      `/model-endpoints/${encodeURIComponent(reference)}/probe${force ? '?force=true' : ''}`,
+      { method: 'POST' },
+    ),
+
+  usage: (reference: string) =>
+    request<EndpointUsageRollup>(`/model-endpoints/${encodeURIComponent(reference)}/usage`),
 };

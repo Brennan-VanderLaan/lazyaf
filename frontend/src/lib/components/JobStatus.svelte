@@ -3,6 +3,8 @@
   import type { Job, JobStatus as JobStatusType } from '../api/types';
   import { jobs as jobsApi } from '../api/client';
   import { jobsStore, getJobForCard } from '../stores/jobs';
+  // T1: third copy of the same duration maths, same `-14399s` bug.
+  import { formatDuration } from '../utils/time';
 
   export let cardId: string;
   export let jobId: string | null;
@@ -13,6 +15,8 @@
   let loadingLogs = false;
   let logsError: string | null = null;
   let logsInterval: ReturnType<typeof setInterval> | null = null;
+  /** Ticks so a queued/running job's elapsed time advances without a store update. */
+  let now = Date.now();
 
   // Subscribe to the job store for this card
   $: jobFromStore = jobId ? getJobForCard(cardId) : null;
@@ -31,7 +35,10 @@
     }
   });
 
+  const clockInterval = setInterval(() => (now = Date.now()), 1000);
+
   onDestroy(() => {
+    clearInterval(clockInterval);
     if (logsInterval) {
       clearInterval(logsInterval);
     }
@@ -91,16 +98,6 @@
     failed: '✗',
   };
 
-  function formatDuration(startedAt: string | null, completedAt: string | null): string {
-    if (!startedAt) return '';
-    const start = new Date(startedAt);
-    const end = completedAt ? new Date(completedAt) : new Date();
-    const seconds = Math.floor((end.getTime() - start.getTime()) / 1000);
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = seconds % 60;
-    return `${minutes}m ${remainingSeconds}s`;
-  }
 </script>
 
 {#if job || jobId}
@@ -117,7 +114,7 @@
       </div>
       {#if job?.started_at}
         <span class="job-duration">
-          {formatDuration(job.started_at, job.completed_at)}
+          {formatDuration(job.started_at, job.completed_at, now)}
         </span>
       {/if}
     </div>

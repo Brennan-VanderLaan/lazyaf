@@ -1,15 +1,45 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { repos, cards, pipelines, pipelineRuns, lazyafFiles, playground, runners } from './client';
+import {
+  ApiError,
+  NETWORK_ERROR_STATUS,
+  repos,
+  cards,
+  pipelines,
+  pipelineRuns,
+  lazyafFiles,
+  playground,
+  runners,
+} from './client';
 
 // Capture the request the client builds instead of hitting the network.
 const fetchMock = vi.fn();
 vi.stubGlobal('fetch', fetchMock);
 
-function jsonResponse(body: unknown, status = 200) {
+/**
+ * A stand-in Response. `text()` is the ONLY body reader the error path uses
+ * (a real body can be consumed once), so the fakes model that: `json()` is
+ * for the success path, `text()` for the failure path, and neither is called
+ * twice.
+ */
+function jsonResponse(body: unknown, status = 200, statusText = '') {
   return {
     ok: status >= 200 && status < 300,
     status,
+    statusText,
     json: async () => body,
+    text: async () => JSON.stringify(body),
+  };
+}
+
+function rawResponse(text: string, status: number, statusText = '') {
+  return {
+    ok: false,
+    status,
+    statusText,
+    json: async () => {
+      throw new Error('not json');
+    },
+    text: async () => text,
   };
 }
 
@@ -103,31 +133,83 @@ describe('request bodies and methods', () => {
   });
 });
 
+/**
+ * QA triage T7: every failure used to reach the user as
+ * `alert("Unknown error")`. The status code was discarded before anything
+ * could use it, FastAPI's 422 array rendered as `[object Object]`, a
+ * plain-text 500 or an HTML 502 became the literal words "Unknown error", and
+ * an unreachable backend surfaced as a bare `TypeError: Failed to fetch`.
+ *
+ * These pin the replacement: an `ApiError` that keeps the status and always
+ * carries text a human can act on.
+ */
 describe('response handling', () => {
   it('throws the server-provided detail on error responses', async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ detail: 'Card not found' }, 404));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ detail: 'Card not found' }, 404, 'Not Found'));
     await expect(cards.get('nope')).rejects.toThrow('Card not found');
   });
 
+  it('keeps the HTTP status on the thrown error instead of discarding it', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ detail: 'Card not found' }, 404, 'Not Found'));
+    const error = await cards.get('nope').catch((e) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(404);
+    expect(error.detail).toBe('Card not found');
+    expect(error.isNetworkError).toBe(false);
+  });
+
   it('falls back to the HTTP status when the error body has no detail', async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({}, 500));
+    fetchMock.mockResolvedValueOnce(jsonResponse({}, 500, 'Internal Server Error'));
     await expect(repos.list()).rejects.toThrow('HTTP 500');
   });
 
-  it('reports "Unknown error" when the error body is not JSON at all', async () => {
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 500,
-      json: async () => { throw new Error('not json'); },
-    });
-    await expect(repos.list()).rejects.toThrow('Unknown error');
+  it('flattens a FastAPI 422 array instead of rendering [object Object]', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        { detail: [{ loc: ['body', 'name'], msg: 'Field required', type: 'missing' }] },
+        422,
+        'Unprocessable Entity',
+      ),
+    );
+    const error = await repos.create({ name: '' } as never).catch((e) => e);
+    expect(error.message).toContain('name: Field required');
+    expect(error.message).not.toContain('[object Object]');
+    expect(error.status).toBe(422);
+  });
+
+  it('shows a non-JSON error body verbatim rather than saying "Unknown error"', async () => {
+    // A plain-text 500 from an unhandled backend exception (QA triage T3).
+    fetchMock.mockResolvedValueOnce(rawResponse('Internal Server Error', 500, 'Internal Server Error'));
+    const error = await repos.list().catch((e) => e);
+    expect(error.message).toContain('Internal Server Error');
+    expect(error.message).toContain('HTTP 500');
+    expect(error.message).not.toContain('Unknown error');
+  });
+
+  it('truncates a huge HTML error body instead of pasting a page into an alert', async () => {
+    fetchMock.mockResolvedValueOnce(rawResponse('<html>' + 'x'.repeat(5000) + '</html>', 502, 'Bad Gateway'));
+    const error = await repos.list().catch((e) => e);
+    expect(error.status).toBe(502);
+    expect(error.message.length).toBeLessThan(300);
+    expect(error.message).toContain('…');
+  });
+
+  it('reports an unreachable backend as such, with status 0', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    const error = await repos.list().catch((e) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.status).toBe(NETWORK_ERROR_STATUS);
+    expect(error.isNetworkError).toBe(true);
+    expect(error.message).toContain('Cannot reach the LazyAF backend');
   });
 
   it('returns undefined for 204 No Content', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 204,
+      statusText: 'No Content',
       json: async () => { throw new Error('no body'); },
+      text: async () => '',
     });
     await expect(cards.delete('c1')).resolves.toBeUndefined();
   });

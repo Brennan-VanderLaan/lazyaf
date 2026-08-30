@@ -17,11 +17,11 @@
  *    NOT to render "0%". Those are different facts and the board must not blur
  *    them.
  *
- * Prerequisites: the compose e2e stack with LAZYAF_TEST_MODE=true and the mock
- * runner (see e2e/README.md):
+ * Prerequisites: the compose e2e stack with LAZYAF_TEST_MODE=true and the
+ * runner agent (see e2e/README.md):
  *
  *   docker compose -f docker-compose.yml -f frontend/e2e/compose.test-mode.yml \
- *     --profile e2e up -d backend-e2e runner-mock-e2e
+ *     --profile e2e up -d backend-e2e runner-agent-e2e
  *
  * Nothing here is skipped when a prerequisite is missing — `resetBackend`
  * fails loudly with the startup command (R4).

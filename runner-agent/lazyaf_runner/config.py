@@ -21,14 +21,36 @@ import os
 import platform
 import socket
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
 
-#: Shared enrollment secret. Same dev constant as the backend's
-#: ``settings.runner_auth_secret`` default (house pattern from 12.3): usable
-#: out of the box, obviously wrong in production.
-DEFAULT_RUNNER_TOKEN = "lazyaf-runner-auth-secret-key-change-in-production"
+#: Where the shared enrollment secret can come from, highest precedence first.
+#: A ``*_FILE`` variant beats its inline twin because that is how docker
+#: secrets and kubernetes mounted Secrets deliver a value, and the agent-
+#: specific name beats the backend's own name so one k8s Secret can be mounted
+#: into both workloads under whichever key is convenient.
+#:
+#: There is NO default. The backend no longer ships one either (a constant in a
+#: public repo is not a secret), so an agent with nothing configured would fail
+#: the /ws/runner handshake anyway - better to say so before dialling.
+TOKEN_SOURCES = (
+    "LAZYAF_RUNNER_TOKEN_FILE",
+    "LAZYAF_RUNNER_TOKEN",
+    "LAZYAF_RUNNER_AUTH_SECRET_FILE",
+    "LAZYAF_RUNNER_AUTH_SECRET",
+)
+
+#: The constants LazyAF shipped before 12.7. Public, therefore not secrets:
+#: treated exactly as "unset" so an inherited config fails loudly instead of
+#: enroling a fleet anyone on the internet could join.
+RETIRED_PUBLIC_TOKENS = frozenset(
+    {
+        "lazyaf-runner-auth-secret-key-change-in-production",
+        "lazyaf-step-auth-secret-key-change-in-production",
+    }
+)
 
 DEFAULT_BACKEND_URL = "http://localhost:8000"
 DEFAULT_ORCHESTRATOR = "docker"
@@ -111,6 +133,69 @@ def _env_flag(env: dict, name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def resolve_token(env: dict) -> str:
+    """The enrollment secret, from the first source in ``TOKEN_SOURCES``.
+
+    Returns ``""`` when nothing is configured rather than raising, because
+    ``--token`` is applied AFTER ``from_env`` and is a legitimate way to supply
+    it. ``validate()`` is where a still-empty token becomes fatal.
+
+    A ``*_FILE`` that is set but unreadable IS fatal here: pointing at a file is
+    an explicit statement about where the secret lives, and quietly falling
+    through to a different source would hide a broken mount behind a handshake
+    rejection an hour later.
+    """
+    for name in TOKEN_SOURCES:
+        raw = (env.get(name) or "").strip()
+        if not raw:
+            continue
+        if name.endswith("_FILE"):
+            try:
+                value = Path(raw).read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                detail = getattr(exc, "strerror", None) or exc.__class__.__name__
+                raise ConfigError(
+                    f"{name}={raw!r} could not be read ({detail}). It should be a "
+                    "path to a file containing the shared enrollment secret - "
+                    "that is how docker secrets and kubernetes mounted Secrets "
+                    "deliver one."
+                ) from exc
+            if not value:
+                raise ConfigError(f"{name}={raw!r} points at an empty file.")
+        else:
+            value = raw
+        if value in RETIRED_PUBLIC_TOKENS:
+            raise ConfigError(
+                f"{name} holds the retired public development default. That "
+                "value shipped in LazyAF's source, so it is published and "
+                "anyone can use it to enrol a runner. Generate a real one on "
+                "the backend host with `python scripts/bootstrap_secrets.py` "
+                "and set the SAME value here."
+            )
+        return value
+    return ""
+
+
+#: The whole fix, in the failure - the agent is often the thing running on a
+#: host you cannot easily read docs from.
+_NO_TOKEN_MESSAGE = (
+    "no enrollment secret configured. The agent authenticates to the backend "
+    "with the shared secret the backend knows as LAZYAF_RUNNER_AUTH_SECRET; "
+    "without it the /ws/runner upgrade is rejected before `register` and this "
+    "host never appears in the runner list.\n"
+    "\n"
+    "Supply it, highest precedence first:\n"
+    "  --token <value>                     (overrides the environment)\n"
+    "  LAZYAF_RUNNER_TOKEN_FILE=<path>     (docker secrets / k8s mounted Secret)\n"
+    "  LAZYAF_RUNNER_TOKEN=<value>\n"
+    "  LAZYAF_RUNNER_AUTH_SECRET_FILE=<path>\n"
+    "  LAZYAF_RUNNER_AUTH_SECRET=<value>   (the backend's own variable name)\n"
+    "\n"
+    "It must EQUAL the backend's LAZYAF_RUNNER_AUTH_SECRET. On the backend "
+    "host, `python scripts/bootstrap_secrets.py` generates one into .env."
+)
+
+
 @dataclass
 class RunnerConfig:
     """Everything the agent needs to know about itself and its backend."""
@@ -121,7 +206,9 @@ class RunnerConfig:
     runner_type: str = DEFAULT_RUNNER_TYPE
     labels: dict = field(default_factory=dict)
     orchestrator: str = DEFAULT_ORCHESTRATOR
-    token: str = DEFAULT_RUNNER_TOKEN
+    #: Shared enrollment secret. Empty means "not configured", which
+    #: ``validate()`` rejects. There is no usable default by design.
+    token: str = ""
     #: Overrides ``config.backend_url`` for the STEP CONTAINER (section 3.4).
     #: ``http://backend:8000`` is meaningless off the compose network; this is
     #: the single most likely remote deployment failure and this is its fix.
@@ -177,7 +264,7 @@ class RunnerConfig:
             runner_type=env.get("LAZYAF_RUNNER_TYPE") or DEFAULT_RUNNER_TYPE,
             labels=parse_labels(env.get("LAZYAF_RUNNER_LABELS")),
             orchestrator=orchestrator,
-            token=env.get("LAZYAF_RUNNER_TOKEN") or DEFAULT_RUNNER_TOKEN,
+            token=resolve_token(env),
             step_backend_url=env.get("LAZYAF_STEP_BACKEND_URL") or "",
             git_url_template=env.get("LAZYAF_GIT_URL_TEMPLATE") or "",
             step_network=env.get("LAZYAF_STEP_NETWORK") or DEFAULT_STEP_NETWORK,
@@ -195,12 +282,29 @@ class RunnerConfig:
     def validate(self) -> None:
         """Refuse configurations that would leak or misbehave.
 
+        Two guards, in the order a misconfiguration is most likely:
+
+        The MISSING TOKEN check comes first because it is the one that turns
+        into a silent empty runner list. Without a secret the HTTP upgrade is
+        rejected before ``accept()``, so the operator sees "no runners" with
+        nothing in the agent's log to explain it.
+
         The plaintext guard is the one with teeth: ``execute_step.config``
         carries the step JWT and ``secret_environment`` inside
         ``control_files``. Sending that across a real network in the clear is
         not a default worth having, so ``ws://`` to a non-loopback host needs
         an explicit ``LAZYAF_RUNNER_ALLOW_INSECURE=1``.
         """
+        if not (self.token or "").strip():
+            raise ConfigError(_NO_TOKEN_MESSAGE)
+        if self.token.strip() in RETIRED_PUBLIC_TOKENS:
+            raise ConfigError(
+                "the configured enrollment secret is the retired public "
+                "development default, which is published in LazyAF's source. "
+                "Use the value the backend generated - see "
+                "`python scripts/bootstrap_secrets.py` on the backend host."
+            )
+
         url = self.ws_url
         if url.startswith("ws://") and not is_loopback(url) and not self.allow_insecure:
             raise ConfigError(
@@ -230,7 +334,7 @@ class RunnerConfig:
             "runner_type": self.runner_type,
             "labels": self.labels,
             "orchestrator": self.orchestrator,
-            "token": "<default>" if self.token == DEFAULT_RUNNER_TOKEN else "<set>",
+            "token": "<set>" if (self.token or "").strip() else "<unset>",
             "step_backend_url": self.step_backend_url or "<from config>",
             "git_url_template": self.git_url_template or "<from config>",
             "step_network": self.step_network,
@@ -246,13 +350,15 @@ def _split_csv(raw: str | None) -> tuple[str, ...]:
 __all__ = [
     "DEFAULT_BACKEND_URL",
     "DEFAULT_ORCHESTRATOR",
-    "DEFAULT_RUNNER_TOKEN",
     "DEFAULT_RUNNER_TYPE",
     "DEFAULT_STEP_NETWORK",
+    "RETIRED_PUBLIC_TOKENS",
     "RUNNER_WS_PATH",
+    "TOKEN_SOURCES",
     "ConfigError",
     "RunnerConfig",
     "is_loopback",
     "parse_labels",
+    "resolve_token",
     "websocket_url",
 ]

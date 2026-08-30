@@ -13,10 +13,15 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { get } from 'svelte/store';
 import type { Runner, RunnerState } from '../api/types';
+import { ApiError } from '../api/client';
 
 const listMock = vi.fn();
 
-vi.mock('../api/client', () => ({
+// Partial mock: only the HTTP verb is faked. `ApiError` stays REAL, because
+// the store's error text now flows through `utils/errors.describeError`,
+// which narrows on it - a hand-stubbed class here would test the stub.
+vi.mock('../api/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../api/client')>()),
   runners: { list: (...args: unknown[]) => listMock(...args) },
 }));
 
@@ -80,9 +85,27 @@ describe('snapshot half', () => {
     listMock.mockRejectedValue(new Error('backend down'));
     await runnersStore.load();
 
-    expect(get(runnersStore.error)).toBe('backend down');
+    // Prefixed so the sidebar says WHICH panel is broken - the raw message is
+    // now the server's own sentence and does not carry that on its own.
+    expect(get(runnersStore.error)).toBe('Could not load runners: backend down');
     // Showing the last known fleet beats blanking the panel on one 500.
     expect(get(runnersStore).map((r) => r.id)).toEqual(['a']);
+  });
+
+  it('reports the real API failure, never the words "Unknown error"', async () => {
+    listMock.mockRejectedValue(
+      new ApiError(0, 'Cannot reach the LazyAF backend (Failed to fetch)'),
+    );
+    await runnersStore.load();
+
+    expect(get(runnersStore.error)).toContain('Cannot reach the LazyAF backend');
+    expect(get(runnersStore.error)).not.toContain('Unknown error');
+  });
+
+  it('names the panel even when the thrown value carries no message at all', async () => {
+    listMock.mockRejectedValue(null);
+    await runnersStore.load();
+    expect(get(runnersStore.error)).toBe('Could not load runners: The request failed');
   });
 
   it('rows are ordered by id so a state change never reshuffles the panel', async () => {
@@ -96,6 +119,56 @@ describe('snapshot half', () => {
 
     runnersStore.applyDelta(makeRunner({ id: 'zeta', status: 'busy' }));
     expect(get(runnersStore).map((r) => r.id)).toEqual(['alpha', 'mid', 'zeta']);
+  });
+});
+
+/**
+ * QA triage T7: "One transient blip pins a bare 'Unknown error' in the sidebar
+ * forever, cleared only by refresh." `error` was only ever cleared inside
+ * `load()`, and `load()` had exactly one call site - `RunnerPanel.onMount`.
+ */
+describe('error state is recoverable without a page reload', () => {
+  it('a successful reload clears an error left by a failed one', async () => {
+    listMock.mockRejectedValue(new Error('backend down'));
+    await runnersStore.load();
+    expect(get(runnersStore.error)).not.toBeNull();
+
+    listMock.mockReset();
+    listMock.mockResolvedValue([makeRunner({ id: 'a' })]);
+    await runnersStore.load();
+
+    expect(get(runnersStore.error)).toBeNull();
+    expect(get(runnersStore).map((r) => r.id)).toEqual(['a']);
+  });
+
+  it('clearError() dismisses a report the user has read, without a refetch', async () => {
+    listMock.mockRejectedValue(new Error('backend down'));
+    await runnersStore.load();
+    const callsBefore = listMock.mock.calls.length;
+
+    runnersStore.clearError();
+
+    expect(get(runnersStore.error)).toBeNull();
+    expect(listMock.mock.calls.length).toBe(callsBefore);
+  });
+
+  it('a delta does NOT clear the error: it does not repair a missing snapshot', async () => {
+    listMock.mockRejectedValue(new Error('backend down'));
+    await runnersStore.load();
+
+    runnersStore.applyDelta(makeRunner({ id: 'a', status: 'busy' }));
+
+    // The row lands (it is live information) but the panel keeps saying the
+    // fleet list is incomplete, because it still is.
+    expect(get(runnersStore).map((r) => r.id)).toEqual(['a']);
+    expect(get(runnersStore.error)).toContain('Could not load runners');
+  });
+
+  it('reset() clears the error too, so a torn-down panel starts clean', async () => {
+    listMock.mockRejectedValue(new Error('backend down'));
+    await runnersStore.load();
+    runnersStore.reset();
+    expect(get(runnersStore.error)).toBeNull();
   });
 });
 

@@ -24,14 +24,17 @@ tdd/unit/services/test_no_legacy_code.py imports each surviving module.
 """
 
 from . import agent_config
-from . import agent_wrapper
 from . import executors
 from . import git_helpers
 from . import usage
 
+# `agent_wrapper` is deliberately NOT imported here. The agent images launch it
+# as `python3 -m runner_common.agent_wrapper`, and runpy re-executing a module
+# this package already put in sys.modules emits a RuntimeWarning - the first
+# line of every agent log. Consumers import the submodule explicitly.
+
 __all__ = [
     "agent_config",
-    "agent_wrapper",
     "executors",
     "git_helpers",
     "usage",

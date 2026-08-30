@@ -9,7 +9,7 @@ profile — through a vite dev server. Nothing is mocked below the browser.
 # 1. Backend + runners (from repo root). The override enables the env-gated
 #    test-mode API (/api/test/reset, /api/test/seed) that the specs depend on.
 docker compose -f docker-compose.yml -f frontend/e2e/compose.test-mode.yml \
-  --profile e2e up -d backend-e2e runner-mock-e2e
+  --profile e2e up -d backend-e2e runner-agent-e2e
 
 # 2. Tests (from frontend/). Playwright starts its own vite dev server on
 #    :5174 proxying to the backend, so nothing else to start — and nothing

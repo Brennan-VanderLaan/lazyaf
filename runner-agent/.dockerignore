@@ -1,0 +1,38 @@
+# Build context filter for runner-agent/Dockerfile.
+#
+# Added with the release CI (.github/workflows). The Dockerfile already COPYs
+# selectively (pyproject.toml, README.md, lazyaf_runner/), so this is mostly
+# about keeping HOST BYTECODE out of a published image: `COPY lazyaf_runner
+# ./lazyaf_runner` would otherwise carry __pycache__/*.pyc compiled by the
+# developer's interpreter into an image that runs a different one.
+#
+# The `.env` rule is the same non-negotiable as everywhere else: a
+# credential must never enter a build context. .github/scripts/
+# scan_image_secrets.py fails the build if one reaches the image.
+
+# Host bytecode and tool caches.
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# The agent's own suite. Not COPY'd, not shipped; excluded so it cannot
+# become an accidental dependency of the image.
+tests
+
+# Local virtualenv and packaging residue.
+.venv
+*.egg-info
+build
+dist
+
+# Credentials. Never in a build context, never in a published image.
+.env
+.env.*
+
+# Docker's own files and local noise.
+Dockerfile
+.dockerignore
+*.log
+.DS_Store

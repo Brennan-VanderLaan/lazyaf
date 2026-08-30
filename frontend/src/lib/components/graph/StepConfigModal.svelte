@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { PipelineStepV2, StepType, RunnerType } from '../../api/types';
+  import { EndpointSelect } from '../endpoint';
 
   interface Props {
     step: PipelineStepV2;
@@ -24,8 +25,15 @@
   const runnerTypes: { value: RunnerType; label: string }[] = [
     { value: 'claude-code', label: 'Claude Code' },
     { value: 'gemini', label: 'Gemini' },
+    // M14: the LazyAF harness driving a self-hosted OpenAI-compatible
+    // endpoint. Choosing it swaps the model field for an endpoint picker,
+    // because a self-hosted step names an ENDPOINT rather than a model id.
+    { value: 'openai-harness', label: 'Self-hosted (openai-harness)' },
     { value: 'any', label: 'Any Available' },
   ];
+
+  /** True while the step is aimed at a model endpoint rather than a CLI. */
+  let isHarness = $derived(editedStep.config.runner_type === 'openai-harness');
 
   // Update config when type changes
   function onTypeChange(newType: StepType) {
@@ -178,6 +186,66 @@
             {/each}
           </select>
         </div>
+
+        {#if isHarness}
+          <div class="form-group">
+            <label for="agent-endpoint">Model endpoint</label>
+            <EndpointSelect
+              id="agent-endpoint"
+              testid="step-endpoint-select"
+              value={editedStep.config.model ?? ''}
+              onChange={(value) => (editedStep.config.model = value || undefined)}
+            />
+            <p class="hint">
+              Emitted as <code>model: "endpoint:&lt;name&gt;"</code>. There is no default
+              endpoint — guessing which GPU to bill is not a recoverable mistake.
+            </p>
+          </div>
+
+          <details class="harness-budgets" data-testid="harness-budgets">
+            <summary>Harness budgets</summary>
+            <div class="form-row">
+              <div class="form-group half">
+                <label for="harness-mode">Loop mode</label>
+                <select
+                  id="harness-mode"
+                  data-testid="harness-mode-select"
+                  value={editedStep.config.harness?.mode ?? 'auto'}
+                  onchange={(e) => {
+                    const mode = e.currentTarget.value as 'auto' | 'tools' | 'text';
+                    editedStep.config.harness = { ...editedStep.config.harness, mode };
+                  }}
+                >
+                  <option value="auto">auto (decide from the probe)</option>
+                  <option value="tools">tools (pin)</option>
+                  <option value="text">text (pin the fallback protocol)</option>
+                </select>
+              </div>
+              <div class="form-group half">
+                <label for="harness-iterations">Max turns</label>
+                <input
+                  id="harness-iterations"
+                  type="number"
+                  min="1"
+                  data-testid="harness-iterations-input"
+                  placeholder="40"
+                  value={editedStep.config.harness?.max_iterations ?? ''}
+                  oninput={(e) => {
+                    const raw = e.currentTarget.value.trim();
+                    editedStep.config.harness = {
+                      ...editedStep.config.harness,
+                      max_iterations: raw === '' ? undefined : Number(raw),
+                    };
+                  }}
+                />
+              </div>
+            </div>
+            <p class="hint">
+              Blank takes the backend default. Pinning <code>text</code> on a tool-capable model
+              is how an experiment makes the loop shape an independent variable.
+            </p>
+          </details>
+        {/if}
 
         <div class="form-group">
           <label for="agent-title">Task Title</label>
@@ -483,5 +551,34 @@
 
   .btn.primary:hover {
     filter: brightness(1.1);
+  }
+
+  /* M14: the self-hosted endpoint picker and its collapsed budgets. */
+  .hint {
+    margin: 0.3rem 0 0;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
+
+  .harness-budgets {
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 1rem;
+  }
+
+  .harness-budgets summary {
+    cursor: pointer;
+    font-size: 0.82rem;
+    color: var(--text-muted);
+  }
+
+  .harness-budgets code,
+  .hint code {
+    font-size: 0.7rem;
+    background: var(--badge-bg);
+    padding: 0 0.2rem;
+    border-radius: 3px;
   }
 </style>

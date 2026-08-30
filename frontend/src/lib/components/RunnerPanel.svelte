@@ -24,6 +24,7 @@
   import { onMount } from 'svelte';
   import { runnersStore, connectedRunners, busyRunners, idleRunners } from '../stores/runners';
   import type { Runner, RunnerState } from '../api/types';
+  import { formatAge } from '../utils/time';
 
   let showRunners = true;
   /** Ticks once a second purely so "connected 4m ago" stays honest. */
@@ -78,15 +79,14 @@
     return chips;
   }
 
+  /**
+   * T1: this used to be `Math.max(0, …)` over a browser-local parse of a
+   * naive-UTC `connected_at`, which turned a four-hour error into a permanent,
+   * believable `ws 0s`. `formatAge` parses the wire format as UTC and reports
+   * an impossible value as '—' rather than clamping it into a plausible lie.
+   */
   function connectionAge(runner: Runner, atMs: number): string {
-    if (!runner.connected_at) return '';
-    const started = Date.parse(runner.connected_at);
-    if (Number.isNaN(started)) return '';
-    const seconds = Math.max(0, Math.floor((atMs - started) / 1000));
-    if (seconds < 60) return `${seconds}s`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-    return `${Math.floor(seconds / 86400)}d`;
+    return formatAge(runner.connected_at, atMs);
   }
 </script>
 
@@ -192,7 +192,33 @@
   {/if}
 
   {#if $runnersError}
-    <div class="panel-error" data-testid="runner-error">{$runnersError}</div>
+    <!--
+      QA triage T7: this error used to be permanent. `load()` was the only
+      thing that cleared it and `onMount` was its only caller, so a single
+      blip pinned "Unknown error" here until the page was reloaded. It is now
+      recoverable three ways: the reconnect snapshot re-runs load(), Retry
+      re-runs it on demand, and Dismiss drops a report the user has read.
+    -->
+    <div class="panel-error" data-testid="runner-error" role="alert">
+      <span class="panel-error-text">{$runnersError}</span>
+      <span class="panel-error-actions">
+        <button
+          class="btn-link"
+          data-testid="runner-error-retry"
+          disabled={$runnersLoading}
+          on:click={() => runnersStore.load()}
+        >
+          {$runnersLoading ? 'Retrying…' : 'Retry'}
+        </button>
+        <button
+          class="btn-link"
+          data-testid="runner-error-dismiss"
+          on:click={() => runnersStore.clearError()}
+        >
+          Dismiss
+        </button>
+      </span>
+    </div>
   {/if}
 </div>
 
@@ -418,8 +444,36 @@
   }
 
   .panel-error {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
     margin-top: 0.5rem;
     font-size: 0.72rem;
     color: var(--error-color, #f38ba8);
+  }
+
+  .panel-error-text {
+    overflow-wrap: anywhere;
+  }
+
+  .panel-error-actions {
+    display: flex;
+    gap: 0.6rem;
+  }
+
+  .btn-link {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--primary-color, #89b4fa);
+    font-size: 0.72rem;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  .btn-link:disabled {
+    color: var(--text-muted, #6c7086);
+    cursor: default;
+    text-decoration: none;
   }
 </style>

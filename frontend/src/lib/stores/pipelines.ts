@@ -1,6 +1,7 @@
 import { writable, derived } from 'svelte/store';
 import type { Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, RunStatus, StepRun } from '../api/types';
 import { pipelines as pipelinesApi, pipelineRuns as runsApi } from '../api/client';
+import { timestampOrder } from '../utils/time';
 
 // Pipelines store
 function createPipelinesStore() {
@@ -109,16 +110,41 @@ function createActiveRunsStore() {
     loading: { subscribe: loading.subscribe },
     error: { subscribe: error.subscribe },
 
+    /**
+     * The recent-runs page is AUTHORITATIVE for the runs it covers, so this
+     * replaces them rather than merging into whatever the map already held.
+     * Merging is why a run deleted server-side stayed on screen forever with a
+     * working View button, and why a single ghost left in "running" kept
+     * `hasActiveRuns` true — a 3s poll and a pulsing "live" dot that never
+     * stopped.
+     *
+     * The one run a replace must not drop is one that is genuinely live but
+     * falls off the page. That can only happen when the server filled the page
+     * (`runs.length >= limit`), and such a run is necessarily OLDER than the
+     * oldest row returned. Those are carried over while still pending/running.
+     * Everything else the page omits is gone, because the page says so.
+     */
     async loadRecent(limit: number = 20) {
       loading.set(true);
       error.set(null);
       try {
         const runs = await runsApi.list({ limit });
-        update(map => {
+        update(prev => {
+          const next = new Map<string, PipelineRun>();
           for (const run of runs) {
-            map.set(run.id, run);
+            next.set(run.id, run);
           }
-          return new Map(map);
+          if (runs.length > 0 && runs.length >= limit) {
+            const pageFloor = Math.min(...runs.map(r => timestampOrder(r.created_at)));
+            for (const [id, run] of prev) {
+              if (next.has(id)) continue;
+              const live = run.status === 'pending' || run.status === 'running';
+              if (live && timestampOrder(run.created_at) < pageFloor) {
+                next.set(id, run);
+              }
+            }
+          }
+          return next;
         });
         return runs;
       } catch (e) {

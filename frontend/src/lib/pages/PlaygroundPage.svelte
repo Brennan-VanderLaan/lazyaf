@@ -2,6 +2,8 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import { playgroundStore, isRunning, canStart, hasResult } from '../stores/playground';
   import { modelsStore, claudeModels, geminiModels, modelsLoading } from '../stores/models';
+  import { EndpointOptionGroup } from '../components/endpoint';
+  import { endpointsStore } from '../stores/endpoints';
   import { selectedRepoId, selectedRepo } from '../stores/repos';
   import { agentFilesStore } from '../stores/agentFiles';
   import { repos, lazyafFiles } from '../api/client';
@@ -47,16 +49,28 @@
   }
 
   // Get available models based on runner type
-  $: availableModels = $playgroundStore.runnerType === 'claude-code' ? $claudeModels : $geminiModels;
+  // The harness has no CLI model list of its own - its models are the
+  // registered endpoints, which arrive through EndpointOptionGroup below.
+  $: availableModels =
+    $playgroundStore.runnerType === 'openai-harness'
+      ? []
+      : $playgroundStore.runnerType === 'claude-code'
+        ? $claudeModels
+        : $geminiModels;
 
   // Auto-select first model when runner type changes or models load
   $: {
-    const models = $playgroundStore.runnerType === 'claude-code' ? $claudeModels : $geminiModels;
-    const currentModel = $playgroundStore.model;
-    if (models.length > 0) {
-      const isValidModel = models.some(m => m.id === currentModel);
-      if (!isValidModel) {
-        playgroundStore.setConfig({ model: models[0].id as any });
+    // M14: the harness has no CLI model list, so this auto-select must not
+    // run for it - otherwise it would stomp a chosen `endpoint:<name>` back
+    // to a Claude model the moment the endpoint store settled.
+    if ($playgroundStore.runnerType !== 'openai-harness') {
+      const models = $playgroundStore.runnerType === 'claude-code' ? $claudeModels : $geminiModels;
+      const currentModel = $playgroundStore.model;
+      if (models.length > 0) {
+        const isValidModel = models.some(m => m.id === currentModel);
+        if (!isValidModel) {
+          playgroundStore.setConfig({ model: models[0].id as any });
+        }
       }
     }
   }
@@ -215,6 +229,8 @@
   onMount(() => {
     // Load available models
     modelsStore.load();
+    // M14: the merged selector needs the endpoint registry too.
+    void endpointsStore.load();
 
     if ($selectedRepoId) {
       playgroundStore.setConfig({ repoId: $selectedRepoId });
@@ -319,11 +335,13 @@
             <select
               id="runner-type"
               value={$playgroundStore.runnerType}
-              on:change={(e) => playgroundStore.setConfig({ runnerType: e.currentTarget.value as 'claude-code' | 'gemini' })}
+              on:change={(e) => playgroundStore.setConfig({ runnerType: e.currentTarget.value as 'claude-code' | 'gemini' | 'openai-harness' })}
               disabled={$isRunning}
             >
               <option value="claude-code">Claude Code</option>
               <option value="gemini">Gemini</option>
+              <!-- M14: LazyAF supplies the agent loop; the model is one you host. -->
+              <option value="openai-harness">Self-hosted endpoint</option>
             </select>
           </div>
 
@@ -333,11 +351,18 @@
               id="model"
               value={$playgroundStore.model}
               on:change={(e) => playgroundStore.setConfig({ model: e.currentTarget.value as any })}
-              disabled={$isRunning || $modelsLoading || availableModels.length === 0}
+              disabled={$isRunning || ($playgroundStore.runnerType !== 'openai-harness' && ($modelsLoading || availableModels.length === 0))}
             >
               {#each availableModels as model}
                 <option value={model.id} title={model.description}>{model.name}</option>
               {/each}
+              <!--
+                M14: self-hosted endpoints merge into the SAME selector as a
+                `Self-hosted` optgroup, emitting `endpoint:<name>`. One merged
+                list beats two competing ones, and the value it emits is the
+                one spelling `resolve_step_endpoint` parses.
+              -->
+              <EndpointOptionGroup />
             </select>
           </div>
         </div>

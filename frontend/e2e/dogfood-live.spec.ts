@@ -22,7 +22,7 @@
  *
  * Prerequisites (see e2e/README.md):
  *   docker compose -f docker-compose.yml -f frontend/e2e/compose.test-mode.yml \
- *     --profile e2e up -d backend-e2e runner-mock-e2e
+ *     --profile e2e up -d backend-e2e runner-agent-e2e
  */
 
 import { test, expect, type Page } from '@playwright/test';

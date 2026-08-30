@@ -19,7 +19,11 @@ export type RunnerState =
 // flavor a card/job wants ('claude-code' | 'gemini' | 'mock'), not a runner's
 // lifecycle. A 12.6 runner-agent reports its own free-form `runner_type`
 // (default 'generic'), so `Runner.runner_type` below is a plain string.
-export type RunnerType = 'any' | 'claude-code' | 'gemini' | 'mock';
+// M14 adds a fourth flavor: `openai-harness`, the LazyAF agent loop driven
+// against a self-hosted OpenAI-compatible endpoint. It is a peer of the three
+// CLI agents, not a new step type - `resolve_agent_type` validates it against
+// `pipeline_executor.DEFAULT_AGENT_IMAGE` exactly like the others.
+export type RunnerType = 'any' | 'claude-code' | 'gemini' | 'mock' | 'openai-harness';
 export type StepType = 'agent' | 'script' | 'docker';
 
 export interface StepConfig {
@@ -28,6 +32,37 @@ export interface StepConfig {
   working_dir?: string;    // For script steps
   env?: Record<string, string>;  // For docker steps
   volumes?: string[];      // For docker steps
+  /**
+   * M14. `endpoint:<name>` selects a self-hosted model endpoint — the SAME
+   * `model` field the API models already use, which is precisely why the four
+   * selection surfaces need no schema of their own (`resolve_step_endpoint`
+   * precedence rule 2).
+   */
+  model?: string;
+  /** The explicit spelling: an endpoint name or uuid (precedence rule 1). */
+  endpoint?: string;
+  /** Per-step overrides for the harness loop. Absent = backend defaults. */
+  harness?: HarnessBudgets;
+}
+
+/**
+ * The knobs an operator may set on a harness step. Everything omitted takes
+ * the backend's default, which is the only place they are spelled.
+ *
+ * `mode` is the one worth understanding: `auto` decides from the endpoint's
+ * PROBED `supports_tools`, while pinning `tools` or `text` makes the loop
+ * shape an independent variable — forcing `text` on a tool-capable model
+ * measures the cost of the fallback protocol directly, which is what M13
+ * wants it for.
+ */
+export interface HarnessBudgets {
+  mode?: 'auto' | 'tools' | 'text';
+  max_iterations?: number;
+  max_total_tokens?: number;
+  time_budget_seconds?: number;
+  temperature?: number;
+  seed?: number | null;
+  require_changes?: boolean;
 }
 
 export interface Repo {
@@ -430,12 +465,17 @@ export type PlaygroundStatus = 'idle' | 'queued' | 'running' | 'completed' | 'fa
 // Model options for each runner type
 export type ClaudeModel = 'claude-sonnet-4-5-20250929' | 'claude-opus-4-5-20250929' | 'claude-sonnet-4-20250514' | 'claude-haiku-4-5-20251001';
 export type GeminiModel = 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-3-flash-preview' | 'gemini-3-pro-preview';
-export type AgentModel = ClaudeModel | GeminiModel;
+// M14: `endpoint:<name>` is a legal model everywhere a model is chosen. It is
+// a TEMPLATE literal rather than a closed union because the set of endpoints
+// is operator data, not a vocabulary this file can enumerate.
+export type SelfHostedModel = `endpoint:${string}`;
+export type AgentModel = ClaudeModel | GeminiModel | SelfHostedModel;
 
 export interface PlaygroundTestRequest {
   agent_id?: string | null;
   repo_agent_name?: string | null;
-  runner_type: 'claude-code' | 'gemini' | 'mock';
+  // M14 adds 'openai-harness': the LazyAF loop against a self-hosted endpoint.
+  runner_type: 'claude-code' | 'gemini' | 'mock' | 'openai-harness';
   model?: AgentModel | null;  // Specific model to use
   branch: string;
   task_override?: string | null;
@@ -1227,3 +1267,187 @@ export type ExperimentCellFrame = Pick<
   | 'prompt_template_id'
   | 'prompt_version'
 >;
+
+// =============================================================================
+// Model endpoints — self-hosted OpenAI-compatible servers (Milestone 14.1)
+//
+// These mirror `backend/app/schemas/model_endpoint.py` FIELD FOR FIELD. That
+// module has exactly one projection (`endpoint_read`), which both
+// `GET /api/model-endpoints` and the `model_endpoint_status` WS frame go
+// through, so there is one shape here rather than a REST shape and a delta
+// shape the store would have to reconcile.
+//
+// THE SECURITY PROPERTY, restated on this side because it constrains the UI:
+// there is no field here that can hold a secret VALUE. `auth_secret_ref` is
+// the NAME of a backend environment variable and `secret_present` says
+// whether that variable is set. The create/edit form therefore never has a
+// password input, and says so.
+// =============================================================================
+
+export type EndpointServerKind = 'ollama' | 'vllm' | 'llamacpp' | 'lmstudio' | 'other';
+export type EndpointAuthStyle = 'none' | 'bearer' | 'header';
+export type EndpointReach = 'direct' | 'runner-local' | 'proxy';
+export type EndpointProbeStatus = 'unprobed' | 'ok' | 'degraded' | 'unreachable';
+
+/**
+ * DERIVED backend-side from probe_status + probe age + consecutive_failures
+ * (`ModelEndpoint.health`). The frontend RENDERS it and never recomputes it:
+ * a second definition here would be a second writer that drifts from the
+ * first, which is the exact thing the backend property's docstring refuses.
+ */
+export type EndpointHealth = 'healthy' | 'stale' | 'degraded' | 'unhealthy' | 'unprobed';
+
+/**
+ * What the last probe observed. A SNAPSHOT, not a live reference.
+ *
+ * `supports_tools` is deliberately THREE-state: `true` (probed, works),
+ * `false` (probed, does not — the step runs the no-tools fallback protocol),
+ * and `null` (NEVER PROBED — we have not asked). `null` is not "assume no":
+ * dispatch REFUSES on it, and the UI must render it as visibly different
+ * from `false` or every new endpoint silently reads as "no tool support".
+ */
+export interface EndpointCapabilities {
+  supports_tools: boolean | null;
+  supports_streaming: boolean | null;
+  reports_usage: boolean | null;
+  /** EFFECTIVE window: operator override, else what the probe found, else null. */
+  context_window: number | null;
+  max_output_tokens: number | null;
+  probe_status: EndpointProbeStatus;
+  probed_at: string | null;
+  /** 'backend' or 'runner:<id>' — WHICH machine could reach it. */
+  probed_from: string | null;
+  probe_age_seconds: number | null;
+  stale: boolean;
+}
+
+/** The cost coordinates that travel to the container on the wire. */
+export interface EndpointPricing {
+  gpu_node_id: string;
+  /** `1.0 / max_concurrency` — computed backend-side, in one place. */
+  gpu_fraction: number;
+  /** True when a rate exists AT ALL. `0.00/hr` is priced; `null` is unknown. */
+  priced: boolean;
+}
+
+/** Mirrors `ModelEndpointRead`. */
+export interface ModelEndpoint {
+  id: string;
+  name: string;
+  description: string | null;
+  base_url: string;
+  model: string;
+  server_kind: string;
+
+  auth_style: string;
+  /** The NAME of a backend env var, never a value. */
+  auth_secret_ref: string | null;
+  auth_header_name: string | null;
+  /** Is that variable actually set in the backend environment? */
+  secret_present: boolean;
+
+  reach: string;
+  runner_label: string | null;
+  /**
+   * How many CONNECTED runners carry `runner_label`. `0` on a runner-local
+   * endpoint is the reason a step would sit at NO_RUNNER_TIMEOUT — visible
+   * before anyone dispatches to it. `null` when the fact does not apply.
+   */
+  runner_count: number | null;
+
+  /** Money is a STRING on the wire. `null` = unpriced; `"0.000000"` = free. */
+  rate_usd_hour: string | null;
+  gpu_node_id: string;
+  gpu_fraction: number;
+  priced: boolean;
+
+  max_concurrency: number;
+  request_timeout_seconds: number;
+  /** The raw OVERRIDE column. The effective value is capabilities.context_window. */
+  context_window: number | null;
+  context_window_source: string | null;
+  max_output_tokens: number | null;
+
+  capabilities: EndpointCapabilities;
+  pricing: EndpointPricing;
+  health: EndpointHealth;
+  probe_detail: Record<string, unknown>;
+  consecutive_failures: number;
+  last_success_at: string | null;
+  last_error: string | null;
+  /** Non-fatal note about the URL shape. Stated, never fixed. */
+  warning: string | null;
+
+  enabled: boolean;
+  /** Steps currently holding one of this endpoint's concurrency slots. */
+  in_flight: number;
+
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ModelEndpointCreate {
+  name: string;
+  description?: string | null;
+  base_url: string;
+  model: string;
+  server_kind?: EndpointServerKind;
+  auth_style?: EndpointAuthStyle;
+  auth_secret_ref?: string | null;
+  auth_header_name?: string | null;
+  reach?: EndpointReach;
+  runner_label?: string | null;
+  rate_usd_hour?: string | null;
+  gpu_node_id?: string | null;
+  max_concurrency?: number;
+  request_timeout_seconds?: number;
+  context_window?: number | null;
+  max_output_tokens?: number | null;
+  enabled?: boolean;
+}
+
+/** PATCH body. Absent means "leave it"; an explicit null on a NOT NULL column is a 422. */
+export type ModelEndpointUpdate = Partial<ModelEndpointCreate>;
+
+/**
+ * `POST .../probe` and `POST /api/model-endpoints`.
+ *
+ * **200 even when the endpoint is down**: a probe is an observation, and
+ * "it is down" is a successful observation. `cached` is true when the record
+ * came back without an upstream call (inside the 30s floor), or when a
+ * runner-local probe was DISPATCHED rather than performed here — in which
+ * case `probe_run_id` names the run that carries it.
+ */
+export interface EndpointProbeResponse {
+  endpoint: ModelEndpoint;
+  cached: boolean;
+  probe_run_id: string | null;
+  detail: string | null;
+}
+
+/** `GET /api/model-endpoints/{id}/usage` — joined through step_usages.gpu_node_id. */
+export interface EndpointUsageRollup {
+  endpoint_id: string;
+  gpu_node_id: string;
+  steps: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cost_usd: string | null;
+  by_source: Record<string, number>;
+  cost_coverage: number;
+  median_wall_clock_ms: number | null;
+}
+
+/**
+ * The `model_endpoint_status` WS frame (cross-agent contract #10).
+ *
+ * `endpoint: null` means DELETED — the row is gone, not merely idle. The
+ * publisher is `ConnectionManager.publish_model_endpoint_status`, and the
+ * body is the same `endpoint_read` projection the REST list returns, so a
+ * page hydrated by the snapshot and a page updated by a delta cannot show
+ * different fields.
+ */
+export interface ModelEndpointStatusFrame {
+  id: string;
+  endpoint: ModelEndpoint | null;
+}

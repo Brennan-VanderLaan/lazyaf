@@ -20,12 +20,16 @@ class ExecutorMode(str, Enum):
     """Which execution path runs a step (cross-file contract #3, 12.2-INT).
 
     Recorded on StepRun.executor at dispatch time (R1: routing is observable,
-    never inferred). REMOTE arrives with Phase 12.6's runner agents; until
-    then the pipeline executor rejects it loudly.
+    never inferred).
+
+    LEGACY left in the 12.6 deletion commit together with the polling queue
+    it named. Migration 0007 nulls the `executor` of any StepRun still
+    carrying it: the value can no longer be read back as a member of this
+    enum, and NULL says "run by a path this system no longer has" rather
+    than relabelling old history as something it was not.
     """
 
     LOCAL = "local"
-    LEGACY = "legacy"
     REMOTE = "remote"
 
 
@@ -124,8 +128,18 @@ class StepExecution(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     execution_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     step_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("step_runs.id"), nullable=False)
-    status: Mapped[str] = mapped_column(String(50), default=StepExecutionStatus.PENDING.value)
+    # Indexed (12.6): the runner dispatcher scans status == 'pending' on every
+    # wake, so this is a hot predicate rather than an occasional filter.
+    status: Mapped[str] = mapped_column(
+        String(50), default=StepExecutionStatus.PENDING.value, index=True
+    )
     runner_id: Mapped[str | None] = mapped_column(String(36), nullable=True)  # Remote executor only
+    # Requirements the step was dispatched with (JSON, 12.6). DURABLE on
+    # purpose: a requeued step must be re-matchable after a backend restart,
+    # so the `requires:` block cannot live only in the dispatch closure.
+    runner_requirements: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # When the assignment CAS succeeded - ACK-timeout forensics (12.6).
+    assigned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     container_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # Local executor only
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -35,10 +35,11 @@ Ownership notes (R3: one writer per datum)
   cards router still CREATES the Job row (``card.job_id`` and the
   ``lazyaf/{job_id[:8]}`` branch name are load-bearing for the existing UI
   and the jobs API); this module owns every subsequent status transition.
-- ``job_queue.enqueue`` is called by NOTHING on this path. That is asserted,
-  not assumed: ``tdd/unit/services/test_no_legacy_enqueue.py`` spies on the
-  real queue and requires zero calls (R1 - a silent fallback to the legacy
-  runner path is indistinguishable from success).
+- There is no runner queue left to fall back to (12.6 deleted it). The
+  ad-hoc agent path runs on the control layer, and
+  ``tdd/unit/services/test_no_legacy_code.py`` asserts the removed
+  modules stay removed - unconditionally, with no importorskip that a
+  later deletion could disarm.
 - The card's TEST GATE lives here too. A card reaches ``in_review`` only
   when the agent step succeeded AND every test tied back to the run is
   green; a red suite lands the card ``failed`` and fires no ``card_complete``

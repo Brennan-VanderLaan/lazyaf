@@ -29,11 +29,11 @@ from app.config import get_settings
 from app.database import Base, get_db
 from app.models import Card, Pipeline, Repo
 from app.models.card import CardStatus, StepType
+from app.services.execution.runner_dispatcher import runner_dispatcher
+from app.services.execution.runner_registry import runner_registry
 from app.services.git_server import git_repo_manager
-from app.services.job_queue import job_queue
 from app.services.pipeline_executor import pipeline_executor
 from app.services.playground_service import playground_service
-from app.services.runner_pool import runner_pool
 from app.services.trigger_service import reset_trigger_dedup
 from app.services.websocket import manager
 from app.services.workspace_service import workspace_service
@@ -62,10 +62,6 @@ def register_resettable(name: str, async_fn: Callable[[], Awaitable[object]]) ->
     _RESETTABLES[name] = async_fn
 
 
-async def _reset_runner_pool() -> None:
-    runner_pool.reset()
-
-
 async def _reset_trigger_dedup() -> None:
     reset_trigger_dedup()
 
@@ -74,8 +70,15 @@ async def _reset_workspace_service() -> None:
     workspace_service.reset()
 
 
-register_resettable("job_queue", job_queue.clear)
-register_resettable("runner_pool", _reset_runner_pool)
+# 12.6: the polling pool and its queue are gone; the registry and the
+# dispatcher are what hold runner state in memory now, and BOTH must be wiped
+# with the DB. The registry closes every live socket (a runner reconnects and
+# re-enrols against the clean database), and the dispatcher drops its waiters,
+# its in-flight assignments and its loop-bound wake event - a reset that left
+# any of those behind would hand the next test an assignment for a step row
+# that no longer exists.
+register_resettable("runner_registry", runner_registry.reset)
+register_resettable("runner_dispatcher", runner_dispatcher.reset)
 register_resettable("websocket_manager", manager.reset)
 register_resettable("playground_sessions", playground_service.reset)
 register_resettable("trigger_dedup", _reset_trigger_dedup)

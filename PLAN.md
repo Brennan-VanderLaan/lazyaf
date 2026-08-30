@@ -329,6 +329,38 @@ class BenchmarkCase:
     created_at: datetime
 ```
 
+### StrategyTemplate  *(Milestone 13 — the independent variable)*
+A strategy is a graph of activity plus how models are assigned to its roles. It
+is DATA: authoring a new strategy means writing a template, not changing code.
+
+```python
+class StrategyTemplate:
+    id: UUID
+    slug: str                    # "planner-fanout-8" | "adversarial-3" | "one-shot"
+    description: str
+    graph: dict                  # a v2 pipeline graph: steps + edges + fan-out/join.
+                                 # Step configs carry ROLE placeholders, not models:
+                                 #   {"role": "planner"} / {"role": "worker", "fanout": 8}
+    roles: list[str]             # ["planner", "worker", "integrator", "reviewer"]
+    loop_policy: dict            # {max_iterations, budget_usd, stop_on}
+    parallelism: dict            # {max_concurrent_workers, worker_workspace: "per-worker"|"shared"}
+    created_at: datetime
+```
+
+> **Why roles, not models:** the owner's leading hypothesis is that a high-end
+> model writing instructions for a fan-out of small models beats one big model
+> doing everything. That strategy is only expressible if a template says "planner"
+> and "worker" and the *trial* binds those roles to concrete models — otherwise
+> every model mix is a different template and nothing is comparable.
+
+> **Parallel writers need isolation.** Workspaces are per-RUN (12.2-INT); K
+> workers writing `/workspace/repo` concurrently would trample each other.
+> Fan-out templates therefore declare `worker_workspace: "per-worker"`, and the
+> orchestrator gives each worker its own workspace (own branch off the case's
+> base commit), with an integrator step merging the results. **Integration
+> conflict rate is a first-class measured outcome**, not an implementation
+> detail — it may well be the dominant cost of aggressive parallelism.
+
 ### Trial / TrialIteration  *(Milestone 13)*
 A Trial is one loop run of one case under one (model, prompt, policy) variant.
 TrialIteration is the per-cycle record — the cost *curve*, which is the actual
@@ -339,7 +371,11 @@ class Trial:
     id: UUID
     experiment_id: UUID | None   # set when part of a matrix fan-out
     benchmark_case_id: UUID
-    model: str
+    strategy_template_id: UUID   # THE independent variable
+    model_assignment: dict       # {"planner": "claude-opus-5", "worker": "haiku-4.5",
+                                 #  "integrator": "claude-sonnet-5"} - a strategy may
+                                 # use several models in different roles, so cost is
+                                 # attributed PER ROLE from StepUsage, never per trial
     prompt_template_id: UUID | None
     prompt_version: int | None
     loop_policy: dict            # {max_iterations, budget_usd, stop_on}
@@ -347,9 +383,14 @@ class Trial:
     solved_at_iteration: int | None   # headline metric; None = never solved
     iterations_used: int
     total_cost_usd: Decimal
+    cost_by_role: dict           # {"planner": 0.42, "worker": 1.10, ...}
     total_input_tokens: int
     total_output_tokens: int
-    wall_clock_ms: int
+    wall_clock_ms: int           # co-headline: parallelism buys latency with money,
+                                 # so a cost-only board would rank fan-out as worse
+                                 # while hiding the entire point of it
+    serial_equivalent_ms: int | None  # summed step time; wall_clock/serial = speedup
+    integration_conflicts: int   # merges the integrator could not take cleanly
     base_commit_sha: str
     final_commit_sha: str | None
     branch: str
@@ -929,6 +970,15 @@ Decisions made DURING implementation (all shipped and gate-verified):
   fixtures with contamination noted, and headline metrics = cost-to-solve,
   regression rate, iterations-to-solve. (Owner — "I am a scientist at heart")
 
+- 2026-08-29 Benchmark trials vary ARBITRARY STRATEGY GRAPHS (one-shots,
+  adversarial fan-outs, planner->K-workers->integrator, gated combinations), not
+  a fixed set of loops; models are bound to graph ROLES per trial, so a single
+  strategy may mix a high-end planner with cheap parallel workers. Cost is
+  attributed per role; wall-clock and integration-conflict rate join the board
+  because parallelism trades money for latency. (Owner)
+- 2026-08-29 No v0 case study from existing session data — wait for real
+  controlled trials with a one-shot baseline. (Owner)
+
 - OPEN: v1 pipeline retirement shape (12.8, owner confirms).
 - OPEN: whether `12.0` counts as done at 12.5 (runner-common adopted by agent
   images) or 12.8 (all runners retired) — resolves itself as those land.
@@ -967,14 +1017,31 @@ Decisions made DURING implementation (all shipped and gate-verified):
 - **Corpus: ingested repos pinned per case.** Fixture repos live in the internal
   git server; each case pins a `base_commit_sha`. Hermetic, offline-capable,
   versioned with the platform, and reuses ingest + population unchanged.
+- **The independent variable is the STRATEGY, not the model** (owner,
+  2026-08-29). The thesis under test is "these ways of building software with AI
+  work better", so trials vary the *loop shape* and treat models as a resource a
+  strategy allocates. Models remain a covariate: repeat the comparison across
+  model mixes to show an effect is not one model's artifact.
+- **A strategy is an arbitrary graph of activity, expressed as data.** Not an
+  enum of blessed loops — a `StrategyTemplate` is a pipeline graph (steps, edges,
+  fan-out/join, conditions) + a role->model assignment + a loop policy. The
+  platform already executes exactly this shape, so adding a strategy is authoring
+  data, not code. The catalog is open-ended; representative members:
+  - **one-shot** — a single agent step, the naive baseline every claim is measured against
+  - **test-first** — write oracle-shaped tests, then implement against them
+  - **adversarial** — implement -> fan out N independent reviewers -> join -> fix
+  - **planner/executor fan-out** — a high-end model writes instructions, K small
+    models execute them in parallel, an integrator merges (the owner's hypothesis:
+    buy latency and cost efficiency by spending a little intelligence up front)
+  - **gated** — any of the above, plus a real CI gate that must pass before done
+  - and combinations, since these compose as graphs rather than as modes
 - **Loop driver: the LazyAF pipeline loop.** Each iteration is a real pipeline
-  run — agent step, then the oracle test step, then failures fed forward into the
-  next iteration's agent step. Every iteration is therefore visible, costed, and
-  diffable, and the cost curve falls out of data the platform already writes.
-  *Implementation note:* the v2 graph is a DAG (`entry_points` +
-  all-upstream-satisfied traversal) — cycles would deadlock the traversal. So a
-  **Trial orchestrator drives N sequential pipeline runs**, one per iteration,
-  rather than a cyclic graph. No graph-engine change needed.
+  run of the strategy graph — visible, costed, diffable. *Implementation note:*
+  the v2 graph is a DAG (`entry_points` + all-upstream-satisfied traversal), so
+  iteration is NOT a cycle in the graph: a **Trial orchestrator drives N
+  sequential pipeline runs**, one per iteration, feeding the previous iteration's
+  failures forward. Fan-out *within* an iteration is native graph behavior and
+  needs no new engine work.
 - **Cost sources: CLI-reported + GPU-node model.** See `StepUsage`.
 - **Audience: a public write-up backed by a reproducible bundle** (owner,
   2026-08-29). Anyone should be able to download the corpus + results and re-run
@@ -999,6 +1066,17 @@ Decisions made DURING implementation (all shipped and gate-verified):
   distribution** — whether a loop converges or thrashes, and whether late
   iterations ever earn their keep. Solve-rate-at-fixed-budget stays available as
   a normalization but is not the headline.
+- **Added for graph strategies:** because strategies differ in *shape*, the board
+  also reports **wall-clock-to-solve** and **speedup** (serial-equivalent /
+  wall-clock) — a fan-out that costs 3x but finishes in a third of the time is a
+  different trade, not a worse result — plus **integration conflict rate** for
+  parallel strategies and **cost-by-role**, which is what actually tests the
+  "expensive planner, cheap workers" hypothesis.
+- **Fairness across differently-shaped strategies** comes from holding the case,
+  base commit, oracle, and BUDGET constant: given the same dollars and the same
+  wall-clock ceiling, which strategy solves more? That is why fixed-budget
+  solve-rate stays in the board even though cost-to-solve is the headline —
+  without a shared cap, an unbounded strategy can always "win" by spending more.
 
 ### Controls (a benchmark without them proves nothing)
 
@@ -1021,22 +1099,30 @@ Seed a starter suite spanning verticals x complexity.
    validation catches a deliberately-miswired case.
 
 ### Phase 13.2 — Trial orchestrator & loop policy
-`Trial` / `TrialIteration` + the orchestrator: reset to `base_commit_sha` on a
-fresh branch, run iteration pipelines until solved / max_iterations /
-budget_usd exhausted, recording per-iteration cost, diff churn, and oracle
-progress. Budget enforcement is hard (a trial cannot outspend its cap).
+`StrategyTemplate` + `Trial` / `TrialIteration` + the orchestrator: bind roles to
+models, reset to `base_commit_sha` on a fresh branch, run iteration pipelines of
+the strategy graph until solved / max_iterations / budget_usd exhausted,
+recording per-iteration cost (by role), diff churn, and oracle progress. Budget
+enforcement is hard (a trial cannot outspend its cap) and applies across the
+whole fan-out, not per worker. Parallel templates get **per-worker workspaces**
+(each worker a branch off the base commit) plus an integrator step; integration
+conflicts are recorded rather than silently dropped.
    EXIT GATE: a mock-model trial on a starter case solves at a known iteration
    with a complete per-iteration cost curve; a deliberately-unsolvable case
    terminates at budget_exhausted without overspending.
 
-### Phase 13.3 — Benchmark experiments & the effectiveness board
-Extend `Experiment` to target a suite: (case x model x prompt x policy x repeat)
-fan-out through the executor layer. Aggregate per case, per vertical, per
-complexity: solve-rate, median cost-to-solve, cost curve shape, regression rate
-(`pass_to_pass` broken), and iterations-to-solve distribution. This is the
-leaderboard 12.6.5 starts and 13.3 finishes — ranked by evidence, not vibes.
-   EXIT GATE: a 2-model x 2-policy matrix over a 3-case suite produces a board
-   where the same case is comparable across variants on both axes.
+### Phase 13.3 — Strategy experiments & the effectiveness board
+Extend `Experiment` so a matrix axis is **strategy_template x model_assignment x
+repeat** over a suite of cases. Aggregate per strategy, per vertical, per
+complexity: solve-rate at a shared budget, median cost-to-solve, cost-by-role,
+wall-clock and speedup, regression rate, integration conflict rate, and the
+iterations-to-solve distribution. This is the board that answers the actual
+question — *which way of working with AI is effective, and what does it cost* —
+rather than which vendor's model scores highest.
+   EXIT GATE: a 3-strategy matrix (one-shot / adversarial / planner-fanout) over
+   a 3-case suite, repeated, produces a board where the SAME case is comparable
+   across strategy shapes on cost, wall-clock and regression rate — and the
+   one-shot baseline is present in every comparison as the control.
 
 ### Phase 13.4 — Variance, controls & the "real or noise" question
 Aggregation over N repeats with distributions (median + spread, not means alone);
@@ -1072,6 +1158,16 @@ the case set exactly (results within variance, which is the honest claim).
   turns out to discriminate between loops that binary solve-rate cannot.
 - **Licensing per fixture** now that the bundle is public: the export must decide
   per case what it may redistribute (hence `license` on `BenchmarkCase`).
+- **How do K workers avoid duplicating each other's work?** The planner's
+  instructions are the coordination mechanism; if they partition badly, fan-out
+  degrades into K agents solving the same subproblem. Worth measuring directly
+  (overlap in files touched across workers) rather than assuming.
+- **Does the integrator need to be a strong model?** Cheap planning + cheap
+  execution + expensive integration may be the real shape. `cost_by_role` is
+  designed to answer this empirically.
+- **Fan-out ceiling:** at what K does added parallelism stop helping (or start
+  hurting via conflicts)? A sweep over K on one case is a cheap early experiment
+  and probably the first genuinely publishable result this harness can produce.
 
 
 ---

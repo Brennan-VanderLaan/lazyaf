@@ -5,6 +5,7 @@ from app.models.runner import Runner, RunnerStatus
 from app.models.agent_file import AgentFile
 from app.models.pipeline import Pipeline, PipelineRun, StepRun, RunStatus, StepExecution, StepExecutionStatus
 from app.models.spec import Feature, UserStory, AcceptanceCriterion, PromptTemplate, FeatureStatus, StoryStatus
+from app.models.testref import TestRef, TestRun, TestRefStatus, TestRunStatus
 from app.models.workspace import Workspace
 
 __all__ = [
@@ -30,5 +31,9 @@ __all__ = [
     "PromptTemplate",
     "FeatureStatus",
     "StoryStatus",
+    "TestRef",
+    "TestRun",
+    "TestRefStatus",
+    "TestRunStatus",
     "Workspace",
 ]

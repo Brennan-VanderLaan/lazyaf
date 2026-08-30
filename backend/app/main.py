@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 from app.database import init_db
 from app.routers import repos, cards, jobs, runners, agent_files, pipelines, lazyaf_files
-from app.routers import git, playground, models, steps, spec
+from app.routers import git, playground, models, steps, spec, test_results
 from app.services.websocket import manager
 
 # Import models to ensure they're registered with Base before init_db
@@ -100,6 +100,7 @@ app.include_router(playground.session_router)
 app.include_router(models.router)
 app.include_router(steps.router)
 app.include_router(spec.router)
+app.include_router(test_results.router)
 
 if settings.test_mode:
     # e2e-only reset/seed surface; module stays unimported when the flag is off

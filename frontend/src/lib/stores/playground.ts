@@ -7,7 +7,8 @@ interface PlaygroundState {
   repoId: string | null;
   agentId: string | null;
   repoAgentName: string | null;
-  runnerType: 'claude-code' | 'gemini';
+  // M14 adds 'openai-harness': the LazyAF loop against a self-hosted endpoint.
+  runnerType: 'claude-code' | 'gemini' | 'openai-harness';
   model: AgentModel | null;  // Specific model to use
   branch: string | null;
   taskOverride: string;

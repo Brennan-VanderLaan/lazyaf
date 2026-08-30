@@ -1,6 +1,7 @@
 import { writable, derived } from 'svelte/store';
 import type { Job, JobStatus } from '../api/types';
 import { jobs as jobsApi } from '../api/client';
+import { timestampOrder } from '../utils/time';
 
 export interface JobStatusUpdate {
   id: string;
@@ -100,7 +101,13 @@ function createJobsStore() {
         for (const job of jobs.values()) {
           if (job.card_id === cardId) {
             // Return the most recent job for this card
-            if (!foundJob || job.created_at > foundJob.created_at) {
+            // Compared as INSTANTS, not as strings. This store mixes two
+            // spellings of the same moment - `created_at` from the API and
+            // the `new Date().toISOString()` stamped above for a job first
+            // seen over the socket - and ">" on strings only accidentally
+            // agrees with ">" on times while both sides happen to be spelled
+            // the same way.
+            if (!foundJob || timestampOrder(job.created_at) > timestampOrder(foundJob.created_at)) {
               foundJob = job;
             }
           }
@@ -123,7 +130,7 @@ export function getJobForCard(cardId: string) {
     let latestJob: Job | undefined;
     for (const job of $jobs.values()) {
       if (job.card_id === cardId) {
-        if (!latestJob || job.created_at > latestJob.created_at) {
+        if (!latestJob || timestampOrder(job.created_at) > timestampOrder(latestJob.created_at)) {
           latestJob = job;
         }
       }

@@ -46,7 +46,7 @@ Env first, CLI flags override.
 | `LAZYAF_RUNNER_TYPE` | `--type` | `generic` | matched by `requires.runner_type` |
 | `LAZYAF_RUNNER_LABELS` | `--labels` | `""` | `has=gpio,has=camera,zone=workshop`; a repeated key becomes a list |
 | `LAZYAF_ORCHESTRATOR` | `--orchestrator` | `docker` | key into `ORCHESTRATORS` |
-| `LAZYAF_RUNNER_TOKEN` | `--token` | dev constant | shared enrollment secret; must match the backend's `LAZYAF_RUNNER_AUTH_SECRET` |
+| `LAZYAF_RUNNER_TOKEN` | `--token` | **none - required** | shared enrollment secret; must EQUAL the backend's `LAZYAF_RUNNER_AUTH_SECRET`. Also read, in precedence order, from `LAZYAF_RUNNER_TOKEN_FILE`, `LAZYAF_RUNNER_AUTH_SECRET_FILE`, `LAZYAF_RUNNER_AUTH_SECRET` (the `_FILE` forms hold a *path*, for docker secrets / k8s mounted Secrets). No default exists: the agent refuses to start without one rather than dialling and being rejected. |
 | `LAZYAF_STEP_BACKEND_URL` | `--step-backend-url` | unset | backend URL for **step containers** |
 | `LAZYAF_GIT_URL_TEMPLATE` | - | unset | overrides the clone URL; `{repo_id}` is substituted |
 | `LAZYAF_STEP_NETWORK` | - | `bridge` | docker network for spawned step containers |

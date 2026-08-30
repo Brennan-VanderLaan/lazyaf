@@ -45,6 +45,10 @@ AGENT_CONFIG_PATH_ENV = "LAZYAF_AGENT_CONFIG_PATH"
 #: Keys that must be present and truthy.
 REQUIRED_KEYS = ("agent", "prompt", "repo")
 
+#: The 14.x agent vocabulary entry (cross-agent contract #5). Named once here
+#: so the two places this module checks it cannot drift apart.
+HARNESS_AGENT = "openai-harness"
+
 #: Filename the wrapper materialises the curated spec bundle under, inside the
 #: directory the backend announced through AGENT_CONFIG_PATH_ENV (12.6.6).
 #: Pinned equal to ``control_layer.workspace.SPEC_CONTEXT_FILENAME`` by the
@@ -58,7 +62,8 @@ class AgentConfig:
 
     # --- what to run -------------------------------------------------------
     agent: str
-    """Executor selector: 'claude-code' | 'gemini' | 'mock'. No default."""
+    """Executor selector: 'claude-code' | 'gemini' | 'mock' |
+    'openai-harness'. No default."""
 
     prompt: str
     """The work itself. RENDERED BACKEND-SIDE (app/services/agent_prompt.py);
@@ -109,6 +114,47 @@ class AgentConfig:
     at ``<control dir>/spec_context.md`` for an agent that wants to re-read
     its brief 40 turns in, and so the size/truncation facts can be LOGGED: a
     silently-shrunk brief is exactly the dark behaviour R1 forbids."""
+
+    endpoint: Optional[Dict[str, Any]] = None
+    """The self-hosted endpoint this step runs against (14.1), or None.
+
+    {id, name, base_url, model, server_kind, reach, auth_style, auth_env,
+     auth_header, request_timeout_seconds, capabilities, pricing}
+
+    ``capabilities`` is a SNAPSHOT taken at dispatch, not a live reference: a
+    step must behave identically if someone re-probes the endpoint mid-run,
+    and a snapshot is also what M13 needs to attribute a result to the
+    capabilities that were actually in force.
+
+    ``auth_env`` names the FIXED container-side variable the harness reads.
+    THE AGENT CONFIG NEVER CARRIES THE KEY — the value arrives through 12.5's
+    ``secret_environment`` in the STEP config file, which run.py merges into
+    the child's env and then deletes."""
+
+    harness: Dict[str, Any] = field(default_factory=dict)
+    """The harness's budgets and loop shape (14.2).
+
+    {mode, max_iterations, max_total_tokens, time_budget_seconds,
+     max_tool_calls_per_turn, shell_timeout_seconds, tool_output_max_bytes,
+     temperature, top_p, seed, require_changes, debug_transcript}
+
+    ``mode`` is how M13 makes LOOP SHAPE an independent variable: forcing
+    ``text`` on a tool-capable model measures the cost of the fallback
+    protocol directly."""
+
+    @property
+    def harness_mode(self) -> str:
+        """``'tools'`` | ``'text'``, resolved from ``harness.mode`` and the
+        probed capability.
+
+        ONE FUNCTION DECIDES (cross-agent contract 4.3.7):
+        ``runner_common.harness.loop.resolve_harness_mode``. ``auto`` with
+        ``supports_tools is None`` is a REFUSAL, not a guess — the backend
+        already refuses to dispatch an unprobed endpoint, so reaching that
+        branch means the wire lied."""
+        from .harness.loop import resolve_harness_mode
+
+        return resolve_harness_mode(self.endpoint, self.harness)
 
     @property
     def spec_markdown(self) -> Optional[str]:
@@ -189,7 +235,8 @@ def load_agent_config(config_path: Path) -> Optional[AgentConfig]:
 
     if not isinstance(data["agent"], str):
         _fail(
-            "agent must be a string ('claude-code' | 'gemini' | 'mock'); "
+            "agent must be a string ('claude-code' | 'gemini' | 'mock' | "
+            "'openai-harness'); "
             f"got {type(data['agent']).__name__}"
         )
         return None
@@ -222,6 +269,53 @@ def load_agent_config(config_path: Path) -> Optional[AgentConfig]:
             )
             return None
 
+    # 14.1/14.2. SAME three-way strictness as spec_context above, and for the
+    # same reason: an additive optional key that an old consumer ignores and a
+    # new one defaults does NOT justify a version bump, but a key that is
+    # PRESENT AND WRONG is a refusal — a wrapper that half-understands its
+    # instructions is worse than one that refuses, and "which GPU am I
+    # billing" is not a field to guess at.
+    endpoint = data.get("endpoint")
+    if endpoint is not None and not isinstance(endpoint, dict):
+        _fail(
+            f"endpoint must be an object or null; got {type(endpoint).__name__}"
+        )
+        return None
+
+    harness = data.get("harness")
+    if harness is not None and not isinstance(harness, dict):
+        _fail(f"harness must be an object or null; got {type(harness).__name__}")
+        return None
+    harness = harness or {}
+
+    if data["agent"] == HARNESS_AGENT:
+        if not isinstance(endpoint, dict):
+            _fail(
+                f"agent '{HARNESS_AGENT}' requires an endpoint block naming the "
+                "OpenAI-compatible server to drive; there is no default endpoint"
+            )
+            return None
+        for key in ("base_url", "model"):
+            if not endpoint.get(key):
+                _fail(
+                    f"agent '{HARNESS_AGENT}' requires endpoint.{key}; the "
+                    "backend must not dispatch a harness step without one"
+                )
+                return None
+        # The mode is resolved HERE, at load, so an endpoint whose capability
+        # record cannot answer "does it do tool calling" fails before the
+        # container spends a token — not 40 turns in.
+        try:
+            from .harness.loop import resolve_harness_mode
+
+            resolve_harness_mode(endpoint, harness)
+        except ValueError as exc:
+            _fail(str(exc))
+            return None
+        except ImportError as exc:  # pragma: no cover - packaging regression
+            _fail(f"the harness package is not importable: {exc}")
+            return None
+
     return AgentConfig(
         version=AGENT_CONFIG_VERSION,
         agent=data["agent"],
@@ -236,6 +330,8 @@ def load_agent_config(config_path: Path) -> Optional[AgentConfig]:
         mock_config=data.get("mock_config"),
         role=data.get("role"),
         spec_context=spec_context,
+        endpoint=endpoint,
+        harness=harness,
     )
 
 

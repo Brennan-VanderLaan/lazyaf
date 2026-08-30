@@ -12,6 +12,7 @@
    * criterion with forty tests cannot own the number.
    */
   import type { Leaderboard, LeaderboardVariant } from '../../api/types';
+  import { CostBasisPill } from '../endpoint';
   import { NOT_RANKED_NOTE } from '../../api/types';
   import { formatUsd, formatRate, formatDuration } from '../../stores/experiments';
 
@@ -131,12 +132,28 @@
             {/if}
           </td>
           <td class="num">
-            {formatUsd(variant.cost_usd_total)}
-            {#if variant.cost_coverage !== null && variant.cost_coverage < 1}
-              <span class="sub warn" data-testid="leaderboard-cost-coverage">
-                coverage {formatRate(variant.cost_coverage)}
+            <!--
+              M14 decision 4, UI half. A variant with NO cost data renders as
+              an ABSENCE - struck through, "no cost data" - never as a number.
+              The failure this prevents is a board that puts an Anthropic
+              invoice next to a locally-derived node-rate figure and lets
+              someone quote the ratio; a $0.00 in this column would read as
+              "this was free" when the truth is "we do not know".
+            -->
+            {#if variant.cost_coverage === 0}
+              <span class="no-cost" data-testid="leaderboard-no-cost">
+                <s>{formatUsd(variant.cost_usd_total)}</s>
+                <span class="sub warn">no cost data</span>
               </span>
+            {:else}
+              {formatUsd(variant.cost_usd_total)}
+              {#if variant.cost_coverage !== null && variant.cost_coverage < 1}
+                <span class="sub warn" data-testid="leaderboard-cost-coverage">
+                  coverage {formatRate(variant.cost_coverage)}
+                </span>
+              {/if}
             {/if}
+            <span class="sub"><CostBasisPill coverage={variant.cost_coverage} /></span>
           </td>
           <td class="num">{formatUsd(variant.cost_usd_per_run_median)}</td>
           <td class="num">{formatDuration(variant.wall_clock_ms_median)}</td>
@@ -330,5 +347,10 @@
     color: var(--text-muted, #6c7086);
     font-style: italic;
     font-size: 0.82rem;
+  }
+
+  /* M14: an unpriced variant's cost is an absence, rendered as one. */
+  .no-cost s {
+    color: var(--text-muted);
   }
 </style>

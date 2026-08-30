@@ -1,6 +1,7 @@
 import { derived, writable } from 'svelte/store';
 import type { Runner, RunnerState } from '../api/types';
 import { runners as runnersApi } from '../api/client';
+import { describeError } from '../utils/errors';
 
 /**
  * Runner store - Phase 12.6: SNAPSHOT FETCH + WEBSOCKET DELTAS.
@@ -66,6 +67,11 @@ function createRunnersStore() {
    * (deltas that arrived while the socket was down were never seen, so the
    * in-memory map is stale by an unknown amount and only a snapshot can fix
    * it).
+   *
+   * The reconnect half is wired in `stores/websocket.ts` (`snapshotTargets`).
+   * Until that landed this docstring described a call that did not exist, and
+   * a single transient failure pinned an error in the sidebar until the page
+   * was reloaded - QA triage T7.
    */
   async function load() {
     loading.set(true);
@@ -79,10 +85,25 @@ function createRunnersStore() {
       loaded.set(true);
       publish();
     } catch (e) {
-      error.set(e instanceof Error ? e.message : 'Failed to load runners');
+      // Prefixed, because `ApiError.message` is now the server's own sentence
+      // ("HTTP 503 Service Unavailable", "Cannot reach the LazyAF backend...")
+      // and on its own it does not say WHICH panel is broken.
+      error.set(`Could not load runners: ${describeError(e)}`);
     } finally {
       loading.set(false);
     }
+  }
+
+  /**
+   * Dismiss a stale error without refetching.
+   *
+   * An error is a report about ONE past attempt, not a permanent property of
+   * the panel. Before this the store only ever cleared `error` inside
+   * `load()`, and `load()` had a single call site inside `onMount` - so one
+   * blip pinned "Unknown error" in the sidebar until F5.
+   */
+  function clearError() {
+    error.set(null);
   }
 
   /**
@@ -100,6 +121,11 @@ function createRunnersStore() {
    */
   function applyDelta(runner: Runner | null | undefined) {
     if (!runner || !runner.id) return;
+    // Deliberately does NOT clear `error`: a delta proves the socket is up,
+    // but it does not repair a snapshot that never landed, and a panel that
+    // silently drops the warning while still listing a partial fleet is
+    // exactly the kind of quiet lie R1 forbids. Recovery is `load()` (which
+    // the reconnect resync calls) or the panel's explicit Retry.
     if (isGone(runner.status)) {
       byId.delete(runner.id);
     } else {
@@ -123,6 +149,7 @@ function createRunnersStore() {
     loaded: { subscribe: loaded.subscribe },
     load,
     applyDelta,
+    clearError,
     reset,
   };
 }

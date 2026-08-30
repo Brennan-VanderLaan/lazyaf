@@ -18,13 +18,17 @@ import pytest
 
 from lazyaf_runner.cli import build_parser, config_from_args
 from lazyaf_runner.config import (
-    DEFAULT_RUNNER_TOKEN,
     ConfigError,
     RunnerConfig,
     is_loopback,
     parse_labels,
+    resolve_token,
     websocket_url,
 )
+
+#: Every plaintext-guard case needs SOME token, because validate() rejects a
+#: missing one first (12.7: there is no default enrollment secret any more).
+TOKEN = "a-configured-enrollment-secret"
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +127,7 @@ def test_non_loopback_is_not_loopback() -> None:
 # ---------------------------------------------------------------------------
 
 def test_plaintext_to_loopback_is_allowed() -> None:
-    RunnerConfig(backend_url="http://localhost:8000").validate()
+    RunnerConfig(backend_url="http://localhost:8000", token=TOKEN).validate()
 
 
 def test_plaintext_to_a_real_host_is_refused_by_default() -> None:
@@ -131,16 +135,18 @@ def test_plaintext_to_a_real_host_is_refused_by_default() -> None:
     control_files; in the clear across a real network that is a credential
     broadcast."""
     with pytest.raises(ConfigError) as excinfo:
-        RunnerConfig(backend_url="http://10.0.0.5:8000").validate()
+        RunnerConfig(backend_url="http://10.0.0.5:8000", token=TOKEN).validate()
     assert "step JWT" in str(excinfo.value)
 
 
 def test_plaintext_to_a_real_host_can_be_opted_into() -> None:
-    RunnerConfig(backend_url="http://10.0.0.5:8000", allow_insecure=True).validate()
+    RunnerConfig(
+        backend_url="http://10.0.0.5:8000", allow_insecure=True, token=TOKEN
+    ).validate()
 
 
 def test_tls_to_a_real_host_needs_no_opt_in() -> None:
-    RunnerConfig(backend_url="https://lazyaf.example.com").validate()
+    RunnerConfig(backend_url="https://lazyaf.example.com", token=TOKEN).validate()
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +216,8 @@ def test_from_env_defaults() -> None:
     assert config.backend_url == "http://localhost:8000"
     assert config.runner_type == "generic"
     assert config.orchestrator == "docker"
-    assert config.token == DEFAULT_RUNNER_TOKEN
+    # 12.7: no default enrollment secret. Empty here, fatal at validate().
+    assert config.token == ""
     assert config.step_network == "bridge"
     assert config.allow_insecure is False
     assert config.bind_allowlist == ()
@@ -226,7 +233,7 @@ def test_redacted_never_shows_the_token() -> None:
     blob = str(RunnerConfig(token="hunter2").redacted())
     assert "hunter2" not in blob
     assert "<set>" in blob
-    assert "<default>" in str(RunnerConfig().redacted())
+    assert "<unset>" in str(RunnerConfig().redacted())
 
 
 # ---------------------------------------------------------------------------
@@ -275,3 +282,107 @@ def test_cli_exposes_every_documented_flag() -> None:
         "--log-level",
         "--version",
     } <= options
+
+
+# ---------------------------------------------------------------------------
+# Enrollment secret (12.7): no default, *_FILE wins, missing is fatal
+# ---------------------------------------------------------------------------
+
+def test_no_token_configured_is_empty_not_a_default() -> None:
+    """The public dev constant is gone. Nothing stands in for it."""
+    assert resolve_token({}) == ""
+    assert RunnerConfig.from_env({}).token == ""
+
+
+def test_inline_token_is_read() -> None:
+    assert resolve_token({"LAZYAF_RUNNER_TOKEN": "  inline-secret  "}) == "inline-secret"
+
+
+def test_backend_variable_name_is_accepted_as_a_fallback() -> None:
+    """One k8s Secret, mounted into either workload under either key."""
+    assert resolve_token({"LAZYAF_RUNNER_AUTH_SECRET": "shared"}) == "shared"
+
+
+def test_runner_token_beats_the_backend_variable_name() -> None:
+    resolved = resolve_token(
+        {"LAZYAF_RUNNER_TOKEN": "specific", "LAZYAF_RUNNER_AUTH_SECRET": "generic"}
+    )
+    assert resolved == "specific"
+
+
+def test_token_file_wins_over_the_inline_value(tmp_path) -> None:
+    """docker secrets and k8s deliver a PATH; it must beat an inline leftover."""
+    path = tmp_path / "runner_secret"
+    path.write_text("from-the-mounted-file\n", encoding="utf-8")
+    resolved = resolve_token(
+        {
+            "LAZYAF_RUNNER_TOKEN_FILE": str(path),
+            "LAZYAF_RUNNER_TOKEN": "stale-inline-value",
+        }
+    )
+    assert resolved == "from-the-mounted-file"
+
+
+def test_auth_secret_file_is_also_honored(tmp_path) -> None:
+    path = tmp_path / "shared_secret"
+    path.write_text("mounted-shared\n", encoding="utf-8")
+    assert resolve_token({"LAZYAF_RUNNER_AUTH_SECRET_FILE": str(path)}) == "mounted-shared"
+
+
+def test_unreadable_token_file_is_fatal_not_a_silent_fallback(tmp_path) -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_token(
+            {
+                "LAZYAF_RUNNER_TOKEN_FILE": str(tmp_path / "nope"),
+                "LAZYAF_RUNNER_TOKEN": "would-have-worked",
+            }
+        )
+    assert "LAZYAF_RUNNER_TOKEN_FILE" in str(excinfo.value)
+
+
+def test_empty_token_file_is_fatal(tmp_path) -> None:
+    path = tmp_path / "empty"
+    path.write_text("   \n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        resolve_token({"LAZYAF_RUNNER_TOKEN_FILE": str(path)})
+
+
+def test_the_retired_public_default_is_rejected() -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        resolve_token(
+            {"LAZYAF_RUNNER_TOKEN": "lazyaf-runner-auth-secret-key-change-in-production"}
+        )
+    assert "published" in str(excinfo.value)
+
+
+def test_validate_refuses_to_start_without_a_token() -> None:
+    with pytest.raises(ConfigError) as excinfo:
+        RunnerConfig(backend_url="http://localhost:8000").validate()
+    message = str(excinfo.value)
+    assert "LAZYAF_RUNNER_AUTH_SECRET" in message
+    assert "LAZYAF_RUNNER_TOKEN_FILE" in message
+    assert "bootstrap_secrets.py" in message
+
+
+def test_validate_refuses_the_retired_default_supplied_directly() -> None:
+    config = RunnerConfig(
+        backend_url="http://localhost:8000",
+        token="lazyaf-runner-auth-secret-key-change-in-production",
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        config.validate()
+    assert "published" in str(excinfo.value)
+
+
+def test_cli_token_flag_satisfies_validate() -> None:
+    config = config_from_args(["--token", "from-the-cli"], env={})
+    config.validate()
+    assert config.token == "from-the-cli"
+
+
+def test_no_token_value_reaches_the_redacted_form(tmp_path) -> None:
+    path = tmp_path / "secret"
+    path.write_text("SENTINEL-DO-NOT-LEAK", encoding="utf-8")
+    config = RunnerConfig.from_env({"LAZYAF_RUNNER_TOKEN_FILE": str(path)})
+    assert "SENTINEL-DO-NOT-LEAK" not in str(config.redacted())
+    assert config.redacted()["token"] == "<set>"

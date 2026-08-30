@@ -209,7 +209,13 @@ class TestDispatch:
     def test_make_executor_and_the_vocabulary_have_one_source(self):
         """F3.3: EXECUTORS is the ONLY mapping. An agent it does not name
         cannot be constructed, and one it names must be."""
-        assert sorted(agent_wrapper.EXECUTORS) == ["claude-code", "gemini", "mock"]
+        # 14.2 added the FOURTH and only new entry (cross-agent contract #5).
+        assert sorted(agent_wrapper.EXECUTORS) == [
+            "claude-code",
+            "gemini",
+            "mock",
+            "openai-harness",
+        ]
         with pytest.raises(KeyError):
             agent_wrapper.make_executor(
                 type("Cfg", (), {"agent": "gpt-5", "stream": True, "mock_config": None})

@@ -9,6 +9,7 @@ import type {
   StepRunV2,
 } from '../api/types';
 import { debug as debugApi } from '../api/client';
+import { parseTimestamp } from '../utils/time';
 
 /**
  * Debug Re-Run store - Phase 12.7.
@@ -164,11 +165,18 @@ function graphStepOrder(graph: PipelineGraphModel): string[] {
 // Countdown helpers
 // -----------------------------------------------------------------------------
 
-/** Milliseconds left before `expiresAt`, floored at 0. null when unbounded. */
+/**
+ * Milliseconds left before `expiresAt`, floored at 0. null when unbounded.
+ *
+ * Parsed through the shared helper: `expires_at` is a backend timestamp, and
+ * `new Date(naiveUtcString)` read it as browser-local - so a four-hour session
+ * on a UTC-4 laptop counted down from eight, or showed 0:00 while the gate was
+ * still open (QA triage T1).
+ */
 export function remainingMs(expiresAt: string | null, now: number = Date.now()): number | null {
   if (!expiresAt) return null;
-  const deadline = new Date(expiresAt).getTime();
-  if (Number.isNaN(deadline)) return null;
+  const deadline = parseTimestamp(expiresAt);
+  if (deadline === null) return null;
   return Math.max(0, deadline - now);
 }
 

@@ -67,6 +67,13 @@
     }
   }
 
+  // Unified-diff FILE HEADERS are not diff content. Without this guard the
+  // `--- a/path` line rendered as a red removed row reading "-- a/path" and
+  // `+++ b/path` as a green added row, on every expanded file in every diff.
+  // Same treatment as RawDiffViewer.svelte, and as the backend's own +/-
+  // counts (git_server.py excludes `+++`/`---` from additions/deletions).
+  const FILE_HEADER = /^(---|\+\+\+|diff --git |index |new file |deleted file |similarity index |rename )/;
+
   function parseDiffLines(diffText: string): Array<{type: string; content: string; oldNum?: number; newNum?: number}> {
     if (!diffText) return [];
 
@@ -74,9 +81,14 @@
     const result: Array<{type: string; content: string; oldNum?: number; newNum?: number}> = [];
     let oldLine = 0;
     let newLine = 0;
+    // Headers only ever appear in the prologue BEFORE the first @@ hunk, so
+    // the filter is scoped there. A content line that legitimately begins
+    // "--" or "++" lives inside a hunk and is still rendered.
+    let inHunk = false;
 
     for (const line of lines) {
       if (line.startsWith('@@')) {
+        inHunk = true;
         // Parse hunk header like @@ -1,5 +1,7 @@
         const match = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
         if (match) {
@@ -84,6 +96,8 @@
           newLine = parseInt(match[2]) - 1;
         }
         result.push({ type: 'hunk', content: line });
+      } else if (!inHunk && FILE_HEADER.test(line)) {
+        continue;
       } else if (line.startsWith('+')) {
         newLine++;
         result.push({ type: 'add', content: line.slice(1), newNum: newLine });

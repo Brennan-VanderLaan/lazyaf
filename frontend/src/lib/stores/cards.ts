@@ -1,4 +1,4 @@
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import type { Card, CardCreate, CardUpdate, CardStatus, ApproveResponse, RebaseResponse } from '../api/types';
 import { cards as cardsApi } from '../api/client';
 import { selectedRepoId } from './repos';
@@ -7,6 +7,34 @@ function createCardsStore() {
   const { subscribe, set, update } = writable<Card[]>([]);
   const loading = writable(false);
   const error = writable<string | null>(null);
+
+  /**
+   * Insert-or-replace by id. THE only way a card enters this list.
+   *
+   * `updateLocal` used to REFUSE to add an unknown card ("adding is handled
+   * by create() to avoid race conditions with WebSocket"). That does dodge the
+   * duplicate row, but it also means a card created anywhere other than this
+   * tab - the CLI, a second browser, a teammate during a demo - never appears
+   * until someone reloads: the board silently shows TO DO 0 while a card sits
+   * in it. Keying on the id fixes both halves at once, which is what
+   * stores/repos.ts does for the same race.
+   *
+   * The repo guard is the reason this is not a straight copy of that one: this
+   * store holds ONE repo's board, so a frame for a card in another repository
+   * must not be adopted into it.
+   */
+  function upsert(card: Card) {
+    update(cards => {
+      const index = cards.findIndex(c => c.id === card.id);
+      if (index >= 0) {
+        const next = [...cards];
+        next[index] = card;
+        return next;
+      }
+      if (card.repo_id !== get(selectedRepoId)) return cards;
+      return [...cards, card];
+    });
+  }
 
   return {
     subscribe,
@@ -30,7 +58,7 @@ function createCardsStore() {
       error.set(null);
       try {
         const card = await cardsApi.create(repoId, data);
-        update(cards => [...cards, card]);
+        upsert(card);
         return card;
       } catch (e) {
         error.set(e instanceof Error ? e.message : 'Failed to create card');
@@ -146,15 +174,7 @@ function createCardsStore() {
     },
 
     updateLocal(card: Card) {
-      update(cards => {
-        // Only update existing cards, never add new ones
-        // Adding is handled by create() to avoid race conditions with WebSocket
-        const existing = cards.find(c => c.id === card.id);
-        if (existing) {
-          return cards.map(c => c.id === card.id ? card : c);
-        }
-        return cards;
-      });
+      upsert(card);
     },
 
     deleteLocal(id: string) {

@@ -7,6 +7,27 @@ function createReposStore() {
   const loading = writable(false);
   const error = writable<string | null>(null);
 
+  /**
+   * Insert-or-replace by id. THE only way a repo enters this list.
+   *
+   * `create`/`ingest` used to append their own HTTP response unconditionally,
+   * which races the `repo_created` frame the same write broadcasts: the frame
+   * arrives first on a local backend, `updateLocal` appends it, and then the
+   * POST resolves and appends the SAME repo a second time. One click, two
+   * identical rows in the sidebar - the first thing a demo does, and it
+   * looked like the backend had created two repositories (it had not; a
+   * reload showed one). Both paths now go through this.
+   */
+  function upsert(repo: Repo) {
+    update(repos => {
+      const index = repos.findIndex(r => r.id === repo.id);
+      if (index < 0) return [...repos, repo];
+      const updated = [...repos];
+      updated[index] = repo;
+      return updated;
+    });
+  }
+
   return {
     subscribe,
     loading: { subscribe: loading.subscribe },
@@ -29,7 +50,7 @@ function createReposStore() {
       error.set(null);
       try {
         const repo = await reposApi.create(data);
-        update(repos => [...repos, repo]);
+        upsert(repo);
         return repo;
       } catch (e) {
         error.set(e instanceof Error ? e.message : 'Failed to create repo');
@@ -43,7 +64,7 @@ function createReposStore() {
         const result = await reposApi.ingest(data);
         // Fetch the full repo object after ingest
         const repo = await reposApi.get(result.id);
-        update(repos => [...repos, repo]);
+        upsert(repo);
         return repo;
       } catch (e) {
         error.set(e instanceof Error ? e.message : 'Failed to ingest repo');
@@ -64,18 +85,7 @@ function createReposStore() {
 
     // WebSocket updates - optimistic updates from other clients
     updateLocal(repo: Repo) {
-      update(repos => {
-        const index = repos.findIndex(r => r.id === repo.id);
-        if (index >= 0) {
-          // Update existing repo
-          const updated = [...repos];
-          updated[index] = repo;
-          return updated;
-        } else {
-          // Add new repo
-          return [...repos, repo];
-        }
-      });
+      upsert(repo);
     },
 
     deleteLocal(id: string) {

@@ -27,6 +27,7 @@
   } from '../../api/client';
   import { reposStore } from '../../stores/repos';
   import { experimentsStore, estimateIsFresh, cellCount } from '../../stores/experiments';
+  import { EndpointSelect } from '../endpoint';
 
   const dispatch = createEventDispatcher<{ launched: { id: string } }>();
 
@@ -35,7 +36,22 @@
    * There is no model-name -> agent inference anywhere in this flow: an
    * unknown agent is a 422 from the backend, not a guess (R1).
    */
-  const AGENTS = ['claude-code', 'gemini', 'mock'];
+  const AGENTS = ['claude-code', 'gemini', 'mock', 'openai-harness'];
+
+  /**
+   * M14: THIS is what lets one matrix mix API and self-hosted models in a
+   * single run - the whole point of the milestone.
+   *
+   * `MatrixModelEntry` needs no schema change to do it: a self-hosted cell is
+   * just `{agent: "openai-harness", model: "endpoint:local-4090"}`, because
+   * `model` is already the field the resolver reads and `endpoint:<name>` is
+   * already the one sugar spelling it parses. The row's free-text model input
+   * is swapped for an endpoint picker so the operator cannot typo a
+   * coordinate the leaderboard will then key history on.
+   */
+  function isHarnessRow(agent: string): boolean {
+    return agent === 'openai-harness';
+  }
 
   let name = '';
   let description = '';
@@ -254,13 +270,25 @@
             <option value={agent}>{agent}</option>
           {/each}
         </select>
-        <input
-          data-testid="model-name-input"
-          type="text"
-          placeholder="model id (blank = CLI default)"
-          bind:value={row.model}
-          on:input={invalidateEstimate}
-        />
+        {#if isHarnessRow(row.agent)}
+          <EndpointSelect
+            testid="model-endpoint-select"
+            value={row.model ?? ''}
+            onChange={(value) => {
+              row.model = value;
+              modelRows = modelRows;
+              invalidateEstimate();
+            }}
+          />
+        {:else}
+          <input
+            data-testid="model-name-input"
+            type="text"
+            placeholder="model id (blank = CLI default)"
+            bind:value={row.model}
+            on:input={invalidateEstimate}
+          />
+        {/if}
         <input
           data-testid="model-label-input"
           type="text"

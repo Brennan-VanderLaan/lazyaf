@@ -153,7 +153,7 @@ test.describe('QA-6 finding 1: naive UTC vs local time', () => {
    * Root cause: backend emits naive UTC (app/models/*.py `default=datetime.utcnow`)
    * and PipelinesPage.svelte:125-133 subtracts it from `Date.now()`.
    */
-  test.fail('a RUNNING run must not show a negative duration', async ({ page }) => {
+  test('a RUNNING run must not show a negative duration', async ({ page }) => {
     await mockApi(page, { pipelines: [pipeline()], runs: [run()] });
     await openPipelines(page, 'runs');
 
@@ -169,7 +169,7 @@ test.describe('QA-6 finding 1: naive UTC vs local time', () => {
    * reading formatted as if it were local, so a run started "just now" is
    * displayed hours in the future.
    */
-  test.fail('the Started column must show the run start in local time', async ({ page }) => {
+  test('the Started column must show the run start in local time', async ({ page }) => {
     await mockApi(page, { pipelines: [pipeline()], runs: [run()] });
     await openPipelines(page, 'runs');
 
@@ -194,7 +194,7 @@ test.describe('QA-6 finding 1: naive UTC vs local time', () => {
    * a second time.
    * Root cause: PipelineRunViewer.svelte:124-132.
    */
-  test.fail('the run detail modal must not show a negative duration', async ({ page }) => {
+  test('the run detail modal must not show a negative duration', async ({ page }) => {
     await mockApi(page, { pipelines: [pipeline()], runs: [run()] });
     await openPipelines(page, 'runs');
     await page.getByRole('button', { name: 'View' }).first().click();
@@ -341,7 +341,7 @@ test.fail('a run that vanishes server-side must disappear from the Runs tab', as
  * ago reads "ws 0s" for as long as the UTC offset lasts. The clamp hides the
  * bug rather than fixing it.
  */
-test.fail('a runner connected 30 minutes ago does not read "ws 0s"', async ({ page }) => {
+test('a runner connected 30 minutes ago does not read "ws 0s"', async ({ page }) => {
   const connectedAt = naiveUtc(-30 * 60 * 1000); // half an hour ago, naive UTC
 
   const json = (body: unknown) => ({

@@ -209,6 +209,19 @@ describe('countdown', () => {
     expect(remainingMs('2026-08-30T12:05:00Z', now)).toBe(300_000);
   });
 
+  it('reads a NAIVE backend expires_at as UTC, not as browser-local time', () => {
+    // QA triage T1: the backend serialises `expires_at` with no designator,
+    // and `new Date(str)` therefore read it as local. On a UTC-4 laptop a
+    // four-hour debug session counted down from eight; west of UTC the other
+    // way, a live gate showed 0:00. Both spellings must land on one instant.
+    expect(remainingMs('2026-08-30T12:05:00', now)).toBe(300_000);
+    expect(remainingMs('2026-08-30T12:05:00.123456', now)).toBe(300_123);
+  });
+
+  it('returns null - never NaN - for an unparseable deadline', () => {
+    expect(remainingMs('not a date', now)).toBeNull();
+  });
+
   it('formats under and over an hour', () => {
     expect(formatCountdown(65_000)).toBe('1:05');
     expect(formatCountdown(3_725_000)).toBe('1:02:05');

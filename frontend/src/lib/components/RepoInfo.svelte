@@ -4,6 +4,7 @@
   import { repos } from '../api/client';
   import type { BranchInfo, Commit } from '../api/types';
   import BranchManager from './BranchManager.svelte';
+  import { formatRelative, fromEpochSeconds } from '../utils/time';
 
   let showBranchManager = false;
 
@@ -88,18 +89,9 @@
     setTimeout(() => copied = false, 2000);
   }
 
+  /** Commit times are unix SECONDS. Shared formatter - see utils/time.ts. */
   function formatTimestamp(timestamp: number): string {
-    const date = new Date(timestamp * 1000);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
-    const diffHours = Math.floor(diffMins / 60);
-    const diffDays = Math.floor(diffHours / 24);
-
-    if (diffMins < 60) return `${diffMins}m ago`;
-    if (diffHours < 24) return `${diffHours}h ago`;
-    if (diffDays < 7) return `${diffDays}d ago`;
-    return date.toLocaleDateString();
+    return formatRelative(fromEpochSeconds(timestamp));
   }
 
   function getBranchesAtCommit(sha: string): BranchInfo[] {

@@ -29,7 +29,7 @@ export async function resetBackend(request: APIRequestContext): Promise<void> {
     throw new Error(
       `POST /api/test/reset failed (${response.status()}): ${await response.text()}\n` +
       `The e2e backend must run with LAZYAF_TEST_MODE=true - start it with:\n` +
-      `  docker compose -f docker-compose.yml -f frontend/e2e/compose.test-mode.yml --profile e2e up -d backend-e2e runner-mock-e2e`
+      `  docker compose -f docker-compose.yml -f frontend/e2e/compose.test-mode.yml --profile e2e up -d backend-e2e runner-agent-e2e`
     );
   }
 }

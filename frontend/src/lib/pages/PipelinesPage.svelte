@@ -6,6 +6,10 @@
   import type { Pipeline, PipelineRun, RunStatus, RepoPipeline } from '../api/types';
   import { lazyafFiles } from '../api/client';
   import PipelineRunViewer from '../components/PipelineRunViewer.svelte';
+  // T1: naive-UTC timestamps rendered `-14399s` durations and a "Started"
+  // column hours in the future. One shared parser now, no local copies.
+  import { formatDateTime, formatDuration, timestampOrder } from '../utils/time';
+  import { describeError } from '../utils/errors';
 
   type TabType = 'pipelines' | 'runs';
   let activeTab: TabType = 'pipelines';
@@ -47,7 +51,7 @@
       activeTab = 'runs';
     } catch (e) {
       console.error('Failed to run repo pipeline:', e);
-      alert(`Failed to run pipeline: ${e instanceof Error ? e.message : 'Unknown error'}`);
+      alert(`Failed to run pipeline: ${describeError(e)}`);
     }
   }
 
@@ -116,24 +120,20 @@
     }
   }
 
-  function formatDate(dateStr: string): string {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
+  // Durations tick against `runsNow` rather than `Date.now()` so a live run's
+  // "Duration" column advances on its own instead of freezing at whatever it
+  // read when the row last happened to re-render.
+  let runsNow = Date.now();
+  onMount(() => {
+    const tick = setInterval(() => (runsNow = Date.now()), 1000);
+    return () => clearInterval(tick);
+  });
 
-  function formatDuration(start: string | null, end: string | null): string {
-    if (!start) return '-';
-    const startTime = new Date(start).getTime();
-    const endTime = end ? new Date(end).getTime() : Date.now();
-    const seconds = Math.floor((endTime - startTime) / 1000);
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    return `${minutes}m ${seconds % 60}s`;
-  }
-
-  // Get all runs sorted by date
+  // Get all runs sorted by date. `timestampOrder` parks rows with an
+  // unparseable created_at at the bottom instead of letting a NaN comparison
+  // shuffle the whole list.
   $: allRuns = Array.from($activeRunsStore.values())
-    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    .sort((a, b) => timestampOrder(b.created_at) - timestampOrder(a.created_at));
 </script>
 
 <div class="pipelines-page" data-testid="pipelines-page">
@@ -189,7 +189,7 @@
             {#each repoPipelines as pipeline}
               <div class="pipeline-card repo-card" data-testid="pipeline" data-pipeline-name={pipeline.name}>
                 <div class="card-header">
-                  <h3>
+                  <h3 title={pipeline.name}>
                     {pipeline.name}
                     <span class="repo-source-badge">repo</span>
                   </h3>
@@ -204,7 +204,7 @@
                   <p class="card-description">{pipeline.description}</p>
                 {/if}
                 <div class="card-meta">
-                  <span class="step-count">{pipeline.steps.length} steps</span>
+                  <span class="step-count">{pipeline.steps.length} step{pipeline.steps.length === 1 ? '' : 's'}</span>
                   <div class="step-types">
                     {#each [...new Set(pipeline.steps.map(s => s.type))] as type}
                       <span class="step-type-badge">{type}</span>
@@ -246,7 +246,7 @@
             {#each $pipelinesStore as pipeline}
               <div class="pipeline-card" data-testid="pipeline" data-pipeline-id={pipeline.id}>
                 <div class="card-header">
-                  <h3>{pipeline.name}</h3>
+                  <h3 title={pipeline.name}>{pipeline.name}</h3>
                   <div class="card-actions">
                     <button class="btn-icon" title="Edit" on:click={() => handleEdit(pipeline)}>
                       <span>Edit</span>
@@ -260,7 +260,7 @@
                   <p class="card-description">{pipeline.description}</p>
                 {/if}
                 <div class="card-meta">
-                  <span class="step-count">{pipeline.steps.length} steps</span>
+                  <span class="step-count">{pipeline.steps.length} step{pipeline.steps.length === 1 ? '' : 's'}</span>
                   <div class="step-types">
                     {#each [...new Set(pipeline.steps.map(s => s.type))] as type}
                       <span class="step-type-badge">{type}</span>
@@ -331,8 +331,8 @@
                     <td>
                       <span class="trigger-badge">{run.trigger_type}</span>
                     </td>
-                    <td>{formatDate(run.created_at)}</td>
-                    <td>{formatDuration(run.started_at, run.completed_at)}</td>
+                    <td>{formatDateTime(run.created_at)}</td>
+                    <td>{formatDuration(run.started_at, run.completed_at, runsNow)}</td>
                     <td>
                       <button class="btn-view">View</button>
                     </td>
@@ -569,16 +569,27 @@
     align-items: flex-start;
   }
 
+  /* A long pipeline name used to stretch this h3 to its full scrollWidth
+     (measured 66642px inside a 436px card), pushing Edit and Run outside the
+     clipped card where they could not be clicked. The name now ellipsizes and
+     the actions keep their width. Covers both card headers (repo + platform),
+     which share this selector. */
   .card-header h3 {
     margin: 0;
     font-size: 1.1rem;
     font-weight: 600;
     color: var(--text-color);
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .card-actions {
     display: flex;
     gap: 0.5rem;
+    flex-shrink: 0;
   }
 
   .btn-icon {

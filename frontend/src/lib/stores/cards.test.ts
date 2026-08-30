@@ -24,6 +24,7 @@ vi.mock('../api/client', () => ({
 }));
 
 import { cardsStore, cardsByStatus } from './cards';
+import { selectedRepoId } from './repos';
 import { cards as cardsApi } from '../api/client';
 
 function makeCard(overrides: Partial<Card> = {}): Card {
@@ -57,6 +58,7 @@ async function seed(cards: Card[]) {
 
 beforeEach(() => {
   cardsStore.clear();
+  selectedRepoId.set('repo-1');
   vi.clearAllMocks();
 });
 
@@ -72,13 +74,44 @@ describe('cardsStore.updateLocal', () => {
     expect(cards.find(c => c.id === 'c1')?.status).toBe('in_progress');
   });
 
-  it('never adds unknown cards (WS race protection)', async () => {
+  // This used to assert "never adds unknown cards (WS race protection)".
+  // Refusing the insert did dodge a duplicate row, but it also meant a card
+  // created anywhere but this tab - the CLI, a second browser, a teammate
+  // mid-demo - never appeared until a reload: the board rendered TO DO 0
+  // while a card sat in it. The race is now handled by keying on the id, so
+  // the frame can be adopted AND cannot duplicate.
+  it('adopts an unknown card for the selected repo (a create from elsewhere)', async () => {
+    selectedRepoId.set('repo-1');
     await seed([makeCard({ id: 'c1' })]);
 
-    cardsStore.updateLocal(makeCard({ id: 'unseen' }));
+    cardsStore.updateLocal(makeCard({ id: 'unseen', repo_id: 'repo-1' }));
 
-    expect(get(cardsStore)).toHaveLength(1);
-    expect(get(cardsStore)[0].id).toBe('c1');
+    expect(get(cardsStore).map(c => c.id)).toEqual(['c1', 'unseen']);
+  });
+
+  it('ignores a card belonging to a repo other than the open board', async () => {
+    selectedRepoId.set('repo-1');
+    await seed([makeCard({ id: 'c1' })]);
+
+    cardsStore.updateLocal(makeCard({ id: 'elsewhere', repo_id: 'repo-2' }));
+
+    expect(get(cardsStore).map(c => c.id)).toEqual(['c1']);
+  });
+
+  it('does not duplicate when the WS frame beats the create response', async () => {
+    selectedRepoId.set('repo-1');
+    await seed([]);
+
+    const created = makeCard({ id: 'racy', repo_id: 'repo-1', title: 'from ws' });
+    // The socket wins the race...
+    cardsStore.updateLocal(created);
+    // ...and then the POST this tab issued resolves with the same row.
+    vi.mocked(cardsApi.create).mockResolvedValueOnce({ ...created, title: 'from http' });
+    await cardsStore.create('repo-1', { title: 'racy' } as never);
+
+    const cards = get(cardsStore);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].title).toBe('from http');
   });
 });
 

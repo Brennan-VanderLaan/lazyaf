@@ -3,6 +3,10 @@
   import { reposStore, selectedRepoId, selectedRepo } from '../stores/repos';
   import type { RepoCreate } from '../api/types';
   import RepoInfo from './RepoInfo.svelte';
+  // QA triage T7: the connection indicator has to live inside an
+  // always-mounted component. This is the topmost one under src/lib/;
+  // its natural home is App.svelte's sidebar, above <RepoSelector />.
+  import ConnectionStatus from './ConnectionStatus.svelte';
 
   let showAddForm = false;
   let newRepo: RepoCreate = { name: '', default_branch: 'main' };
@@ -33,6 +37,8 @@
     }
   }
 </script>
+
+<ConnectionStatus />
 
 <div class="repo-selector" data-testid="repo-selector">
   <div class="repo-header">

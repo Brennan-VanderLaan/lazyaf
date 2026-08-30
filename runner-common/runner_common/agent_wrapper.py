@@ -60,6 +60,7 @@ from .executors import (
     GeminiExecutor,
     MockExecutor,
 )
+from .harness import HarnessExecutor
 from .usage import (
     SCRAPE_FAILED_LOG_MARKER,
     USAGE_PATH_ENV,
@@ -80,12 +81,20 @@ from .usage import (
 #: and not the other. The builders resolve the executor classes from module
 #: globals at CALL time, which is also what keeps them substitutable in
 #: tests.
+#: 14.2 adds a FOURTH entry and nothing else. The harness takes its whole
+#: configuration through this builder — the endpoint block and the harness
+#: budgets, both straight off the wire — which is exactly why 12.5's
+#: cross-agent contract #4 survives: ``ExecutorConfig`` and ``ExecutorResult``
+#: gain no fields for it.
 EXECUTORS = {
     "claude-code": lambda cfg: ClaudeExecutor(
         output_format="stream-json" if cfg.stream else "json"
     ),
     "gemini": lambda cfg: GeminiExecutor(),
     "mock": lambda cfg: MockExecutor(mock_config=cfg.mock_config),
+    "openai-harness": lambda cfg: HarnessExecutor(
+        endpoint=cfg.endpoint, harness=cfg.harness
+    ),
 }
 
 #: Longest rendered log line for one streamed event (a 40 KB tool result is

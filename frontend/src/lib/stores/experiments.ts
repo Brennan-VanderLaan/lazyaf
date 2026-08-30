@@ -144,15 +144,15 @@ export function formatRate(value: number | null | undefined): string {
   return `${Math.round(value * 100)}%`;
 }
 
-/** Milliseconds as a short human duration. `null` is an em dash. */
-export function formatDuration(ms: number | null | undefined): string {
-  if (ms === null || ms === undefined) return '—';
-  if (ms < 1000) return `${ms}ms`;
-  const seconds = ms / 1000;
-  if (seconds < 60) return `${seconds.toFixed(1)}s`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${Math.round(seconds % 60)}s`;
-}
+/**
+ * Milliseconds as a short human duration. `null` is an em dash.
+ *
+ * Re-exported rather than reimplemented: duration rendering lives in
+ * `utils/time.ts` and nowhere else (QA triage T1 - the same maths had been
+ * copy-pasted into six files and every copy was wrong in the same way).
+ * `formatMillis` takes a SPAN; `formatDuration` there takes two endpoints.
+ */
+export { formatMillis as formatDuration } from '../utils/time';
 
 /** Cells that reached a terminal state, over the total. */
 export function cellsDone(progress: {

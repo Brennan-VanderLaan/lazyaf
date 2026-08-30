@@ -7,6 +7,9 @@
   // nothing without a session - so the viewer stays exactly what it was for
   // every run that is not being debugged.
   import { DebugPanel, DebugRerunModal } from './debug';
+  // T1: this file carried its own copy of the duration maths that rendered
+  // `-14399s` off naive-UTC timestamps. There is one copy now.
+  import { formatDuration } from '../utils/time';
 
   export let run: PipelineRun;
 
@@ -22,6 +25,10 @@
   // The launcher needs the PIPELINE, not just the run: breakpoints are step
   // keys read off the step list. Fetched on demand, so an ordinary viewer
   // open costs no extra request.
+  // Ticks once a second so a running step's duration counts up on its own
+  // rather than freezing until the next store update happens to re-render.
+  let viewerNow = Date.now();
+
   let showDebugRerun = false;
   let debugPipeline: Pipeline | null = null;
   let debugLaunchError: string | null = null;
@@ -68,7 +75,10 @@
     refreshInterval = null;
   }
 
+  const clockInterval = setInterval(() => (viewerNow = Date.now()), 1000);
+
   onDestroy(() => {
+    clearInterval(clockInterval);
     if (refreshInterval) {
       clearInterval(refreshInterval);
     }
@@ -163,15 +173,6 @@
     }
   }
 
-  function formatDuration(start: string | null, end: string | null): string {
-    if (!start) return '-';
-    const startTime = new Date(start).getTime();
-    const endTime = end ? new Date(end).getTime() : Date.now();
-    const seconds = Math.floor((endTime - startTime) / 1000);
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    return `${minutes}m ${seconds % 60}s`;
-  }
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
@@ -204,7 +205,7 @@
 
       <div class="run-meta">
         <span>Trigger: {liveRun.trigger_type}</span>
-        <span>Duration: {formatDuration(liveRun.started_at, liveRun.completed_at)}</span>
+        <span>Duration: {formatDuration(liveRun.started_at, liveRun.completed_at, viewerNow)}</span>
       </div>
 
       {#if debugLaunchError}
@@ -229,7 +230,7 @@
             </span>
             <span class="step-info">
               <span class="step-name">{stepRun.step_name}</span>
-              <span class="step-duration">{formatDuration(stepRun.started_at, stepRun.completed_at)}</span>
+              <span class="step-duration">{formatDuration(stepRun.started_at, stepRun.completed_at, viewerNow)}</span>
             </span>
           </button>
         {/each}

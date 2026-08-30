@@ -2,6 +2,9 @@
   import { createEventDispatcher } from 'svelte';
   import type { AgentFile } from '../api/types';
   import { agentFilesStore } from '../stores/agentFiles';
+  // T1: `new Date(naiveUtcString)` rendered Created/Updated hours in the
+  // future on any non-UTC machine, and "Invalid Date" for a null.
+  import { formatDateTime } from '../utils/time';
 
   export let agentFile: AgentFile | null = null;
 
@@ -139,11 +142,11 @@
         <div class="agent-meta">
           <div class="meta-item">
             <span class="meta-label">Created:</span>
-            <span class="meta-value">{new Date(agentFile.created_at).toLocaleString()}</span>
+            <span class="meta-value">{formatDateTime(agentFile.created_at)}</span>
           </div>
           <div class="meta-item">
             <span class="meta-label">Updated:</span>
-            <span class="meta-value">{new Date(agentFile.updated_at).toLocaleString()}</span>
+            <span class="meta-value">{formatDateTime(agentFile.updated_at)}</span>
           </div>
         </div>
       {/if}

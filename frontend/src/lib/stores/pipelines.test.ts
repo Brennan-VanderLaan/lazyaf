@@ -1,7 +1,18 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { get } from 'svelte/store';
-import { activeRunsStore, runsByStatus, hasActiveRuns } from './pipelines';
 import type { PipelineRun, RunStatus } from '../api/types';
+
+// `pipelineRuns.list` is the seam: recent runs enter the store through the real
+// HTTP client the store calls, not through a hand-poked internal map.
+const listMock = vi.fn();
+
+vi.mock('../api/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../api/client')>()),
+  pipelineRuns: { list: (...args: unknown[]) => listMock(...args) },
+}));
+
+// Dynamic so the mock factory above is installed before the store module runs.
+const { activeRunsStore, runsByStatus, hasActiveRuns } = await import('./pipelines');
 
 function makeRun(overrides: Partial<PipelineRun> = {}): PipelineRun {
   return {
@@ -24,6 +35,7 @@ function makeRun(overrides: Partial<PipelineRun> = {}): PipelineRun {
 
 beforeEach(() => {
   activeRunsStore.clear();
+  listMock.mockReset();
 });
 
 describe('activeRunsStore', () => {
@@ -62,6 +74,56 @@ describe('activeRunsStore', () => {
 
   it('get returns undefined for an unknown id', () => {
     expect(activeRunsStore.get('missing')).toBeUndefined();
+  });
+});
+
+describe('activeRunsStore.loadRecent', () => {
+  it('drops a run the new payload no longer lists', async () => {
+    activeRunsStore.addRun(makeRun({ id: 'deleted-run', status: 'passed', created_at: '2026-01-01T00:00:00Z' }));
+    activeRunsStore.addRun(makeRun({ id: 'kept-run', status: 'passed', created_at: '2026-01-02T00:00:00Z' }));
+
+    listMock.mockResolvedValue([makeRun({ id: 'kept-run', status: 'passed', created_at: '2026-01-02T00:00:00Z' })]);
+    await activeRunsStore.loadRecent();
+
+    const map = get(activeRunsStore);
+    expect(map.has('deleted-run')).toBe(false);
+    expect(map.get('kept-run')?.id).toBe('kept-run');
+    expect(map.size).toBe(1);
+  });
+
+  it('stops the live poll once the ghost running run is gone from the payload', async () => {
+    activeRunsStore.addRun(makeRun({ id: 'ghost', status: 'running' }));
+    expect(get(hasActiveRuns)).toBe(true);
+
+    listMock.mockResolvedValue([]);
+    await activeRunsStore.loadRecent();
+
+    expect(get(activeRunsStore).size).toBe(0);
+    expect(get(hasActiveRuns)).toBe(false);
+  });
+
+  it('keeps a live run that fell off the end of a full page', async () => {
+    activeRunsStore.addRun(makeRun({ id: 'off-page-live', status: 'running', created_at: '2026-01-01T00:00:00Z' }));
+    activeRunsStore.addRun(makeRun({ id: 'off-page-done', status: 'passed', created_at: '2026-01-01T00:00:00Z' }));
+
+    // A full page (limit === payload length) means older runs exist beyond it.
+    listMock.mockResolvedValue([makeRun({ id: 'newer', status: 'passed', created_at: '2026-01-05T00:00:00Z' })]);
+    await activeRunsStore.loadRecent(1);
+
+    const map = get(activeRunsStore);
+    expect(map.has('off-page-live')).toBe(true);
+    expect(map.has('off-page-done')).toBe(false);
+    expect(map.has('newer')).toBe(true);
+  });
+
+  it('takes the payload copy of a run it already held', async () => {
+    activeRunsStore.addRun(makeRun({ id: 'r1', status: 'running', steps_completed: 1 }));
+
+    listMock.mockResolvedValue([makeRun({ id: 'r1', status: 'passed', steps_completed: 3 })]);
+    await activeRunsStore.loadRecent();
+
+    expect(get(activeRunsStore).get('r1')?.status).toBe('passed');
+    expect(get(activeRunsStore).get('r1')?.steps_completed).toBe(3);
   });
 });
 

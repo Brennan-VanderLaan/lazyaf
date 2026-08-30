@@ -1,5 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, tick } from 'svelte';
+  import { EndpointSelect } from './endpoint';
   import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType, StepType, StepConfig, AgentFile, RepoAgent, MergedAgent, Feature, UserStory } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
@@ -34,6 +35,12 @@
   let title = card?.title ?? '';
   let description = card?.description ?? '';
   let runnerType: RunnerType = card?.runner_type ?? 'any';
+  /**
+   * M14. A self-hosted card names an ENDPOINT, carried in `step_config.model`
+   * as `endpoint:<name>` - the same field an API model would occupy, which is
+   * why `agent_run.start_card_work` needs no new parameter for it.
+   */
+  let endpointModel: string = card?.step_config?.model ?? '';
   let stepType: StepType = card?.step_type ?? 'agent';
   let stepCommand: string = card?.step_config?.command ?? '';
   let stepImage: string = card?.step_config?.image ?? '';
@@ -130,18 +137,46 @@
     { value: 'any', label: 'Any Runner' },
     { value: 'claude-code', label: 'Claude Code' },
     { value: 'gemini', label: 'Gemini CLI' },
+    // M14: the LazyAF harness against a self-hosted OpenAI-compatible
+    // endpoint. It is a peer of the CLI agents, not a new step type.
+    { value: 'openai-harness', label: 'Self-hosted endpoint' },
     { value: 'mock', label: 'Mock (Testing)' },
   ];
 
+  /**
+   * Step types a NEW card may be given.
+   *
+   * 'script' and 'docker' are gone: Phase 12.4 removed script/docker
+   * execution from the runners, so POST /api/cards/{id}/start refuses them
+   * (DEPRECATED_CARD_STEP_TYPES in backend/app/routers/cards.py, which now
+   * also refuses them at creation with a 422). Offering them here invited a
+   * mistake the product then punished three clicks later.
+   *
+   * Docker steps still run in a PIPELINE - that editor is
+   * components/graph/StepConfigModal.svelte and is deliberately untouched.
+   *
+   * The script/docker field blocks below are kept for EDITING a card created
+   * before that guard; nothing can select those types any more.
+   */
   const stepTypeOptions: { value: StepType; label: string; description: string }[] = [
     { value: 'agent', label: 'AI Agent', description: 'AI implements the feature using Claude or Gemini' },
-    { value: 'script', label: 'Shell Script', description: 'Run a shell command directly in the repo' },
-    { value: 'docker', label: 'Docker Container', description: 'Run a command inside a Docker container' },
   ];
+  // Labels for badges on legacy cards (the meta section renders card.step_type
+  // even when it is no longer offerable).
+  const legacyStepTypeLabels: Record<string, string> = {
+    script: 'Shell Script (deprecated)',
+    docker: 'Docker Container (deprecated)',
+  };
 
   // Build step config from individual fields
   function buildStepConfig(): StepConfig | null {
-    if (stepType === 'agent') return null;
+    if (stepType === 'agent') {
+      // A self-hosted agent card carries exactly one extra fact: which
+      // endpoint. Everything else about the step is unchanged.
+      return runnerType === 'openai-harness' && endpointModel
+        ? { model: endpointModel }
+        : null;
+    }
 
     const config: StepConfig = {};
     if (stepCommand) config.command = stepCommand;
@@ -414,7 +449,15 @@
       <button class="btn-close" aria-label="Close" data-testid="close-btn" on:click={() => dispatch('close')}>✕</button>
     </div>
 
-    <form on:submit|preventDefault={handleSubmit}>
+    <!--
+      `on:submit={handleSubmit}` passed the DOM SubmitEvent as `andStart`, and
+      an event object is truthy - so the plain "Create Card" button (type=submit)
+      did exactly what "Create & Submit" does: it created the card AND started
+      an agent run. A card could not be drafted into To Do at all, and on a
+      real runner that is an unasked-for paid run on every card creation.
+      The arrow function is what keeps the default false.
+    -->
+    <form on:submit|preventDefault={() => handleSubmit(false)}>
       <div class="form-group">
         <label for="title">Title</label>
         <input
@@ -473,9 +516,23 @@
                 Only Claude Code runners will work on this task.
               {:else if runnerType === 'gemini'}
                 Only Gemini CLI runners will work on this task.
+              {:else if runnerType === 'openai-harness'}
+                LazyAF supplies the agent loop and drives a model you host yourself.
               {/if}
             </p>
           </div>
+
+          {#if runnerType === 'openai-harness'}
+            <div class="form-group">
+              <label for="card-endpoint">Model endpoint</label>
+              <EndpointSelect
+                id="card-endpoint"
+                testid="card-endpoint-select"
+                value={endpointModel}
+                onChange={(value) => (endpointModel = value)}
+              />
+            </div>
+          {/if}
 
           {#if mergedAgents.length > 0}
             <div class="form-group">
@@ -616,7 +673,7 @@
           <div class="meta-item">
             <span class="meta-label">Type:</span>
             <span class="meta-value step-type-badge" data-step={card.step_type}>
-              {stepTypeOptions.find(o => o.value === card.step_type)?.label || card.step_type}
+              {stepTypeOptions.find(o => o.value === card.step_type)?.label || legacyStepTypeLabels[card.step_type] || card.step_type}
             </span>
           </div>
           {#if card.step_type !== 'agent' && card.step_config}

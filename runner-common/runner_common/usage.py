@@ -69,6 +69,11 @@ PROVIDER_BY_AGENT = {
     "claude-code": "anthropic",
     "gemini": "google",
     "mock": "self-hosted",
+    # 14.2. Constant for the harness executor: an OpenAI-compatible server is
+    # what it is, whether it runs on the operator's 4090 or on a runpod pod.
+    # The NODE (`gpu_node_id`) is what distinguishes them, and that is the
+    # server's business, not the wrapper's.
+    "openai-harness": "openai-compatible",
 }
 
 #: Fallback when the agent is unknown to the map (never a hard failure).
@@ -391,6 +396,113 @@ def scrape_gemini_usage(
         result[SCRAPE_ERROR_KEY] = f"gemini usage scrape raised {exc!r}"
         print(f"{SCRAPE_FAILED_LOG_MARKER}: {exc!r}", file=sys.stderr)
     return result
+
+
+# --------------------------------------------------------------------------
+# multi-request accumulation (14.2)
+# --------------------------------------------------------------------------
+
+#: The reason string the harness hands ``scrape_failure_reason`` when NO turn
+#: reported usage. Reusing the 12.5 marker machinery means
+#: ``scripts/verify_executor.py``'s existing grep catches it on the dogfood
+#: lane for free — no new marker, no second grep.
+NO_USAGE_REASON_TEMPLATE = (
+    "endpoint reported no usage block in any of {turns} turns"
+)
+
+
+class TokenAccumulator:
+    """Sum OpenAI-compatible ``usage`` blocks ACROSS TURNS (14.2).
+
+    THE ONLY GENUINELY NEW ACCOUNTING LOGIC IN MILESTONE 14. The three CLI
+    executors scrape ONE final report; the harness makes N requests and must
+    add them up. A last-response-wins bug here would report a 40-turn step as
+    costing one turn, which is the shape of error that makes a self-hosted
+    model look free.
+
+    A PARTIAL IS NEVER READ AS A TOTAL. If some turns reported usage and some
+    did not, the sums are the sums of the REPORTING turns and
+    ``turns_without_usage`` says so out loud. If no turn reported a given
+    counter at all, that counter is ``None`` — never ``0``. A zero is a claim
+    ("this turn cost nothing"); a null is an absence ("the server did not
+    say"), and collapsing the two is how a board reports a quietly-too-cheap
+    median.
+    """
+
+    def __init__(self):
+        self.turns = 0
+        self.turns_with_usage = 0
+        self._input = 0
+        self._input_seen = False
+        self._output = 0
+        self._output_seen = False
+        self._cache_read = 0
+        self._cache_read_seen = False
+
+    def add(self, usage_block: Any) -> None:
+        """Fold one response's ``usage`` object in. Never raises."""
+        self.turns += 1
+        if not isinstance(usage_block, dict):
+            return
+        prompt = _int_or_none(usage_block.get("prompt_tokens"))
+        completion = _int_or_none(usage_block.get("completion_tokens"))
+        details = usage_block.get("prompt_tokens_details")
+        cached = (
+            _int_or_none(details.get("cached_tokens"))
+            if isinstance(details, dict)
+            else None
+        )
+        if prompt is None and completion is None and cached is None:
+            return
+        self.turns_with_usage += 1
+        if prompt is not None:
+            self._input += prompt
+            self._input_seen = True
+        if completion is not None:
+            self._output += completion
+            self._output_seen = True
+        if cached is not None:
+            self._cache_read += cached
+            self._cache_read_seen = True
+
+    @property
+    def turns_without_usage(self) -> int:
+        return max(self.turns - self.turns_with_usage, 0)
+
+    @property
+    def input_tokens(self) -> Optional[int]:
+        return self._input if self._input_seen else None
+
+    @property
+    def output_tokens(self) -> Optional[int]:
+        return self._output if self._output_seen else None
+
+    @property
+    def cache_read_tokens(self) -> Optional[int]:
+        return self._cache_read if self._cache_read_seen else None
+
+    @property
+    def reported_anything(self) -> bool:
+        return self.turns_with_usage > 0
+
+    @property
+    def total_tokens(self) -> int:
+        """Tokens spent so far, for the loop's budget check.
+
+        ``0`` when nothing was reported, which means an endpoint that reports
+        no usage cannot be stopped by the TOKEN budget — it is stopped by the
+        iteration and time budgets instead. Stated rather than papered over
+        with an estimate: an invented token count is exactly the fiction this
+        module refuses everywhere else.
+        """
+        return (self._input if self._input_seen else 0) + (
+            self._output if self._output_seen else 0
+        )
+
+    def no_usage_reason(self) -> Optional[str]:
+        if self.reported_anything or self.turns == 0:
+            return None
+        return NO_USAGE_REASON_TEMPLATE.format(turns=self.turns)
 
 
 # --------------------------------------------------------------------------

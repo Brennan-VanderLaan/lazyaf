@@ -1,11 +1,3 @@
-# interim DooD for dogfood CI tier T2 - retired at Phase 12.4 (step-container socket option)
-# tradeoff: the socket grants host-root-equivalent access to step scripts - accepted for single-user dev, retired at 12.4
-x-runner-dood: &runner-dood
-  volumes:
-    - /var/run/docker.sock:/var/run/docker.sock
-  group_add:
-    - "0"  # docker.sock is root-group 660 in Docker Desktop's VM; the non-root runner user needs it
-
 services:
   backend:
     build: ./backend
@@ -36,7 +28,6 @@ services:
     restart: unless-stopped
 
   runner-claude:
-    <<: *runner-dood
     build: ./runner-claude
     environment:
       - BACKEND_URL=http://backend:8000
@@ -50,7 +41,6 @@ services:
       replicas: ${CLAUDE_RUNNERS:-1}
 
   runner-gemini:
-    <<: *runner-dood
     build: ./runner-gemini
     environment:
       - BACKEND_URL=http://backend:8000
@@ -64,7 +54,6 @@ services:
       replicas: ${GEMINI_RUNNERS:-1}
 
   runner-mock:
-    <<: *runner-dood
     build: ./runner-mock
     environment:
       - BACKEND_URL=http://backend:8000

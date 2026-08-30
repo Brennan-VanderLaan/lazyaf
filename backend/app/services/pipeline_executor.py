@@ -1009,7 +1009,26 @@ class PipelineExecutor:
         previous_step_logs: str | None = None,
         required_runner_id: str | None = None,
     ) -> None:
-        """Legacy path (unchanged semantics): temporary Card + Job + queue."""
+        """Legacy path (unchanged semantics): temporary Card + Job + queue.
+
+        Guard (12.4 fallout): script/docker steps must NEVER reach the runner
+        queue. Phase 12.4 deleted their execution from every runner entrypoint
+        (`execute_job` rejects them now), so enqueueing one produces a job that
+        is picked up and immediately failed - the silent in_progress -> failed
+        loop. The router already refuses to route them legacy; this is the
+        belt-and-braces stop at the enqueue site, and it raises so the caller's
+        dispatch error path fails the step with a real message.
+        """
+        from app.services.workspace.execution_router import LOCAL_STEP_TYPES
+
+        if step_type in LOCAL_STEP_TYPES:
+            raise RuntimeError(
+                f"Refusing to enqueue a {step_type!r} step ('{step_name}') to the "
+                "legacy runner queue: runners reject script/docker jobs since "
+                "Phase 12.4. This step belongs on the local executor - a legacy "
+                "route for it is a routing bug, not a fallback."
+            )
+
         # For agent steps, use title/description from config
         if step_type == "agent":
             card_title = step_config.get("title", card_title)

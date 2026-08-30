@@ -38,7 +38,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import StepExecution, StepRun, StepExecutionStatus
+from app.schemas.testref import TestIngestResponse, TestResultsManifest
 from app.services.control_layer.auth import validate_step_token
+from app.services.test_ingestion import ingest_manifest
 from app.services.websocket import manager
 
 
@@ -323,4 +325,35 @@ async def send_heartbeat(
     return HeartbeatResponse(
         timeout_extended=timeout_extended,
         last_seen=now.isoformat(),
+    )
+
+
+@router.post("/{step_id}/test-results", response_model=TestIngestResponse)
+async def ingest_step_test_results(
+    step_id: str,
+    request: TestResultsManifest,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+) -> TestIngestResponse:
+    """
+    Ingest a test-results manifest for this step (Phase 12.2.6, contract #3).
+
+    Called by the control runtime after the command exits, when the pytest
+    plugin wrote a manifest to LAZYAF_TEST_RESULTS_PATH. Same Bearer step
+    token as /logs; terminal StepExecutions answer 409 like every other
+    write endpoint (zombie-token hardening). The server derives pipeline
+    run / repo / commit / branch from the StepExecution -> StepRun ->
+    PipelineRun chain; unknown lazyaf_test_ids auto-create ORPHAN TestRefs.
+    Idempotent per (step_run, test_ref): a re-POST updates rather than
+    duplicates.
+    """
+    execution = await verify_step_auth(step_id, authorization, db)
+    _reject_terminal_writes(execution)
+
+    counts = await ingest_manifest(db, execution, request)
+    return TestIngestResponse(
+        results_received=counts.results_received,
+        test_runs_created=counts.test_runs_created,
+        test_runs_updated=counts.test_runs_updated,
+        orphan_refs_created=counts.orphan_refs_created,
     )

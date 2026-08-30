@@ -443,92 +443,37 @@ def execute_mock_agent_step(job: dict):
             cleanup_workspace()
 
 
-def execute_script_step(job: dict):
-    """Execute a script step (same as other runners)."""
-    job_id = job["id"]
-    step_config = job.get("step_config", {}) or {}
-    command = step_config.get("command", "")
+# ---------------------------------------------------------------------------
+# DEDUP NOTE (Phase 12.4): the function below is byte-for-byte identical in
+# runner-claude/entrypoint.py, runner-gemini/entrypoint.py and
+# runner-mock/entrypoint.py, and semantically identical to the CANONICAL
+# definition, runner_common.entrypoint.reject_non_agent_step (which differs
+# only in the helper call signatures of the runner-common package: it passes
+# runner_id/BACKEND_URL explicitly where these images use module globals).
+#
+# It is not imported because it CANNOT be: the runner images are built from
+# this single-file entrypoint and do not install the runner-common package
+# (see this image's Dockerfile - deliberately unchanged by 12.4). Until an
+# image installs runner-common, keep the copies in sync BY HAND: edit the
+# canonical copy first, then mirror it into all three images.
+# ---------------------------------------------------------------------------
+def reject_non_agent_step(job: dict):
+    """Loudly reject script/docker jobs - dead path since Phase 12.4.
 
-    is_continuation = job.get("is_continuation", False)
-    continue_in_context = job.get("continue_in_context", False)
-    pipeline_run_id = job.get("pipeline_run_id")
-
-    if not command:
-        log("ERROR: No command specified in step_config")
-        complete_job(success=False, error="No command specified")
-        return
-
-    # Normalize line endings
-    command = command.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n")
-
-    log(f"Executing script step: {command[:100]}...")
+    Script and docker steps run on the local executor since 12.4; runners are
+    agent-only. A job of that type reaching a runner means a stale queue entry
+    or a routing bug - fail it clearly rather than executing silently.
+    """
+    step_type = job.get('step_type', 'unknown')
+    job_id = job.get('id', 'unknown')
+    error = (
+        f"Runner rejected job {job_id[:8]} (step_type={step_type}): "
+        "script steps run on the local executor since 12.4; runners are "
+        "agent-only. This job should not have been enqueued to a runner."
+    )
+    log(f"ERROR: {error}")
     report_job_status(job_id, "running")
-
-    try:
-        # Determine workspace
-        if pipeline_run_id:
-            workspace = Path(f"/workspace/{pipeline_run_id[:8]}/repo")
-        else:
-            workspace = Path("/workspace/repo")
-
-        # Clone repo if needed and not a continuation
-        repo_id = job.get("repo_id", "")
-        use_internal_git = job.get("use_internal_git", False)
-
-        if is_continuation and workspace.exists():
-            log("Continuing from previous step - using existing workspace")
-            working_dir = str(workspace)
-        elif use_internal_git and repo_id:
-            repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
-            log(f"Cloning from internal git: {repo_url}")
-
-            run_command(["git", "config", "--global", "user.email", "lazyaf-mock@localhost"])
-            run_command(["git", "config", "--global", "user.name", "LazyAF Mock Agent"])
-
-            if workspace.exists():
-                run_command(["sudo", "rm", "-rf", str(workspace)])
-            workspace.parent.mkdir(parents=True, exist_ok=True)
-
-            exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
-            if exit_code != 0:
-                raise Exception("Failed to clone repository")
-
-            working_dir = str(workspace)
-        else:
-            working_dir = step_config.get("working_dir", "/workspace")
-
-        # Write script to temp file
-        script_path = Path(working_dir) / ".lazyaf_script.sh"
-        with open(script_path, "w") as f:
-            f.write("#!/bin/bash\nset -e\n")
-            f.write(command)
-            f.write("\n")
-
-        run_command(["chmod", "+x", str(script_path)])
-
-        # Execute script
-        exit_code, stdout, stderr = run_command(["bash", str(script_path)], cwd=working_dir)
-
-        # Clean up script
-        try:
-            script_path.unlink()
-        except:
-            pass
-
-        if exit_code == 0:
-            log("Script completed successfully")
-            complete_job(success=True)
-        else:
-            log(f"Script failed with exit code {exit_code}")
-            complete_job(success=False, error=f"Command failed with exit code {exit_code}")
-
-    except Exception as e:
-        log(f"ERROR: {e}")
-        complete_job(success=False, error=str(e))
-
-    finally:
-        if not continue_in_context:
-            cleanup_workspace()
+    complete_job(success=False, error=error)
 
 
 def execute_job(job: dict):
@@ -538,13 +483,8 @@ def execute_job(job: dict):
 
     log(f"Job {job_id[:8]}: step_type={step_type}")
 
-    if step_type == "script":
-        execute_script_step(job)
-    elif step_type == "docker":
-        # For docker steps, the mock runner just runs the command directly
-        # (Docker-in-Docker would be complex for a test runner)
-        log("Docker step running as script (mock runner limitation)")
-        execute_script_step(job)
+    if step_type in ("script", "docker"):
+        reject_non_agent_step(job)
     else:
         # Default to mock agent step
         execute_mock_agent_step(job)

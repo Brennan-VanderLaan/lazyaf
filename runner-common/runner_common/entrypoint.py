@@ -446,172 +446,33 @@ def execute_agent_step(job: dict) -> None:
             log("Preserving workspace for next step")
 
 
-def execute_script_step(job: dict) -> None:
-    """Execute a script step (shell command)."""
-    job_id = job["id"]
-    step_config = job.get("step_config", {}) or {}
-    command = step_config.get("command", "")
-    pipeline_run_id = job.get("pipeline_run_id")
-    is_continuation = job.get("is_continuation", False)
-    continue_in_context = job.get("continue_in_context", False)
-    step_name = job.get("step_name", "script")
-    step_index = job.get("step_index", 0)
+def reject_non_agent_step(job: dict) -> None:
+    """Loudly reject script/docker jobs - dead path since Phase 12.4.
 
-    workspace = get_workspace(pipeline_run_id)
+    CANONICAL DEFINITION (dedup note): this function is byte-duplicated in
+    runner-claude/entrypoint.py, runner-gemini/entrypoint.py and
+    runner-mock/entrypoint.py. Those images are built from their own
+    single-file entrypoints and do NOT install runner-common, so they cannot
+    import this one; keeping them in sync is manual until an image installs
+    the package. Change this copy first, then mirror it.
 
-    if not command:
-        log("ERROR: No command specified")
-        complete_job(runner_id, False, BACKEND_URL, error="No command specified")
-        return
-
-    # Log context
-    log("=" * 50)
-    log(f"SCRIPT STEP: {step_name}")
-    if pipeline_run_id:
-        log(f"  - Pipeline: {pipeline_run_id[:8]}")
-    log("=" * 50)
-
+    Script and docker steps run on the backend's local executor since 12.4
+    (ExecutionRouter never routes them legacy, and PipelineExecutor refuses
+    to enqueue them). A job of that type reaching a runner means a stale
+    queue entry or a routing bug - fail it clearly rather than executing it
+    behind the router's back (a second source of truth for script/docker
+    semantics is exactly what 12.4 deleted).
+    """
+    step_type = job.get("step_type", "unknown")
+    job_id = job.get("id", "unknown")
+    error = (
+        f"Runner rejected job {job_id[:8]} (step_type={step_type}): "
+        "script steps run on the local executor since 12.4; runners are "
+        "agent-only. This job should not have been enqueued to a runner."
+    )
+    log(f"ERROR: {error}")
     report_status(job_id, "running", BACKEND_URL)
-
-    try:
-        # Setup repo
-        setup_repo(job, workspace, is_continuation)
-
-        if pipeline_run_id and step_index == 0:
-            init_context(workspace, pipeline_run_id)
-
-        # Normalize command
-        command = command.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\r\n', '\n')
-
-        # Write script
-        script_path = workspace / ".lazyaf_script.sh"
-        script_path.write_text(f"#!/bin/bash\nset -e\n{command}\n")
-        subprocess.run(["chmod", "+x", str(script_path)])
-
-        # Execute
-        log(f"Running script in {workspace}...")
-        result = subprocess.run(
-            ["bash", str(script_path)],
-            cwd=str(workspace),
-            capture_output=True,
-            text=True,
-        )
-
-        # Clean up script
-        try:
-            script_path.unlink()
-        except Exception:
-            pass
-
-        step_output = f"Exit code: {result.returncode}\n\n--- STDOUT ---\n{result.stdout}\n\n--- STDERR ---\n{result.stderr}"
-
-        # Write context
-        if pipeline_run_id:
-            write_step_log(workspace, step_index, step_output, step_name)
-
-        if result.returncode == 0:
-            log("Script completed successfully")
-            complete_job(runner_id, True, BACKEND_URL)
-        else:
-            log(f"Script failed with exit code {result.returncode}")
-            complete_job(runner_id, False, BACKEND_URL, error=f"Exit code {result.returncode}")
-
-    except Exception as e:
-        log(f"ERROR: {e}")
-        complete_job(runner_id, False, BACKEND_URL, error=str(e))
-
-    finally:
-        if not continue_in_context:
-            cleanup_workspace(workspace)
-
-
-def execute_docker_step(job: dict) -> None:
-    """Execute a docker step (command in container)."""
-    job_id = job["id"]
-    step_config = job.get("step_config", {}) or {}
-    image = step_config.get("image", "")
-    command = step_config.get("command", "")
-    pipeline_run_id = job.get("pipeline_run_id")
-    is_continuation = job.get("is_continuation", False)
-    continue_in_context = job.get("continue_in_context", False)
-    step_name = job.get("step_name", "docker")
-    step_index = job.get("step_index", 0)
-
-    workspace = get_workspace(pipeline_run_id)
-
-    if not image or not command:
-        log("ERROR: Image and command required")
-        complete_job(runner_id, False, BACKEND_URL, error="Image and command required")
-        return
-
-    log("=" * 50)
-    log(f"DOCKER STEP: {step_name}")
-    log(f"  Image: {image}")
-    log("=" * 50)
-
-    report_status(job_id, "running", BACKEND_URL)
-
-    try:
-        # Setup repo
-        setup_repo(job, workspace, is_continuation)
-
-        if pipeline_run_id and step_index == 0:
-            init_context(workspace, pipeline_run_id)
-
-        # Normalize command
-        command = command.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\r\n', '\n')
-
-        # Write script
-        script_path = workspace / ".lazyaf_script.sh"
-        script_path.write_text(f"#!/bin/bash\nset -e\n{command}\n")
-        subprocess.run(["chmod", "+x", str(script_path)])
-
-        # Build docker command
-        docker_cmd = [
-            "docker", "run", "--rm",
-            "-v", f"{workspace}:/workspace",
-            "-w", "/workspace",
-        ]
-
-        # Add env vars
-        for key, value in step_config.get("env", {}).items():
-            docker_cmd.extend(["-e", f"{key}={value}"])
-
-        docker_cmd.extend([image, "bash", "/workspace/.lazyaf_script.sh"])
-
-        # Execute
-        log(f"Running in container: {image}")
-        result = subprocess.run(
-            docker_cmd,
-            capture_output=True,
-            text=True,
-        )
-
-        # Clean up
-        try:
-            script_path.unlink()
-        except Exception:
-            pass
-
-        step_output = f"Exit code: {result.returncode}\n\n--- STDOUT ---\n{result.stdout}\n\n--- STDERR ---\n{result.stderr}"
-
-        if pipeline_run_id:
-            write_step_log(workspace, step_index, step_output, step_name)
-
-        if result.returncode == 0:
-            log("Docker step completed successfully")
-            complete_job(runner_id, True, BACKEND_URL)
-        else:
-            log(f"Docker step failed with exit code {result.returncode}")
-            complete_job(runner_id, False, BACKEND_URL, error=f"Exit code {result.returncode}")
-
-    except Exception as e:
-        log(f"ERROR: {e}")
-        complete_job(runner_id, False, BACKEND_URL, error=str(e))
-
-    finally:
-        if not continue_in_context:
-            cleanup_workspace(workspace)
+    complete_job(runner_id, False, BACKEND_URL, error=error)
 
 
 def execute_job(job: dict) -> None:
@@ -628,10 +489,8 @@ def execute_job(job: dict) -> None:
         complete_job(runner_id, False, BACKEND_URL, error="Playground not supported")
         return
 
-    if step_type == "script":
-        execute_script_step(job)
-    elif step_type == "docker":
-        execute_docker_step(job)
+    if step_type in ("script", "docker"):
+        reject_non_agent_step(job)
     else:
         execute_agent_step(job)
 

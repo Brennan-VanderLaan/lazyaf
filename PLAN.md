@@ -345,34 +345,44 @@ Detailed documentation for completed phases is in `historical-documents/`.
 | 8 | Test Result Capture | COMPLETE | Test results displayed in UI |
 | 8.5 | CI/CD Foundation | COMPLETE | Script/docker step types |
 | 9-9.1 | Pipelines | COMPLETE | Multi-step workflows with context |
-| 12.0 | Unify Entrypoints | COMPLETE | runner-common package, unified entrypoint |
+| 12.0 | Unify Entrypoints | PARTIAL | runner-common package exists + tested; runner images do not import it yet (12.5/12.8) |
 | 12.1 | LocalExecutor + State Machine | COMPLETE | Step state machine, idempotency, LocalExecutor, crash recovery |
+| 0 | Self-Hosting Bootstrap | COMPLETE | LazyAF runs LazyAF's CI: tiered dogfood pipeline + ci_gate floors/skip baseline, alembic, test-mode API |
+| 12.2-INT | Workspace Persistence + Executor Wiring | COMPLETE | Workspace model/service, repo population, router -> LocalExecutor by default, per-step `executor` recorded |
+| 12.2.5 | Specification Data Model | COMPLETE | Feature/UserStory/AcceptanceCriterion/PromptTemplate + API + MCP + Specs UI |
+| 12.3 | Control Layer & Step Images | COMPLETE | Built lazyaf-* images, in-container control runtime -> live steps API, terminal reconciliation |
 
 ---
 
 ## Current Status
 
-> Corrected 2026-08-29. See "Milestone 12 — Attempt #3 Roadmap" below for the plan of
-> record; `upcoming/failure_01-salvage-audit.md` for the salvage map + post-mortem of
-> the abandoned first attempt.
+> Last updated 2026-08-29 (end of session). Plan of record: "Milestone 12 —
+> Attempt #3 Roadmap" below. Salvage map + post-mortem of the abandoned first
+> attempt: `upcoming/failure_01-salvage-audit.md`.
 
-**Live and complete**: Phases 1-11 (the shipping product: cards/board, agents, internal
-git server, pipelines incl. the v2 graph editor, playground, MCP, CLI) plus Phase 12.1's
-execution substrate (StepExecution + state machine + LocalExecutor + crash recovery).
-1,130 tests green as of 2026-08-29.
+**Milestone 12 progress: Phase 0, 12.2-INT, 12.2.5 and 12.3 are COMPLETE**, each
+signed off by its own dogfood exit gate (LazyAF's CI, running on LazyAF). Twelve
+green push-triggered self-hosted runs to date; ~1,520 backend tests + 78 frontend
+unit tests green; last stable commit `69f3ef0`, pushed to origin.
 
-**Built but NOT wired** (tested libraries, zero production callers):
-- Phase 12.0 runner-common — the three runner images still ship monolithic entrypoints
-  and do not import it (the COMPLETE mark in the phase table is aspirational).
-- Phase 12.2 workspace package — no DB model, ExecutionRouter is a stub,
-  pipeline_executor still dispatches via the in-memory job queue.
-- Phase 12.3 control layer — the /api/steps/* endpoints ARE live and tested; the step
-  images exist only as Python string-generators, nothing builds them.
+| Phase | Status | Evidence |
+|-------|--------|----------|
+| 0 — Self-hosting bootstrap | COMPLETE | Push -> tiered dogfood pipeline, ci_gate floors + skip baseline enforced |
+| 12.2-INT — Workspace persistence + executor wiring | COMPLETE | Steps run in ephemeral containers on persistent volumes; `executor='local'` verified per run |
+| 12.2.5 — Specification data model | COMPLETE | Feature/UserStory/AcceptanceCriterion/PromptTemplate + API + MCP + Specs UI, seeded with the three north-star stories |
+| 12.3 — Control layer & step images | COMPLETE | Real `lazyaf-{base,claude,test-runner}:dev` images, in-container runtime reporting to `/api/steps/*`, run #11 passed the gate |
+| 12.2.6 — Test result tie-back | IN PROGRESS | Wave 3 interrupted mid-implementation (uncommitted tree) |
+| 12.4 — Script/docker steps fully ephemeral | IN PROGRESS | Runner slimming started in the same wave; routing itself already local since 12.2-INT |
+| 12.5 / 12.6 / 12.6.5 / 12.6.6 / 12.7 / 12.8 | NOT STARTED | 12.6's 137-test contract suite sits dormant in-tree, self-activating when its modules land |
 
-**Not started**: 12.2.5, 12.2.6, 12.4, 12.5, 12.6, 12.6.5, 12.6.6, 12.7, 12.8.
+**Execution today**: script/docker steps flow pipeline_executor -> ExecutionRouter ->
+LocalExecutor -> ephemeral control-mode container on a persistent workspace volume,
+reporting status/logs to the live steps API. Agent steps still take the legacy
+card -> job -> queue -> polling runner path until 12.5.
 
-**Execution today** still flows the legacy path end to end:
-card -> job -> in-memory queue -> long-lived polling runners.
+**Still true from the January-era assessment**: Phase 12.0's COMPLETE mark in the
+table above remains aspirational — the three runner images still ship monolithic
+entrypoints and do not import `runner-common` (adoption lands in 12.5/12.8).
 
 **Abandoned attempt**: branch `failure_01` (12.0 -> 12.7 in two days, 2026-01-03/04).
 Reference only — never merge it.
@@ -392,6 +402,7 @@ T2 41 / T3 17), workspace created+cleaned (0 leaked). Spec layer live with
 the three north-star stories seeded; live WS step streaming in the UI with a
 contract-pinning test. Ten more confirmed review findings fixed pre-commit;
 dogfood run cccae257 caught a DooD landmine-2 seam the review missed (fixed).
+
 **Phase 12.3: COMPLETE (2026-08-29).** Real images (lazyaf-{base,claude,
 test-runner}:dev, reproducible content-hash builds), in-container control
 runtime reporting to the live steps API, one reporting path with terminal
@@ -402,7 +413,11 @@ each caught a real environment seam host testing could not: repo uid
 ownership, async completion timing, socket group across gosu, platform-
 dependent tree-hash collation, cross-uid git trust, docker client timeout
 under DooD load, sibling-network reachability — all regression-tested now.
-Next: Phase 12.2.6 (test tie-back) + Phase 12.4 (runner slimming).
+
+**Wave 3 (12.2.6 + 12.4): PAUSED mid-implementation (2026-08-29, quota).**
+Partial, unverified agent edits sit uncommitted in the working tree; nothing
+pushed. Resume = reconcile the partial tree against the wave's pinned contracts,
+finish, review, then dogfood-gate it.
 
 Phase 12.1 deliverables (COMPLETE):
   - `StepExecution` model with unique `execution_key` for idempotency
@@ -524,7 +539,7 @@ Migration policy: alembic migrations land serialized on main only; Track B
 rebases before generating. Startup runs `alembic upgrade head`; existing
 unversioned dev DBs are stamped at baseline first.
 
-#### Phase 0 — Self-hosting bootstrap + salvage quick wins  [prologue]
+#### Phase 0 — Self-hosting bootstrap + salvage quick wins  [prologue]  ✅ COMPLETE
 
 0a DOGFOOD CI LIVE (US-1 minimal form, on the legacy path):
    - Pipeline-definition sync on push: the receive-pack handler re-reads
@@ -561,7 +576,7 @@ unversioned dev DBs are stamped at baseline first.
    LazyAF itself, green, with per-tier executed counts >= committed floors;
    two rapid pushes produce one run; dogfood-live spec passes.
 
-#### Phase 12.2-INT — Workspace persistence + wiring the dark libraries [A]
+#### Phase 12.2-INT — Workspace persistence + wiring the dark libraries [A]  ✅ COMPLETE
 
 The step both prior attempts died before/at. Deliverables:
    - Alembic-born Workspace model (ADAPT failure_01 schema onto main's
@@ -597,7 +612,7 @@ The step both prior attempts died before/at. Deliverables:
    across success, failure, and backend-restart orphan-sweep scenarios; tier
    floors hold.
 
-#### Phase 12.2.5 — Specification data model  [B, parallelizable now]
+#### Phase 12.2.5 — Specification data model  [B]  ✅ COMPLETE
 
 Feature / UserStory / AcceptanceCriterion / PromptTemplate + card links +
 promote-to-feature; CRUD routers + minimal UI + MCP spec tools; serialized
@@ -607,7 +622,7 @@ check) and activates in 12.2.6. Seed with THIS ROADMAP's three user stories.
    EXIT GATE: spec CRUD API tests + spec-UI Playwright spec (R8); the three
    north-star stories queryable via API and MCP.
 
-#### Phase 12.3 — Real step images + control layer  [A]
+#### Phase 12.3 — Real step images + control layer  [A]  ✅ COMPLETE
 
 Port failure_01's images/ tree (base + control runtime + backend client +
 claude + test-runner) with the audit's contract fixes: LogLine payload
@@ -624,7 +639,7 @@ install-uv step dissolves into the image).
    logs/heartbeat feeding the UI (round-trip test over the POST path); tier
    floors hold.
 
-#### Phase 12.2.6 — Test result tie-back  [B, needs 12.3]
+#### Phase 12.2.6 — Test result tie-back  [B, needs 12.3]  🔄 IN PROGRESS (Wave 3, paused)
 
 Manifest channel `/workspace/.control/test_results.json` picked up at step
 end -> POST /api/test-results/ingest -> TestRef/TestRun joined to criterion +
@@ -637,7 +652,7 @@ runner-common (`lazyaf_test_id` marker). Sparkline/history UI deferred to
    US-1/2/3 criteria; a dogfood run produces TestRuns joined to criteria; the
    history endpoint returns the series.
 
-#### Phase 12.4 — Script/docker steps fully ephemeral  [A]
+#### Phase 12.4 — Script/docker steps fully ephemeral  [A]  🔄 IN PROGRESS (routing done in 12.2-INT; runner slimming paused)
 
 All script/docker steps through LocalExecutor + step images by default; step
 config gains a socket/volume option so the T2 Docker tier runs in ephemeral
@@ -745,7 +760,31 @@ to historical-documents/.
   (Claude, honoring owner's hybrid-model ambition)
 - 2026-08-29 12.6.5 guardrails: dry-run estimate + per-experiment cap, not
   confirm-only. (Claude — veto welcome)
+
+Decisions made DURING implementation (all shipped and gate-verified):
+- 12.3 reporting path: control-mode steps report through the in-container
+  runtime to /api/steps/*, which is the SOLE StepRun.logs writer; stock
+  images keep the stdout-stream path. Mode is explicit (image label value
+  `1` + LAZYAF_CONTROL), never inferred, and a control step whose runtime
+  never reported CANNOT pass (StepExecution stuck PREPARING = loud failure).
+- 12.3 config delivery: per-step `/workspace/.control/<step_execution_id>.json`
+  via put_archive onto a created-but-unstarted container, consumed-once.
+  (Per-step, not per-run: the run-scoped path collided under graph fan-out.)
+- Step capabilities: `needs: [docker]` sugar translates to the socket mount
+  behind an allowlist — one translation site for 12.4 to change. Interim
+  runner-service DooD anchor retired when the tiers moved to step containers.
+- Images: `lazyaf-{base,claude,test-runner}:dev`, content-hash labels, built
+  by `scripts/build_images.py`; T2 preflights `--check` so stale images fail
+  loudly instead of silently testing yesterday's runtime. Backend never
+  auto-builds; `step_default_image` deliberately stays a pullable image.
+- Environment invariants learned from dogfood runs #5-#11 (each now regression
+  -tested): population chowns the repo to the step uid; the entrypoint joins
+  the socket group before gosu; the tree hash sorts POSIX-normalized paths;
+  Docker client timeout must exceed the longest container wait budget.
+
 - OPEN: v1 pipeline retirement shape (12.8, owner confirms).
+- OPEN: whether `12.0` counts as done at 12.5 (runner-common adopted by agent
+  images) or 12.8 (all runners retired) — resolves itself as those land.
 
 ---
 
@@ -2049,6 +2088,8 @@ The fast path - backend spawns containers directly, with full lifecycle tracking
 ### Phase 12.2.5: Specification Data Model
 **Goal**: Stand up the spec layer (Feature / UserStory / AcceptanceCriterion / PromptTemplate) with CRUD APIs and a minimal UI. No execution changes yet — just the foundation for Phase 12.2.6 and beyond.
 
+> **[Superseded 2026-08-29 — 12.2.5 shipped alongside 12.2-INT and 12.3 landed first; 12.2.6 is a deliberate retrofit. Kept for design context.]**
+>
 > **Why now (before 12.3):** Phase 12.3 freezes the Control Layer protocol — what steps report back to the backend. Once the spec models exist, 12.3 can extend that protocol with a test-result manifest channel (see Phase 12.2.6) instead of bolting it on later.
 
 #### Tests First (Define Contracts)

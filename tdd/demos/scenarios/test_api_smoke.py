@@ -151,21 +151,23 @@ class TestAPISmokeTests:
         # Start (requires ingested repo)
         start_response = await client.post(f"/api/cards/{card_id}/start")
         assert start_response.status_code == 200
+        assert start_response.json()["status"] == "in_progress"
 
-        # Move to in_review (simulating runner completing work)
-        review_response = await client.patch(
-            f"/api/cards/{card_id}",
-            json={"status": "in_review"},
-        )
-        assert review_response.status_code == 200
-
-        # Move to done directly (approve requires actual git branches from runner)
-        done_response = await client.patch(
+        # PATCH is the board's drag handler, NOT a lifecycle backdoor. Since
+        # 12.7 it refuses `in_progress` and `done` in both directions
+        # (MANUAL_STATUSES in app/routers/cards.py, QA finding T2): a card
+        # reaches Done by being merged, not by being written.
+        blocked = await client.patch(
             f"/api/cards/{card_id}",
             json={"status": "done"},
         )
-        assert done_response.status_code == 200
-        assert done_response.json()["status"] == "done"
+        assert blocked.status_code == 400, blocked.text
+        assert "done" in blocked.json()["detail"]
+
+        # The way out of `in_progress` is the endpoint that cancels the work.
+        reject_response = await client.post(f"/api/cards/{card_id}/reject")
+        assert reject_response.status_code == 200
+        assert reject_response.json()["status"] == "todo"
 
     async def test_runners_list(self, client):
         """Runners list endpoint responds."""

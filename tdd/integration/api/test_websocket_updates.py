@@ -181,11 +181,17 @@ class TestCardUpdateWebSocketBroadcast:
 
         mock_ws.clear_messages()
 
-        # Update card status
+        # Update card status. `in_review` and not `in_progress`: PATCH is the
+        # board's drag handler, and the 12.7 card state machine
+        # (backend/app/routers/cards.py MANUAL_STATUSES) reserves
+        # `in_progress` and `done` for the endpoints that actually start and
+        # merge work. What this test covers - a status write broadcasts the
+        # whole card, timestamps included - is unchanged.
         response = await client.patch(
             f"/api/cards/{card_id}",
-            json={"status": "in_progress"},
+            json={"status": "in_review"},
         )
+        assert response.status_code == 200, response.text
         updated_card = response.json()
 
         await asyncio.sleep(0.1)
@@ -194,7 +200,7 @@ class TestCardUpdateWebSocketBroadcast:
         payload = message["payload"]
 
         # Verify status changed
-        assert payload["status"] == "in_progress"
+        assert payload["status"] == "in_review"
 
         # Verify timestamps are present
         assert "created_at" in payload
@@ -278,16 +284,19 @@ class TestCardActionWebSocketBroadcasts:
         assert payload["created_at"] == started_card["created_at"]
         assert payload["updated_at"] == started_card["updated_at"]
 
-    async def test_approve_card_broadcasts_with_timestamps(self, client, repo, mock_ws):
+    async def test_approve_card_broadcasts_with_timestamps(
+        self, client, ingested_repo, db_session, mock_ws
+    ):
         """Approving a card broadcasts update with timestamps."""
-        create_response = await client.post(
-            f"/api/repos/{repo['id']}/cards",
-            json=card_create_payload(title="Approve Test"),
-        )
-        card_id = create_response.json()["id"]
+        # `approve` now requires something to merge: `in_review` AND a branch
+        # that exists on an ingested repo (QA finding T2). `card_in_review`
+        # is the one helper that stages that state - through the ORM and the
+        # real git server, never through the PATCH guard under test.
+        from tdd.integration.api.test_cards_api import card_in_review
 
-        # Move to in_review
-        await client.patch(f"/api/cards/{card_id}", json={"status": "in_review"})
+        card_id = await card_in_review(
+            client, db_session, ingested_repo["id"], title="Approve Test"
+        )
 
         mock_ws.clear_messages()
 

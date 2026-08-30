@@ -253,3 +253,80 @@ class TestDeleteRepo:
         repos = list_response.json()
         assert len(repos) == 1
         assert repos[0]["name"] == "Keep"
+
+
+class TestDeleteRepoWithLiveWork:
+    """DELETE must refuse while the repo has work in flight (QA2-08).
+
+    Deleting a repo removes its git storage and cascade-deletes its Cards and
+    Pipelines. Mid-run that strands a Job at 'running' forever pointing at a
+    card that no longer exists, and erases a live PipelineRun out from under
+    the executor.
+    """
+
+    async def _repo(self, client, name="LiveWorkRepo"):
+        response = await client.post("/api/repos", json=repo_create_payload(name=name))
+        return response.json()["id"]
+
+    async def test_delete_refused_while_a_pipeline_run_is_live(
+        self, client, db_session
+    ):
+        from app.models import Pipeline, PipelineRun
+
+        repo_id = await self._repo(client)
+        pipeline = Pipeline(repo_id=repo_id, name="Live Pipeline")
+        db_session.add(pipeline)
+        await db_session.flush()
+        run = PipelineRun(pipeline_id=pipeline.id, status="running")
+        db_session.add(run)
+        await db_session.commit()
+
+        response = await client.delete(f"/api/repos/{repo_id}")
+        assert_status_code(response, 409)
+
+        detail = response.json()["detail"]
+        assert run.id in detail, f"refusal does not name the live run: {detail}"
+        assert "cancel" in detail.lower(), f"refusal gives no way forward: {detail}"
+
+        # Repo and run both survive.
+        assert_status_code(await client.get(f"/api/repos/{repo_id}"), 200)
+        assert_status_code(await client.get(f"/api/pipeline-runs/{run.id}"), 200)
+
+    async def test_delete_refused_while_a_job_is_running(self, client, db_session):
+        from app.models import Card, Job
+
+        repo_id = await self._repo(client, name="LiveJobRepo")
+        card = Card(repo_id=repo_id, title="Live card", status="in_progress")
+        db_session.add(card)
+        await db_session.flush()
+        job = Job(card_id=card.id, status="running")
+        db_session.add(job)
+        await db_session.commit()
+
+        response = await client.delete(f"/api/repos/{repo_id}")
+        assert_status_code(response, 409)
+
+        detail = response.json()["detail"]
+        assert job.id in detail, f"refusal does not name the live job: {detail}"
+        assert "cancel" in detail.lower(), f"refusal gives no way forward: {detail}"
+
+        # The job is still 'running' against a card and repo that still exist -
+        # nothing has been stranded.
+        assert_status_code(await client.get(f"/api/repos/{repo_id}"), 200)
+
+    async def test_finished_work_does_not_block_delete(self, client, db_session):
+        from app.models import Card, Job, Pipeline, PipelineRun
+
+        repo_id = await self._repo(client, name="SettledRepo")
+        pipeline = Pipeline(repo_id=repo_id, name="Done Pipeline")
+        card = Card(repo_id=repo_id, title="Done card", status="done")
+        db_session.add_all([pipeline, card])
+        await db_session.flush()
+        db_session.add_all([
+            PipelineRun(pipeline_id=pipeline.id, status="passed"),
+            Job(card_id=card.id, status="completed"),
+        ])
+        await db_session.commit()
+
+        response = await client.delete(f"/api/repos/{repo_id}")
+        assert_deleted_response(response)

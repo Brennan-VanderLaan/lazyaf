@@ -84,6 +84,29 @@ class ConnectionManager:
             {"pipeline_run_id": run_id, "step_index": step_index, "status": status},
         )
 
+    async def publish_model_endpoint_status(
+        self, endpoint_id: str, payload: dict
+    ) -> None:
+        """Broadcast one model endpoint's current record (M14, contract #10).
+
+        Emitted on probe completion, health change and in-flight change, so
+        the Endpoints page updates from a DELTA rather than by polling (the
+        12.6 runner-store pattern). The payload is the SAME projection the
+        REST API returns (`schemas.model_endpoint.endpoint_ws_payload`), so
+        a page hydrated by the snapshot and a page updated by the frame
+        cannot show different fields.
+
+        `model_endpoint_status` is a NEW frame type and lands on both sides
+        in one commit: this publisher and `stores/websocket.ts`'s
+        `ServerMessageType` + `HANDLED_MESSAGE_TYPES` + switch. The drift
+        guard in `websocket.test.ts` greps this source, so adding it here
+        without the frontend half FAILS that test - which is the point.
+        """
+        await self.broadcast(
+            "model_endpoint_status",
+            {"id": endpoint_id, "endpoint": payload},
+        )
+
     # --- Local per-run log observers (12.5, cross-agent contract #8) -------
     # Ad-hoc agent runs (playground) need every log line of ONE run without
     # opening a websocket. Registration is by pipeline_run_id; the callback

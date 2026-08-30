@@ -1,5 +1,4 @@
 import json
-from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 from pydantic import BaseModel, field_validator, model_validator
@@ -7,6 +6,9 @@ from sqlalchemy import inspect as sa_inspect
 
 from app.models.card import StepType
 from app.models.pipeline import ExecutorMode, RunStatus
+from app.schemas._datetime import UTCDateTime
+from app.schemas._patch import not_null
+from app.schemas._strings import Body, Name
 
 
 # =============================================================================
@@ -130,11 +132,16 @@ class PipelineStepConfig(BaseModel):
 
 
 class PipelineBase(BaseModel):
+    # Bare `str` on purpose: PipelineRead inherits this and must keep
+    # serializing rows written before the bound existed. The bound goes on
+    # the INPUT schemas below. See app/schemas/_strings.py.
     name: str
     description: str | None = None
 
 
 class PipelineCreate(PipelineBase):
+    name: Name
+    description: Body | None = None
     steps: list[PipelineStepConfig] = []
     steps_graph: Optional[PipelineGraphModel] = None  # Graph-based definition (v2)
     triggers: list[TriggerConfig] = []
@@ -152,12 +159,16 @@ class PipelineCreate(PipelineBase):
 
 
 class PipelineUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
+    name: Name | None = None
+    description: Body | None = None
     steps: list[PipelineStepConfig] | None = None
     steps_graph: Optional[PipelineGraphModel] = None  # Graph-based definition (v2)
     triggers: list[TriggerConfig] | None = None
     is_template: bool | None = None
+
+    # pipelines.description and .steps_graph are nullable; the rest are
+    # NOT NULL and an explicit null used to reach the column as a 500.
+    _reject_nulls = not_null("name", "steps", "triggers", "is_template")
 
 
 class PipelineRead(PipelineBase):
@@ -167,8 +178,8 @@ class PipelineRead(PipelineBase):
     steps_graph: Optional[PipelineGraphModel] = None  # Graph-based definition (v2)
     triggers: list[TriggerConfig] = []
     is_template: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     @field_validator("steps", mode="before")
     @classmethod
@@ -232,8 +243,8 @@ class StepRunRead(BaseModel):
     runner_id: str | None = None
     logs: str = ""
     error: str | None = None
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    started_at: UTCDateTime | None = None
+    completed_at: UTCDateTime | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -294,9 +305,9 @@ class PipelineRunRead(BaseModel):
     # Graph execution tracking (for parallel execution)
     active_step_ids: list[str] = []  # Steps currently executing in parallel
     completed_step_ids: list[str] = []  # Steps that have completed
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
-    created_at: datetime
+    started_at: UTCDateTime | None = None
+    completed_at: UTCDateTime | None = None
+    created_at: UTCDateTime
     step_runs: list[StepRunRead] = []
 
     @field_validator("trigger_context", mode="before")

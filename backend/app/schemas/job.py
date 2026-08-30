@@ -1,9 +1,9 @@
 import json
-from datetime import datetime
 from typing import Any
 from pydantic import BaseModel, field_validator
 
 from app.models.job import JobStatus
+from app.schemas._datetime import UTCDateTime
 
 
 class JobRead(BaseModel):
@@ -14,9 +14,9 @@ class JobRead(BaseModel):
     status: JobStatus
     logs: str = ""
     error: str | None = None
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
-    created_at: datetime
+    started_at: UTCDateTime | None = None
+    completed_at: UTCDateTime | None = None
+    created_at: UTCDateTime
     # Step type and config (Phase 8.5)
     step_type: str = "agent"
     step_config: dict[str, Any] | None = None

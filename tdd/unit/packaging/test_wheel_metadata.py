@@ -195,6 +195,16 @@ class TestPackagedTreeIsClean:
             and ".egg-info" not in str(p)
             and "dist" not in p.relative_to(CLI_DIR).parts
             and "build" not in p.relative_to(CLI_DIR).parts
+            # A local virtualenv is not the build context and is gitignored,
+            # but it DOES sit under cli/ the moment anyone runs `uv run` or
+            # `python -m venv` there - and site-packages is full of `test_*.py`
+            # and `.env`-shaped files, so without this line a developer's own
+            # tooling turns T1 red for reasons that have nothing to do with
+            # what ships. (Observed: `cd cli && uv run ...` failed
+            # test_no_env_or_credential_files and test_no_tests_in_the_build_context.)
+            and ".venv" not in p.relative_to(CLI_DIR).parts
+            and "venv" not in p.relative_to(CLI_DIR).parts
+            and "node_modules" not in p.relative_to(CLI_DIR).parts
         ]
 
     def test_no_env_or_credential_files(self):

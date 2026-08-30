@@ -2,10 +2,11 @@
 Playground schemas for ephemeral agent testing.
 """
 
-from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel
+
+from app.schemas._datetime import UTCDateTime
 
 
 class PlaygroundTestRequest(BaseModel):
@@ -33,8 +34,8 @@ class PlaygroundStatus(BaseModel):
 
     session_id: str
     status: Literal["queued", "running", "completed", "failed", "cancelled"]
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
+    started_at: UTCDateTime | None = None
+    completed_at: UTCDateTime | None = None
 
 
 class PlaygroundResult(BaseModel):
@@ -55,4 +56,4 @@ class PlaygroundLogEvent(BaseModel):
 
     type: str  # "log" | "tool" | "status" | "complete" | "error" | "ping"
     data: str
-    timestamp: datetime
+    timestamp: UTCDateTime

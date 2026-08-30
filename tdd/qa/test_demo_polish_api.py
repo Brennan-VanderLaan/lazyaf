@@ -67,17 +67,6 @@ def repo():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding 1: every model uses `default=datetime.utcnow` (naive) and "
-        "pydantic serializes it with no designator, e.g. "
-        "'2026-08-30T10:33:35.485909'. ECMA-262 parses that as LOCAL time, so "
-        "the UI renders a RUNNING pipeline at '-14399s' and shows 'Started' "
-        "hours in the future. Fix: store/emit tz-aware UTC "
-        "(datetime.now(timezone.utc)) so the payload ends in 'Z'."
-    ),
-)
 def test_repo_created_at_carries_a_timezone(repo):
     assert TZ_AWARE.search(repo["created_at"]), (
         f"created_at={repo['created_at']!r} has no timezone designator; "
@@ -85,10 +74,6 @@ def test_repo_created_at_carries_a_timezone(repo):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding 1: same naive-UTC serialization on the pipeline schema.",
-)
 def test_pipeline_timestamps_carry_a_timezone(repo):
     resp = requests.post(
         f"{BASE_URL}/api/repos/{repo['id']}/pipelines",
@@ -104,25 +89,27 @@ def test_pipeline_timestamps_carry_a_timezone(repo):
         assert TZ_AWARE.search(pipeline[field]), f"{field}={pipeline[field]!r} is naive"
 
 
-def test_naive_timestamp_is_actually_utc_not_local():
+def test_timestamp_is_the_right_instant_not_just_a_relabelled_one():
     """
-    Pin down WHICH way the bug points, so a fix that merely relabels local time
-    as UTC does not slip through.
+    Pin down WHICH way the bug pointed, so a "fix" that merely relabels local
+    wall-clock time as UTC cannot slip through.
 
-    The value is naive UTC, so comparing it to `utcnow()` must land within a
-    few seconds, while comparing it to local wall-clock time will not (unless
-    the host happens to run on UTC).
+    The stored value is UTC, so the emitted instant must land within seconds of
+    `now(timezone.utc)`. A relabelled local time would be off by the host's
+    whole UTC offset and fail here even though it carries a designator.
     """
-    before = datetime.utcnow()
+    before = datetime.now(timezone.utc)
     resp = requests.post(
         f"{BASE_URL}/api/repos", json={"name": _name("tz")}, timeout=TIMEOUT
     )
     assert resp.status_code == 201, resp.text
-    created = datetime.fromisoformat(resp.json()["created_at"].rstrip("Z"))
+    raw = resp.json()["created_at"]
 
-    # Whatever the fix, the instant itself must be sane against UTC.
+    created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    assert created.tzinfo is not None, f"created_at={raw!r} is still naive"
+
     drift = abs((created - before).total_seconds())
-    assert drift < 120, f"created_at is {drift}s away from utcnow()"
+    assert drift < 120, f"created_at={raw!r} is {drift}s away from now(UTC)"
 
 
 # ---------------------------------------------------------------------------

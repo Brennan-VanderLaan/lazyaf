@@ -318,6 +318,12 @@ class Settings(BaseModel):
     default_prompt_template: str | None = None  # Global default prompt template for AI agents
     # Mounts the /api/test reset/seed endpoints (e2e harness only - never prod)
     test_mode: bool = False
+    # Echo every SQL statement to the log. Off by default: it was hardcoded ON,
+    # so a running backend logged every statement of every request - which costs
+    # real CPU under the dashboard's 3s poll and buries anything worth reading
+    # in the log a human is actually looking at. Set LAZYAF_DB_ECHO=1 to debug
+    # a query.
+    db_echo: bool = False
     # --- Execution plumbing (Phase 12.2-INT) ---
     # Named docker network shared by backend, runners, and step/helper containers.
     container_network: str = "lazyaf-network"
@@ -371,6 +377,7 @@ def get_settings() -> Settings:
         default_runner_type=os.getenv("DEFAULT_RUNNER_TYPE", "any"),
         default_prompt_template=os.getenv("DEFAULT_PROMPT_TEMPLATE"),
         test_mode=os.getenv("LAZYAF_TEST_MODE", "").lower() in ("1", "true", "yes"),
+        db_echo=os.getenv("LAZYAF_DB_ECHO", "").lower() in ("1", "true", "yes"),
         container_network=os.getenv("CONTAINER_NETWORK", "lazyaf-network"),
         container_git_url_template=os.getenv(
             "CONTAINER_GIT_URL_TEMPLATE", "http://backend:8000/git/{repo_id}.git"

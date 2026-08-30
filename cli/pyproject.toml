@@ -47,6 +47,20 @@ classifiers = [
 # forbids pairing a license expression with license classifiers, and
 # setuptools>=77 rejects the combination outright.
 
+[project.optional-dependencies]
+# 12.7 interactive debug terminal (`lazyaf debug attach`). An EXTRA, not a
+# core dependency, and the reason is stated rather than assumed: `websockets`
+# is needed by exactly one subcommand, every other verb - including
+# `debug attach --print-credential` - is plain HTTP, and tdd/unit/packaging
+# pins the core dependency set precisely so that adding to a published
+# wheel's install footprint stays a deliberate decision. `debug_cmd.py`
+# refuses LOUDLY with this install line when the extra is absent; it never
+# degrades silently to the non-interactive path.
+#   Upper bound: the client uses `websockets.asyncio.client` (>=13) and falls
+#   back to the legacy `websockets.client` (>=12) explicitly, so a new major
+#   must be tried before it is allowed.
+terminal = ["websockets>=12.0,<16"]
+
 [project.urls]
 Homepage = "https://github.com/Brennan-VanderLaan/lazyaf"
 Repository = "https://github.com/Brennan-VanderLaan/lazyaf"

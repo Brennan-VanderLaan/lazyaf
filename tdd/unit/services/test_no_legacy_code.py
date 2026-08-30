@@ -106,6 +106,11 @@ FORBIDDEN = [
 SEARCH_ROOTS = [
     "backend/app",
     "frontend/src",
+    # The browser suite is the one "test" tree that IS shipping surface: its
+    # headers and its resetBackend failure message hand an operator a literal
+    # `docker compose ... up -d` line. Six of them still named the deleted
+    # `runner-mock-e2e` service, because nothing walked here.
+    "frontend/e2e",
     "runner-common/runner_common",
     "scripts",
     ".lazyaf",

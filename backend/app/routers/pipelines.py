@@ -1,5 +1,6 @@
 import json
 from typing import Optional
+from urllib.parse import quote
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -28,6 +29,34 @@ from app.models import StepUsage
 from app.schemas.usage import RunUsageRollup
 
 router = APIRouter(tags=["pipelines"])
+
+# A run in one of these states still owns a step container and is still being
+# steered by the executor. Nothing that would delete the run row out from under
+# it may proceed while it is in flight.
+IN_FLIGHT_RUN_STATUSES = (RunStatus.PENDING.value, RunStatus.RUNNING.value)
+
+
+def live_run_refusal(subject: str, runs: list) -> str:
+    """Human-readable 409 body naming the live run(s) and how to proceed.
+
+    Shared with the repo delete guard (repos.py) so both refusals read the
+    same and there is one place that knows the wording (R3). This string is
+    what a person reads on screen when a tidy-up collides with a running
+    pipeline, so it names the run and the exact next call rather than just
+    saying "conflict".
+    """
+    listed = ", ".join(f"{r.id} ({r.status})" for r in runs[:3])
+    if len(runs) > 3:
+        listed += f", and {len(runs) - 3} more"
+    first = runs[0].id
+    return (
+        f"{subject} still has a live run and was not deleted. "
+        f"In-flight: {listed}. Deleting now would erase the run "
+        f"mid-flight and leave its step container behind. Cancel it first "
+        f"(POST /api/pipeline-runs/{first}/cancel), or wait for it to finish, "
+        f"then delete again."
+    )
+
 
 
 def parse_steps(steps_str: str | None) -> list:
@@ -248,6 +277,23 @@ async def delete_pipeline(pipeline_id: str, db: AsyncSession = Depends(get_db)):
     pipeline = result.scalar_one_or_none()
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline not found")
+
+    # A pipeline delete CASCADES its runs (Pipeline.runs is delete-orphan), so
+    # deleting one mid-run does not stop the run - it erases the row the
+    # executor and /cancel are both steering by. The run 404s instantly,
+    # /cancel can no longer reach it, and its step container is left behind
+    # exited instead of being removed. Refuse loudly at the edge (R1) and name
+    # the way out rather than half-deleting a live thing.
+    live = (
+        await db.execute(
+            select(PipelineRun)
+            .where(PipelineRun.pipeline_id == pipeline_id)
+            .where(PipelineRun.status.in_(IN_FLIGHT_RUN_STATUSES))
+            .order_by(PipelineRun.created_at)
+        )
+    ).scalars().all()
+    if live:
+        raise HTTPException(status_code=409, detail=live_run_refusal(f"Pipeline '{pipeline.name}'", live))
 
     await db.delete(pipeline)
     await db.commit()
@@ -488,6 +534,32 @@ async def get_step_logs(run_id: str, step_index: int, db: AsyncSession = Depends
 # Pipeline Export
 # ============================================================================
 
+def _content_disposition(pipeline_name: str) -> str:
+    """RFC 6266 Content-Disposition for the exported YAML.
+
+    The name is user data and used to go into the header RAW: a non-Latin-1
+    name (any accent, any CJK) 500s on header encoding, and a name carrying
+    CR, LF or NUL makes h11 refuse the whole response - uvicorn drops the
+    connection and the browser hangs with no response at all. So: drop
+    non-printable characters, keep an ASCII `filename=` fallback for old
+    clients, and carry the real name in `filename*` as UTF-8 percent-encoding.
+    """
+    unsafe = '"' + chr(92)  # quote and backslash would break the quoted form
+    cleaned = "".join(
+        ch for ch in (pipeline_name or "")
+        if ch.isprintable() and ch not in unsafe
+    ).strip().replace(" ", "_")
+    if not cleaned:
+        cleaned = "pipeline"
+    utf8_name = f"{cleaned}.yaml"
+
+    ascii_name = utf8_name.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    return (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(utf8_name, safe='')}"
+    )
+
+
 @router.get("/api/pipelines/{pipeline_id}/export/yaml")
 async def export_pipeline_yaml(pipeline_id: str, db: AsyncSession = Depends(get_db)):
     """Export a pipeline to YAML format."""
@@ -567,7 +639,7 @@ async def export_pipeline_yaml(pipeline_id: str, db: AsyncSession = Depends(get_
     return Response(
         content=yaml_content,
         media_type="application/x-yaml",
-        headers={"Content-Disposition": f"attachment; filename={pipeline.name.replace(' ', '_')}.yaml"}
+        headers={"Content-Disposition": _content_disposition(pipeline.name)},
     )
 
 

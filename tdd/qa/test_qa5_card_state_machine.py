@@ -52,11 +52,7 @@ def test_card_cannot_jump_from_todo_straight_to_in_review(card):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding 4b (MAJOR): approving a branchless card silently "
-           "reports success and marks it done without merging anything",
-)
+# QA5-4b FIXED (12.7): approve refuses a card with no branch to merge.
 def test_approving_a_card_with_no_branch_is_refused(card):
     moved_status, moved = api(
         "PATCH", f"/api/cards/{card['id']}", {"status": "in_review"}

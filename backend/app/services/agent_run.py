@@ -91,7 +91,9 @@ from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
+from app.schemas._datetime import utc_isoformat
 from app.models import (
     Card,
     Job,
@@ -129,13 +131,31 @@ DEFAULT_AGENT_TIMEOUT = 1800
 # (cross-agent contract #5). "any" resolves to claude-code: the legacy queue
 # let any registered runner take the job, but a local agent step must name
 # one CLI at dispatch, and claude-code is the platform default.
+# M14 adds `openai-harness`. `schemas/experiment.AGENT_VOCABULARY` derives
+# from this dict, so cards, the playground AND the 12.6.5 experiment matrix
+# all inherit the new agent from this one line - which is why a self-hosted
+# matrix cell (`{"agent": "openai-harness", "model": "endpoint:local-4090"}`)
+# needs no schema change anywhere.
 AGENT_BY_RUNNER_TYPE = {
     "any": "claude-code",
     "claude-code": "claude-code",
     "gemini": "gemini",
     "mock": "mock",
+    "openai-harness": "openai-harness",
 }
 DEFAULT_AGENT = "claude-code"
+
+# PipelineRun.trigger_type for the one-step run that probes a `runner-local`
+# endpoint from the network position the real step will occupy (M14 s2.3).
+TRIGGER_ENDPOINT_PROBE = "endpoint_probe"
+
+# What that run executes. A module of the tested runner-common package, exactly
+# like the agent wrapper - the operator never writes it.
+ENDPOINT_PROBE_COMMAND = "python3 -m runner_common.endpoint_probe"
+
+# Its budget. Four HTTP requests with a 60s total cap, plus container start on
+# someone else's hardware.
+ENDPOINT_PROBE_TIMEOUT = 120
 
 # Step-config keys this module writes itself; anything else on a card's
 # step_config is passed through untouched (forward compatibility with keys
@@ -416,6 +436,126 @@ async def start_adhoc_agent_run(
     return pipeline_run
 
 
+async def start_endpoint_probe_run(db: AsyncSession, endpoint) -> PipelineRun:
+    """Probe a `runner-local` endpoint FROM THE RUNNER (M14 s2.3).
+
+    A `runner-local` endpoint is unreachable from the backend BY DEFINITION -
+    that is the whole point of the mode - so probing it uses the machinery that
+    already reaches that host: a one-step ad-hoc SCRIPT run pinned by
+    `requires: {has: [<runner_label>]}`, which 12.6's router sends remote and
+    12.6's dispatcher matches against the runner registry.
+
+    Worth the extra plumbing for one reason: it probes from **the exact network
+    position the real step will occupy**, which the backend cannot do for this
+    mode. And the failure to schedule it is itself information - if no runner
+    carries the label, the run fails at `NO_RUNNER_TIMEOUT` with "no runner
+    carries label endpoint:local-4090", which is the true reason the endpoint
+    is unusable.
+
+    The container reports back to `/api/model-endpoints/{id}/probe-result` with
+    the step JWT it holds; `probed_from` is stamped SERVER-SIDE from
+    `step_execution.runner_id` and never read from the payload.
+
+    THE REPO IS INCIDENTAL. A probe reads no code, but 12.6's remote path
+    provisions its workspace from a clone URL, so this borrows the oldest
+    registered repo and SAYS SO in the log rather than inventing a repo-less
+    execution path for one step type.
+    """
+    from app.models.model_endpoint import default_runner_label
+
+    if endpoint.reach != "runner-local":
+        raise ValueError(
+            f"endpoint '{endpoint.name}' has reach={endpoint.reach!r}; only a "
+            f"runner-local endpoint is probed by a run (every other reach is "
+            f"probed in-process by the backend, which is the network position "
+            f"that matters for it)"
+        )
+
+    repo = (
+        await db.execute(select(Repo).order_by(Repo.created_at).limit(1))
+    ).scalars().first()
+    if repo is None:
+        raise ValueError(
+            "a runner-local endpoint is probed by a real pipeline run, and a "
+            "pipeline run needs a repo to provision its workspace from. "
+            "Register a repo first."
+        )
+
+    label = endpoint.runner_label or default_runner_label(endpoint.name)
+    logger.info(
+        "Probing runner-local endpoint %s from a run pinned to label %r "
+        "(workspace borrowed from repo %s - a probe reads no code)",
+        endpoint.name,
+        label,
+        repo.id[:8],
+    )
+
+    # The runner pin is written by the ONE writer of that injection
+    # (`pipeline_executor.inject_endpoint_requirements`), not spelled again
+    # here: the probe run and a real harness step must land on the SAME runner
+    # for the probe to mean anything, and two spellings of one pin is how they
+    # drift apart.
+    from app.services.pipeline_executor import inject_endpoint_requirements
+
+    step_config = inject_endpoint_requirements(
+        {
+            "image": "lazyaf-agent-base:dev",
+            "command": ENDPOINT_PROBE_COMMAND,
+            "environment": {"LAZYAF_PROBE_ENDPOINT_ID": endpoint.id},
+            # Read by `pipeline_executor._prepare_control_mode`: this step, and
+            # only this step, gets its own JWT placed in the SECRET channel so
+            # the probe can authenticate its report. Nothing else in the
+            # platform puts a step token in a step's environment.
+            "endpoint_probe": endpoint.id,
+        },
+        endpoint,
+    )
+    step = {
+        "id": "probe",
+        "name": f"Probe endpoint {endpoint.name}",
+        "type": "script",
+        "config": step_config,
+        "timeout": ENDPOINT_PROBE_TIMEOUT,
+        "on_success": "next",
+        "on_failure": "stop",
+    }
+
+    pipeline = Pipeline(
+        id=str(uuid4()),
+        repo_id=repo.id,
+        name=adhoc_pipeline_name(TRIGGER_ENDPOINT_PROBE, endpoint.id),
+        description=(
+            "Ephemeral one-step pipeline that probes a runner-local model "
+            "endpoint from the box that hosts it. Hidden from "
+            "GET /api/pipelines; its RUN is visible."
+        ),
+        steps=json.dumps([step]),
+        steps_graph=None,
+        triggers="[]",
+        is_template=False,
+    )
+    db.add(pipeline)
+    await db.commit()
+    await db.refresh(pipeline)
+
+    from app.services.pipeline_executor import pipeline_executor
+
+    return await pipeline_executor.start_pipeline(
+        db=db,
+        pipeline=pipeline,
+        repo=repo,
+        trigger_type=TRIGGER_ENDPOINT_PROBE,
+        trigger_ref=endpoint.id,
+        trigger_context={
+            "branch": repo.default_branch,
+            "base_branch": repo.default_branch,
+            "repo_id": repo.id,
+            "adhoc": True,
+            "model_endpoint_id": endpoint.id,
+        },
+    )
+
+
 async def start_card_work(
     db: AsyncSession,
     card: Card,
@@ -508,7 +648,7 @@ async def _mark_job_running(
 
     from app.services.websocket import manager
 
-    await manager.send_job_status(_job_ws_dict(job))
+    await manager.send_job_status(job_ws_dict(job))
 
 
 async def _agent_step_run(db: AsyncSession, run_id: str) -> StepRun | None:
@@ -521,7 +661,7 @@ async def _agent_step_run(db: AsyncSession, run_id: str) -> StepRun | None:
     return result.scalars().first()
 
 
-def _job_ws_dict(job: Job) -> dict:
+def job_ws_dict(job: Job) -> dict:
     """The job frame the card panel renders.
 
     Carries the test columns because ``JobStatus.svelte`` renders them off
@@ -533,8 +673,8 @@ def _job_ws_dict(job: Job) -> dict:
         "card_id": job.card_id,
         "status": job.status,
         "error": job.error,
-        "started_at": job.started_at.isoformat() if job.started_at else None,
-        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "started_at": utc_isoformat(job.started_at),
+        "completed_at": utc_isoformat(job.completed_at),
         "tests_run": job.tests_run,
         "tests_passed": job.tests_passed,
         "test_pass_count": job.test_pass_count,
@@ -658,6 +798,230 @@ def _run_agent_name(pipeline_run: PipelineRun, steps_json: str | None) -> str | 
         if step.get("type") == "agent":
             return (step.get("config") or {}).get("agent")
     return None
+
+
+# -----------------------------------------------------------------------------
+# Cancellation - the other end of a run's life (QA finding T2)
+# -----------------------------------------------------------------------------
+#
+# Ending card work early is NOT "write failed on the Job row". Since 12.5 the
+# container doing the work belongs to a PipelineRun and the Job is its twin;
+# flipping the twin without touching the run is a cancel that cancels nothing
+# - the agent keeps running (and burning provider budget) while the UI
+# reports it stopped. That is precisely how `reject` used to strand a run:
+# the card went back to `todo` with its branch nulled, the agent kept
+# committing to that branch, and a second agent could be started alongside it.
+#
+# Every caller that ends card work early comes through here:
+# POST /api/jobs/{id}/cancel and POST /api/cards/{id}/reject. Neither of them
+# reimplements any of it (R3: one writer for one decision).
+
+
+class CancelRunFailed(Exception):
+    """A live run behind a card could not be cancelled.
+
+    Carries the run id so the HTTP layer can name it. NEVER swallow this:
+    the container may still be running, and the only thing worse than a
+    failed cancel is one that LOOKS like it worked (R1).
+    """
+
+    def __init__(self, run_id: str, cause: Exception):
+        super().__init__(f"could not cancel run {run_id[:8]}: {cause}")
+        self.run_id = run_id
+        self.cause = cause
+
+
+@dataclass
+class CardWorkCancellation:
+    """What a cancel actually stopped.
+
+    ``job`` is the Job row this call LANDED (already mutated, not yet
+    committed - the caller owns the transaction and the WS frame).
+    """
+
+    run_ids: list[str]
+    job: Job | None = None
+
+    @property
+    def stopped_anything(self) -> bool:
+        return bool(self.run_ids) or self.job is not None
+
+
+def _live_run_query(*conditions):
+    """A PipelineRun select whose ``step_runs`` are genuinely loaded.
+
+    ``populate_existing`` because the run row may already be in this
+    session's identity map (the request that started it used the same
+    session in tests, and a read-then-cancel request pair can do it in
+    production too), and an eager loader is SKIPPED for an instance that is
+    already there. ``cancel_run`` walks ``step_runs`` to find the containers
+    to kill and re-reads the run through ``Session.refresh``; a lazy load
+    there raises under asyncio and kills nothing.
+    """
+    return (
+        select(PipelineRun)
+        .where(*conditions)
+        .options(selectinload(PipelineRun.step_runs))
+        .execution_options(populate_existing=True)
+    )
+
+
+async def live_card_work_runs(db: AsyncSession, card_id: str) -> list[PipelineRun]:
+    """Every still-live ad-hoc card-work run for this card.
+
+    Keyed on the PERSISTED trigger columns, so it finds a run whose Job has
+    not been linked back yet (``Job.step_run_id`` is written at dispatch) -
+    the window an instant Reject or a double-click lands in. Normally 0 or 1
+    rows; more than one means an older duplicate-start got through, and
+    cancelling a card must stop all of them.
+    """
+    result = await db.execute(
+        _live_run_query(
+            PipelineRun.trigger_type == TRIGGER_CARD_WORK,
+            PipelineRun.trigger_ref == card_id,
+            PipelineRun.status.in_(LIVE_RUN_STATUSES),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def _run_behind_job(
+    db: AsyncSession, job: Job
+) -> tuple[PipelineRun | None, bool]:
+    """``(run, cancelling_the_job_owns_it)`` for the run this job's step is in.
+
+    The link is ``Job.step_run_id`` (written by ``_mark_job_running`` at
+    dispatch) -> StepRun -> PipelineRun.
+    """
+    if not job.step_run_id:
+        return None, False
+
+    run_id = (
+        await db.execute(
+            select(StepRun.pipeline_run_id).where(StepRun.id == job.step_run_id)
+        )
+    ).scalar_one_or_none()
+    if run_id is None:
+        logger.info(
+            "Job %s has no step run %s any more - nothing to cancel",
+            job.id[:8],
+            job.step_run_id[:8],
+        )
+        return None, False
+
+    run = (await db.execute(_live_run_query(PipelineRun.id == run_id))).scalar_one_or_none()
+    if run is None:
+        logger.info(
+            "Job %s has no pipeline run behind step run %s - nothing to cancel",
+            job.id[:8],
+            job.step_run_id[:8],
+        )
+        return None, False
+
+    # Ad-hoc runs only. A card's ad-hoc run exists solely to do this job, so
+    # cancelling the job means cancelling the run. A job that belongs to a
+    # step of a REAL pipeline does not own that pipeline, and cancelling one
+    # card's job must not take a multi-step run down with it.
+    if run.trigger_type not in ADHOC_TRIGGER_TYPES:
+        logger.info(
+            "Job %s belongs to pipeline run %s (trigger_type=%r), not to an "
+            "ad-hoc card-work run - not cancelling the run",
+            job.id[:8],
+            run.id[:8],
+            run.trigger_type,
+        )
+        return run, False
+
+    return run, True
+
+
+async def runs_to_cancel_for_job(db: AsyncSession, job: Job) -> list[PipelineRun]:
+    """The runs that cancelling this JOB must stop.
+
+    Two lookups, because the exact link is not always there yet:
+
+    1. ``Job.step_run_id`` -> StepRun -> PipelineRun (ad-hoc runs only).
+    2. Failing that, the card's own live card-work runs. A job cancelled
+       between ``start`` and dispatch has no ``step_run_id`` yet, so lookup 1
+       finds nothing while a real run is already pending - and returning
+       "nothing to cancel" there is how a rejected card kept an agent.
+
+    Lookup 2 is skipped when lookup 1 found a NON-ad-hoc run: that job is a
+    pipeline step, and the card it names is not what it is running.
+    """
+    run, owns_it = await _run_behind_job(db, job)
+    if run is not None and not owns_it:
+        return []
+    if run is not None:
+        return [run] if run.status in LIVE_RUN_STATUSES else []
+    if job.card_id:
+        return await live_card_work_runs(db, job.card_id)
+    return []
+
+
+async def cancel_runs(db: AsyncSession, runs: list[PipelineRun]) -> list[str]:
+    """Cancel each live run. Raises CancelRunFailed on the first failure."""
+    from app.services.pipeline_executor import pipeline_executor
+
+    cancelled: list[str] = []
+    for run in runs:
+        if run.status not in LIVE_RUN_STATUSES:
+            logger.info(
+                "Run %s is already %s - nothing to cancel", run.id[:8], run.status
+            )
+            continue
+        try:
+            await pipeline_executor.cancel_run(db, run)
+        except Exception as e:
+            logger.exception(
+                "Could not cancel run %s - the agent container may STILL BE "
+                "RUNNING",
+                run.id[:8],
+            )
+            raise CancelRunFailed(run.id, e) from e
+        cancelled.append(run.id)
+        logger.info("Cancelled ad-hoc run %s", run.id[:8])
+    return cancelled
+
+
+async def cancel_card_work(
+    db: AsyncSession,
+    *,
+    card: Card | None = None,
+    job: Job | None = None,
+    error: str,
+) -> CardWorkCancellation:
+    """Stop the work behind a card and/or a job, and land the Job row.
+
+    Does NOT commit and does NOT broadcast: the caller owns the transaction
+    (``reject`` lands the card in the same one) and the WS frames.
+
+    Scope follows what it was given. A JOB alone is job-scoped, so a
+    pipeline-step job cannot take its pipeline down. A CARD also sweeps
+    every live card-work run for that card, because a card whose status is
+    being unwound must not leave one running behind a stale ``job_id``.
+    """
+    if job is None and card is not None and card.job_id:
+        job = await db.get(Job, card.job_id)
+
+    runs: dict[str, PipelineRun] = {}
+    if job is not None:
+        for run in await runs_to_cancel_for_job(db, job):
+            runs[run.id] = run
+    if card is not None:
+        for run in await live_card_work_runs(db, card.id):
+            runs.setdefault(run.id, run)
+
+    run_ids = await cancel_runs(db, list(runs.values()))
+
+    landed = None
+    if job is not None and job.status in ("queued", "running"):
+        job.status = "failed"
+        job.error = error
+        job.completed_at = datetime.utcnow()
+        landed = job
+
+    return CardWorkCancellation(run_ids=run_ids, job=landed)
 
 
 # -----------------------------------------------------------------------------
@@ -847,7 +1211,7 @@ async def _complete_card_work(
 
     await manager.send_card_updated(card_to_ws_dict(card))
     if job is not None:
-        await manager.send_job_status(_job_ws_dict(job))
+        await manager.send_job_status(job_ws_dict(job))
 
     logger.info(
         "Card %s -> %s from ad-hoc run %s",

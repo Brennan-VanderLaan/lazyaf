@@ -59,15 +59,10 @@ def _trial(repo_id: str):
     return body.get("status"), step_errors(body)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-1 (BLOCKER): two parallel entry points share one "
-        "workspace volume; the second step's get_or_create force-removes the "
-        "volume the first step is still populating, so the run fails with a "
-        "raw Docker 409 'volume is in use'. ~1 run in 3."
-    ),
-)
+# QA3-1 was REFUTED by the QA triage and PASSES here (verifier, 2026-08-30):
+# parallel entry points share the workspace without destroying it. The strict
+# xfail was written on a premise the triage itself withdrew; removed, not
+# re-marked.
 def test_parallel_entry_points_do_not_destroy_the_shared_workspace():
     require_stack()
     repo_id = ensure_repo()
@@ -92,14 +87,8 @@ def test_parallel_entry_points_do_not_destroy_the_shared_workspace():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-2 (MAJOR): when the workspace race fires, the raw "
-        "Docker API error (URL, API version, container id) is surfaced "
-        "verbatim as the step error a user reads in the UI."
-    ),
-)
+# QA3-2 was REFUTED by the QA triage and PASSES here (verifier, 2026-08-30):
+# no raw Docker client text reaches a step error. Removed, not re-marked.
 def test_step_errors_never_leak_raw_docker_client_text():
     require_stack()
     repo_id = ensure_repo()

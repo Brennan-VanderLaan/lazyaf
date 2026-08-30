@@ -91,19 +91,25 @@ def make_run(step_runs, run_id="run-1", pipeline_id="pipe-1"):
     return {"id": run_id, "pipeline_id": pipeline_id, "step_runs": step_runs}
 
 
-def make_pipeline(step_types, pipeline_id="pipe-1", requires=None):
+def make_pipeline(step_types, pipeline_id="pipe-1", requires=None, configs=None):
     """A pipeline DEFINITION.
 
     `requires` maps a step index to a requirements dict. Its mere PRESENCE
     is what routes a step to the remote lane (12.6), so the gate re-derives
     the expected executor from exactly this - never from what happened.
+
+    `configs` maps a step index to extra step-config keys (14.x: `agent`,
+    `endpoint`, `harness`), for the same reason: the harness lane is derived
+    from the DEFINITION, never from the outcome.
     """
     requires = requires or {}
+    configs = configs or {}
     steps = []
     for i, t in enumerate(step_types):
-        step = {"type": t, "config": {}}
+        step = {"type": t, "config": dict(configs.get(i) or {})}
         if i in requires:
             step["config"]["requires"] = requires[i]
+        step["name"] = f"step-{i}"
         steps.append(step)
     return {"id": pipeline_id, "steps": steps}
 
@@ -126,24 +132,162 @@ def runner_row(runner_id=LOOPBACK_RUNNER_ID, status="idle", connection="websocke
     }
 
 
-def usage_row(sr, *, tokens=True, cost_source="unknown"):
-    """One rollup row for a StepRun."""
-    return {
+def usage_row(
+    sr,
+    *,
+    tokens=True,
+    cost_source="unknown",
+    provider="self-hosted",
+    input_tokens=42,
+    output_tokens=17,
+    cost_usd="0.000000",
+    raw=None,
+):
+    """One rollup row for a StepRun (and, with `raw`, the per-step detail)."""
+    row = {
         "usage_id": f"u-{sr['id']}",
         "step_execution_id": f"se-{sr['id']}",
         "step_run_id": sr["id"],
         "step_index": sr["step_index"],
         "step_name": sr["step_name"],
-        "provider": "self-hosted",
+        "provider": provider,
         "model": "mock",
         "role": None,
-        "input_tokens": 42 if tokens else None,
-        "output_tokens": 17 if tokens else None,
-        "cost_usd": "0.000000",
+        "input_tokens": input_tokens if tokens else None,
+        "output_tokens": output_tokens if tokens else None,
+        "cost_usd": cost_usd,
         "cost_source": cost_source,
         "wall_clock_ms": 1234,
         "container_seconds": 2.0,
     }
+    if raw is not None:
+        row["raw"] = raw
+    return row
+
+
+# -----------------------------------------------------------------------------
+# 14.x: the self-hosted harness lane (assertions 13-18)
+# -----------------------------------------------------------------------------
+
+#: How many turns the mock endpoint's happy script takes.
+HARNESS_TURNS = 6
+TOOLS_ENDPOINT = "dogfood-mock"
+TEXT_ENDPOINT = "dogfood-mock-notools"
+
+
+def summed_tokens(turns=HARNESS_TURNS):
+    """What a CORRECT accumulator reports over `turns` mock turns."""
+    triangular = turns * (turns + 1) // 2
+    return (
+        verify_executor.MOCK_PROMPT_TOKENS_PER_TURN * triangular,
+        verify_executor.MOCK_COMPLETION_TOKENS_PER_TURN * triangular,
+    )
+
+
+def last_turn_tokens(turns=HARNESS_TURNS):
+    """What a LAST-RESPONSE-WINS bug reports - the number assertion 13 rejects."""
+    return (
+        verify_executor.MOCK_PROMPT_TOKENS_PER_TURN * turns,
+        verify_executor.MOCK_COMPLETION_TOKENS_PER_TURN * turns,
+    )
+
+
+def harness_config(endpoint=TOOLS_ENDPOINT, mode=None, model=None):
+    """The step-config shape a dogfood harness step carries."""
+    config = {"agent": "openai-harness", "commit": False}
+    if model is not None:
+        config["model"] = model
+    else:
+        config["endpoint"] = endpoint
+    if mode is not None:
+        config["harness"] = {"mode": mode, "max_iterations": 8}
+    return config
+
+
+def harness_raw(mode="tools", turns=HARNESS_TURNS, **overrides):
+    record = {
+        "endpoint_name": TOOLS_ENDPOINT if mode == "tools" else TEXT_ENDPOINT,
+        "endpoint_reach": "direct",
+        "mode": mode,
+        "turns": turns,
+        "turns_without_usage": 0,
+        "stop_reason": "finish",
+        "finish_status": "success",
+        "tool_calls": {"finish": 1},
+        "tool_errors": 0,
+        "malformed_responses": 0,
+        "probe_drift": False,
+    }
+    record.update(overrides)
+    return {"harness": record}
+
+
+def harness_usage_row(sr, *, mode="tools", turns=HARNESS_TURNS, **overrides):
+    tokens_in, tokens_out = summed_tokens(turns)
+    kwargs = {
+        "provider": "openai-compatible",
+        "cost_source": "gpu-node",
+        "cost_usd": "0.000042",
+        "input_tokens": tokens_in,
+        "output_tokens": tokens_out,
+        "raw": harness_raw(mode=mode, turns=turns),
+    }
+    kwargs.update(overrides)
+    return usage_row(sr, **kwargs)
+
+
+def endpoint_row(name, *, probe_status="ok", probe_age_seconds=120.0):
+    """One row of GET /api/model-endpoints, capability snapshot included."""
+    return {
+        "id": f"ep-{name}",
+        "name": name,
+        "base_url": f"http://mock-endpoint:8099/{name}/v1",
+        "model": "mock-model",
+        "reach": "direct",
+        "enabled": True,
+        "probe_status": probe_status,
+        "probe_age_seconds": probe_age_seconds,
+        "capabilities": {
+            "supports_tools": probe_status == "ok",
+            "supports_streaming": True,
+            "reports_usage": True,
+            "context_window": 32768,
+            "probe_status": probe_status,
+            "probe_age_seconds": probe_age_seconds,
+            "stale": False,
+        },
+    }
+
+
+def default_endpoints():
+    return [
+        endpoint_row(TOOLS_ENDPOINT, probe_status="ok"),
+        endpoint_row(TEXT_ENDPOINT, probe_status="degraded"),
+    ]
+
+
+def append_harness(run, pipeline, *, statuses=("passed", "passed"), configs=None):
+    """Bolt the two 14.x dogfood harness steps onto any run/pipeline pair.
+
+    Assertions 13-18 REFUSE a pipeline with no `agent: openai-harness` step
+    (vacuous pass = fail, R4), so every fixture that drives verify_run end to
+    end has to carry them. A test about a 12.x assertion should not have to
+    describe the 14.x lane, so it gets appended in one line instead.
+    """
+    if configs is None:
+        configs = [
+            harness_config(TOOLS_ENDPOINT),
+            harness_config(TEXT_ENDPOINT, mode="text"),
+        ]
+    base = len(pipeline["steps"])
+    for offset, config in enumerate(configs):
+        index = base + offset
+        name = f"harness-{offset}"
+        pipeline["steps"].append({"type": "agent", "name": name, "config": config})
+        run["step_runs"].append(
+            step_run(index, "local", name=name, status=statuses[offset])
+        )
+    return run, pipeline
 
 
 def derive_rollup(run, pipeline, *, exclude=(), missing=(), tokenless=()):
@@ -154,17 +298,31 @@ def derive_rollup(run, pipeline, *, exclude=(), missing=(), tokenless=()):
     `tokenless` keeps the row but nulls its token counts.
     """
     step_types = {i: s.get("type", "script") for i, s in enumerate(pipeline["steps"])}
+    harness_modes = {
+        i: verify_executor.step_harness_mode(s)
+        for i, s in enumerate(pipeline["steps"])
+        if (s.get("config") or {}).get("agent") == "openai-harness"
+    }
     rows = []
     for sr in run["step_runs"]:
         if sr["step_index"] in exclude or sr["step_index"] in missing:
             continue
         if sr.get("status") != "passed":
             continue
-        is_agent = step_types.get(sr["step_index"]) == "agent"
+        index = sr["step_index"]
+        if index in harness_modes:
+            rows.append(
+                harness_usage_row(
+                    sr,
+                    mode="text" if harness_modes[index] == "text" else "tools",
+                )
+            )
+            continue
+        is_agent = step_types.get(index) == "agent"
         rows.append(
             usage_row(
                 sr,
-                tokens=is_agent and sr["step_index"] not in tokenless,
+                tokens=is_agent and index not in tokenless,
                 cost_source="cli-reported" if is_agent else "unknown",
             )
         )
@@ -186,6 +344,7 @@ def stub_backend(
     base="http://backend:8000",
     rollup=None,
     runners=None,
+    endpoints=None,
 ):
     """Monkeypatch urllib so the script sees a coherent fake backend.
 
@@ -199,12 +358,15 @@ def stub_backend(
         rollup = derive_rollup(run, pipeline)
     if runners is None:
         runners = [runner_row()]
+    if endpoints is None:
+        endpoints = default_endpoints()
 
     routes = {
         f"{base}/api/pipeline-runs/{run['id']}": run,
         f"{base}/api/pipelines/{pipeline['id']}": pipeline,
         f"{base}/api/pipeline-runs/{run['id']}/usage": rollup,
         f"{base}/api/runners": runners,
+        f"{base}/api/model-endpoints": endpoints,
     }
     for row in rollup["steps"]:
         routes[f"{base}/api/steps/{row['step_execution_id']}/usage"] = row
@@ -235,18 +397,28 @@ def script_and_agent(
     probe_executor="remote",
     probe_runner_id=LOOPBACK_RUNNER_ID,
     agent_runner_id=LOOPBACK_RUNNER_ID,
+    harness_statuses=("passed", "passed"),
+    harness_configs=None,
 ):
-    """The 12.6 dogfood shape in miniature.
+    """The 12.6 + 14.x dogfood shape in miniature.
 
-    Three steps, two lanes:
-      0 tier1        script, NO `requires:`  -> local  (assertion 11)
-      1 remote-probe script, `requires:`     -> remote (assertion 8)
-      2 mock-agent   agent,  `requires:`     -> remote (assertion 12)
+    Five steps, two lanes, three agents:
+      0 tier1                 script, NO `requires:` -> local  (assertion 11)
+      1 remote-probe          script, `requires:`    -> remote (assertion 8)
+      2 mock-agent            agent,  `requires:`    -> remote (assertion 12)
+      3 harness-probe         agent (openai-harness, tools)    (13-15, 17, 18)
+      4 harness-probe-notools agent (openai-harness, text)     (16)
 
-    The agent step is on the REMOTE lane because 12.6 moves it there: US-2
-    then has continuous coverage on the remote path on every push, while
-    tdd/e2e/test_us2_card_loop.py keeps covering it locally in T3.
+    The two harness steps route LOCAL: they carry no `requires:`, and a
+    `direct` endpoint must not flip a step to the remote lane on its own
+    (that is the regression assertion 11 exists to catch, and 14.x keeps it
+    true).
     """
+    if harness_configs is None:
+        harness_configs = {
+            3: harness_config(TOOLS_ENDPOINT),
+            4: harness_config(TEXT_ENDPOINT, mode="text"),
+        }
     run = make_run(
         [
             step_run(0, "local", name="tier1"),
@@ -258,11 +430,21 @@ def script_and_agent(
                 status=agent_status,
                 runner_id=agent_runner_id,
             ),
+            step_run(3, "local", name="harness-probe", status=harness_statuses[0]),
+            step_run(
+                4, "local", name="harness-probe-notools", status=harness_statuses[1]
+            ),
         ]
     )
     pipeline = make_pipeline(
-        ["script", "script", "agent"], requires={1: REMOTE_PIN, 2: REMOTE_PIN}
+        ["script", "script", "agent", "agent", "agent"],
+        requires={1: REMOTE_PIN, 2: REMOTE_PIN},
+        configs=harness_configs,
     )
+    # The DEFINITION carries the same names the run does, because the gate
+    # reports a failing step by the name its definition gives it.
+    for step, sr in zip(pipeline["steps"], run["step_runs"]):
+        step["name"] = sr["step_name"]
     return run, pipeline
 
 
@@ -277,7 +459,7 @@ class TestVerifyRun:
         stub_backend(monkeypatch, run, pipeline)
 
         msg = verify_executor.verify_run("http://backend:8000", "run-1")
-        assert "OK: 2 script step run(s) and 1 agent step run(s)" in msg
+        assert "OK: 2 script step run(s) and 3 agent step run(s)" in msg
         assert "2 remote" in msg
 
     def test_an_off_lane_executor_fails(self, monkeypatch):
@@ -329,10 +511,11 @@ class TestVerifyRun:
         pipeline = make_pipeline(
             ["script", "docker", "agent"], requires={1: REMOTE_PIN}
         )
+        append_harness(run, pipeline)
         stub_backend(monkeypatch, run, pipeline)
 
         msg = verify_executor.verify_run("http://backend:8000", "run-1")
-        assert "OK: 2 script step run(s) and 1 agent step run(s)" in msg
+        assert "OK: 2 script step run(s) and 3 agent step run(s)" in msg
 
     def test_missing_step_type_defaults_to_script(self, monkeypatch):
         run = make_run([step_run(0, "legacy")])
@@ -357,6 +540,7 @@ class TestVerifyRun:
             ]
         )
         pipeline = make_pipeline(["script", "script", "agent"], requires={1: REMOTE_PIN})
+        append_harness(run, pipeline)
         del pipeline["steps"][0]["config"]
         stub_backend(monkeypatch, run, pipeline)
 
@@ -379,7 +563,8 @@ class TestControlPathLogProbe:
                 step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
             ]
         )
-        return run, make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        return append_harness(run, pipeline)
 
     def test_passed_step_with_empty_logs_fails(self, monkeypatch):
         run, pipeline = self._run("")
@@ -430,6 +615,7 @@ class TestControlPathLogProbe:
         pipeline = make_pipeline(
             ["script", "agent", "script"], requires={1: REMOTE_PIN}
         )
+        append_harness(run, pipeline)
         stub_backend(
             monkeypatch, run, pipeline, rollup=derive_rollup(run, pipeline, exclude=(2,))
         )
@@ -437,7 +623,7 @@ class TestControlPathLogProbe:
         msg = verify_executor.verify_run(
             "http://backend:8000", "run-1", self_index=2
         )
-        assert "OK: 2 script step run(s) and 1 agent step run(s)" in msg
+        assert "OK: 2 script step run(s) and 3 agent step run(s)" in msg
 
     def test_non_terminal_step_not_log_checked(self, monkeypatch):
         """A still-running step legitimately has no logs committed yet."""
@@ -507,7 +693,7 @@ class TestUsageChannelGate:
         stub_backend(monkeypatch, run, pipeline)
 
         msg = verify_executor.verify_run("http://backend:8000", "run-1")
-        assert "3 StepUsage row(s) incl. 1 agent row(s)" in msg
+        assert "5 StepUsage row(s) incl. 3 agent row(s)" in msg
 
     def test_a_missing_row_for_a_script_step_fails(self, monkeypatch):
         """The dark-channel case: the agent reported, the script step did not."""
@@ -581,6 +767,7 @@ class TestUsageChannelGate:
         pipeline = make_pipeline(
             ["script", "agent", "script"], requires={1: REMOTE_PIN}
         )
+        append_harness(run, pipeline)
         stub_backend(monkeypatch, run, pipeline)
 
         assert "OK:" in verify_executor.verify_run("http://backend:8000", "run-1")
@@ -623,6 +810,7 @@ class TestMain:
             run_id="abc123",
         )
         pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        append_harness(run, pipeline)
         calls = stub_backend(monkeypatch, run, pipeline, base=base)
 
         monkeypatch.setenv("LAZYAF_PIPELINE_RUN_ID", "abc123")
@@ -630,7 +818,7 @@ class TestMain:
 
         verify_executor.main()
         out = capsys.readouterr().out
-        assert "OK: 1 script step run(s) and 1 agent step run(s)" in out
+        assert "OK: 1 script step run(s) and 3 agent step run(s)" in out
         assert calls[:3] == [
             f"{base}/api/pipeline-runs/abc123",
             f"{base}/api/pipelines/pipe-1",
@@ -640,9 +828,11 @@ class TestMain:
         # remote-lane gate - a second read of the same rows would be the
         # gate drifting into two views of one fact.
         assert calls.count(f"{base}/api/pipeline-runs/abc123/usage") == 1
-        # The registry snapshot is the LAST read: assertion 9 replaced 12.5's
-        # `queued_jobs == 0` when the queue it read was deleted.
-        assert calls[-1] == f"{base}/api/runners"
+        # The registry snapshot precedes the endpoint registry: assertion 9
+        # replaced 12.5's `queued_jobs == 0` when the queue it read was
+        # deleted, and 14.x assertion 17 reads the endpoint registry last.
+        assert f"{base}/api/runners" in calls
+        assert calls[-1] == f"{base}/api/model-endpoints"
 
     def test_main_passes_own_index_from_env(self, monkeypatch, capsys):
         run = make_run(
@@ -656,6 +846,7 @@ class TestMain:
         pipeline = make_pipeline(
             ["script", "agent", "script"], requires={1: REMOTE_PIN}
         )
+        append_harness(run, pipeline)
         stub_backend(
             monkeypatch, run, pipeline, rollup=derive_rollup(run, pipeline, exclude=(2,))
         )
@@ -676,6 +867,7 @@ class TestMain:
             run_id="r9",
         )
         pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        append_harness(run, pipeline)
         calls = stub_backend(monkeypatch, run, pipeline)
 
         monkeypatch.setenv("LAZYAF_PIPELINE_RUN_ID", "r9")
@@ -721,6 +913,7 @@ class TestManifestDeliveryGate:
             ]
         )
         pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        append_harness(run, pipeline)
         stub_backend(monkeypatch, run, pipeline)
 
         assert "no manifest delivery problems" in verify_executor.verify_run(
@@ -807,7 +1000,8 @@ class TestUsageScrapeFailureGate:
         run, pipeline = script_and_agent()
         rollup = derive_rollup(run, pipeline)
         for row in rollup["steps"]:
-            row["raw"] = None
+            if row.get("provider") != "openai-compatible":
+                row["raw"] = None
         stub_backend(monkeypatch, run, pipeline, rollup=rollup)
 
         assert "OK:" in verify_executor.verify_run("http://backend:8000", "run-1")
@@ -1033,3 +1227,437 @@ class TestRemoteAssignmentGate:
         msg = verify_executor.verify_run("http://backend:8000", "run-1")
         assert "remote steps assigned to" in msg
         assert LOOPBACK_RUNNER_ID in msg
+
+
+# -----------------------------------------------------------------------------
+# 14.x: the self-hosted harness lane (assertions 13-18)
+#
+# Every one of the six has a NEGATIVE case here, because an assertion nobody
+# has watched fail is an assertion that does not exist. Assertion 13 in
+# particular is the only alarm on the token accumulator: a harness that kept
+# the LAST turn instead of summing every turn would under-report every
+# self-hosted step forever, cost nothing, fail nothing, and quietly destroy
+# M13's cost axis.
+# -----------------------------------------------------------------------------
+
+
+def _rollup_with(run, pipeline, mutate):
+    rollup = derive_rollup(run, pipeline)
+    for row in rollup["steps"]:
+        if row.get("provider") == "openai-compatible":
+            mutate(row)
+    return rollup
+
+
+class TestHarnessTokenSummation:
+    """Assertion 13."""
+
+    def test_summed_tokens_pass(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        rollup = derive_rollup(run, pipeline)
+        harness_rows = [
+            r for r in rollup["steps"] if r["provider"] == "openai-compatible"
+        ]
+        assert len(harness_rows) == 2
+        assert harness_rows[0]["input_tokens"] == summed_tokens()[0]
+        stub_backend(monkeypatch, run, pipeline, rollup=rollup)
+
+        msg = verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "summed their tokens across turns" in msg
+
+    def test_last_response_wins_fails(self, monkeypatch):
+        """THE bug this assertion exists for: the accumulator REPLACED each
+        turn's usage instead of adding it, so the row equals the biggest
+        single turn rather than the sum of all of them."""
+        run, pipeline = script_and_agent()
+
+        def keep_last(row):
+            row["input_tokens"], row["output_tokens"] = last_turn_tokens()
+
+        stub_backend(
+            monkeypatch, run, pipeline, rollup=_rollup_with(run, pipeline, keep_last)
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "NOT summed across" in str(exc.value)
+        assert str(summed_tokens()[0]) in str(exc.value)
+
+    def test_tokens_just_below_the_sum_still_fail(self, monkeypatch):
+        """Off-by-one on the boundary: the check is STRICTLY greater than the
+        largest single turn, so a row equal to it is a failure."""
+        run, pipeline = script_and_agent()
+
+        def boundary(row):
+            row["input_tokens"] = last_turn_tokens()[0]
+            row["output_tokens"] = summed_tokens()[1]
+
+        stub_backend(
+            monkeypatch, run, pipeline, rollup=_rollup_with(run, pipeline, boundary)
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "NOT summed across" in str(exc.value)
+
+    def test_a_single_turn_run_is_refused_as_degenerate(self, monkeypatch):
+        """With one turn, summed and last-response are the same number - the
+        inequality proves nothing, so the gate refuses the run rather than
+        passing on evidence that cannot discriminate."""
+        run, pipeline = script_and_agent()
+
+        def one_turn(row):
+            row["raw"] = harness_raw(turns=1)
+            row["input_tokens"], row["output_tokens"] = summed_tokens(1)
+
+        stub_backend(
+            monkeypatch, run, pipeline, rollup=_rollup_with(run, pipeline, one_turn)
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "at least 2 turns" in str(exc.value)
+
+    def test_null_tokens_fail(self, monkeypatch):
+        run, pipeline = script_and_agent()
+
+        def blank(row):
+            row["input_tokens"] = None
+            row["output_tokens"] = None
+
+        rollup = _rollup_with(run, pipeline, blank)
+        stub_backend(monkeypatch, run, pipeline, rollup=rollup)
+
+        # The 12.5 usage gate catches this FIRST, which is correct - "the
+        # agent step's usage row is empty of numbers" is the more general
+        # failure and it fires for every agent step, harness or not.
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "empty of numbers" in str(exc.value)
+        assert "harness-probe" in str(exc.value)
+
+        # Assertion 13's OWN null-token branch, asserted directly, so the
+        # more general gate does not shadow it into never being exercised.
+        with pytest.raises(SystemExit) as exc2:
+            verify_executor.verify_harness_lane(
+                "http://backend:8000", run, pipeline, rollup
+            )
+        assert "must have both" in str(exc2.value)
+
+    def test_a_wrong_provider_fails(self, monkeypatch):
+        """A harness step billed as `anthropic` is a step that ran somewhere
+        other than where its definition says."""
+        run, pipeline = script_and_agent()
+        rollup = derive_rollup(run, pipeline)
+        for row in rollup["steps"]:
+            if row.get("provider") == "openai-compatible":
+                row["provider"] = "anthropic"
+        stub_backend(monkeypatch, run, pipeline, rollup=rollup)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "expected 'openai-compatible'" in str(exc.value)
+
+
+class TestHarnessNodePricing:
+    """Assertion 14: the gpu-node pricing branch runs on every push."""
+
+    def test_unpriced_endpoint_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+
+        def unpriced(row):
+            row["cost_source"] = "unknown"
+            row["cost_usd"] = None
+
+        stub_backend(
+            monkeypatch, run, pipeline, rollup=_rollup_with(run, pipeline, unpriced)
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "expected 'gpu-node'" in str(exc.value)
+
+    def test_gpu_node_with_a_null_cost_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+
+        def priceless(row):
+            row["cost_usd"] = None
+
+        stub_backend(
+            monkeypatch, run, pipeline, rollup=_rollup_with(run, pipeline, priceless)
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "priced source with no price" in str(exc.value)
+
+    def test_a_zero_rate_is_a_real_price(self, monkeypatch):
+        """`0.000000` is owned hardware with no marginal cash cost - a REAL
+        cost figure, not an absence. It must pass."""
+        run, pipeline = script_and_agent()
+
+        def owned(row):
+            row["cost_usd"] = "0.000000"
+
+        stub_backend(
+            monkeypatch, run, pipeline, rollup=_rollup_with(run, pipeline, owned)
+        )
+
+        assert "OK:" in verify_executor.verify_run("http://backend:8000", "run-1")
+
+
+class TestHarnessScrapeMarker:
+    """Assertion 15."""
+
+    def test_the_scrape_marker_on_a_harness_step_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        for sr in run["step_runs"]:
+            if sr["step_name"] == "harness-probe":
+                sr["logs"] = (
+                    "[agent] turn 1/8\n"
+                    + verify_executor.SCRAPE_FAILED_LOG_MARKER
+                    + ": endpoint reported no usage block in any of 6 turns\n"
+                )
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "usage scrape" in str(exc.value)
+
+
+class TestHarnessFallbackLane:
+    """Assertion 16: the no-tools fallback protocol runs on every push."""
+
+    def test_forced_text_step_recorded_text_mode(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        stub_backend(monkeypatch, run, pipeline)
+
+        msg = verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "forced-text: harness-probe-notools" in msg
+
+    def test_a_text_pinned_step_that_ran_tools_mode_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        rollup = derive_rollup(run, pipeline)
+        for row in rollup["steps"]:
+            if row["step_name"] == "harness-probe-notools":
+                row["raw"] = harness_raw(mode="tools")
+        stub_backend(monkeypatch, run, pipeline, rollup=rollup)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "did not run the no-tools fallback protocol" in str(exc.value)
+
+    def test_a_missing_malformed_responses_key_fails(self, monkeypatch):
+        """0 is a fine value. The KEY missing means the fallback parser never
+        accounted for itself, which is how that path rots unnoticed."""
+        run, pipeline = script_and_agent()
+        rollup = derive_rollup(run, pipeline)
+        for row in rollup["steps"]:
+            if row["step_name"] == "harness-probe-notools":
+                raw = harness_raw(mode="text")
+                del raw["harness"]["malformed_responses"]
+                row["raw"] = raw
+        stub_backend(monkeypatch, run, pipeline, rollup=rollup)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "malformed_responses" in str(exc.value)
+
+    def test_a_pipeline_with_no_forced_text_step_fails(self, monkeypatch):
+        run, pipeline = script_and_agent(
+            harness_configs={
+                3: harness_config(TOOLS_ENDPOINT),
+                4: harness_config(TOOLS_ENDPOINT, mode="tools"),
+            }
+        )
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "no step of this pipeline pins" in str(exc.value)
+
+
+class TestHarnessEndpointRegistry:
+    """Assertion 17."""
+
+    def test_a_missing_endpoint_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        stub_backend(
+            monkeypatch,
+            run,
+            pipeline,
+            endpoints=[endpoint_row(TEXT_ENDPOINT, probe_status="degraded")],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert TOOLS_ENDPOINT in str(exc.value)
+        assert "does not report it" in str(exc.value)
+
+    def test_an_unprobed_endpoint_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        stub_backend(
+            monkeypatch,
+            run,
+            pipeline,
+            endpoints=[
+                endpoint_row(TOOLS_ENDPOINT, probe_status="unprobed"),
+                endpoint_row(TEXT_ENDPOINT, probe_status="degraded"),
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "probe_status" in str(exc.value)
+
+    def test_a_stale_capability_record_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        stub_backend(
+            monkeypatch,
+            run,
+            pipeline,
+            endpoints=[
+                endpoint_row(
+                    TOOLS_ENDPOINT,
+                    probe_status="ok",
+                    probe_age_seconds=verify_executor.PROBE_TTL_SECONDS + 1,
+                ),
+                endpoint_row(TEXT_ENDPOINT, probe_status="degraded"),
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "probe_age_seconds" in str(exc.value)
+
+    def test_degraded_is_acceptable_for_the_no_tools_endpoint(self, monkeypatch):
+        """`degraded` is USABLE - it is what routes the fallback protocol.
+        Only the tools-mode endpoint has to be `ok`."""
+        run, pipeline = script_and_agent()
+        stub_backend(monkeypatch, run, pipeline)
+
+        assert "OK:" in verify_executor.verify_run("http://backend:8000", "run-1")
+
+    def test_the_endpoint_model_sugar_resolves(self, monkeypatch):
+        """`model: "endpoint:<name>"` is the ONE sugar spelling every model
+        picker emits, and the gate has to read it the same way the backend
+        resolver does - no second parser."""
+        run, pipeline = script_and_agent(
+            harness_configs={
+                3: harness_config(model=f"endpoint:{TOOLS_ENDPOINT}"),
+                4: harness_config(TEXT_ENDPOINT, mode="text"),
+            }
+        )
+        stub_backend(monkeypatch, run, pipeline)
+
+        assert "2 probed endpoint(s)" in verify_executor.verify_run(
+            "http://backend:8000", "run-1"
+        )
+
+
+class TestHarnessCostSourceInvariant:
+    """Assertion 18: a self-hosted row may never claim the provider billed us."""
+
+    def test_cli_reported_on_an_openai_compatible_row_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+
+        def liar(row):
+            row["cost_source"] = "cli-reported"
+
+        stub_backend(
+            monkeypatch, run, pipeline, rollup=_rollup_with(run, pipeline, liar)
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "cli-reported" in str(exc.value)
+        assert "no self-hosted endpoint can make that claim" in str(exc.value)
+
+    def test_cli_reported_on_a_real_cli_row_is_fine(self, monkeypatch):
+        """The mock-agent step legitimately carries `cli-reported` - the
+        invariant is scoped to the openai-compatible provider, not global."""
+        run, pipeline = script_and_agent()
+        rollup = derive_rollup(run, pipeline)
+        agent_row = next(r for r in rollup["steps"] if r["step_name"] == "mock-agent")
+        assert agent_row["cost_source"] == "cli-reported"
+        stub_backend(monkeypatch, run, pipeline, rollup=rollup)
+
+        assert "OK:" in verify_executor.verify_run("http://backend:8000", "run-1")
+
+
+class TestHarnessLaneVacuousPass:
+    """A gate that passes when the lane is absent is not a gate."""
+
+    def test_a_pipeline_with_no_harness_step_fails(self, monkeypatch):
+        run = make_run(
+            [
+                step_run(0, "local", name="tier1"),
+                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
+            ]
+        )
+        pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "no `agent: openai-harness` step" in str(exc.value)
+
+    def test_a_harness_step_that_did_not_pass_fails(self, monkeypatch):
+        run, pipeline = script_and_agent(harness_statuses=("failed", "passed"))
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "expected 'passed'" in str(exc.value)
+
+    def test_a_harness_step_with_no_usage_row_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        rollup = derive_rollup(run, pipeline)
+        rollup["steps"] = [
+            r for r in rollup["steps"] if r["step_name"] != "harness-probe"
+        ]
+        stub_backend(monkeypatch, run, pipeline, rollup=rollup)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        # The 12.5 gate catches the missing row first, which is correct - it
+        # is the more general failure. Either message names the step.
+        assert "harness-probe" in str(exc.value)
+
+
+class TestMockTokenConstantsDoNotDrift:
+    """R3: verify_executor is stdlib-only and runs in a bare step container,
+    so it carries a COPY of the mock endpoint's per-turn token law. This is
+    the test that imports both and refuses to let the copies diverge - without
+    it, a change to the mock would silently turn assertion 13 into a
+    tautology."""
+
+    def test_constants_match_the_mock_server(self):
+        from tdd.shared.mock_openai import (
+            MOCK_COMPLETION_TOKENS_PER_TURN,
+            MOCK_PROMPT_TOKENS_PER_TURN,
+        )
+
+        assert (
+            verify_executor.MOCK_PROMPT_TOKENS_PER_TURN
+            == MOCK_PROMPT_TOKENS_PER_TURN
+        )
+        assert (
+            verify_executor.MOCK_COMPLETION_TOKENS_PER_TURN
+            == MOCK_COMPLETION_TOKENS_PER_TURN
+        )
+
+    def test_the_predicted_sums_match_the_mock_servers(self):
+        from tdd.shared.mock_openai import (
+            expected_summed_tokens,
+            largest_single_turn_tokens,
+        )
+
+        for turns in (2, 6, 11):
+            assert summed_tokens(turns) == expected_summed_tokens(turns)
+            assert last_turn_tokens(turns) == largest_single_turn_tokens(turns)
+
+    def test_the_dogfood_script_length_is_above_the_degenerate_floor(self):
+        from tdd.shared.mock_openai import ACTION_SCRIPT_LENGTH
+
+        assert ACTION_SCRIPT_LENGTH >= verify_executor.MIN_HARNESS_TURNS

@@ -65,16 +65,13 @@ def _build_history(repo_id: str) -> int:
     return sum(len(run.get("step_runs", [])) for run in body)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-12 (BLOCKER): with 7 runs / ~300 step runs in the "
-        "database, 20 simultaneous GET /api/pipeline-runs return HTTP 500 "
-        "(QueuePool checkout timeout). Root causes: echo=True hardcoded at "
-        "backend/app/database.py:15 and an unbounded selectinload of "
-        "step_runs -> executions in list_all_pipeline_runs."
-    ),
-)
+# QA3-12 PASSES against the 12.7 stack (verifier, 2026-08-30): 20 simultaneous
+# GET /api/pipeline-runs over a history this test builds itself all answer 200.
+# The strict xfail is removed rather than re-marked - a strict xfail that
+# passes is itself a failure, and the assertion below is the lock now.
+# NOT claimed fixed at the root: list_all_pipeline_runs still selectinloads
+# step_runs -> executions and StepRunRead still carries `logs`, so the
+# PAYLOAD half of QA finding T5 is open (see the verifier report).
 def test_concurrent_readers_of_the_run_list_do_not_get_500s():
     require_stack()
     repo_id = ensure_repo()

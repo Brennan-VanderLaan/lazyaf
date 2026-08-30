@@ -83,8 +83,15 @@ class TestCardsRunOnTheControlLayer:
         await client.post(f"/api/cards/{card['id']}/start")
         await _settle()
 
-        # Retry is only legal from failed/in_review.
-        await client.patch(f"/api/cards/{card['id']}", json={"status": "failed"})
+        # Retry is only legal from failed/in_review. `in_progress -> failed`
+        # is the RUN's outcome to write, not a field update - PATCH refuses it
+        # since 12.7 (MANUAL_STATUSES in app/routers/cards.py, QA finding T2),
+        # so the precondition is staged through the ORM rather than through
+        # the guard. What this test asserts - that retry takes the same ad-hoc
+        # control-layer path start does - is unchanged.
+        from tdd.integration.api.test_cards_api import stage_card
+
+        await stage_card(db_session, card["id"], status="failed")
 
         response = await client.post(f"/api/cards/{card['id']}/retry")
         assert response.status_code == 200, response.text

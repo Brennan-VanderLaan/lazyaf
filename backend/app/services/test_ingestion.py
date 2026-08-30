@@ -38,8 +38,16 @@ file_path (contract #3) is REPO-ROOT-relative. A manifest path that is not
 (absolute, drive-lettered, parent-escaping) is refused and logged rather
 than overwriting a seeded repo-root-relative path with a worse one.
 
-Experiment context (model / prompt_template_id) is NULL until Phase 12.6.5
-threads it through the step config.
+Experiment context (Phase 12.6.5) is DERIVED HERE, never trusted from the
+wire. When the run's PERSISTED trigger says `experiment`, the cell row it
+points at is the authority for which variant produced these results, and its
+coordinates (experiment_run_id / model / prompt_template_id / prompt_version)
+are stamped onto every TestRun of the step. The manifest schema
+(`TestResultsManifest`) is UNCHANGED — the frozen control-layer protocol
+stays frozen, and a container cannot mislabel which variant it was. This is
+the same wire-vs-server split `usage_ingestion` states in its own docstring
+("step_run_id, pipeline_run_id | HERE — never trusted from the wire").
+Non-experiment runs stamp NULL, which is the true value, not a hole.
 """
 import json
 import logging
@@ -52,6 +60,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Pipeline, PipelineRun, StepExecution, StepRun, TestRef, TestRefStatus, TestRun
+# TRIGGER_EXPERIMENT lives on models.experiment, the leaf module both this
+# path and the experiment service import, so the two sides of the cell -> run
+# link cannot fork (R3).
+from app.models.experiment import TRIGGER_EXPERIMENT, ExperimentRun
 from app.schemas.testref import TestResultEntry, TestResultsManifest
 
 logger = logging.getLogger(__name__)
@@ -83,6 +95,13 @@ class _RunContext:
     repo_id: str
     commit_sha: str
     branch: str | None
+    # Experiment coordinates (12.6.5). All four are NULL unless the run's
+    # PERSISTED trigger says this run IS an experiment cell — see the module
+    # docstring on why they are derived here and not read off the manifest.
+    experiment_run_id: str | None = None
+    model: str | None = None
+    prompt_template_id: str | None = None
+    prompt_version: int | None = None
 
 
 @dataclass
@@ -166,6 +185,11 @@ async def _resolve_run_context(db: AsyncSession, execution: StepExecution) -> _R
                 StepRun.pipeline_run_id,
                 Pipeline.repo_id,
                 PipelineRun.trigger_context,
+                # The DURABLE cell link (12.6.5): trigger_type/trigger_ref are
+                # written at run CREATION, so they are already true even when
+                # a step finishes in under 100 ms.
+                PipelineRun.trigger_type,
+                PipelineRun.trigger_ref,
             )
             .join(PipelineRun, PipelineRun.id == StepRun.pipeline_run_id)
             .join(Pipeline, Pipeline.id == PipelineRun.pipeline_id)
@@ -182,13 +206,35 @@ async def _resolve_run_context(db: AsyncSession, execution: StepExecution) -> _R
         except (json.JSONDecodeError, TypeError):
             logger.warning("Unparseable trigger_context on pipeline run %s", row.pipeline_run_id)
 
-    return _RunContext(
+    ctx = _RunContext(
         step_run_id=row.id,
         pipeline_run_id=row.pipeline_run_id,
         repo_id=row.repo_id,
         commit_sha=context.get("commit_sha") or context.get("sha") or "",
         branch=context.get("branch"),
     )
+
+    # Experiment coordinates, from the CELL ROW (one indexed PK read), not
+    # from the manifest. A cell that is gone leaves them NULL and logs — the
+    # results are still ingested, because dropping measurements over a
+    # missing label would be the worse failure.
+    if row.trigger_type == TRIGGER_EXPERIMENT and row.trigger_ref:
+        cell = await db.get(ExperimentRun, row.trigger_ref)
+        if cell is None:
+            logger.warning(
+                "Run %s claims trigger_type=%r but experiment cell %s is gone "
+                "— ingesting without experiment coordinates",
+                row.pipeline_run_id,
+                TRIGGER_EXPERIMENT,
+                row.trigger_ref,
+            )
+        else:
+            ctx.experiment_run_id = cell.id
+            ctx.model = cell.model
+            ctx.prompt_template_id = cell.prompt_template_id
+            ctx.prompt_version = cell.prompt_version
+
+    return ctx
 
 
 async def _select_refs(
@@ -329,6 +375,10 @@ async def ingest_manifest(
             run.duration_ms = item.duration_ms
             run.commit_sha = ctx.commit_sha
             run.branch = ctx.branch
+            run.experiment_run_id = ctx.experiment_run_id
+            run.model = ctx.model
+            run.prompt_template_id = ctx.prompt_template_id
+            run.prompt_version = ctx.prompt_version
             counts.test_runs_updated += 1
         else:
             run = TestRun(
@@ -339,6 +389,10 @@ async def ingest_manifest(
                 branch=ctx.branch,
                 status=item.status,
                 duration_ms=item.duration_ms,
+                experiment_run_id=ctx.experiment_run_id,
+                model=ctx.model,
+                prompt_template_id=ctx.prompt_template_id,
+                prompt_version=ctx.prompt_version,
             )
             db.add(run)
             existing_runs[ref.id] = run

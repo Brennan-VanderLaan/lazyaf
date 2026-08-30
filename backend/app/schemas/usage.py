@@ -21,11 +21,12 @@ for dollars, ever.
 """
 import json
 import logging
-from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel
+
+from app.schemas._datetime import UTCDateTime
 
 logger = logging.getLogger(__name__)
 
@@ -135,8 +136,8 @@ class StepUsageRead(BaseModel):
     role: str | None = None
     determinism: dict = {}
     raw: dict | None = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     @classmethod
     def from_model(cls, usage: Any) -> "StepUsageRead":

@@ -10,9 +10,10 @@ contract #4). Deliberately not typed as the enum: an unknown status written
 by a future backend must render in the panel as an unknown status, not 500
 the list endpoint for every runner.
 """
-from datetime import datetime
 
 from pydantic import BaseModel, Field
+
+from app.schemas._datetime import UTCDateTime
 
 
 class RunnerRead(BaseModel):
@@ -27,9 +28,9 @@ class RunnerRead(BaseModel):
     current_step_execution_id: str | None = None
     protocol_version: int | None = None
     agent_version: str | None = None
-    connected_at: datetime | None = None
-    last_heartbeat: datetime | None = None
-    created_at: datetime | None = None
+    connected_at: UTCDateTime | None = None
+    last_heartbeat: UTCDateTime | None = None
+    created_at: UTCDateTime | None = None
     #: "websocket" when this backend process holds a live socket for the row,
     #: "none" otherwise. The DB row alone cannot answer this - a status of
     #: "idle" left behind by a crashed process looks identical - so the

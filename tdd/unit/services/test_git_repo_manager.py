@@ -120,6 +120,32 @@ class TestCreateBareRepo:
         head_content = (path / "HEAD").read_text()
         assert "ref:" in head_content
 
+    @pytest.mark.parametrize("branch", ["main", "trunk", "develop"])
+    def test_head_points_at_the_requested_default_branch(
+        self, repo_manager, sample_repo_id, branch
+    ):
+        """HEAD names the branch the caller asked for, not dulwich's 'master'.
+
+        dulwich init_bare hardcodes refs/heads/master. The repo row said
+        'main', so the two disagreed from the moment of creation, and
+        GET /branches then "synced" the row to 'master' - a branch with no
+        ref. The sidebar read 'master' while the board header read 'main'
+        (QA-API-08 / T19).
+        """
+        repo_manager.create_bare_repo(sample_repo_id, branch)
+        head = (repo_manager.get_repo_path(sample_repo_id) / "HEAD").read_text()
+        assert head.strip() == f"ref: refs/heads/{branch}"
+
+    def test_head_is_unborn_not_a_ref(self, repo_manager, sample_repo_id):
+        """Pointing HEAD costs no object: the branch still does not exist.
+
+        This is what makes the fix free - and it is also why list_branches
+        must not adopt HEAD as the default until a push creates the ref.
+        """
+        repo_manager.create_bare_repo(sample_repo_id, "main")
+        assert repo_manager.list_branches(sample_repo_id) == []
+        assert repo_manager.get_default_branch(sample_repo_id) == "main"
+
     def test_create_bare_repo_duplicate_raises_error(self, repo_manager, sample_repo_id):
         """Raises ValueError when repo already exists."""
         repo_manager.create_bare_repo(sample_repo_id)

@@ -99,7 +99,14 @@ AGENT_CONFIG_VERSION = 1
 
 #: The agent vocabulary (cross-agent contract #5). There is no default
 #: agent: an unknown value fails at dispatch, never silently picks one.
-AGENT_TYPES = ("claude-code", "gemini", "mock")
+#: `openai-harness` joined at M14: the LazyAF-supplied agent loop driving a
+#: self-hosted OpenAI-compatible endpoint. It is an EXECUTOR, not a new step
+#: type, which is why this is a one-word edit here.
+AGENT_TYPES = ("claude-code", "gemini", "mock", "openai-harness")
+
+#: The one agent that drives a `ModelEndpoint`. Spelled once; every check
+#: below and in `pipeline_executor` reads it from here.
+HARNESS_AGENT = "openai-harness"
 
 #: `context.previous_step_logs` cap. The previous step's whole log stream can
 #: be megabytes; a prompt is not a log sink. Head-truncated (the TAIL is what
@@ -224,6 +231,120 @@ def validate_spec_context(spec_context: Optional[Dict[str, Any]]) -> None:
         )
 
 
+# --- The endpoint / harness blocks (M14, wave8 s4.1) ------------------------
+#
+# Two ADDITIVE optional top-level keys, and `version` stays 1. This follows
+# the precedent this module already documents for `spec_context`: an additive
+# optional key that an old consumer ignores and a new one defaults does not
+# justify a version bump, because bumping strands every runner agent in the
+# field mid-phase.
+#
+# The key sets are declared as data so the contract test can assert on them
+# by identity rather than by re-typing them (R3).
+
+ENDPOINT_BLOCK_KEYS = (
+    "id",
+    "name",
+    "base_url",
+    "model",
+    "server_kind",
+    "reach",
+    "auth_style",
+    "auth_env",
+    "auth_header",
+    "request_timeout_seconds",
+    "capabilities",
+    "pricing",
+)
+ENDPOINT_CAPABILITY_KEYS = (
+    "supports_tools",
+    "supports_streaming",
+    "reports_usage",
+    "context_window",
+    "max_output_tokens",
+    "probe_status",
+    "probed_at",
+    "probed_from",
+    "probe_age_seconds",
+    "stale",
+)
+ENDPOINT_PRICING_KEYS = ("gpu_node_id", "gpu_fraction", "priced")
+HARNESS_BLOCK_KEYS = (
+    "mode",
+    "max_iterations",
+    "max_total_tokens",
+    "time_budget_seconds",
+    "max_tool_calls_per_turn",
+    "shell_timeout_seconds",
+    "tool_output_max_bytes",
+    "temperature",
+    "top_p",
+    "seed",
+    "require_changes",
+    "debug_transcript",
+)
+
+
+def validate_endpoint_block(agent: str, endpoint: Optional[Dict[str, Any]]) -> None:
+    """Raise ValueError when the agent and the endpoint block disagree.
+
+    - `openai-harness` REQUIRES a block with non-empty `base_url` and `model`,
+      and `capabilities.probe_status != "unprobed"`. Dispatching a harness
+      step against an unprobed endpoint would put a 60s capability discovery
+      inside a 30-minute step's timeout budget and would only then find out
+      the model cannot tool-call.
+    - ANY OTHER AGENT MUST NOT CARRY ONE. An endpoint block on a `claude-code`
+      step is an authoring mistake whose silent acceptance would be a step
+      that looks self-hosted in the UI and bills Anthropic.
+    """
+    if agent != HARNESS_AGENT:
+        if endpoint is not None:
+            raise ValueError(
+                f"agent {agent!r} must not carry an `endpoint` block: an "
+                f"endpoint on a non-harness step is a step that would look "
+                f"self-hosted in the UI and bill a commercial provider. Use "
+                f"agent: {HARNESS_AGENT!r} to run against a model endpoint."
+            )
+        return
+
+    if not isinstance(endpoint, dict):
+        raise ValueError(
+            f"agent {HARNESS_AGENT!r} requires an `endpoint` block naming the "
+            f"OpenAI-compatible server to drive; there is no default endpoint "
+            f"(guessing which GPU to bill is not a recoverable mistake)"
+        )
+    for key in ("base_url", "model"):
+        if not endpoint.get(key):
+            raise ValueError(
+                f"agent {HARNESS_AGENT!r} requires endpoint.{key}; refusing to "
+                f"dispatch a harness step without one"
+            )
+    capabilities = endpoint.get("capabilities") or {}
+    if capabilities.get("probe_status") == "unprobed":
+        name = endpoint.get("name") or endpoint.get("id") or "?"
+        raise ValueError(
+            f"endpoint {name!r} has never been probed; POST "
+            f"/api/model-endpoints/{endpoint.get('id')}/probe first. A "
+            f"30-minute agent step is not the place to discover that the "
+            f"model cannot tool-call."
+        )
+
+
+def validate_harness_block(agent: str, harness: Optional[Dict[str, Any]]) -> None:
+    """The `harness` block is meaningful only for the harness agent."""
+    if harness in (None, {}):
+        return
+    if not isinstance(harness, dict):
+        raise ValueError(
+            f"harness must be an object or None; got {type(harness).__name__}"
+        )
+    if agent != HARNESS_AGENT:
+        raise ValueError(
+            f"agent {agent!r} must not carry a `harness` block: the loop "
+            f"budgets it configures exist only inside the LazyAF agent harness"
+        )
+
+
 def generate_agent_config(
     *,
     agent: str,
@@ -252,6 +373,8 @@ def generate_agent_config(
     mock_config: Optional[Dict[str, Any]] = None,
     role: Optional[str] = None,
     spec_context: Optional[Dict[str, Any]] = None,
+    endpoint: Optional[Dict[str, Any]] = None,
+    harness: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Generate the agent payload file for an agent step (12.5).
 
@@ -286,13 +409,23 @@ def generate_agent_config(
             Its `markdown` is ALREADY inside `prompt`; it travels here as well
             so the wrapper can materialise it at SPEC_CONTEXT_PATH and log
             what it received. Refused at dispatch when it is over budget.
+        endpoint: The `ModelEndpoint` SNAPSHOT (M14) an `openai-harness` step
+            drives, or None for every other agent. A snapshot, not a live
+            reference: a step must behave identically if someone re-probes the
+            endpoint mid-run, and M13 needs to attribute a result to the
+            capabilities that were actually in force. It carries `auth_env`
+            (the NAME of the container-side variable) and NEVER a key value.
+        harness: The harness's budgets and loop shape (M14). Meaningful only
+            for `openai-harness`.
 
     Returns:
         The agent configuration dictionary.
 
     Raises:
-        ValueError: on an unknown agent (there is NO default agent), or on a
-            spec_context that is malformed or over the token budget.
+        ValueError: on an unknown agent (there is NO default agent), on a
+            spec_context that is malformed or over the token budget, on an
+            endpoint/agent mismatch, on an unprobed endpoint, or when `model`
+            and `endpoint.model` disagree.
     """
     if agent not in AGENT_TYPES:
         raise ValueError(
@@ -300,6 +433,33 @@ def generate_agent_config(
         )
 
     validate_spec_context(spec_context)
+    validate_endpoint_block(agent, endpoint)
+    validate_harness_block(agent, harness)
+
+    if agent == HARNESS_AGENT:
+        # The top-level `model` is the 12.5 contract every executor reads; the
+        # endpoint block is self-contained so `HarnessExecutor` needs exactly
+        # one argument. Both come from ONE source and the contract test pins
+        # that they are equal - a mismatch would mean the usage row's model and
+        # the model actually driven are two different strings.
+        endpoint_model = (endpoint or {}).get("model")
+        if model is None:
+            model = endpoint_model
+        elif model != endpoint_model:
+            raise ValueError(
+                f"agent config model {model!r} disagrees with endpoint.model "
+                f"{endpoint_model!r}; they are two spellings of one fact and "
+                f"the producer sets both from the same source"
+            )
+        if agents_json is not None:
+            # Seam left open on purpose (wave8 s12): the harness does not do
+            # subagents. Multi-agent shapes belong in the graph, where they are
+            # visible and costed per role, not inside one step's loop.
+            raise ValueError(
+                f"agent {HARNESS_AGENT!r} does not support `agents_json`: the "
+                f"harness runs one loop, and multi-agent shapes belong in the "
+                f"graph where they are visible and costed per role"
+            )
 
     logs, truncated = truncate_previous_step_logs(previous_step_logs)
 
@@ -341,6 +501,11 @@ def generate_agent_config(
         "mock_config": mock_config,
         "role": role,
         "spec_context": spec_context,
+        # M14, additive and LAST: a pre-14 consumer ignores both; a 14 consumer
+        # defaults them to None/{} (runner_common.agent_config), which is why
+        # `version` stays 1 and no runner agent in the field is stranded.
+        "endpoint": endpoint,
+        "harness": dict(harness or {}) if agent == HARNESS_AGENT else {},
     }
 
 
@@ -366,4 +531,6 @@ def agent_config_keys() -> List[str]:
         "mock_config",
         "role",
         "spec_context",
+        "endpoint",
+        "harness",
     ]

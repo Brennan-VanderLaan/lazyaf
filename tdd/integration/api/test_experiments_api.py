@@ -23,6 +23,7 @@ either way is that those two columns carry the durable link.
 import asyncio
 import json
 import sys
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -43,7 +44,12 @@ from app.models import (
     RunStatus,
     UserStory,
 )
-from app.models.experiment import Experiment, ExperimentRun, ExperimentRunStatus
+from app.models.experiment import (
+    Experiment,
+    ExperimentRun,
+    ExperimentRunStatus,
+    ExperimentStatus,
+)
 from app.models.spec import PromptTemplate
 from app.services import experiment_service as svc
 from app.services.websocket import manager
@@ -76,9 +82,11 @@ def _register_router():
 def _clean_pump_state():
     svc._pump_locks.clear()
     svc._repump.clear()
+    svc._pump_sessions.clear()
     yield
     svc._pump_locks.clear()
     svc._repump.clear()
+    svc._pump_sessions.clear()
 
 
 class _CapturingSocket:
@@ -597,7 +605,12 @@ class TestLaunch:
         statuses = ws_frames.of_type("experiment_status")
         cells = ws_frames.of_type("experiment_cell_status")
         assert statuses, "no experiment_status frame"
-        assert len(cells) == 2
+        # BOTH cells are announced - asserted as a SET of cell_index, not as a
+        # frame count. Cell runs land asynchronously and each landing emits its
+        # own frame, so `len(cells) == 2` was really asserting "the background
+        # dispatch has not finished yet", which is true on an idle host and
+        # false under load. What the launch contract owes is a frame per cell.
+        assert {frame["cell_index"] for frame in cells} == {0, 1}
         assert {"id", "name", "status", "cells_total", "by_status", "spend_usd",
                 "budget_usd", "cost_coverage", "stalled"} <= set(statuses[0])
         assert {"id", "experiment_id", "cell_index", "variant_index", "status",
@@ -725,6 +738,54 @@ class TestLifecycle:
 
         detail = (await client.get(f"/api/experiments/{body['id']}")).json()
         assert detail["stalled"] is True
+
+    async def test_a_settled_but_unclosed_matrix_is_reported_and_resumable(
+        self, client, card, db_session
+    ):
+        """Every cell terminal, `completed_at` still null: a restart landed in
+        the window between the last cell's commit and its close.
+
+        Nothing is pending and nothing is live, so the old `stalled` test
+        ("pending work with nothing running") called this healthy and the row
+        read as in-flight forever. It is reported instead, and /resume closes
+        it.
+
+        The state is BUILT, not launched into: launching starts real cell runs
+        whose completions land from background sessions, and this experiment's
+        whole point is that no live work exists. Launching first and racing to
+        overwrite the cells would be asserting on a stopwatch.
+        """
+        body = await create(client, card, max_concurrency=2)
+        experiment = await db_session.get(Experiment, body["id"])
+        experiment.status = ExperimentStatus.RUNNING.value
+        experiment.launched_at = datetime.utcnow()
+        for index in range(2):
+            db_session.add(
+                ExperimentRun(
+                    id=str(uuid4()), experiment_id=experiment.id,
+                    cell_index=index, variant_index=index, agent="mock",
+                    status=ExperimentRunStatus.PASSED.value,
+                    completed_at=datetime.utcnow(),
+                )
+            )
+        await db_session.commit()
+
+        detail = (await client.get(f"/api/experiments/{body['id']}")).json()
+        assert detail["status"] == "running"
+        assert detail["completed_at"] is None
+        assert detail["stalled"] is True, (
+            "a matrix with nothing left to do and no completed_at is a stall, "
+            "not a healthy running experiment"
+        )
+
+        svc._pump_locks.clear()
+        assert (
+            await client.post(f"/api/experiments/{body['id']}/resume")
+        ).status_code == 200
+        closed = (await client.get(f"/api/experiments/{body['id']}")).json()
+        assert closed["status"] == "complete"
+        assert closed["completed_at"] is not None
+        assert closed["stalled"] is False
 
     async def test_resume_on_a_terminal_experiment_is_a_409(
         self, client, card, db_session

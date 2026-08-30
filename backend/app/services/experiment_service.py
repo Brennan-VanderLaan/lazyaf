@@ -86,7 +86,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -140,6 +140,20 @@ ESTIMATE_HISTORY_LIMIT = 50
 
 _ZERO = Decimal("0")
 
+#: A cell in one of these still owes the matrix a result, so the experiment
+#: cannot be closed while one exists. DERIVED from the model's vocabularies
+#: rather than re-listed, so it cannot fork from them (R3). "Unfinished" and
+#: "live" are different questions and the pump asks both: a PENDING cell
+#: occupies no concurrency (it is not live) but the matrix is not finished
+#: while it exists.
+#: REQUESTED EDIT (models/experiment.py, not this phase's file): this belongs
+#: next to LIVE_CELL_STATUSES / TERMINAL_CELL_STATUSES as
+#: ``UNFINISHED_CELL_STATUSES``; it is defined here only because that module
+#: is out of this agent's ownership.
+UNFINISHED_CELL_STATUSES = (
+    frozenset({ExperimentRunStatus.PENDING.value}) | LIVE_CELL_STATUSES
+)
+
 # Per-experiment dispatch serialization. PROCESS-LOCAL by construction: the
 # pump is in-process, which is exactly why `stalled` is reported and `resume`
 # exists rather than this pretending to be durable.
@@ -151,6 +165,23 @@ _ZERO = Decimal("0")
 # user-created experiments, is a bounded and tiny cost; correctness is not.
 _pump_locks: dict[str, asyncio.Lock] = {}
 _repump: set[str] = set()
+
+#: The session the current lock holder is pumping on, for exactly one
+#: question: is a caller that found the lock held RE-ENTERING the holder's own
+#: stack? It is, when it arrives on the holder's session - that is the
+#: synchronous-completion path (``_dispatch_cell`` -> ``start_cell_run``
+#: completes the run inline -> ``on_cell_complete`` -> ``pump``). Such a caller
+#: must not emit SQL: the holder is mid-transaction on that very session, and
+#: a second statement there either commits the holder's half-done work or
+#: fails outright ("this session is in 'prepared' state"). It also does not
+#: need to - the holder reaches its own finalize on the way out of the call
+#: this caller is inside. Every OTHER session decides for itself; see ``pump``.
+#: REQUESTED EDIT (tdd/unit/services/experiment_rows.py, not this agent's
+#: file): `clean_pump_state` should clear `_pump_sessions` alongside
+#: `_pump_locks` / `_repump`. It is popped in `pump`'s `finally`, so it only
+#: survives a test that abandons a pump mid-flight - but the fixture exists
+#: precisely because process-global pump state must not cross tests.
+_pump_sessions: dict[str, AsyncSession] = {}
 
 
 # =============================================================================
@@ -692,15 +723,35 @@ async def pump(db: AsyncSession, experiment_id: str) -> int:
     and returns 0; the holder loops until the flag is clear. This is what
     stops a synchronously-failing dispatch from recursing through
     ``on_cell_complete`` back into ``pump``.
+
+    DISPATCH is delegated to the lock holder that way. FINALIZATION is not.
+    A swallowed caller on its own session runs its own ``_finalize_cas``
+    before returning, and a pump that dies runs one on the way out. Delegating
+    the CLOSE makes a completed cell's fate depend on another coroutine, on
+    another session, still being in a position to notice it - a holder that
+    raised, or that had already read the board, decides for a cell it never
+    saw and nobody decides again. That is the zero-winner stall: nothing
+    failed, nothing is in flight, and the matrix sits ``running`` forever. The
+    CAS costs one indexed UPDATE, cannot fire early (a cell is PENDING or
+    DISPATCHING or RUNNING right up until it is terminal - never briefly
+    invisible) and cannot fire twice, so the honest thing is for every
+    completion that CAN ask the database to ask it.
+
+    The one caller that cannot is the one re-entering on the holder's own
+    session - see ``_pump_sessions``. It is also the one that needs no help:
+    the holder finalizes on the way out of the call it is standing inside.
     """
     lock = _pump_locks.setdefault(experiment_id, asyncio.Lock())
     if lock.locked():
         _repump.add(experiment_id)
+        if _pump_sessions.get(experiment_id) is not db:
+            await _finalize_quietly(db, experiment_id)
         return 0
 
     dispatched = 0
     try:
         async with lock:
+            _pump_sessions[experiment_id] = db
             while True:
                 _repump.discard(experiment_id)
                 dispatched += await _pump_once(db, experiment_id)
@@ -712,8 +763,11 @@ async def pump(db: AsyncSession, experiment_id: str) -> int:
             "state and POST /api/experiments/{id}/resume can restart it",
             experiment_id[:8],
         )
+        # A pump that died still owes the matrix the close it was carrying.
+        await _finalize_quietly(db, experiment_id)
     finally:
         _repump.discard(experiment_id)
+        _pump_sessions.pop(experiment_id, None)
     return dispatched
 
 
@@ -728,7 +782,7 @@ async def _pump_once(db: AsyncSession, experiment_id: str) -> int:
         # completed_at and budget_overrun_usd — or an aborted matrix reads as
         # permanently in-flight.
         if experiment.completed_at is None:
-            await _maybe_finalize(db, experiment)
+            await _maybe_finalize(db, experiment.id)
         return 0
 
     dispatched = 0
@@ -754,7 +808,7 @@ async def _pump_once(db: AsyncSession, experiment_id: str) -> int:
         dispatched += 1
         await _dispatch_cell(db, experiment, pending.id)
 
-    await _maybe_finalize(db, experiment)
+    await _maybe_finalize(db, experiment.id)
     return dispatched
 
 
@@ -1022,49 +1076,145 @@ async def _exhaust_budget(
     )
 
 
-async def _maybe_finalize(db: AsyncSession, experiment: Experiment) -> None:
-    """Finalize when no cell is pending and none is live.
+async def _finalize_cas(db: AsyncSession, experiment_id: str) -> bool:
+    """Close the experiment, or lose the race. ONE statement, no read-then-decide.
 
-    Guarded on ``completed_at``, not on the status: an ABORTED experiment is
-    already 'terminal' by status while its running cells are still landing,
-    and it still needs closing exactly once.
+    This is the same compare-and-set the dispatcher claims a cell with
+    (``_claim``), applied to the other end of a cell's life. It has to be,
+    because cells complete on their OWN sessions - ``on_run_complete`` lands
+    each run from the session that ran it - so "count the unfinished cells in
+    Python, then decide" is a read-then-decide ACROSS SESSIONS. Two cells
+    landing together could each read a stale ``remaining >= 1`` and each
+    decline, and the matrix then sits ``running`` with ``completed_at NULL``
+    forever: nothing failed, nothing is in flight, and only a manual
+    ``POST /resume`` moves it. Zero winners is the failure mode, not two.
+
+    So the whole decision - "is there any unfinished cell left, has anyone
+    closed this already, and what does it close AS" - is evaluated by the
+    DATABASE inside a single ``UPDATE``:
+
+    - ``NOT EXISTS(unfinished cell)`` is the "am I the last one" test, read at
+      statement time rather than from a Python snapshot taken earlier;
+    - ``completed_at IS NULL`` is the exactly-once guard, so a second caller
+      that also sees a settled matrix updates zero rows;
+    - the final status is a ``CASE`` over the row's OWN pre-update status, so
+      an ``abort`` that lands between another caller's read and its write
+      cannot be overwritten with ``complete``.
+
+    ``rowcount == 1`` means THIS caller closed it. Every completion path calls
+    this after committing its own cell, which is what makes a winner certain:
+    the last commit is followed by a CAS that can see every commit before it.
+
+    ``budget_overrun_usd`` is deliberately NOT written here - see
+    ``_finalize_if_settled``.
     """
-    if experiment.completed_at is not None:
-        return
-    remaining = await _count_cells(
-        db,
-        experiment.id,
-        frozenset({ExperimentRunStatus.PENDING.value}) | LIVE_CELL_STATUSES,
+    unfinished = (
+        select(ExperimentRun.id)
+        .where(
+            ExperimentRun.experiment_id == experiment_id,
+            ExperimentRun.status.in_(tuple(UNFINISHED_CELL_STATUSES)),
+        )
+        .exists()
     )
-    if remaining:
-        await broadcast_experiment(db, experiment.id)
-        return
-
-    skipped = await _count_cells(
-        db, experiment.id, frozenset({ExperimentRunStatus.SKIPPED_BUDGET.value})
+    refused_for_budget = (
+        select(ExperimentRun.id)
+        .where(
+            ExperimentRun.experiment_id == experiment_id,
+            ExperimentRun.status == ExperimentRunStatus.SKIPPED_BUDGET.value,
+        )
+        .exists()
     )
-    if experiment.status == ExperimentStatus.ABORTED.value:
-        final = ExperimentStatus.ABORTED.value
-    elif skipped:
-        final = ExperimentStatus.BUDGET_EXHAUSTED.value
-    else:
-        final = ExperimentStatus.COMPLETE.value
+    result = await db.execute(
+        update(Experiment)
+        .where(
+            Experiment.id == experiment_id,
+            # Guarded on completed_at, not on the status: an ABORTED
+            # experiment is already 'terminal' by status while its running
+            # cells are still landing, and it still needs closing exactly once.
+            Experiment.completed_at.is_(None),
+            Experiment.status.in_(
+                (
+                    ExperimentStatus.RUNNING.value,
+                    ExperimentStatus.ABORTED.value,
+                )
+            ),
+            ~unfinished,
+        )
+        .values(
+            status=case(
+                (
+                    Experiment.status == ExperimentStatus.ABORTED.value,
+                    ExperimentStatus.ABORTED.value,
+                ),
+                (refused_for_budget, ExperimentStatus.BUDGET_EXHAUSTED.value),
+                else_=ExperimentStatus.COMPLETE.value,
+            ),
+            completed_at=datetime.utcnow(),
+        )
+        # The criteria are SQL the ORM cannot evaluate in Python (EXISTS, CASE),
+        # so the in-session copy is re-read by _finalize_if_settled instead.
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    return result.rowcount == 1
 
-    spend = metrics.observed_spend(await fetch_usage_rows(db, experiment.id))
+
+async def _finalize_if_settled(db: AsyncSession, experiment_id: str) -> bool:
+    """Try to close the matrix. ``True`` only for the caller that won.
+
+    The winner - and only the winner - then writes ``budget_overrun_usd``.
+    That number comes from ``metrics.observed_spend`` over the real
+    ``StepUsage`` rows (R3: there is no second cost formula, and none is going
+    into SQL), so it cannot ride inside the CAS statement. It does not have to:
+    a decision needs to be atomic, a recording does not, and exactly one caller
+    reaches this line. Computing it AFTER the last cell landed is also strictly
+    more accurate than the old pre-decision read.
+    """
+    if not await _finalize_cas(db, experiment_id):
+        return False
+
+    # populate_existing, not a plain get: the CAS wrote around the ORM, so a
+    # copy already in this session's identity map still says running/NULL, and
+    # somebody (abort's caller, the routers) reads the status back off the very
+    # object they handed us. One SELECT, and the in-session copy is true again.
+    experiment = await db.get(Experiment, experiment_id, populate_existing=True)
+    if experiment is None:  # deleted under us; the close still stands
+        return True
+
+    spend = metrics.observed_spend(await fetch_usage_rows(db, experiment_id))
     overrun = spend - Decimal(str(experiment.budget_usd))
-    experiment.status = final
-    experiment.completed_at = datetime.utcnow()
     experiment.budget_overrun_usd = overrun if overrun > 0 else _ZERO
     await db.commit()
     if experiment.budget_overrun_usd > 0:
         logger.warning(
             "Experiment %s finished $%s OVER its cap: the cap bounds dispatch, "
             "and %s cell(s) were already in flight when it tripped",
-            experiment.id[:8],
+            experiment_id[:8],
             money(experiment.budget_overrun_usd),
             experiment.max_concurrency,
         )
-    await broadcast_experiment(db, experiment.id)
+    await broadcast_experiment(db, experiment_id)
+    return True
+
+
+async def _maybe_finalize(db: AsyncSession, experiment_id: str) -> bool:
+    """Finalize if this caller is the last one out; broadcast progress if not."""
+    if await _finalize_if_settled(db, experiment_id):
+        return True
+    await broadcast_experiment(db, experiment_id)
+    return False
+
+
+async def _finalize_quietly(db: AsyncSession, experiment_id: str) -> None:
+    """The finalize attempt on a path that must never raise (see ``pump``)."""
+    try:
+        await _finalize_if_settled(db, experiment_id)
+    except Exception:
+        logger.exception(
+            "Experiment %s finalize check failed; the matrix is left open and "
+            "POST /api/experiments/{id}/resume closes it",
+            experiment_id[:8],
+        )
 
 
 # =============================================================================
@@ -1168,13 +1318,30 @@ async def abort(db: AsyncSession, experiment: Experiment) -> tuple[int, int]:
     await db.commit()
     still_running = await _count_cells(db, experiment.id, LIVE_CELL_STATUSES)
     if not still_running:
-        await _maybe_finalize(db, experiment)
+        await _maybe_finalize(db, experiment.id)
     await broadcast_experiment(db, experiment.id)
     return result.rowcount, still_running
 
 
 async def is_stalled(db: AsyncSession, experiment: Experiment) -> bool:
-    """Running, nothing live, work left: the pump died with a restart."""
+    """Running, nothing live, work left: the pump died with a restart.
+
+    TWO shapes, because there are two things the in-process pump owes a
+    matrix and a restart can drop either:
+
+    1. cells still ``pending`` with nothing running - dispatch died;
+    2. NOTHING unfinished at all and ``completed_at`` still NULL - the last
+       cell landed but the close never ran (a restart in the window between
+       the cell's commit and its ``_finalize_cas``).
+
+    (2) reads as a permanently in-flight experiment if it is not reported,
+    which is exactly the dark state R1 forbids: nothing is pending, so the
+    old test called it healthy, and the row sat ``running`` with a full grid
+    of finished cells. Both shapes are fixed by the same
+    ``POST /api/experiments/{id}/resume`` (and by the lifespan sweep, which
+    re-pumps every ``running`` experiment on boot regardless of this flag -
+    this is what a human or the UI sees in between).
+    """
     if experiment.status != ExperimentStatus.RUNNING.value:
         return False
     live = await _count_cells(db, experiment.id, LIVE_CELL_STATUSES)
@@ -1183,7 +1350,9 @@ async def is_stalled(db: AsyncSession, experiment: Experiment) -> bool:
     pending = await _count_cells(
         db, experiment.id, frozenset({ExperimentRunStatus.PENDING.value})
     )
-    return pending > 0
+    if pending:
+        return True
+    return experiment.completed_at is None
 
 
 async def resume(db: AsyncSession, experiment: Experiment) -> tuple[int, int]:

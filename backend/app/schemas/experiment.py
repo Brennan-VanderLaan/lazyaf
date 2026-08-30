@@ -14,7 +14,6 @@ Validation lives here (models store plain strings, the Card/spec idiom).
 Every refusal names the offending value: a 422 that says "invalid matrix" is
 a 422 nobody can act on.
 """
-from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -29,6 +28,9 @@ from app.models.experiment import (
     ExperimentRunStatus,
     ExperimentStatus,
 )
+from app.schemas._datetime import UTCDateTime
+from app.schemas._patch import not_null
+from app.schemas._strings import Body, Name
 from app.schemas.usage import money
 
 __all__ = [
@@ -233,8 +235,8 @@ class VerifySpec(BaseModel):
 # -----------------------------------------------------------------------------
 
 class ExperimentCreate(BaseModel):
-    name: str
-    description: str = ""
+    name: Name
+    description: Body = ""
     target_type: Literal["card", "user_story"]
     target_id: str
     # Required for a user_story target (a story spans repos; guessing one is
@@ -287,8 +289,8 @@ class ExperimentCreate(BaseModel):
 
 
 class ExperimentUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
+    name: Name | None = None
+    description: Body | None = None
     budget_usd: Decimal | None = None
     max_concurrency: int | None = None
     cell_timeout: int | None = None
@@ -315,6 +317,18 @@ class ExperimentUpdate(BaseModel):
             )
         return value
 
+    # experiments.verify is nullable (null clears the verify spec); every
+    # other column patched here is NOT NULL, so null is a 422, not a 500.
+    _reject_nulls = not_null(
+        "name",
+        "description",
+        "budget_usd",
+        "max_concurrency",
+        "cell_timeout",
+        "push_branches",
+        "matrix",
+    )
+
 
 class ExperimentRead(BaseModel):
     id: str
@@ -334,10 +348,10 @@ class ExperimentRead(BaseModel):
     estimate_basis: EstimateBasis | None = None
     budget_overrun_usd: str
     created_by: str | None = None
-    created_at: datetime
-    updated_at: datetime
-    launched_at: datetime | None = None
-    completed_at: datetime | None = None
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
+    launched_at: UTCDateTime | None = None
+    completed_at: UTCDateTime | None = None
 
     # Progress, computed from the cells (never a materialized column - R3).
     cells_total: int = 0
@@ -364,9 +378,9 @@ class ExperimentCellRead(BaseModel):
     pipeline_run_id: str | None = None
     status: ExperimentRunStatus
     error: str | None = None
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
-    created_at: datetime
+    started_at: UTCDateTime | None = None
+    completed_at: UTCDateTime | None = None
+    created_at: UTCDateTime
     # From StepUsage / TestRun — the sources of truth, joined per read.
     cost_usd: str | None = None
     cost_coverage: float | None = None

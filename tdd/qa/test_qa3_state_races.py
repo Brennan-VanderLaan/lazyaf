@@ -38,14 +38,7 @@ from qa3_support import (  # noqa: E402
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-6 (MAJOR): POST /api/cards/{id}/approve has no status "
-        "guard - a card in `todo` (never started, no branch, no work) is "
-        "moved straight to `done`. backend/app/routers/cards.py:406-465"
-    ),
-)
+# QA3-6 FIXED (12.7): approve requires 'in_review' and a branch.
 def test_approve_rejects_a_card_that_was_never_started():
     require_stack()
     repo_id = ensure_repo()
@@ -59,16 +52,8 @@ def test_approve_rejects_a_card_that_was_never_started():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-7 (MAJOR): approve and reject fired together on one "
-        "card are BOTH accepted - neither re-reads state under a lock and "
-        "neither refuses a conflicting transition, so the card is decided by "
-        "whichever request commits last. About 1 burst in 8 settles on `done` "
-        "with branch_name=None: shown as merged with nothing to have merged."
-    ),
-)
+# QA3-7 FIXED (12.7): both transitions are conditional UPDATEs, so the
+# loser is refused instead of overwriting the winner.
 def test_approve_and_reject_cannot_both_win_on_one_card():
     require_stack()
     repo_id = ensure_repo()
@@ -99,15 +84,9 @@ def test_approve_and_reject_cannot_both_win_on_one_card():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-8 (MAJOR): POST /api/cards/{id}/start racing DELETE "
-        "/api/cards/{id} raises StaleDataError ('UPDATE on cards expected to "
-        "update 1 row(s); 0 were matched') out of the handler as a bare 500. "
-        "Reproduced 8/8. backend/app/routers/cards.py:355 (the commit)."
-    ),
-)
+# QA3-8 FIXED (12.7): start no longer flushes an ORM UPDATE against a row
+# that may be gone (StaleDataError -> 500); the conditional UPDATE matches
+# zero rows and the handler answers 404.
 def test_start_racing_delete_does_not_500():
     require_stack()
     repo_id = ensure_repo()

@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from uuid import uuid4
 
-from sqlalchemy import String, DateTime, Text, ForeignKey, Integer, Boolean
+from sqlalchemy import String, DateTime, Index, Text, ForeignKey, Integer, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -124,6 +124,12 @@ class StepExecution(Base):
         execution_key = "{pipeline_run_id}:{step_index}:{attempt}"
     """
     __tablename__ = "step_executions"
+    __table_args__ = (
+        # The endpoint admission gate's only query (M14 s6.4): count the rows
+        # holding a slot on one endpoint. Composite because the gate always
+        # filters on both columns together.
+        Index("ix_step_executions_endpoint_status", "model_endpoint_id", "status"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     execution_key: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
@@ -134,6 +140,19 @@ class StepExecution(Base):
         String(50), default=StepExecutionStatus.PENDING.value, index=True
     )
     runner_id: Mapped[str | None] = mapped_column(String(36), nullable=True)  # Remote executor only
+    # Which self-hosted model endpoint this step holds a slot on (M14,
+    # cross-agent contract #9). Written by the admission gate's CAS and read
+    # back by it: the in-flight count is READ FROM THE DATABASE, never from an
+    # in-memory counter that a restart loses.
+    #
+    # Deliberately NOT a database-level ForeignKey, following the same
+    # reasoning as step_usages.pipeline_run_id and test_runs.experiment_run_id:
+    # SQLite cannot ALTER a constraint into place, so adding one would mean a
+    # batch REBUILD of step_executions - a table that two other tables' FKs
+    # point at. The DELETE handler in routers/model_endpoints.py nulls
+    # referencing rows explicitly, which is what actually happens on SQLite in
+    # any case (this app never enables PRAGMA foreign_keys).
+    model_endpoint_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # Requirements the step was dispatched with (JSON, 12.6). DURABLE on
     # purpose: a requeued step must be re-matchable after a backend restart,
     # so the `requires:` block cannot live only in the dispatch closure.

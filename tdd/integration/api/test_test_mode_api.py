@@ -96,11 +96,15 @@ class TestGating:
     """The router must not exist at all unless LAZYAF_TEST_MODE is set."""
 
     async def test_router_absent_from_main_app_when_flag_off(self, client):
-        """The suite runs without LAZYAF_TEST_MODE: no /api/test routes."""
+        """The suite runs without LAZYAF_TEST_MODE: no /api/test/* routes.
+
+        Prefix is '/api/test/' (trailing slash): the 12.2.6 test tie-back
+        surface (/api/test-refs/*) legitimately shares the shorter prefix
+        and is NOT gated by the flag."""
         from app.main import app as main_app
 
         test_paths = [
-            r.path for r in main_app.routes if r.path.startswith("/api/test")
+            r.path for r in main_app.routes if r.path.startswith("/api/test/")
         ]
         assert test_paths == []
 

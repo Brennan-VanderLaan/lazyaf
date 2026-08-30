@@ -6,10 +6,15 @@ Contract (pre-agreed interface #4):
     RoutingDecision has mode: "local" | "legacy" and reason: str.
 
 Rules:
-- script / docker steps -> local (LocalExecutor default-ON, R1)
+- script / docker steps -> local (LocalExecutor is their ONLY path since
+  Phase 12.4 deleted script/docker execution from the runners)
 - agent steps -> legacy (until Phase 12.5)
 - step_config["executor"] == "legacy" -> legacy with reason
-  "explicit-override", logged at WARNING (never silent)
+  "explicit-override", logged at WARNING (never silent) ... EXCEPT on a
+  script/docker step, where it raises ValueError naming the unsupported
+  combination (the requested path no longer exists)
+- a runner pin (runner_type / requires) on a script/docker step -> local
+  anyway, at WARNING (the pin is dropped, not honored, until 12.6)
 - unknown step types -> legacy, logged at WARNING with the type in the reason
 - any other executor override value -> ValueError (loud config error)
 
@@ -81,16 +86,16 @@ class TestDefaultRouting:
 # -----------------------------------------------------------------------------
 
 class TestExplicitOverride:
-    def test_explicit_legacy_override_routes_legacy(self, router):
+    def test_explicit_legacy_override_on_agent_routes_legacy(self, router):
         decision = router.decide(
-            "script", {"command": "pytest", "executor": "legacy"}
+            "agent", {"prompt": "do it", "executor": "legacy"}
         )
         assert decision.mode == "legacy"
         assert decision.reason == "explicit-override"
 
     def test_explicit_override_logged_at_warning(self, router, caplog):
         with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
-            router.decide("script", {"command": "pytest", "executor": "legacy"})
+            router.decide("agent", {"prompt": "do it", "executor": "legacy"})
 
         warnings = [
             r for r in caplog.records
@@ -99,13 +104,6 @@ class TestExplicitOverride:
         assert len(warnings) == 1
         assert "legacy" in warnings[0].getMessage().lower()
         assert "override" in warnings[0].getMessage().lower()
-
-    def test_override_on_agent_step_still_explicit_override_reason(self, router):
-        decision = router.decide(
-            "agent", {"prompt": "do it", "executor": "legacy"}
-        )
-        assert decision.mode == "legacy"
-        assert decision.reason == "explicit-override"
 
     def test_no_warning_for_default_routing(self, router, caplog):
         with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
@@ -126,23 +124,62 @@ class TestExplicitOverride:
 
 
 # -----------------------------------------------------------------------------
-# Contract: runner pins route legacy until 12.6 (fix 9)
+# Contract (12.4 fallout): `executor: legacy` on a script/docker step is a
+# DEAD path - the runners reject those step types now. The router refuses the
+# combination outright so the step fails at dispatch with a real message,
+# instead of being enqueued into a queue whose consumers will reject it
+# (the silent in_progress -> failed loop).
+# -----------------------------------------------------------------------------
+
+class TestLegacyOverrideOnDeletedPath:
+    @pytest.mark.parametrize("step_type", ["script", "docker"])
+    def test_legacy_override_on_script_or_docker_raises(self, router, step_type):
+        with pytest.raises(ValueError) as exc:
+            router.decide(
+                step_type,
+                {"command": "pytest", "image": "python:3.12", "executor": "legacy"},
+            )
+        message = str(exc.value)
+        # Names the unsupported COMBINATION, not just "bad config".
+        assert step_type in message
+        assert "legacy" in message
+        assert "12.4" in message
+
+    def test_legacy_override_raise_beats_pin(self, router):
+        """An explicit override is still evaluated first - it raises rather
+        than falling through to the pin's local routing."""
+        with pytest.raises(ValueError):
+            router.decide(
+                "script",
+                {"command": "x", "runner_type": "any", "executor": "legacy"},
+            )
+
+    def test_raise_happens_before_any_decision_is_returned(self, router):
+        """No RoutingDecision escapes for the unsupported combination."""
+        for step_type in ("script", "docker"):
+            with pytest.raises(ValueError):
+                router.decide(step_type, {"executor": "legacy"})
+
+
+# -----------------------------------------------------------------------------
+# Contract (12.4 fallout): runner pins on script/docker route LOCAL anyway.
 #
-# Restores the failure-era contract (git show HEAD:.../test_execution_router.py
-# had runner_type/requires routing to a runner-aware path): a step carrying a
-# runner pin must NOT lose it by running locally. Until RemoteExecutor (12.6)
-# honors pins, they route LEGACY - loudly.
+# Before 12.4 a pin routed LEGACY so the runner queue could honor it. The
+# runners no longer execute script/docker steps at all, so legacy would mean
+# "never runs". The work matters more than the pin: route local, and WARN
+# loudly that the pin is being dropped (not honored) until RemoteExecutor
+# arrives at 12.6.
 # -----------------------------------------------------------------------------
 
 class TestRunnerPins:
-    def test_script_with_runner_type_pins_legacy(self, router):
+    def test_script_with_runner_type_routes_local(self, router):
         decision = router.decide(
             "script", {"command": "flash firmware.bin", "runner_type": "claude-code"}
         )
-        assert decision.mode == "legacy"
-        assert decision.reason == "pinned-runner-legacy-until-12.6"
+        assert decision.mode == "local"
+        assert decision.reason == "pin-not-honorable-local-until-12.6"
 
-    def test_docker_with_requires_pins_legacy(self, router):
+    def test_docker_with_requires_routes_local(self, router):
         decision = router.decide(
             "docker",
             {
@@ -151,10 +188,10 @@ class TestRunnerPins:
                 "requires": {"hardware": ["gpio", "uart"]},
             },
         )
-        assert decision.mode == "legacy"
-        assert decision.reason == "pinned-runner-legacy-until-12.6"
+        assert decision.mode == "local"
+        assert decision.reason == "pin-not-honorable-local-until-12.6"
 
-    def test_pin_logged_at_warning(self, router, caplog):
+    def test_pin_logged_at_warning_naming_pin_and_phase(self, router, caplog):
         with caplog.at_level(logging.WARNING, logger=ROUTER_LOGGER):
             router.decide("script", {"command": "x", "runner_type": "gemini"})
         warnings = [r for r in caplog.records if r.name == ROUTER_LOGGER]
@@ -162,6 +199,8 @@ class TestRunnerPins:
         message = warnings[0].getMessage()
         assert "runner_type" in message
         assert "12.6" in message
+        # The pin is DROPPED, and the log says so - never a silent strip.
+        assert "LOCAL" in message
 
     def test_agent_step_keeps_agent_reason_over_pin(self, router):
         """Agent steps are legacy for their own (12.5) reason; a runner_type
@@ -172,17 +211,27 @@ class TestRunnerPins:
         assert decision.mode == "legacy"
         assert decision.reason == "agent-steps-legacy-until-12.5"
 
-    def test_explicit_override_wins_over_pin(self, router):
-        decision = router.decide(
-            "script",
-            {"command": "x", "runner_type": "any", "executor": "legacy"},
-        )
-        assert decision.mode == "legacy"
-        assert decision.reason == "explicit-override"
-
     def test_unpinned_script_still_local(self, router):
         decision = router.decide("script", {"command": "pytest"})
         assert decision.mode == "local"
+        assert decision.reason == "script-default-local"
+
+    def test_no_script_or_docker_config_can_route_legacy(self, router):
+        """Property: the router NEVER hands a script/docker step to the
+        legacy queue, whatever the config carries (it either routes local or
+        raises)."""
+        configs = [
+            {},
+            {"command": "pytest"},
+            {"runner_type": "claude-code"},
+            {"requires": {"hardware": ["gpio"]}},
+            {"runner_type": "any", "requires": {"gpu": True}},
+            {"image": "python:3.12", "env": {"A": "b"}},
+        ]
+        for step_type in ("script", "docker"):
+            for config in configs:
+                decision = router.decide(step_type, config)
+                assert decision.mode == "local", (step_type, config)
 
 
 # -----------------------------------------------------------------------------

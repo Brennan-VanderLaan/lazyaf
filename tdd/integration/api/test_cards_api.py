@@ -425,3 +425,124 @@ class TestCardLifecycleActions:
         """Returns 404 when retrying non-existent card."""
         response = await client.post("/api/cards/nonexistent/retry")
         assert_not_found(response, "Card")
+
+
+class TestScriptDockerCardsRejected:
+    """12.4 fallout: script/docker cards have no execution path.
+
+    Phase 12.4 deleted script/docker execution from every runner entrypoint,
+    and cards run ONLY on the runner queue (LocalExecutor is driven per
+    PipelineRun/StepRun, which a card does not have). Starting one used to
+    enqueue a job that a runner picked up and instantly rejected - the card
+    flipped in_progress and then failed with a message about a routing bug.
+
+    The contract now: reject at the API with a 400 that names the reason, and
+    leave the card exactly where it was.
+    """
+
+    @pytest.mark.parametrize(
+        "step_type,step_config",
+        [
+            ("script", {"command": "pytest -q"}),
+            ("docker", {"image": "python:3.12", "command": "pytest -q"}),
+        ],
+    )
+    async def test_start_rejects_script_and_docker_cards(
+        self, client, ingested_repo, clean_job_queue, step_type, step_config
+    ):
+        payload = card_create_payload(title=f"A {step_type} card")
+        payload["step_type"] = step_type
+        payload["step_config"] = step_config
+        card_id = (
+            await client.post(
+                f"/api/repos/{ingested_repo['id']}/cards", json=payload
+            )
+        ).json()["id"]
+
+        response = await client.post(f"/api/cards/{card_id}/start")
+
+        assert_status_code(response, 400)
+        detail = response.json()["detail"]
+        assert step_type in detail
+        assert "12.4" in detail
+        # Points at the supported alternative rather than just saying "no".
+        assert "pipeline" in detail.lower()
+
+    @pytest.mark.parametrize("step_type", ["script", "docker"])
+    async def test_rejected_card_stays_in_todo(
+        self, client, ingested_repo, clean_job_queue, step_type
+    ):
+        """No silent in_progress -> failed loop: the card never moves."""
+        payload = card_create_payload(title=f"Untouched {step_type} card")
+        payload["step_type"] = step_type
+        payload["step_config"] = {"command": "echo hi", "image": "alpine:3"}
+        card_id = (
+            await client.post(
+                f"/api/repos/{ingested_repo['id']}/cards", json=payload
+            )
+        ).json()["id"]
+
+        await client.post(f"/api/cards/{card_id}/start")
+
+        card = (await client.get(f"/api/cards/{card_id}")).json()
+        assert card["status"] == "todo"
+        assert card["job_id"] is None
+        assert card["branch_name"] is None
+
+    @pytest.mark.parametrize("step_type", ["script", "docker"])
+    async def test_retry_rejects_script_and_docker_cards(
+        self, client, ingested_repo, clean_job_queue, step_type
+    ):
+        """Retry closes the same loop - a failed script card cannot be
+        re-enqueued into the same rejection."""
+        payload = card_create_payload(title=f"Failed {step_type} card")
+        payload["step_type"] = step_type
+        payload["step_config"] = {"command": "echo hi", "image": "alpine:3"}
+        card_id = (
+            await client.post(
+                f"/api/repos/{ingested_repo['id']}/cards", json=payload
+            )
+        ).json()["id"]
+        await client.patch(f"/api/cards/{card_id}", json={"status": "failed"})
+
+        response = await client.post(f"/api/cards/{card_id}/retry")
+
+        assert_status_code(response, 400)
+        assert step_type in response.json()["detail"]
+
+        card = (await client.get(f"/api/cards/{card_id}")).json()
+        assert card["status"] == "failed"
+
+    async def test_agent_cards_still_start(
+        self, client, ingested_repo, clean_job_queue
+    ):
+        """The guard is narrow: agent cards are unaffected."""
+        payload = card_create_payload(title="An agent card")
+        payload["step_type"] = "agent"
+        card_id = (
+            await client.post(
+                f"/api/repos/{ingested_repo['id']}/cards", json=payload
+            )
+        ).json()["id"]
+
+        response = await client.post(f"/api/cards/{card_id}/start")
+
+        assert_status_code(response, 200)
+        assert response.json()["status"] == "in_progress"
+
+    @pytest.mark.parametrize("step_type", ["script", "docker"])
+    async def test_script_docker_cards_are_still_creatable(
+        self, client, repo, step_type
+    ):
+        """Deprecated, not removed: existing cards keep round-tripping so a
+        user can read them and convert them - only STARTING is refused."""
+        payload = card_create_payload(title=f"Legacy {step_type} card")
+        payload["step_type"] = step_type
+        payload["step_config"] = {"command": "make test", "image": "alpine:3"}
+
+        response = await client.post(
+            f"/api/repos/{repo['id']}/cards", json=payload
+        )
+
+        assert_status_code(response, 201)
+        assert response.json()["step_type"] == step_type

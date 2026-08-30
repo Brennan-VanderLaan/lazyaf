@@ -198,6 +198,7 @@ def script_step(name: str, command: str, **extra) -> dict:
 # -----------------------------------------------------------------------------
 
 class TestTwoStepSharedWorkspace:
+    @pytest.mark.lazyaf_test_id("us1.steps-run-in-isolated-containers")
     async def test_two_step_pipeline_shares_volume_and_home(self, env):
         """Step 1 writes under /workspace/repo and $HOME; step 2 reads both
         back - proving one NAMED volume (and HOME persistence) spans the
@@ -241,6 +242,7 @@ class TestTwoStepSharedWorkspace:
 
 
 class TestLocalFailureCleanup:
+    @pytest.mark.lazyaf_test_id("us1.pipeline-outcome-gates-branch")
     async def test_failing_step_fails_run_and_cleans_workspace(self, env):
         repo, pipeline = await make_repo_and_pipeline(env.factory, [
             script_step("Boom", "echo about-to-fail && exit 7"),

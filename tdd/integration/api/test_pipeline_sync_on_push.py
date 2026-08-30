@@ -451,6 +451,7 @@ class TestSyncShortCircuit:
 class TestPushTriggerDedup:
     """(d) Two rapid identical push events -> exactly one PipelineRun."""
 
+    @pytest.mark.lazyaf_test_id("us1.push-triggered-run-executes-steps")
     async def test_duplicate_push_events_produce_one_run(
         self, client, clean_git_repos, pushed_ci_repo, db_session
     ):

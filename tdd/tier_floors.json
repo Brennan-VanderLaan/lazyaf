@@ -1,15 +1,15 @@
 {
   "T1": {
-    "floor": 1421,
-    "measured": 1450,
+    "floor": 1623,
+    "measured": 1657,
     "measured_on": "2026-08-29",
-    "note": "unit + demos + non-Docker integration (integration/services subtree excluded - it is Docker-real and runs in T2); floor = measured minus ~2% slack. Raised for 12.3 (control-runtime unit suites, steps-router bridge tests, dispatch tests). Raise when suites grow (ratchet up, never down without a PLAN.md note)."
+    "note": "unit + demos + non-Docker integration (integration/services subtree excluded - it is Docker-real and runs in T2); floor = measured minus ~2% slack. Raised for 12.3, then 12.2.6 (test tie-back: testref models, ingestion API, reconcile/history, control-runtime results pickup). Re-measured at the end of the 12.2.6/12.4 wave: the previous 1523 was taken mid-wave, before the tie-back suites (test-refs list API, blocks-done activation, manifest contract, CLI reconcile) and the 12.4 routing tests had all landed. Raise when suites grow (ratchet up, never down without a PLAN.md note)."
   },
   "T2": {
-    "floor": 54,
-    "measured": 56,
+    "floor": 58,
+    "measured": 60,
     "measured_on": "2026-08-29",
-    "note": "Docker-dependent integration (tdd/integration/services: executor + 12.2-INT workspace lifecycle/local pipeline/WS round-trip suites + 12.3 HOME-persistence + base-image contracts on lazyaf-base:dev). Docker down fails loudly in the shared docker_client fixture (tdd/integration/conftest.py). Step images are a PREFLIGHT: run_tier.py T2 runs `build_images.py --check` before pytest and exits loudly with the rebuild command, so the '12.3-images:' skip reason is gone from skip_baseline.json and image-dependent tests always execute under the gate - the floor counts them. Verifier re-measures after the 12.3 wiring wave."
+    "note": "Docker-dependent integration (tdd/integration/services: executor + 12.2-INT workspace lifecycle/local pipeline/WS round-trip suites + 12.3 HOME-persistence + base-image contracts on lazyaf-base:dev). Docker down fails loudly in the shared docker_client fixture (tdd/integration/conftest.py). Step images are a PREFLIGHT: run_tier.py T2 runs `build_images.py --check` before pytest and exits loudly with the rebuild command, so the '12.3-images:' skip reason is gone from skip_baseline.json and image-dependent tests always execute under the gate - the floor counts them. Re-measured after the 12.2.6/12.4 wave (base-image contract suite grew with the LAZYAF_TEST_RESULTS_PATH runtime contracts)."
   },
   "T3": {
     "floor": 16,

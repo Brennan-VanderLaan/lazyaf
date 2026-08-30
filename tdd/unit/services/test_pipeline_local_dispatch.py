@@ -50,7 +50,14 @@ class Decision:
 
 class ContractRouter:
     """Implements the contracted routing rules: script/docker -> local,
-    agent -> legacy, explicit executor=legacy override -> legacy."""
+    agent -> legacy, explicit executor=legacy override -> legacy.
+
+    12.4 fallout: `executor: legacy` on a script/docker step RAISES, exactly
+    as the real ExecutionRouter does. Phase 12.4 deleted script/docker
+    execution from the runners, so honoring that override would enqueue a
+    job guaranteed to be rejected on pickup. Mirrored here so this fake
+    cannot drift into contradicting the router it stands in for.
+    """
 
     def __init__(self):
         self.calls: list[tuple[str, dict]] = []
@@ -58,6 +65,12 @@ class ContractRouter:
     def decide(self, step_type: str, step_config: dict) -> Decision:
         self.calls.append((step_type, dict(step_config or {})))
         if (step_config or {}).get("executor") == "legacy":
+            if step_type in ("script", "docker"):
+                raise ValueError(
+                    f"Unsupported combination: step_type={step_type!r} with "
+                    "executor='legacy' (the legacy path for script/docker was "
+                    "removed in Phase 12.4)"
+                )
             return Decision("legacy", "explicit-override")
         if step_type in ("script", "docker"):
             return Decision("local", f"{step_type}-runs-local")
@@ -360,14 +373,20 @@ class TestRoutingDispatch:
         # Local executor never touched
         assert env.local.calls == []
 
-    async def test_explicit_legacy_override_logged_at_warning(
+    async def test_explicit_legacy_override_on_agent_step_logged_at_warning(
         self, env, enqueue_spy, caplog
     ):
+        """`executor: legacy` on an AGENT step is still honored, loudly.
+
+        Agent steps run on the runner queue until Phase 12.5, so the override
+        names a path that exists. It stays a WARNING - an override is never
+        silent (R1).
+        """
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(
             env.factory,
             repo,
-            [{"name": "S", "type": "script", "config": {"command": "echo x", "executor": "legacy"}}],
+            [{"name": "A", "type": "agent", "config": {"title": "Do it", "executor": "legacy"}}],
         )
 
         with caplog.at_level(logging.WARNING, logger="app.services.pipeline_executor"):
@@ -376,6 +395,38 @@ class TestRoutingDispatch:
         assert run.step_runs[0].executor == "legacy"
         assert len(enqueue_spy.calls) == 1
         assert any("explicit-override" in r.message for r in caplog.records)
+
+    async def test_explicit_legacy_override_on_script_step_fails_loudly(
+        self, env, enqueue_spy
+    ):
+        """`executor: legacy` on a SCRIPT step fails the step at dispatch.
+
+        Updated for Phase 12.4: this used to assert the override routed the
+        step legacy and enqueued it. Runners now REJECT script/docker jobs,
+        so honoring the override would enqueue a job guaranteed to be failed
+        on pickup - the silent in_progress -> failed loop. The router raises
+        instead, and the dispatch error path fails the step with a message
+        naming the unsupported combination. Nothing is enqueued and nothing
+        runs locally: no silent fallback in EITHER direction.
+        """
+        repo = await make_repo(env.factory)
+        pipeline = await make_linear_pipeline(
+            env.factory,
+            repo,
+            [{"name": "S", "type": "script", "config": {"command": "echo x", "executor": "legacy"}}],
+        )
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.FAILED.value
+        step = run.step_runs[0]
+        assert step.status == RunStatus.FAILED.value
+        assert "execution routing failed" in step.error
+        assert "executor='legacy'" in step.error
+        assert step.executor is None
+        assert enqueue_spy.calls == []
+        assert env.local.calls == []
+        assert await fetch_all(env, Job) == []
 
     async def test_routing_failure_fails_step_and_run_loudly(self, env, enqueue_spy):
         env.executor._router = ExplodingRouter()
@@ -1200,16 +1251,46 @@ class TestT1DockerGuard:
         with pytest.raises(AssertionError, match="local_exec"):
             docker_sdk.DockerClient(base_url="tcp://nowhere:1")
 
-    def test_global_executor_routes_legacy_by_default(self):
-        """The conftest legacy-default router is installed on the GLOBAL
-        executor for every test without the local_exec marker."""
+    def test_global_executor_keeps_production_routing(self):
+        """The GLOBAL executor routes with the REAL ExecutionRouter in T1.
+
+        Updated for Phase 12.4: the conftest used to force every step legacy
+        here. That now encodes an impossible production state - the runners
+        REJECT script/docker jobs, so a legacy-routed script step is a
+        routing bug, and the executor's enqueue guard raises on one. T1 stays
+        Docker-free by stubbing the executor's COLLABORATORS (LocalExecutor,
+        WorkspaceService), not by rewriting its routing decision, so what
+        API-tier tests exercise is the production route.
+        """
         from app.services.pipeline_executor import pipeline_executor
 
         decision = pipeline_executor._get_router().decide(
             "script", {"command": "echo hi"}
         )
-        assert decision.mode == ExecutorMode.LEGACY.value
-        assert decision.reason == "t1-conftest-legacy-default"
+        assert decision.mode == ExecutorMode.LOCAL.value
+        assert decision.reason == "script-default-local"
+
+        # Agent steps still route legacy until 12.5 - unchanged.
+        agent = pipeline_executor._get_router().decide("agent", {"title": "x"})
+        assert agent.mode == ExecutorMode.LEGACY.value
+
+    async def test_global_local_path_is_docker_free_in_t1(self):
+        """The stubbed collaborators - not a rerouted decision - are what
+        keep T1 off Docker: exercising the local path must not construct a
+        docker client (which the guard above would turn into an
+        AssertionError)."""
+        from app.services.pipeline_executor import pipeline_executor
+
+        executor = await pipeline_executor._get_local_executor()
+        assert type(executor).__name__ == "_T1StubLocalExecutor"
+
+        events = [
+            event
+            async for event in executor.execute_step({"command": "echo hi"}, {})
+        ]
+        assert events[-1] == {
+            "type": "result", "status": "completed", "exit_code": 0,
+        }
 
 
 # -----------------------------------------------------------------------------

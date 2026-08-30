@@ -22,6 +22,7 @@ Usage:
     python3 scripts/run_tier.py T1 [T2 T3 ...] [-- extra pytest args]
 """
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,29 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
 CI_GATE = REPO_ROOT / "scripts" / "ci_gate.py"
+
+# 12.2.6 test tie-back: every tier loads the manifest plugin explicitly
+# (`-p runner_common.pytest_lazyaf` — DECISION: no pytest11 entry point, see
+# runner-common/pyproject.toml). The backend uv env does NOT install
+# runner-common, so the package rides in via PYTHONPATH from the checkout
+# (uv run passes the environment through). The plugin is a pure no-op unless
+# LAZYAF_TEST_RESULTS_PATH is set — the control runtime injects it per-step,
+# so tier steps in a dogfood run emit manifests while host/local runs stay
+# byte-identical green. Marker registration for plugin-less invocations
+# (plain `uv run pytest ../tdd`) lives in tdd/conftest.py.
+RUNNER_COMMON_DIR = REPO_ROOT / "runner-common"
+
+
+def _tier_env() -> dict:
+    """Environment for the tier pytest subprocess: runner-common importable."""
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{RUNNER_COMMON_DIR}{os.pathsep}{existing}"
+        if existing
+        else str(RUNNER_COMMON_DIR)
+    )
+    return env
 
 # Tier definitions. pytest paths are relative to backend/ (the cwd every
 # selection runs from, matching `cd backend && uv run pytest ...`).
@@ -99,13 +123,17 @@ def run_tier(tier: str, extra_pytest_args: list[str]) -> int:
         "run",
         "pytest",
         *spec["pytest_args"],
+        # 12.2.6 manifest plugin (no-op without LAZYAF_TEST_RESULTS_PATH);
+        # importable via the PYTHONPATH set in _tier_env().
+        "-p",
+        "runner_common.pytest_lazyaf",
         "-rs",
         f"--junitxml={junit_path}",
         *extra_pytest_args,
     ]
     print(f"[run_tier] {tier}: {spec['name']}")
     print(f"[run_tier] {tier}: {' '.join(pytest_cmd)} (cwd={BACKEND_DIR})")
-    rc = subprocess.run(pytest_cmd, cwd=BACKEND_DIR).returncode
+    rc = subprocess.run(pytest_cmd, cwd=BACKEND_DIR, env=_tier_env()).returncode
     if rc != 0:
         # Red pytest stays red - the gate never launders a failing tier.
         print(f"[run_tier] {tier}: pytest failed (rc={rc})", file=sys.stderr)

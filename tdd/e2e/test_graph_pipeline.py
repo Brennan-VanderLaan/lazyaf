@@ -787,6 +787,7 @@ class TestGraphPipelineExecutionVisualization:
     - Completed edges are highlighted
     """
 
+    @pytest.mark.lazyaf_test_id("us1.step-status-streams-to-ui")
     async def test_pipeline_run_includes_step_status_per_node(self, api_client, test_repo):
         """Pipeline run response includes status for each graph node."""
         graph_data = {

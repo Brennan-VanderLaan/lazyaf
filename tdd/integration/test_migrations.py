@@ -24,6 +24,7 @@ import pytest
 import pytest_asyncio
 from alembic import command
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import app.models  # noqa: F401  (register all tables on Base.metadata)
@@ -31,7 +32,7 @@ from app.database import ALEMBIC_BASELINE_REVISION, Base, _alembic_config, _run_
 
 # Tip of the migration chain. Every startup path (fresh upgrade, legacy
 # adoption stamp-then-upgrade) must end here.
-ALEMBIC_HEAD_REVISION = "0003"
+ALEMBIC_HEAD_REVISION = "0004"
 
 EXPECTED_TABLES = {
     "repos",
@@ -50,9 +51,14 @@ EXPECTED_TABLES = {
     "user_stories",
     "acceptance_criteria",
     "prompt_templates",
+    # 0004 (Phase 12.2.6 test tie-back)
+    "test_refs",
+    "test_runs",
 }
 
 SPEC_TABLES = {"features", "user_stories", "acceptance_criteria", "prompt_templates"}
+
+TEST_TIEBACK_TABLES = {"test_refs", "test_runs"}
 
 
 @pytest_asyncio.fixture
@@ -377,9 +383,26 @@ class TestIdempotency:
 class TestRoundTrip:
     """upgrade -> downgrade -> upgrade coverage for revisions 0002 and 0003."""
 
+    async def test_downgrade_to_0003_removes_test_tieback_only(self, engine_factory):
+        """0004's downgrade drops test_refs/test_runs and nothing else: the
+        spec tables, workspaces and step_runs.executor all stay."""
+        engine = engine_factory("rt_0003.db")
+        await _migrate(engine)
+
+        await _downgrade_to(engine, "0003")
+
+        snapshot = await _snapshot(engine)
+        assert TEST_TIEBACK_TABLES.isdisjoint(set(snapshot))
+        assert SPEC_TABLES <= set(snapshot)
+        assert "workspaces" in snapshot
+        assert "executor" in snapshot["step_runs"]["columns"]
+        assert await _alembic_versions(engine) == ["0003"]
+
     async def test_downgrade_to_0002_removes_spec_layer_only(self, engine_factory):
         """0003's downgrade drops the spec tables and the cards link columns,
-        leaving 0002's objects (workspaces, step_runs.executor) intact."""
+        leaving 0002's objects (workspaces, step_runs.executor) intact.
+        (0004's downgrade runs first on the way down, dropping the test
+        tie-back tables.)"""
         engine = engine_factory("rt_0002.db")
         await _migrate(engine)
 
@@ -387,6 +410,7 @@ class TestRoundTrip:
 
         snapshot = await _snapshot(engine)
         assert SPEC_TABLES.isdisjoint(set(snapshot))
+        assert TEST_TIEBACK_TABLES.isdisjoint(set(snapshot))
         assert "feature_id" not in snapshot["cards"]["columns"]
         assert "user_story_id" not in snapshot["cards"]["columns"]
         assert "workspaces" in snapshot
@@ -482,6 +506,133 @@ class TestRoundTrip:
             assert result.one() == ("keepme", None, None)
             result = await conn.execute(text("SELECT executor FROM step_runs WHERE id = 'sr1'"))
             assert result.scalar_one() is None
+
+    async def test_0004_roundtrip_drops_and_recreates_test_tieback(self, engine_factory):
+        """head -> 0003 -> head: test_refs/test_runs rows are gone by design
+        (whole-table drop), the tables come back empty, and rows in the
+        surviving spec tables are untouched."""
+        engine = engine_factory("rt_0004.db")
+        await _migrate(engine)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO repos (id, name, default_branch, is_ingested, created_at) "
+                    "VALUES ('r1', 'repo', 'main', 0, '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO features (id, title, description, status, repo_ids, created_at, updated_at) "
+                    "VALUES ('f1', 'feat', '', 'draft', '[]', '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO user_stories (id, feature_id, title, narrative, status, created_at, updated_at) "
+                    "VALUES ('us1', 'f1', 'story', '', 'accepted', '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO acceptance_criteria (id, user_story_id, text, required, created_at, updated_at) "
+                    "VALUES ('ac1', 'us1', 'crit', 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO test_refs (id, lazyaf_test_id, repo_id, criterion_id, status, created_at, updated_at) "
+                    "VALUES ('tr1', 'suite.case', 'r1', 'ac1', 'active', '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO test_runs (id, test_ref_id, pipeline_run_id, commit_sha, status, created_at) "
+                    "VALUES ('run1', 'tr1', 'pr1', 'abc123', 'passed', '2026-01-01 00:00:00')"
+                )
+            )
+        head = await _snapshot(engine)
+
+        await _downgrade_to(engine, "0003")
+        await _upgrade_to(engine, "head")
+
+        assert await _snapshot(engine) == head
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT COUNT(*) FROM test_refs"))
+            assert result.scalar_one() == 0
+            result = await conn.execute(text("SELECT COUNT(*) FROM test_runs"))
+            assert result.scalar_one() == 0
+            result = await conn.execute(text("SELECT text FROM acceptance_criteria WHERE id = 'ac1'"))
+            assert result.scalar_one() == "crit"
+
+
+class TestTieBackSchemaShape:
+    """0004's test tie-back objects, pinned (contract #1 identity + the
+    index set the hot paths actually use)."""
+
+    async def test_test_ref_identity_is_repo_id_plus_lazyaf_test_id(
+        self, engine_factory
+    ):
+        """The same marker string under two repos is two independent refs;
+        the same string twice under ONE repo is a constraint violation."""
+        engine = engine_factory("tieback_identity.db")
+        await _migrate(engine)
+
+        async with engine.begin() as conn:
+            for repo_id in ("r1", "r2"):
+                await conn.execute(
+                    text(
+                        "INSERT INTO repos (id, name, default_branch, is_ingested, created_at) "
+                        f"VALUES ('{repo_id}', '{repo_id}', 'main', 0, '2026-01-01 00:00:00')"
+                    )
+                )
+            # same lazyaf_test_id, different repos -> both accepted
+            for ref_id, repo_id in (("ref1", "r1"), ("ref2", "r2")):
+                await conn.execute(
+                    text(
+                        "INSERT INTO test_refs (id, lazyaf_test_id, repo_id, status, created_at, updated_at) "
+                        f"VALUES ('{ref_id}', 'suite.case', '{repo_id}', 'active', "
+                        "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                    )
+                )
+
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT COUNT(*) FROM test_refs WHERE lazyaf_test_id = 'suite.case'")
+            )
+            assert result.scalar_one() == 2
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO test_refs (id, lazyaf_test_id, repo_id, status, created_at, updated_at) "
+                        "VALUES ('ref3', 'suite.case', 'r1', 'active', "
+                        "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                    )
+                )
+
+    async def test_tieback_indexes_are_exactly_the_access_paths(self, engine_factory):
+        """Every index earns its write cost: the repo-scoped identity, the
+        criterion join, the (test_ref_id, created_at) history/freshness walk
+        and the step_run_id idempotency lookup — nothing else."""
+        engine = engine_factory("tieback_indexes.db")
+        await _migrate(engine)
+
+        snapshot = await _snapshot(engine)
+        assert snapshot["test_refs"]["indexes"] == {
+            "ix_test_refs_criterion_id": (("criterion_id",), False),
+            "ix_test_refs_repo_id_lazyaf_test_id": (
+                ("repo_id", "lazyaf_test_id"),
+                True,
+            ),
+        }
+        assert snapshot["test_runs"]["indexes"] == {
+            "ix_test_runs_test_ref_id_created_at": (
+                ("test_ref_id", "created_at"),
+                False,
+            ),
+            "ix_test_runs_step_run_id": (("step_run_id",), False),
+        }
 
 
 class TestLoggingIsUntouched:

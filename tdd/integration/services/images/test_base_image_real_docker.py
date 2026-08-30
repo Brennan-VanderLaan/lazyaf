@@ -334,3 +334,177 @@ class TestControlModeRoundTrip:
         )
         assert code == 0, logs
         assert "CONSUMED" in logs
+
+    def test_test_results_manifest_roundtrip(
+        self, docker_client, named_volume, stub_backend
+    ):
+        """12.2.6 transport (contracts #2/#3) against the real image: the
+        runtime injects LAZYAF_TEST_RESULTS_PATH per-step, the step writes a
+        manifest there, and after exit the runtime POSTs it verbatim to
+        /api/steps/{id}/test-results and consumes the file."""
+        step_id = f"exec-{uuid4().hex[:8]}"
+        manifest = {
+            "version": 1,
+            "results": [
+                {
+                    "lazyaf_test_id": "integration.roundtrip",
+                    "status": "passed",
+                    "duration_ms": 7,
+                    "file_path": "tdd/fake/test_roundtrip.py",
+                }
+            ],
+        }
+        manifest_json = json.dumps(manifest)
+        config = {
+            "step_id": step_id,
+            "step_run_id": "sr-int-tr",
+            "execution_key": "run-int:1:sr-int-tr",
+            # Prove the injected env var points at the per-step path, then
+            # leave a manifest there like the pytest plugin would.
+            "command": (
+                'echo "MANIFEST_AT=$LAZYAF_TEST_RESULTS_PATH"\n'
+                f"printf '%s' '{manifest_json}' > \"$LAZYAF_TEST_RESULTS_PATH\""
+            ),
+            "backend_url": f"http://{advertise_addr()}:{stub_backend.port}",
+            "auth_token": "integration-token",
+            "environment": {},
+            "timeout_seconds": 60,
+            "working_directory": "/workspace/repo",
+        }
+
+        from app.config import get_settings
+        net_name = get_settings().container_network
+        try:
+            docker_client.networks.get(net_name)
+        except Exception:
+            docker_client.networks.create(net_name)
+        container = docker_client.containers.create(
+            BASE_IMAGE,
+            volumes={named_volume: {"bind": "/workspace", "mode": "rw"}},
+            environment={"LAZYAF_CONTROL": "1"},
+            network=net_name,
+        )
+        try:
+            assert container.put_archive("/workspace", _config_tar(config))
+            container.start()
+            result = container.wait(timeout=90)
+            logs = container.logs().decode("utf-8", errors="replace")
+        finally:
+            container.remove(force=True)
+
+        assert result.get("StatusCode") == 0, logs
+        # Contract #2: per-step path under /workspace/.control
+        assert (
+            f"MANIFEST_AT=/workspace/.control/test_results.{step_id}.json" in logs
+        ), logs
+
+        # Contract #3: the manifest arrived VERBATIM as its own POST
+        tr_posts = [
+            p for path, p in stub_backend.posts
+            if path == f"/api/steps/{step_id}/test-results"
+        ]
+        assert tr_posts == [manifest], (
+            f"test-results posts: {tr_posts}; all paths: {stub_backend.paths()}"
+        )
+
+        # Delivery failure never fails the step - and here delivery worked,
+        # so the terminal status is a clean completed with no error attached.
+        status_posts = [
+            p for path, p in stub_backend.posts
+            if path == f"/api/steps/{step_id}/status"
+        ]
+        assert status_posts[-1]["status"] == "completed"
+        assert "error" not in status_posts[-1], status_posts[-1]
+
+        # Consume-once: neither the config nor the manifest survived the step
+        code, logs = _run_in_volume(
+            docker_client,
+            named_volume,
+            ["bash", "-c",
+             f"test ! -f /workspace/.control/test_results.{step_id}.json "
+             "&& test ! -f /workspace/.control/step_config.json "
+             "&& echo BOTH-CONSUMED"],
+        )
+        assert code == 0, logs
+        assert "BOTH-CONSUMED" in logs
+
+    def test_malformed_manifest_never_costs_the_terminal_status(
+        self, docker_client, named_volume, stub_backend
+    ):
+        """12.2.6 hardening, real container: the manifest is written by the
+        STEP's own command, i.e. untrusted bytes. A malformed one used to
+        crash the runtime before it reported a terminal status, leaving the
+        StepExecution stuck in "running" until the reaper. Now: nothing is
+        POSTed to /test-results, the drop is LOUD in the terminal status
+        error, the step keeps its own exit code, and the file is consumed."""
+        step_id = f"exec-{uuid4().hex[:8]}"
+        # A bare list (not an object), plus a junk entry: the two shapes the
+        # crash report came in on.
+        garbage = json.dumps(
+            [{"lazyaf_test_id": "nope", "status": "exploded"}, "not-a-dict"]
+        )
+        config = {
+            "step_id": step_id,
+            "step_run_id": "sr-int-bad",
+            "execution_key": "run-int:2:sr-int-bad",
+            "command": (
+                f"printf '%s' '{garbage}' > \"$LAZYAF_TEST_RESULTS_PATH\"\n"
+                "echo step-still-ran"
+            ),
+            "backend_url": f"http://{advertise_addr()}:{stub_backend.port}",
+            "auth_token": "integration-token",
+            "environment": {},
+            "timeout_seconds": 60,
+            "working_directory": "/workspace/repo",
+        }
+
+        from app.config import get_settings
+        net_name = get_settings().container_network
+        try:
+            docker_client.networks.get(net_name)
+        except Exception:
+            docker_client.networks.create(net_name)
+        container = docker_client.containers.create(
+            BASE_IMAGE,
+            volumes={named_volume: {"bind": "/workspace", "mode": "rw"}},
+            environment={"LAZYAF_CONTROL": "1"},
+            network=net_name,
+        )
+        try:
+            assert container.put_archive("/workspace", _config_tar(config))
+            container.start()
+            result = container.wait(timeout=90)
+            logs = container.logs().decode("utf-8", errors="replace")
+        finally:
+            container.remove(force=True)
+
+        assert result.get("StatusCode") == 0, logs
+        assert "step-still-ran" in logs
+
+        # Nothing unusable reached the backend...
+        tr_posts = [
+            p for path, p in stub_backend.posts
+            if path == f"/api/steps/{step_id}/test-results"
+        ]
+        assert tr_posts == [], tr_posts
+
+        # ...but the terminal status DID arrive, carrying the loud warning.
+        status_posts = [
+            p for path, p in stub_backend.posts
+            if path == f"/api/steps/{step_id}/status"
+        ]
+        assert status_posts[-1]["status"] == "completed", status_posts
+        assert "test results manifest" in status_posts[-1].get("error", ""), (
+            status_posts[-1]
+        )
+
+        # Consume-once holds on the malformed path too.
+        code, vlogs = _run_in_volume(
+            docker_client,
+            named_volume,
+            ["bash", "-c",
+             f"test ! -f /workspace/.control/test_results.{step_id}.json "
+             "&& echo CONSUMED"],
+        )
+        assert code == 0, vlogs
+        assert "CONSUMED" in vlogs

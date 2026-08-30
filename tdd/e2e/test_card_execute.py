@@ -56,6 +56,7 @@ class TestCardCreateAndQueue:
         card = response.json()
         assert card["step_config"]["mock_config"] == config
 
+    @pytest.mark.lazyaf_test_id("us2.start-card-begins-implementation")
     async def test_start_card_queues_job(self, api_client, test_repo):
         """Starting a card queues a job for the mock runner."""
         # Create card
@@ -113,6 +114,7 @@ class TestCardExecuteWithMockRunner:
     """
 
     @pytest.mark.slow
+    @pytest.mark.lazyaf_test_id("us2.card-completion-reaches-review")
     async def test_card_reaches_in_review_status(
         self, api_client, test_repo, mock_config, websocket_client
     ):
@@ -192,6 +194,7 @@ class TestCardExecuteWithMockRunner:
         assert event["data"]["card_id"] == card["id"]
 
     @pytest.mark.slow
+    @pytest.mark.lazyaf_test_id("us2.review-shows-diff")
     async def test_diff_available_after_completion(
         self, api_client, test_repo, mock_config
     ):

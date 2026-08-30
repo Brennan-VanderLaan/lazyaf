@@ -331,11 +331,12 @@ class TestCriterionCrud:
         assert (await client.get(f"/api/criteria/{criterion['id']}")).status_code == 404
 
     async def test_criterion_can_have_no_tests(self, client, story):
-        """A criterion exists without TestRefs; the blocks-done rule is
-        stubbed in 12.2.5, so the story can still reach 'done'."""
+        """A non-required criterion exists without TestRefs; since 12.2.6
+        activated the blocks-done rule only REQUIRED criteria block, so the
+        story can still reach 'done'."""
         await client.post(
             f"/api/user-stories/{story['id']}/criteria",
-            json={"text": "Required but unverified", "required": True},
+            json={"text": "Nice-to-have, unverified", "required": False},
         )
         response = await client.patch(
             f"/api/user-stories/{story['id']}",
@@ -344,18 +345,12 @@ class TestCriterionCrud:
         assert_status_code(response, 200)
         assert response.json()["status"] == "done"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Required-criterion-blocks-done ships STUBBED in 12.2.5; "
-            "Phase 12.2.6 joins TestRuns to criteria and activates the rule "
-            "(story with a required criterion lacking a passing TestRun must "
-            "get 409 on PATCH status=done)."
-        ),
-    )
     async def test_required_criterion_blocks_story_done_requires_testruns(
         self, client, story
     ):
+        """Phase 12.2.6 activation: a required criterion lacking a passing
+        TestRun blocks its story from 'done' (was xfail(strict) in 12.2.5).
+        Deeper coverage lives in test_blocks_done_activation.py."""
         await client.post(
             f"/api/user-stories/{story['id']}/criteria",
             json={"text": "Must be verified by a passing TestRun", "required": True},
@@ -364,15 +359,13 @@ class TestCriterionCrud:
             f"/api/user-stories/{story['id']}",
             json={"status": "done"},
         )
-        # 12.2.6 behavior: blocked because the required criterion has no
-        # passing TestRun. Today the stub lets it through (200), so this
-        # assertion fails -> xfail(strict) documents the gap.
         assert response.status_code == 409
 
 
 class TestPromptTemplates:
     """Tests for /api/prompt-templates CRUD."""
 
+    @pytest.mark.lazyaf_test_id("us3.prompt-variants-storable")
     async def test_create_prompt_template(self, client):
         response = await client.post(
             "/api/prompt-templates",
@@ -432,6 +425,7 @@ class TestPromptTemplates:
 class TestSeedMilestone12:
     """Tests for POST /api/features/seed-milestone12."""
 
+    @pytest.mark.lazyaf_test_id("us3.criteria-queryable-for-scoring")
     async def test_seed_creates_feature_with_three_stories(self, client):
         response = await client.post("/api/features/seed-milestone12")
         assert_status_code(response, 200)
@@ -489,3 +483,93 @@ class TestSeedMilestone12:
         assert "push to the internal remote" in narratives
         assert "gating" in narratives
         assert "side-by-side" in narratives
+
+    async def _seeded_criterion_ids(self, client, feature_id):
+        """All criterion ids under the seeded feature's stories."""
+        stories = (
+            await client.get(f"/api/features/{feature_id}/stories")
+        ).json()
+        criterion_ids = set()
+        for s in stories:
+            criteria = (
+                await client.get(f"/api/user-stories/{s['id']}/criteria")
+            ).json()
+            criterion_ids |= {c["id"] for c in criteria}
+        return criterion_ids
+
+    async def test_seed_without_repo_creates_no_test_refs(self, client, db_session):
+        """Without a repo_id there is nothing to hang TestRefs on (repo_id is
+        NOT NULL); the spec seed still succeeds, refs are just skipped."""
+        from sqlalchemy import select
+
+        from app.models import TestRef
+
+        response = await client.post("/api/features/seed-milestone12")
+        assert_status_code(response, 200)
+        result = await db_session.execute(select(TestRef))
+        assert result.scalars().all() == []
+
+    async def test_seed_upserts_starter_set_test_refs(self, client, db_session, repo):
+        """Phase 12.2.6 seed linkage: seeding with a repo_id also upserts an
+        ACTIVE TestRef for every starter-set lazyaf_test_id, each linked to
+        the matching seeded criterion (map: spec.py MILESTONE12_TEST_REF_SEEDS)."""
+        from sqlalchemy import select
+
+        from app.models import TestRef
+        from app.routers.spec import MILESTONE12_TEST_REF_SEEDS
+
+        seeded = (
+            await client.post(
+                "/api/features/seed-milestone12", json={"repo_id": repo["id"]}
+            )
+        ).json()
+        criterion_ids = await self._seeded_criterion_ids(
+            client, seeded["feature"]["id"]
+        )
+
+        result = await db_session.execute(select(TestRef))
+        refs = {r.lazyaf_test_id: r for r in result.scalars().all()}
+        expected_ids = {s["lazyaf_test_id"] for s in MILESTONE12_TEST_REF_SEEDS}
+        assert expected_ids <= set(refs)
+        for seed in MILESTONE12_TEST_REF_SEEDS:
+            ref = refs[seed["lazyaf_test_id"]]
+            assert ref.status == "active"
+            assert ref.file_path == seed["file_path"]
+            assert ref.criterion_id in criterion_ids
+
+    async def test_seed_test_refs_idempotent_and_repairs(
+        self, client, db_session, repo
+    ):
+        """Re-seeding neither duplicates TestRefs nor leaves an orphaned
+        starter-set ref orphaned — the upsert flips it back to active."""
+        from sqlalchemy import select
+
+        from app.models import TestRef
+        from app.routers.spec import MILESTONE12_TEST_REF_SEEDS
+
+        await client.post(
+            "/api/features/seed-milestone12", json={"repo_id": repo["id"]}
+        )
+
+        result = await db_session.execute(select(TestRef))
+        refs = result.scalars().all()
+        first_count = len(refs)
+
+        # Damage one starter-set ref, then re-seed
+        victim_id = MILESTONE12_TEST_REF_SEEDS[0]["lazyaf_test_id"]
+        victim = next(r for r in refs if r.lazyaf_test_id == victim_id)
+        victim.status = "orphan"
+        victim.criterion_id = None
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/features/seed-milestone12", json={"repo_id": repo["id"]}
+        )
+        assert response.json()["created"] is False
+
+        result = await db_session.execute(select(TestRef))
+        refs = result.scalars().all()
+        assert len(refs) == first_count
+        repaired = next(r for r in refs if r.lazyaf_test_id == victim_id)
+        assert repaired.status == "active"
+        assert repaired.criterion_id is not None

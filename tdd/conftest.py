@@ -7,8 +7,10 @@ This file is automatically loaded by pytest and provides:
 - Factory registration
 - Common test utilities
 """
+import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import AsyncGenerator
 
 import pytest
@@ -35,6 +37,17 @@ def pytest_configure(config):
         "local_exec: test exercises the real local execution path (Docker); "
         "exempt from the T1 no-docker guard and the legacy-by-default router "
         "patch on the global pipeline executor",
+    )
+    # 12.2.6 test tie-back (pinned contract #5): the marker name is registered
+    # HERE so plugin-less invocations (plain `uv run pytest ../tdd`, without
+    # `-p runner_common.pytest_lazyaf`) collect annotated tests warning-free
+    # under --strict-markers. The plugin registers the same line when loaded
+    # (duplicate registration is harmless); outcome COLLECTION only happens
+    # with the plugin loaded AND LAZYAF_TEST_RESULTS_PATH set.
+    config.addinivalue_line(
+        "markers",
+        "lazyaf_test_id(id): map this test's outcome to the LazyAF TestRef "
+        "with this stable id (Phase 12.2.6 test tie-back)",
     )
 
 
@@ -76,38 +89,131 @@ def _t1_no_docker_guard(request, monkeypatch):
     yield
 
 
-@pytest.fixture(autouse=True)
-def _route_steps_legacy_by_default(request):
-    """Default the GLOBAL pipeline executor to legacy routing.
+class _T1StubLocalExecutor:
+    """Docker-free stand-in for LocalExecutor on the GLOBAL executor (T1).
 
-    API-tier tests drive the app's global pipeline_executor; without this a
-    plain script step routes local and reaches for Docker/workspaces in the
-    middle of a no-Docker test. Steps go to the (in-memory) legacy job queue
-    instead. Tests that exercise real local execution opt in with
-    @pytest.mark.local_exec; unit tests that inject their own router onto
-    their OWN PipelineExecutor instances are untouched by design.
+    Yields the same event stream shape as the real
+    app.services.execution.local_executor.LocalExecutor (status -> log ->
+    result) and reports a clean success, so an API-tier test that starts a
+    pipeline drives the REAL local dispatch path - router decision, workspace
+    lifecycle, event consumer, StepRun persistence, WS publishes, run
+    continuation - without ever constructing a docker client.
+
+    Stock-image semantics: no control-layer label, no missing images, so
+    every step takes the plain stdout reporting mode.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[dict, dict]] = []
+
+    async def image_supports_control_layer(self, image: str) -> bool:
+        return False
+
+    async def find_missing_images(self, images) -> list[str]:
+        return []
+
+    async def execute_step(self, step_config, execution_context):
+        self.calls.append((dict(step_config), dict(execution_context)))
+        for event in (
+            {"type": "status", "status": "preparing"},
+            {"type": "status", "status": "running"},
+            {"type": "log", "line": f"[t1-stub] {step_config.get('command', '')}"},
+            {"type": "result", "status": "completed", "exit_code": 0},
+        ):
+            await asyncio.sleep(0)
+            yield event
+
+    async def cancel_step(self, execution_key):
+        return False
+
+    async def cancel_all(self):
+        return None
+
+    def reset(self):
+        self.calls.clear()
+
+
+class _T1StubWorkspaceService:
+    """Docker-free stand-in for WorkspaceService on the GLOBAL executor (T1).
+
+    Honors the acquire/release/cleanup lifecycle the executor drives, but
+    never creates a named volume or touches the docker SDK.
+    """
+
+    def __init__(self):
+        self.ops: list[tuple] = []
+        self._workspaces: dict = {}
+
+    async def get_or_create(self, db, pipeline_run_id, repo_id, branch, commit_sha):
+        self.ops.append(
+            ("get_or_create", pipeline_run_id, repo_id, branch, commit_sha)
+        )
+        ws = self._workspaces.get(pipeline_run_id)
+        if ws is None:
+            ws = SimpleNamespace(
+                id=f"t1-ws-{pipeline_run_id[:8]}",
+                pipeline_run_id=pipeline_run_id,
+                volume_name=f"lazyaf-ws-{pipeline_run_id[:8]}",
+                status="ready",
+                use_count=0,
+            )
+            self._workspaces[pipeline_run_id] = ws
+        return ws
+
+    async def acquire(self, db, workspace_id):
+        self.ops.append(("acquire", workspace_id))
+
+    async def release(self, db, workspace_id):
+        self.ops.append(("release", workspace_id))
+
+    async def cleanup(self, db, pipeline_run_id):
+        self.ops.append(("cleanup", pipeline_run_id))
+        self._workspaces.pop(pipeline_run_id, None)
+
+
+@pytest.fixture(autouse=True)
+def _t1_docker_free_local_execution(request):
+    """Make the GLOBAL pipeline executor's LOCAL path Docker-free (T1).
+
+    API-tier tests drive the app's global ``pipeline_executor``. Since Phase
+    12.2-INT script/docker steps route LOCAL, and since Phase 12.4 the legacy
+    runner queue REJECTS them outright - so forcing them legacy here (what
+    this fixture used to do) would encode a production state that can no
+    longer exist, and now trips the executor's enqueue guard.
+
+    Instead we keep the REAL ExecutionRouter - script/docker route local,
+    agent steps still route legacy until 12.5, exactly as in production - and
+    swap only the two collaborators that would reach for Docker: the
+    LocalExecutor and the WorkspaceService. T1 stays Docker-free while the
+    routing decision under test stays the production one.
+
+    Tests that exercise REAL local execution opt out with
+    @pytest.mark.local_exec; unit tests that inject their own router/executor
+    onto their OWN PipelineExecutor instances are untouched by design.
     """
     if request.node.get_closest_marker("local_exec"):
         yield
         return
 
-    from app.models.pipeline import ExecutorMode
     from app.services.pipeline_executor import pipeline_executor
-    from app.services.workspace.execution_router import RoutingDecision
+    from app.services.workspace.execution_router import ExecutionRouter
 
-    class _LegacyOnlyRouter:
-        def decide(self, step_type, step_config):
-            return RoutingDecision(
-                mode=ExecutorMode.LEGACY.value,
-                reason="t1-conftest-legacy-default",
-            )
-
-    previous = pipeline_executor._router
-    pipeline_executor._router = _LegacyOnlyRouter()
+    previous = (
+        pipeline_executor._router,
+        pipeline_executor._local_executor,
+        pipeline_executor._workspace_service,
+    )
+    pipeline_executor._router = ExecutionRouter()
+    pipeline_executor._local_executor = _T1StubLocalExecutor()
+    pipeline_executor._workspace_service = _T1StubWorkspaceService()
     try:
         yield
     finally:
-        pipeline_executor._router = previous
+        (
+            pipeline_executor._router,
+            pipeline_executor._local_executor,
+            pipeline_executor._workspace_service,
+        ) = previous
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -142,16 +248,48 @@ TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
 
 @pytest_asyncio.fixture
-async def async_engine():
-    """Create a test database engine."""
+async def async_engine(tmp_path):
+    """Create a test database engine.
+
+    FILE-backed, not ``:memory:``. Since script/docker steps route LOCAL,
+    starting a pipeline from an API test spawns a background step task that
+    opens its OWN session on this engine (see
+    ``PipelineExecutor._session_factory_for``). SQLAlchemy serves a
+    ``:memory:`` SQLite engine from a StaticPool - ONE shared DBAPI
+    connection - so that task and the test's own ``db_session`` interleave
+    commits and cursors on the same connection and raise
+    ``sqlite3.InterfaceError: Cursor needed to be reset because of
+    commit/rollback``. A file-backed engine gives each session a real
+    connection, which is the same idiom
+    ``tdd/unit/services/test_pipeline_local_dispatch.py`` already uses for
+    this exact concurrency.
+    """
+    db_path = (tmp_path / "lazyaf_test.db").as_posix()
     engine = create_async_engine(
-        TEST_DATABASE_URL,
+        f"sqlite+aiosqlite:///{db_path}",
         echo=False,
         future=True,
+        connect_args={"timeout": 30},
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield engine
+    # Drain the global pipeline executor BEFORE the schema goes away. Since
+    # script/docker steps route LOCAL, starting a pipeline spawns background
+    # asyncio tasks that hold sessions bound to THIS engine; dropping the
+    # tables underneath a still-running step task raises "no such table" out
+    # of a task nobody is awaiting. Autouse fixtures tear down after the
+    # fixtures they were set up before, so the drain has to happen here - at
+    # the engine that owns the rows - not only in _drain_pipeline_executor.
+    from app.services.pipeline_executor import pipeline_executor
+
+    if (
+        pipeline_executor._tasks
+        or pipeline_executor._state_machines
+        or pipeline_executor._run_locks
+        or pipeline_executor._session_factories
+    ):
+        await pipeline_executor.reset()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     await engine.dispose()

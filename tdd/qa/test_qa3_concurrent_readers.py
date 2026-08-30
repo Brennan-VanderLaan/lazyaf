@@ -121,18 +121,26 @@ def test_a_single_run_list_request_is_not_pathologically_slow():
     )
 
 
-def test_health_and_repo_list_survive_the_same_burst():
-    """Control case - not every endpoint folds, so this is not just 'SQLite'.
+def test_health_and_repo_list_survive_the_same_burst_on_a_clean_database():
+    """Control case - the collapse above is DATA-driven, not just 'SQLite'.
 
-    200 simultaneous /health and 100 simultaneous /api/repos all answered 200
-    in about a second. Keeping the control here stops the finding above from
-    being written off as ambient load.
+    On a freshly reset database the very same burst sizes are fine: 100
+    simultaneous /health (no database at all) and 100 simultaneous
+    /api/repos both answer 200 in about a second. That is what makes the
+    run-list finding a finding rather than ambient load.
+
+    Note the flip side, observed while writing this: once the pool IS
+    saturated by the run-list burst, /api/repos returns 500 too (84/100).
+    The pool is process-wide, so one heavy endpoint takes the whole API down
+    with it - hence the reset and cooldown here.
     """
     require_stack()
-    ensure_repo()
+    status, _ = api("POST", "/api/test/reset", timeout=90)
+    assert status == 200
+    time.sleep(35)  # let any in-flight pool checkouts time out and return
 
     health = status_counts(fire_together(100, lambda _i: api("GET", "/health")))
-    repos = status_counts(fire_together(100, lambda _i: api("GET", "/api/repos")))
-
     assert health == {200: 100}, f"/health under load: {health}"
-    assert repos == {200: 100}, f"/api/repos under load: {repos}"
+
+    repos = status_counts(fire_together(100, lambda _i: api("GET", "/api/repos")))
+    assert repos == {200: 100}, f"/api/repos on a clean database: {repos}"

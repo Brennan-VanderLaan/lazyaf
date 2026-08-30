@@ -1,12 +1,23 @@
 from fastapi import WebSocket, WebSocketDisconnect
-from typing import Any
+from typing import Any, Callable
 import asyncio
+import inspect
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
+        # Per-run LOCAL log observers (12.5, cross-agent contract #8). Not
+        # websockets: in-process callbacks for consumers that need a run's
+        # log lines without holding a socket (playground SSE). The manager
+        # is already the single place every log frame passes through (R3),
+        # so this is the one place an observer can hook without a second
+        # log-fan-out path growing in routers/steps.py.
+        self._run_log_observers: dict[str, list[Callable]] = {}
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -73,8 +84,52 @@ class ConnectionManager:
             {"pipeline_run_id": run_id, "step_index": step_index, "status": status},
         )
 
+    # --- Local per-run log observers (12.5, cross-agent contract #8) -------
+    # Ad-hoc agent runs (playground) need every log line of ONE run without
+    # opening a websocket. Registration is by pipeline_run_id; the callback
+    # is invoked as cb(step_index: int, lines: list[str]) and may be sync or
+    # a coroutine function (awaited). Observer failures are logged and
+    # swallowed: a broken observer must never break the log fan-out or the
+    # step behind it.
+    def register_run_log_observer(self, run_id: str, callback: Callable) -> None:
+        """Attach a local log observer to one pipeline run."""
+        self._run_log_observers.setdefault(run_id, []).append(callback)
+
+    def unregister_run_log_observer(
+        self, run_id: str, callback: Callable | None = None
+    ) -> None:
+        """Detach one observer (or every observer of the run when callback
+        is None). Idempotent: unregistering an unknown run is a no-op."""
+        if callback is None:
+            self._run_log_observers.pop(run_id, None)
+            return
+        observers = self._run_log_observers.get(run_id)
+        if not observers:
+            return
+        if callback in observers:
+            observers.remove(callback)
+        if not observers:
+            self._run_log_observers.pop(run_id, None)
+
+    async def _notify_run_log_observers(
+        self, run_id: str, step_index: int, lines: list[str]
+    ) -> None:
+        observers = list(self._run_log_observers.get(run_id) or ())
+        for observer in observers:
+            try:
+                result = observer(step_index, lines)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception(
+                    "run log observer for run %s raised; dropping this "
+                    "batch for that observer (log fan-out continues)",
+                    run_id[:8] if run_id else run_id,
+                )
+
     async def publish_step_log(self, run_id: str, step_index: int, line: str) -> None:
         """Broadcast a single log line from a running step."""
+        await self._notify_run_log_observers(run_id, step_index, [line])
         await self.broadcast(
             "step_log",
             {"pipeline_run_id": run_id, "step_index": step_index, "line": line},
@@ -104,6 +159,10 @@ class ConnectionManager:
         """
         if not lines:
             return
+        # Observers are notified HERE and in publish_step_log - the two leaf
+        # publishers - so every line reaches an observer EXACTLY once
+        # (publish_step_logs delegates to publish_step_log per line).
+        await self._notify_run_log_observers(run_id, step_index, list(lines))
         await self.broadcast(
             "step_log_batch",
             {"pipeline_run_id": run_id, "step_index": step_index, "lines": lines},
@@ -114,6 +173,7 @@ class ConnectionManager:
         (the e2e frontend) are expected to reconnect."""
         connections = self.active_connections
         self.active_connections = []
+        self._run_log_observers.clear()
         for connection in connections:
             try:
                 await connection.close()

@@ -180,18 +180,31 @@ class TestCardExecuteWithMockRunner:
         # Start card
         await api_client.post(f"/api/cards/{card['id']}/start")
 
-        # Wait for card_updated event
+        # Wait for card_updated event.
+        #
+        # The wire envelope is {"type": ..., "payload": ...} (see
+        # ConnectionManager.broadcast) and the payload is card_to_ws_dict(),
+        # which keys the card as "id" - NOT "card_id" (that spelling belongs
+        # to the job_status frame). This predicate read e["data"]["card_id"]
+        # until the 12.5 verification pass: wrong on BOTH keys, so it never
+        # matched anything and the test always took a conditional skip
+        # standing in front of an assertion that could not run - fake green
+        # (R4). Fixed here, and the skip is now a hard failure:
+        # card_updated is broadcast synchronously by
+        # POST /api/cards/{id}/start, before it dispatches, so there is no
+        # legitimate reason for it not to arrive.
         event = await websocket_client.wait_for_event(
             "card_updated",
             timeout=30,
-            predicate=lambda e: e.get("data", {}).get("card_id") == card["id"],
+            predicate=lambda e: e.get("payload", {}).get("id") == card["id"],
         )
 
-        if event is None:
-            # Mock runner might not be running
-            pytest.skip("No WebSocket event received - mock runner may not be running")
-
-        assert event["data"]["card_id"] == card["id"]
+        assert event is not None, (
+            "no card_updated WS frame for the started card within 30s - "
+            "POST /api/cards/{id}/start broadcasts one before it dispatches"
+        )
+        assert event["payload"]["id"] == card["id"]
+        assert event["payload"]["status"] in ("in_progress", "in_review", "failed")
 
     @pytest.mark.slow
     @pytest.mark.lazyaf_test_id("us2.review-shows-diff")

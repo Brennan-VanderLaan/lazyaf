@@ -32,7 +32,7 @@ from app.database import ALEMBIC_BASELINE_REVISION, Base, _alembic_config, _run_
 
 # Tip of the migration chain. Every startup path (fresh upgrade, legacy
 # adoption stamp-then-upgrade) must end here.
-ALEMBIC_HEAD_REVISION = "0004"
+ALEMBIC_HEAD_REVISION = "0005"
 
 EXPECTED_TABLES = {
     "repos",
@@ -54,11 +54,15 @@ EXPECTED_TABLES = {
     # 0004 (Phase 12.2.6 test tie-back)
     "test_refs",
     "test_runs",
+    # 0005 (Phase 12.5 usage channel)
+    "step_usages",
 }
 
 SPEC_TABLES = {"features", "user_stories", "acceptance_criteria", "prompt_templates"}
 
 TEST_TIEBACK_TABLES = {"test_refs", "test_runs"}
+
+USAGE_TABLES = {"step_usages"}
 
 
 @pytest_asyncio.fixture
@@ -135,6 +139,60 @@ async def _upgrade_to(engine, revision):
 async def _downgrade_to(engine, revision):
     async with engine.begin() as conn:
         await conn.run_sync(lambda c: command.downgrade(_alembic_config(c), revision))
+
+
+async def _seed_usage_chain(engine):
+    """A full repo -> pipeline -> run -> step -> execution -> usage chain,
+    plus one TestRef, for the 0005 round-trip and identity tests."""
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO repos (id, name, default_branch, is_ingested, created_at) "
+                "VALUES ('r1', 'repo', 'main', 0, '2026-01-01 00:00:00')"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO test_refs (id, lazyaf_test_id, repo_id, status, created_at, updated_at) "
+                "VALUES ('tr1', 'suite.case', 'r1', 'active', '2026-01-01 00:00:00', "
+                "'2026-01-01 00:00:00')"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO pipelines (id, repo_id, name, steps, triggers, is_template, "
+                "created_at, updated_at) "
+                "VALUES ('p1', 'r1', 'pipe', '[]', '[]', 0, '2026-01-01 00:00:00', "
+                "'2026-01-01 00:00:00')"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO pipeline_runs (id, pipeline_id, status, trigger_type, "
+                "current_step, steps_completed, steps_total, created_at) "
+                "VALUES ('pr1', 'p1', 'passed', 'manual', 0, 1, 1, '2026-01-01 00:00:00')"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO step_runs (id, pipeline_run_id, step_index, step_name, status, logs) "
+                "VALUES ('sr1', 'pr1', 0, 'agent', 'passed', '')"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO step_executions (id, execution_key, step_run_id, status, created_at) "
+                "VALUES ('se1', 'pr1:0:1', 'sr1', 'completed', '2026-01-01 00:00:00')"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO step_usages (id, step_execution_id, step_run_id, pipeline_run_id, "
+                "provider, cost_source, wall_clock_ms, determinism, created_at, updated_at) "
+                "VALUES ('u1', 'se1', 'sr1', 'pr1', 'anthropic', 'cli-reported', 100, '{}', "
+                "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+            )
+        )
 
 
 class TestFreshDatabase:
@@ -393,6 +451,8 @@ class TestRoundTrip:
 
         snapshot = await _snapshot(engine)
         assert TEST_TIEBACK_TABLES.isdisjoint(set(snapshot))
+        # 0005's downgrade ran first on the way down.
+        assert USAGE_TABLES.isdisjoint(set(snapshot))
         assert SPEC_TABLES <= set(snapshot)
         assert "workspaces" in snapshot
         assert "executor" in snapshot["step_runs"]["columns"]
@@ -411,6 +471,7 @@ class TestRoundTrip:
         snapshot = await _snapshot(engine)
         assert SPEC_TABLES.isdisjoint(set(snapshot))
         assert TEST_TIEBACK_TABLES.isdisjoint(set(snapshot))
+        assert USAGE_TABLES.isdisjoint(set(snapshot))
         assert "feature_id" not in snapshot["cards"]["columns"]
         assert "user_story_id" not in snapshot["cards"]["columns"]
         assert "workspaces" in snapshot
@@ -563,6 +624,120 @@ class TestRoundTrip:
             assert result.scalar_one() == 0
             result = await conn.execute(text("SELECT text FROM acceptance_criteria WHERE id = 'ac1'"))
             assert result.scalar_one() == "crit"
+
+
+class TestUsageChannelMigration:
+    """0005's step_usages, pinned (Phase 12.5 usage channel).
+
+    The two scope decisions this revision makes irreversible are asserted
+    here, not just commented: `role` EXISTS on the same migration as the
+    frozen wire (without it `cost_by_role` is unrecoverable), and
+    `trial_iteration_id` does NOT (nothing writes it, no table to
+    reference - it lands with M13's trials table).
+    """
+
+    async def test_downgrade_to_0004_removes_the_usage_table_only(
+        self, engine_factory
+    ):
+        """0005's downgrade drops step_usages and nothing else: the test
+        tie-back tables, the spec tables and workspaces all stay."""
+        engine = engine_factory("down_0004.db")
+        await _migrate(engine)
+
+        await _downgrade_to(engine, "0004")
+
+        snapshot = await _snapshot(engine)
+        assert USAGE_TABLES.isdisjoint(set(snapshot))
+        assert TEST_TIEBACK_TABLES <= set(snapshot)
+        assert SPEC_TABLES <= set(snapshot)
+        assert "workspaces" in snapshot
+        assert await _alembic_versions(engine) == ["0004"]
+
+    async def test_0005_roundtrip_drops_and_recreates_step_usages(
+        self, engine_factory
+    ):
+        """head -> 0004 -> head: usage rows are gone by design (whole-table
+        drop), the table comes back schema-identical and empty, and the
+        test tie-back rows beside it are untouched."""
+        engine = engine_factory("rt_0005.db")
+        await _migrate(engine)
+        await _seed_usage_chain(engine)
+        head = await _snapshot(engine)
+
+        await _downgrade_to(engine, "0004")
+        await _upgrade_to(engine, "head")
+
+        assert await _snapshot(engine) == head
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT COUNT(*) FROM step_usages"))
+            assert result.scalar_one() == 0
+            result = await conn.execute(text("SELECT COUNT(*) FROM test_refs"))
+            assert result.scalar_one() == 1
+
+    async def test_usage_indexes_are_exactly_the_access_paths(self, engine_factory):
+        """Every index earns its write cost: the step_execution_id
+        idempotency key (UNIQUE - a retrying runtime must be structurally
+        unable to double-bill) and the (pipeline_run_id, role) rollup scan.
+        Nothing else."""
+        engine = engine_factory("usage_indexes.db")
+        await _migrate(engine)
+
+        snapshot = await _snapshot(engine)
+        assert snapshot["step_usages"]["indexes"] == {
+            "ix_step_usages_step_execution_id": (("step_execution_id",), True),
+            "ix_step_usages_pipeline_run_id_role": (
+                ("pipeline_run_id", "role"),
+                False,
+            ),
+        }
+
+    async def test_idempotency_key_is_enforced_by_the_database(self, engine_factory):
+        """Two usage rows for one StepExecution is a constraint violation,
+        not an application-level convention: double-billing must be
+        structurally impossible."""
+        engine = engine_factory("usage_identity.db")
+        await _migrate(engine)
+        await _seed_usage_chain(engine)
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO step_usages (id, step_execution_id, provider, cost_source, "
+                        "wall_clock_ms, determinism, created_at, updated_at) "
+                        "VALUES ('u2', 'se1', 'anthropic', 'cli-reported', 200, '{}', "
+                        "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                    )
+                )
+
+    async def test_role_ships_on_this_migration(self, engine_factory):
+        """api-surface 2.6: `role` must exist on the SAME migration as the
+        frozen wire, or cost_by_role is unrecoverable after the fact."""
+        engine = engine_factory("usage_role.db")
+        await _migrate(engine)
+
+        columns = (await _snapshot(engine))["step_usages"]["columns"]
+        assert "role" in columns
+
+    async def test_trial_iteration_id_is_deliberately_absent(self, engine_factory):
+        """Design 3.6: nothing writes it and there is no table to reference
+        in 12.5; an orphan column buys nothing."""
+        engine = engine_factory("usage_no_trial.db")
+        await _migrate(engine)
+
+        columns = (await _snapshot(engine))["step_usages"]["columns"]
+        assert "trial_iteration_id" not in columns
+
+    async def test_cost_usd_is_numeric_not_a_float_column(self, engine_factory):
+        """Money is NUMERIC(18,6) in the DDL - the float column that would
+        silently lose cents must never appear here."""
+        engine = engine_factory("usage_money.db")
+        await _migrate(engine)
+
+        col_type, _nullable, _pk = (await _snapshot(engine))["step_usages"]["columns"][
+            "cost_usd"
+        ]
+        assert "NUMERIC" in col_type.upper()
 
 
 class TestTieBackSchemaShape:

@@ -254,11 +254,16 @@ class TestCardActionWebSocketBroadcasts:
         await asyncio.sleep(0.1)
 
         # Find the card_updated message (there may be job_status messages too)
+        # The FIRST card_updated frame is the start/retry broadcast under
+        # test. Since 12.5 card work is an ad-hoc agent run, so a LATER
+        # card_updated frame carrying the run's outcome can legitimately
+        # arrive within this sleep - taking the last frame would make this
+        # assertion race the agent.
         messages = mock_ws.get_messages()
         card_messages = [m for m in messages if m["type"] == "card_updated"]
         assert len(card_messages) >= 1
 
-        message = card_messages[-1]
+        message = card_messages[0]
         payload = message["payload"]
 
         # Verify card is in_progress with job and branch
@@ -364,11 +369,16 @@ class TestCardActionWebSocketBroadcasts:
         await asyncio.sleep(0.1)
 
         # Find the card_updated message
+        # The FIRST card_updated frame is the start/retry broadcast under
+        # test. Since 12.5 card work is an ad-hoc agent run, so a LATER
+        # card_updated frame carrying the run's outcome can legitimately
+        # arrive within this sleep - taking the last frame would make this
+        # assertion race the agent.
         messages = mock_ws.get_messages()
         card_messages = [m for m in messages if m["type"] == "card_updated"]
         assert len(card_messages) >= 1
 
-        message = card_messages[-1]
+        message = card_messages[0]
         payload = message["payload"]
 
         # Verify card is in_progress with new job

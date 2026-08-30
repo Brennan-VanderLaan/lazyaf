@@ -12,7 +12,8 @@ drive that full round trip through the public API:
 1. Status reporting (passed / failed on real exit codes)
 2. Log streaming (stdout + stderr markers land in StepRun.logs)
 3. HOME=/workspace/home persistence across steps (the 12.3 contract pair)
-4. Script steps sharing the run workspace (+ the 12.5-xfail agent mix)
+4. Script steps sharing the run workspace (+ the agent/script mix, promoted
+   from strict-xfail at 12.5)
 5. Error handling (in-container timeout enforcement, bad commands)
 
 Requirements (loud, never a skip - R4):
@@ -135,8 +136,10 @@ def step_runs_by_index(run: dict) -> dict[int, dict]:
 
 
 def assert_script_steps_local(run: dict) -> None:
-    """R1 observability: every step of these all-script pipelines must record
-    executor='local' - a silent fallback to legacy is a failure, not a pass."""
+    """R1 observability: every step of these pipelines must record
+    executor='local' - a silent fallback to legacy is a failure, not a pass.
+    Since 12.5 this covers AGENT steps too (they run in ephemeral
+    control-mode containers, not on the polling queue)."""
     step_runs = run.get("step_runs", [])
     assert step_runs, f"run {run['id']} has no step_runs"
     for sr in step_runs:
@@ -315,20 +318,18 @@ class TestMixedStepTypePipelines:
         step2_logs = (await fetch_step_logs(api_client, run["id"], 1))["logs"] or ""
         assert "BUILD_ARTIFACT_CONTENT" in step2_logs
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="12.5: agent steps run on the legacy job-queue path with their "
-        "own checkout until Phase 12.5 puts them behind the control layer - "
-        "they cannot yet share /workspace/repo with script steps. strict=True "
-        "so this SCREAMS the day it starts passing (then promote it).",
-    )
     async def test_agent_script_agent_pipeline_shares_workspace(
         self, api_client, test_repo, mock_config
     ):
         """Agent (mock) -> script -> agent (mock) all sharing one workspace.
 
-        This is the 12.5 acceptance shape, parked here strict-xfail per R4
-        (never a silent skip, never test theater)."""
+        PROMOTED at 12.5 (it was strict-xfail through 12.4, exactly so the
+        day it started passing would scream): agent steps no longer take the
+        legacy job-queue path with their own checkout - they run in ephemeral
+        control-mode containers on the SAME named workspace volume as script
+        steps. The chain proves it end to end: agent 1 creates a file, the
+        script step appends to that same file, and agent 3 does a
+        search/replace that only resolves if it sees the script's line."""
         agent1_config = {
             "response_mode": "batch",
             "delay_ms": 50,
@@ -387,6 +388,11 @@ class TestMixedStepTypePipelines:
         )
 
         assert run["status"] == "passed", f"pipeline failed: {run}"
+        # 12.5: agent steps are dispatched to the LOCAL executor, not the
+        # legacy queue. A silent fallback would still pass the workspace
+        # assertion below (the legacy runner clones the repo itself), so
+        # this is the assertion that actually pins the phase.
+        assert_script_steps_local(run)
         step2_logs = (await fetch_step_logs(api_client, run["id"], 1))["logs"] or ""
         assert "Created by agent" in step2_logs, (
             f"script step should see the agent's file: {step2_logs!r}"

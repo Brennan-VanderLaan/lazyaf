@@ -18,7 +18,7 @@ from app.schemas import (
     PipelineRunCreate,
     StepRunRead,
 )
-from app.schemas.pipeline import ADHOC_TRIGGER_TYPES
+from app.schemas.pipeline import ADHOC_TRIGGER_TYPES, DEBUG_TRIGGER_TYPES
 from app.services.agent_run import ADHOC_PREFIX
 from app.services.websocket import manager
 
@@ -280,13 +280,14 @@ async def run_pipeline(
     #
     # Checked FIRST, before any lookup or write, so a refused request cannot
     # have touched anything.
-    if request.trigger_type in ADHOC_TRIGGER_TYPES:
+    if request.trigger_type in ADHOC_TRIGGER_TYPES + DEBUG_TRIGGER_TYPES:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"trigger_type {request.trigger_type!r} is reserved for "
-                "internal ad-hoc agent runs (card work / playground) and "
-                "cannot be set on this endpoint"
+                "internal ad-hoc agent runs (card work / playground / "
+                "experiment) and debug re-runs, and cannot be set on this "
+                "endpoint"
             ),
         )
 

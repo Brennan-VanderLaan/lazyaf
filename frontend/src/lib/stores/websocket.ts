@@ -1,6 +1,18 @@
 import { writable } from 'svelte/store';
-import type { Card, Pipeline, PipelineRun, StepRun, Repo, Runner } from '../api/types';
+import type {
+  Card,
+  Pipeline,
+  PipelineRun,
+  StepRun,
+  Repo,
+  Runner,
+  ExperimentStatusFrame,
+  ExperimentCellFrame,
+  DebugSessionInfo,
+} from '../api/types';
 import { cardsStore } from './cards';
+import { experimentsStore } from './experiments';
+import { debugSessionsStore } from './debug';
 import { jobsStore, type JobStatusUpdate } from './jobs';
 import { pipelinesStore, activeRunsStore, liveStepLogsStore } from './pipelines';
 import { reposStore } from './repos';
@@ -32,7 +44,10 @@ export type ServerMessageType =
   | 'step_log_batch'
   | 'repo_created'
   | 'repo_updated'
-  | 'repo_deleted';
+  | 'repo_deleted'
+  | 'experiment_status'
+  | 'experiment_cell_status'
+  | 'debug_session_status';
 
 /**
  * The full set of server message types the frontend handles. Exported for the
@@ -54,6 +69,9 @@ export const HANDLED_MESSAGE_TYPES: readonly ServerMessageType[] = [
   'repo_created',
   'repo_updated',
   'repo_deleted',
+  'experiment_status',
+  'experiment_cell_status',
+  'debug_session_status',
 ];
 
 /** step_update payload: a bare status transition for one step of a run. */
@@ -161,6 +179,23 @@ export function handleServerMessage(message: WebSocketMessage) {
       break;
     case 'repo_deleted':
       reposStore.deleteLocal((message.payload as { id: string }).id);
+      break;
+    case 'experiment_status':
+      // 12.6.5: a PROGRESS DELTA, not a full experiment row — it carries no
+      // matrix, no verify block and no cells. The store merges it into the
+      // known row for exactly that reason.
+      experimentsStore.applyStatusFrame(message.payload as ExperimentStatusFrame);
+      break;
+    case 'experiment_cell_status':
+      experimentsStore.applyCellFrame(message.payload as ExperimentCellFrame);
+      break;
+    case 'debug_session_status':
+      // 12.7: a FULL projection, the same body GET /api/debug/{id} serves,
+      // so the store replaces wholesale rather than reconciling fields.
+      // Without this case the panel only ever showed its onMount snapshot -
+      // and a session parked at a breakpoint broadcasts nothing else, so a
+      // pause that began after the panel mounted stayed invisible.
+      debugSessionsStore.applyDelta(message.payload as DebugSessionInfo);
       break;
   }
 }

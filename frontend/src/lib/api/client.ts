@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, Feature, FeatureCreate, FeatureUpdate, UserStory, UserStoryCreate, UserStoryUpdate, AcceptanceCriterion, AcceptanceCriterionCreate, AcceptanceCriterionUpdate, PromptTemplate, PromptTemplateCreate, PromptTemplateUpdate } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, Feature, FeatureCreate, FeatureUpdate, UserStory, UserStoryCreate, UserStoryUpdate, AcceptanceCriterion, AcceptanceCriterionCreate, AcceptanceCriterionUpdate, PromptTemplate, PromptTemplateCreate, PromptTemplateUpdate, DebugSessionInfo, DebugRerunRequest, DebugRerunResponse, DebugJoinToken, DebugResumeRequest, DebugResumeResponse, DebugAbortResponse, DebugExtendRequest, DebugExtendResponse, Experiment, ExperimentSummary, ExperimentDetail, ExperimentCreate, ExperimentUpdate, ExperimentEstimate, ExperimentLaunchResponse, ExperimentAbortResponse, ExperimentResumeResponse, ExperimentCell, Leaderboard } from './types';
 
 const BASE_URL = '/api';
 
@@ -347,4 +347,145 @@ export const promptTemplates = {
     body: JSON.stringify(data),
   }),
   delete: (id: string) => request<void>(`/prompt-templates/${id}`, { method: 'DELETE' }),
+};
+
+// =============================================================================
+// Debug Re-Run Mode (Phase 12.7)
+//
+// `createRerun` is the only call that starts anything; every other verb acts
+// on an existing session. There is deliberately NO token accessor here: the
+// UI never holds a terminal credential (GET /api/debug/{id} does not return
+// one), and `joinToken` exists solely so a future "copy a ready-to-paste
+// command" affordance has a mint - the CLI mints its own.
+// =============================================================================
+
+export const debug = {
+  /** Start a debug re-run of `runId`. Breakpoints are step KEYS (see types.ts). */
+  createRerun: (runId: string, data: DebugRerunRequest) =>
+    request<DebugRerunResponse>(`/pipeline-runs/${runId}/debug-rerun`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  /** Every non-terminal session. The store's SNAPSHOT half. */
+  list: () => request<DebugSessionInfo[]>('/debug'),
+
+  get: (sessionId: string) => request<DebugSessionInfo>(`/debug/${sessionId}`),
+
+  /**
+   * Mint a short-lived terminal join credential. Re-mintable by design:
+   * a one-time token cannot survive a dropped CLI reconnecting into the same
+   * shell. Revocation stays free because the WS upgrade re-reads the session
+   * row whatever the JWT says.
+   */
+  joinToken: (sessionId: string) =>
+    request<DebugJoinToken>(`/debug/${sessionId}/join-token`, { method: 'POST' }),
+
+  /** clearRemaining=true drops the remaining breakpoints ("run to completion"). */
+  resume: (sessionId: string, clearRemaining: boolean = false) =>
+    request<DebugResumeResponse>(`/debug/${sessionId}/resume`, {
+      method: 'POST',
+      body: JSON.stringify({ clear_remaining: clearRemaining } satisfies DebugResumeRequest),
+    }),
+
+  /** Ends the session AND cancels its run. Terminal. */
+  abort: (sessionId: string) =>
+    request<DebugAbortResponse>(`/debug/${sessionId}/abort`, { method: 'POST' }),
+
+  extend: (sessionId: string, additionalMinutes: number = 30) =>
+    request<DebugExtendResponse>(`/debug/${sessionId}/extend`, {
+      method: 'POST',
+      body: JSON.stringify({ additional_minutes: additionalMinutes } satisfies DebugExtendRequest),
+    }),
+};
+
+// =============================================================================
+// Experiments (Phase 12.6.5)
+//
+// `dryRun` and `create` are THE SAME ROUTE with a different `dry_run` flag and
+// therefore different response shapes - hence two typed methods over one path
+// rather than one method with a union return. `dryRun` creates nothing (200);
+// `create` creates a draft (201) and still does not spend a cent: dispatch
+// only begins at `launch`.
+//
+// Nothing here launches implicitly. Create -> estimate -> launch are three
+// separate calls precisely so the dollars are shown before they are committed.
+// =============================================================================
+
+export const experiments = {
+  list: (filters?: { status?: string; target_id?: string; repo_id?: string }) => {
+    const params = new URLSearchParams();
+    if (filters?.status) params.set('status', filters.status);
+    if (filters?.target_id) params.set('target_id', filters.target_id);
+    if (filters?.repo_id) params.set('repo_id', filters.repo_id);
+    const qs = params.toString();
+    return request<ExperimentSummary[]>(`/experiments${qs ? `?${qs}` : ''}`);
+  },
+
+  get: (id: string) => request<ExperimentDetail>(`/experiments/${id}`),
+
+  /** Create a DRAFT. No cell dispatches until launch(). */
+  create: (data: ExperimentCreate) =>
+    request<Experiment>('/experiments', {
+      method: 'POST',
+      body: JSON.stringify({ ...data, dry_run: false }),
+    }),
+
+  /**
+   * Cost the matrix WITHOUT creating anything. The Launch button in the UI is
+   * gated on a fresh result from this call (Phase 12.6.5's headline guardrail).
+   */
+  dryRun: (data: ExperimentCreate) =>
+    request<ExperimentEstimate>('/experiments', {
+      method: 'POST',
+      body: JSON.stringify({ ...data, dry_run: true }),
+    }),
+
+  /** The same estimate, for an already-saved draft. */
+  estimate: (id: string) => request<ExperimentEstimate>(`/experiments/${id}/estimate`),
+
+  update: (id: string, data: ExperimentUpdate) =>
+    request<Experiment>(`/experiments/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+
+  delete: (id: string) => request<void>(`/experiments/${id}`, { method: 'DELETE' }),
+
+  /**
+   * Freeze prompt versions, create the cells, start the pump (202). Callers
+   * refetch `get(id)` rather than reading this body.
+   */
+  launch: (id: string) =>
+    request<ExperimentLaunchResponse>(`/experiments/${id}/launch`, { method: 'POST' }),
+
+  /** Cancels PENDING cells only; running cells finish and still count. */
+  abort: (id: string) =>
+    request<ExperimentAbortResponse>(`/experiments/${id}/abort`, { method: 'POST' }),
+
+  /**
+   * Re-pump a stalled experiment (the pump is in-process; a backend restart
+   * strands pending cells). `stalled: true` on the detail is what surfaces it.
+   */
+  resume: (id: string) =>
+    request<ExperimentResumeResponse>(`/experiments/${id}/resume`, { method: 'POST' }),
+
+  /** Per-CELL rows: coordinates + status + cost + test counts. */
+  results: (id: string) => request<ExperimentCell[]>(`/experiments/${id}/results`),
+
+  /** Per-VARIANT aggregation. Always `ranked: false` in this phase. */
+  leaderboard: (id: string) => request<Leaderboard>(`/experiments/${id}/leaderboard`),
+};
+
+export const leaderboards = {
+  /**
+   * Cross-experiment view over every criterion under a feature, including one
+   * `variant_index: null` row for ordinary non-experiment runs.
+   */
+  feature: (featureId: string, experimentIds: string[] = []) => {
+    const params = new URLSearchParams();
+    for (const id of experimentIds) params.append('experiment_id', id);
+    const qs = params.toString();
+    return request<Leaderboard>(`/leaderboards/feature/${featureId}${qs ? `?${qs}` : ''}`);
+  },
 };

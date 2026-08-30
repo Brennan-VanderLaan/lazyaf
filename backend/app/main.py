@@ -14,6 +14,7 @@ logging.basicConfig(
 from app.database import init_db
 from app.routers import repos, cards, jobs, runners, agent_files, pipelines, lazyaf_files
 from app.routers import git, playground, models, steps, spec, test_results
+from app.routers import experiments, debug
 from app.routers import ws_runners
 from app.services.websocket import manager
 
@@ -85,11 +86,35 @@ async def lifespan(app: FastAPI):
                 f"Recovered {len(recovered)} orphaned step executions on startup"
             )
 
+        # 12.7 contract C20: a paused debug gate is an in-process task, so a
+        # restart leaves the session and its run half-alive forever. End
+        # them honestly and remove any stray sidecar. Never raises on a
+        # Docker-less host - the sidecar sweep logs and returns 0.
+        from app.services.execution.debug_session_service import (
+            debug_session_service,
+        )
+
+        swept = await debug_session_service.sweep_paused_sessions(session)
+        if swept:
+            log.info(
+                f"Ended {swept} debug session(s) paused across a restart"
+            )
+
     # The dispatcher installs its wake hook on the registry and its requeue
     # hook on the job recovery service, then owns the assignment loop.
     await runner_dispatcher.start(async_session)
 
     await playground_service.start()
+
+    # 12.6.5: re-pump any experiment a restart stalled. Runs AFTER the
+    # dispatcher and playground service are up because it dispatches real
+    # pipeline runs. Never raises; POST /api/experiments/{id}/resume
+    # remains the guaranteed path.
+    from app.services.experiment_service import resume_stalled_experiments
+
+    resumed = await resume_stalled_experiments()
+    if resumed:
+        log.info(f"Resumed {resumed} experiment(s) stalled by a restart")
     # Periodic workspace orphan audit (Phase 12.2-INT). First sweep runs
     # immediately for startup crash recovery; the loop owns its DB sessions
     # and survives sweep failures (logged, retried next interval).
@@ -147,6 +172,10 @@ app.include_router(models.router)
 app.include_router(steps.router)
 app.include_router(spec.router)
 app.include_router(test_results.router)
+app.include_router(experiments.router)
+# The debug router carries both the 12.7 HTTP surface and the terminal
+# WebSocket (/ws/debug/...); like ws_runners it declares its own paths.
+app.include_router(debug.router)
 # The runner WebSocket (/ws/runner). Registered here rather than under an
 # /api prefix: it is a transport, not a REST surface.
 app.include_router(ws_runners.router)

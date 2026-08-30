@@ -8,6 +8,14 @@ from app.models.spec import Feature, UserStory, AcceptanceCriterion, PromptTempl
 from app.models.testref import TestRef, TestRun, TestRefStatus, TestRunStatus
 from app.models.usage import StepUsage, UsageCostSource, UsageProvider
 from app.models.workspace import Workspace
+from app.models.debug import DebugSession
+from app.models.experiment import (
+    Experiment,
+    ExperimentRun,
+    ExperimentStatus,
+    ExperimentRunStatus,
+    PromptVersion,
+)
 
 __all__ = [
     "Repo",
@@ -40,4 +48,10 @@ __all__ = [
     "UsageProvider",
     "UsageCostSource",
     "Workspace",
+    "DebugSession",
+    "Experiment",
+    "ExperimentRun",
+    "ExperimentStatus",
+    "ExperimentRunStatus",
+    "PromptVersion",
 ]

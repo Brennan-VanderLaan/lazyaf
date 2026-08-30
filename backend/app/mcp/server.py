@@ -1453,3 +1453,233 @@ def link_card_to_story(card_id: str, user_story_id: str) -> dict:
         card = response.json()
         card["message"] = "Card linked to user story successfully"
         return card
+
+
+# =============================================================================
+# Experiments (Phase 12.6.5)
+#
+# An experiment fans one task out across a matrix of (model x prompt x repeat)
+# and reports what each variant cost and how often it satisfied the acceptance
+# criteria. Two properties matter for a caller driving this from Claude
+# Desktop, and both are enforced by the backend, not by convention:
+#
+#   1. `budget_usd` is REQUIRED and is a hard cap on dispatch. Cells refused by
+#      the cap land as "skipped_budget"; they are not silently queued.
+#   2. `dry_run=True` prices the matrix and CREATES NOTHING. Call it first.
+#      An estimate whose basis is not "historical-median" is a LOWER BOUND -
+#      variants with no priced history contribute nothing to the total.
+#
+# The leaderboard REPORTS; it does not rank (`ranked: false`). Do not present
+# its top row as a winner - the separability machinery arrives in Milestone
+# 13.4, and until then the numbers are point values with no claim attached.
+# =============================================================================
+
+
+@mcp.tool()
+def launch_experiment(
+    name: str,
+    target_type: str,
+    target_id: str,
+    models: list[dict] = None,
+    prompts: list[dict] = None,
+    budget_usd: str = "",
+    repeat: int = 1,
+    repo_id: str = "",
+    verify: dict = None,
+    description: str = "",
+    max_concurrency: int = 2,
+    push_branches: bool = False,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Run one task across a matrix of models and prompts, or price the matrix first.
+
+    Args:
+        name: Experiment name
+        target_type: "card" or "user_story" (a "feature" target is refused - it
+            spans repos and has no single task text)
+        target_id: The card or user story ID
+        models: Model-axis entries, e.g.
+            [{"agent": "claude-code", "model": "claude-opus-5", "label": "opus"},
+             {"agent": "claude-code", "model": null, "label": "cli default"}]
+            `agent` is REQUIRED on every entry ("claude-code" | "gemini" |
+            "mock") - the platform never infers a CLI from a model name.
+            `model: null` is a legal control variant meaning the CLI's default.
+        prompts: Prompt-axis entries, e.g.
+            [{"prompt_template_id": "tpl_...", "label": "impl-from-story"},
+             {"prompt_template_id": null, "label": "platform default"}]
+        budget_usd: REQUIRED hard cap as a decimal string, e.g. "5.00"
+        repeat: Runs per variant (>= 1). Fewer than 3 means the leaderboard
+            reports point values only and says so.
+        repo_id: Repo the cells run in. Required for a user_story target that
+            spans more than one repo.
+        verify: Optional {"image": ..., "command": ..., "timeout": N} script
+            step appended to every cell. WITHOUT it a cell produces no test
+            evidence and its pass rate reads N/A - not 0%.
+        description: Optional notes
+        max_concurrency: Cells in flight at once (1-8)
+        push_branches: Push each cell's branch. Defaults False because a
+            push-triggered pipeline with no branches pattern matches every
+            branch and would start CI runs this experiment's cap does not
+            cover. The dry run names them when this is True.
+        dry_run: True -> return the cost estimate and create NOTHING
+
+    Total cells = len(models) * len(prompts) * repeat, capped at 200.
+
+    Returns the estimate (dry_run) or the launched experiment. Call
+    get_experiment() for progress and get_leaderboard() for results.
+    """
+    if not models:
+        return {"error": "models must contain at least one entry, each with an 'agent'"}
+    if not prompts:
+        return {"error": "prompts must contain at least one entry"}
+    if not budget_usd:
+        return {
+            "error": "budget_usd is required (a decimal string like \"5.00\") - "
+            "an experiment without a cap is not launchable"
+        }
+
+    missing_agent = [entry for entry in models if not entry.get("agent")]
+    if missing_agent:
+        return {
+            "error": "every models entry needs an explicit 'agent' "
+            "(claude-code | gemini | mock); no agent is inferred from a model name"
+        }
+
+    payload = {
+        "name": name,
+        "description": description,
+        "target_type": target_type,
+        "target_id": target_id,
+        "matrix": {
+            "models": models,
+            "prompts": prompts,
+            "repeat": repeat,
+        },
+        "budget_usd": budget_usd,
+        "max_concurrency": max_concurrency,
+        "push_branches": push_branches,
+        "dry_run": dry_run,
+    }
+    if repo_id:
+        payload["repo_id"] = repo_id
+    if verify:
+        payload["verify"] = verify
+
+    with _get_client() as client:
+        response = client.post("/api/experiments", json=payload)
+        if response.status_code not in (200, 201):
+            return {"error": f"Failed to create experiment: {response.text}"}
+        body = response.json()
+
+        if dry_run:
+            body["message"] = (
+                f"Dry run only - nothing was created. {body.get('cells')} cells, "
+                f"estimated {body.get('estimated_cost_usd')} USD "
+                f"(basis: {body.get('estimate_basis')})."
+            )
+            if body.get("estimate_basis") != "historical-median":
+                body["message"] += (
+                    " This is a LOWER BOUND: variants with no priced history "
+                    "contribute nothing to the total."
+                )
+            return body
+
+        experiment_id = body["id"]
+        launch = client.post(f"/api/experiments/{experiment_id}/launch")
+        if launch.status_code not in (200, 202):
+            return {
+                "error": f"Experiment {experiment_id} was created but launch failed: {launch.text}",
+                "experiment_id": experiment_id,
+            }
+        result = client.get(f"/api/experiments/{experiment_id}")
+        if result.status_code != 200:
+            return {"experiment_id": experiment_id, "message": "Launched."}
+        detail = result.json()
+        detail["message"] = (
+            f"Launched {detail.get('cells_total')} cells with a "
+            f"{budget_usd} USD cap."
+        )
+        return detail
+
+
+@mcp.tool()
+def get_experiment(experiment_id: str) -> dict:
+    """
+    Get an experiment's status, per-cell progress, and spend against its cap.
+
+    Args:
+        experiment_id: The experiment ID
+
+    Cell statuses distinguish two facts that must not be conflated: "failed"
+    means the cell ran and its suite was red (a real measurement that counts),
+    "error" means the cell ran and measured nothing (excluded from pass rates
+    and reported as an error rate).
+
+    `stalled: true` means the dispatch pump did not survive a backend restart -
+    cells are pending with nothing live. `POST /api/experiments/{id}/resume`
+    re-pumps it (the LazyAF UI exposes this as a Resume button).
+    A `cost_coverage` below 1.0 means some usage rows reported no cost, and
+    those count as zero against the cap: the budget is only enforced on the
+    priced share.
+    """
+    with _get_client() as client:
+        response = client.get(f"/api/experiments/{experiment_id}")
+        if response.status_code == 404:
+            return {"error": f"Experiment {experiment_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to get experiment: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def get_leaderboard(experiment_id: str) -> dict:
+    """
+    Get the per-variant results table for an experiment.
+
+    Args:
+        experiment_id: The experiment ID
+
+    Each row is one (agent, model, prompt template, prompt version) variant
+    with its macro pass rate over acceptance criteria, cost total and median,
+    median wall clock, and error rate.
+
+    READ THE `ranked` FIELD BEFORE SUMMARISING THIS. It is false: 12.6.5
+    reports and does not rank. `pass_rate_macro: null` with a `reason` means
+    nothing was measured - it is NOT a zero, and must never be reported as
+    one. `insufficient_repeats` (n < 3) and a high `error_rate` mean the
+    numbers are not comparable across rows. Relay the `note` and any
+    `warnings` rather than declaring a winner.
+    """
+    with _get_client() as client:
+        response = client.get(f"/api/experiments/{experiment_id}/leaderboard")
+        if response.status_code == 404:
+            return {"error": f"Experiment {experiment_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to get leaderboard: {response.text}"}
+        return response.json()
+
+
+@mcp.tool()
+def abort_experiment(experiment_id: str) -> dict:
+    """
+    Abort an experiment: cancel every cell that has not been dispatched.
+
+    Args:
+        experiment_id: The experiment ID
+
+    Cells already running are LEFT TO FINISH and their results still count -
+    an abort stops future spend, it does not discard measurements already paid
+    for. Aborting a terminal experiment is a 409, not a silent no-op.
+    """
+    with _get_client() as client:
+        response = client.post(f"/api/experiments/{experiment_id}/abort")
+        if response.status_code == 404:
+            return {"error": f"Experiment {experiment_id} not found"}
+        if response.status_code == 409:
+            return {"error": f"Experiment {experiment_id} is already terminal: {response.text}"}
+        if response.status_code not in (200, 202):
+            return {"error": f"Failed to abort experiment: {response.text}"}
+        result = response.json()
+        result["message"] = "Pending cells cancelled; running cells will finish and still count."
+        return result

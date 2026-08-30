@@ -52,18 +52,13 @@ class Decision:
 
 
 class ContractRouter:
-    """Implements the contracted routing rules: script/docker/agent -> local,
-    explicit executor=legacy override -> legacy.
+    """Implements the contracted routing rules: script/docker/agent -> local.
 
-    12.5 fallout: agent steps route LOCAL by default ("agent-default-local");
-    `executor: legacy` on an agent step is the LAST legacy escape hatch and
-    stays honored, loudly.
-
-    12.4 fallout: `executor: legacy` on a script/docker step RAISES, exactly
-    as the real ExecutionRouter does. Phase 12.4 deleted script/docker
-    execution from the runners, so honoring that override would enqueue a
-    job guaranteed to be rejected on pickup. Mirrored here so this fake
-    cannot drift into contradicting the router it stands in for.
+    12.6 fallout: there is no third mode. `executor: legacy` RAISES for every
+    step type (the queue it named was deleted), and so does an unknown step
+    type - there is nothing left to fall back to, so a route the router
+    cannot name is a definition error rather than a detour. Mirrored here so
+    this fake cannot drift into contradicting the router it stands in for.
     """
 
     def __init__(self):
@@ -72,18 +67,15 @@ class ContractRouter:
     def decide(self, step_type: str, step_config: dict) -> Decision:
         self.calls.append((step_type, dict(step_config or {})))
         if (step_config or {}).get("executor") == "legacy":
-            if step_type in ("script", "docker"):
-                raise ValueError(
-                    f"Unsupported combination: step_type={step_type!r} with "
-                    "executor='legacy' (the legacy path for script/docker was "
-                    "removed in Phase 12.4)"
-                )
-            return Decision("legacy", "explicit-override")
+            raise ValueError(
+                "executor='legacy' names an execution path that no longer "
+                "exists: Phase 12.6 deleted the polling runner queue"
+            )
         if step_type in ("script", "docker"):
             return Decision("local", f"{step_type}-runs-local")
         if step_type == "agent":
             return Decision("local", "agent-default-local")
-        return Decision("legacy", f"unknown-step-type:{step_type}")
+        raise ValueError(f"Unknown step type {step_type!r}")
 
 
 class ExplodingRouter:
@@ -175,17 +167,6 @@ class FakeLocalExecutor:
         return False
 
 
-class EnqueueSpy:
-    """Recording spy for job_queue (R1 spy test)."""
-
-    def __init__(self):
-        self.calls = []
-
-    async def enqueue(self, job):
-        self.calls.append(job)
-        return job.id
-
-
 class CapturingSocket:
     """Capturing transport attached to the REAL ConnectionManager (R6)."""
 
@@ -242,16 +223,6 @@ async def env(tmp_path):
     if socket in manager.active_connections:
         manager.active_connections.remove(socket)
     await engine.dispose()
-
-
-@pytest.fixture
-def enqueue_spy(monkeypatch):
-    """Patch the executor module's job_queue with a recording spy."""
-    spy = EnqueueSpy()
-    import app.services.pipeline_executor as pe
-
-    monkeypatch.setattr(pe, "job_queue", spy)
-    return spy
 
 
 async def make_repo(factory) -> Repo:
@@ -337,7 +308,7 @@ def script_step(name="Script", command="echo hi", **extra) -> dict:
 # -----------------------------------------------------------------------------
 
 class TestRoutingDispatch:
-    async def test_script_step_routes_local_and_records_executor(self, env, enqueue_spy):
+    async def test_script_step_routes_local_and_records_executor(self, env):
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(env.factory, repo, [script_step()])
 
@@ -349,9 +320,14 @@ class TestRoutingDispatch:
         # Router was consulted with the contract signature
         assert env.router.calls == [("script", {"command": "echo hi"})]
 
-    async def test_spy_local_steps_never_enqueue_to_job_queue(self, env, enqueue_spy):
-        """R1 SPY TEST: a locally-routed script pipeline makes ZERO calls to
-        job_queue.enqueue and creates no Card/Job rows."""
+    async def test_local_steps_hand_no_job_to_any_runner(self, env):
+        """R1: a locally-routed script pipeline creates NO Card and NO Job row.
+
+        Until 12.6 this spied on `job_queue.enqueue` directly. The queue is
+        gone, so the assertion moved to the DB rows a runner used to be handed
+        - which is the durable half of the same claim, and the half that
+        survives its subject being deleted.
+        """
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(
             env.factory,
@@ -362,18 +338,15 @@ class TestRoutingDispatch:
         run = await start_and_wait(env, pipeline, repo)
 
         assert run.status == RunStatus.PASSED.value
-        assert enqueue_spy.calls == []
         assert await fetch_all(env, Card) == []
         assert await fetch_all(env, Job) == []
         assert all(sr.executor == "local" for sr in run.step_runs)
 
-    async def test_agent_step_routes_local_and_enqueues_nothing(
-        self, env, enqueue_spy
-    ):
+    async def test_agent_step_routes_local_and_hands_no_job_to_a_runner(self, env):
         """12.5: an agent step runs on the local executor like any other.
 
-        No Card, no Job, no queue entry - a silent fallback to legacy is
-        indistinguishable from success (R1), so the absence is asserted.
+        No Card and no Job row: a silent fallback is indistinguishable from
+        success (R1), so the absence is asserted rather than assumed.
         """
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(
@@ -388,16 +361,13 @@ class TestRoutingDispatch:
 
         run = await start_and_wait(env, pipeline, repo)
 
-        assert enqueue_spy.calls == []
         assert run.step_runs[0].executor == "local"
         cards = await fetch_all(env, Card)
         jobs = await fetch_all(env, Job)
         assert cards == [] and jobs == []
         assert len(env.local.calls) == 1
 
-    async def test_agent_step_without_agent_key_fails_that_step_loudly(
-        self, env, enqueue_spy
-    ):
+    async def test_agent_step_without_agent_key_fails_that_step_loudly(self, env):
         """No default agent: a step that names none fails at dispatch with
         the valid vocabulary in the message - it never silently picks one."""
         repo = await make_repo(env.factory)
@@ -410,19 +380,18 @@ class TestRoutingDispatch:
         run = await start_and_wait(env, pipeline, repo)
 
         assert run.status == RunStatus.FAILED.value
-        assert enqueue_spy.calls == []
         error = run.step_runs[0].error or ""
         assert "agent" in error and "claude-code" in error
 
-    async def test_explicit_legacy_override_on_agent_step_logged_at_warning(
-        self, env, enqueue_spy, caplog
-    ):
-        """`executor: legacy` on an AGENT step is still honored, loudly.
+    async def test_explicit_legacy_override_fails_the_agent_step(self, env):
+        """12.6: `executor: legacy` on an AGENT step now FAILS the step.
 
-        After 12.5 this is the LAST remaining legacy escape hatch (R2
-        requires it to stay callable until the 12.6 deletion commit), so the
-        override still names a path that exists. It stays a WARNING - an
-        override is never silent (R1).
+        Through 12.5 this was the last remaining escape hatch and was kept
+        honored on purpose (R2: a phase that moves work off a path leaves the
+        old path usable until the path is deleted). The deletion commit
+        removed the path, so the override fails at dispatch with a message
+        naming what happened - never a silent downgrade to local, which would
+        run the step somewhere the author did not ask for.
         """
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(
@@ -431,25 +400,23 @@ class TestRoutingDispatch:
             [{"name": "A", "type": "agent", "config": {"title": "Do it", "executor": "legacy"}}],
         )
 
-        with caplog.at_level(logging.WARNING, logger="app.services.pipeline_executor"):
-            run = await start_and_wait(env, pipeline, repo)
+        run = await start_and_wait(env, pipeline, repo)
 
-        assert run.step_runs[0].executor == "legacy"
-        assert len(enqueue_spy.calls) == 1
-        assert any("explicit-override" in r.message for r in caplog.records)
+        assert run.status == RunStatus.FAILED.value
+        step = run.step_runs[0]
+        assert step.status == RunStatus.FAILED.value
+        assert step.executor is None
+        assert "legacy" in (step.error or "")
+        assert env.local.calls == []
+        assert await fetch_all(env, Job) == []
 
-    async def test_explicit_legacy_override_on_script_step_fails_loudly(
-        self, env, enqueue_spy
-    ):
+    async def test_explicit_legacy_override_on_script_step_fails_loudly(self, env):
         """`executor: legacy` on a SCRIPT step fails the step at dispatch.
 
-        Updated for Phase 12.4: this used to assert the override routed the
-        step legacy and enqueued it. Runners now REJECT script/docker jobs,
-        so honoring the override would enqueue a job guaranteed to be failed
-        on pickup - the silent in_progress -> failed loop. The router raises
-        instead, and the dispatch error path fails the step with a message
-        naming the unsupported combination. Nothing is enqueued and nothing
-        runs locally: no silent fallback in EITHER direction.
+        12.4 made the router raise for this combination; 12.6 deleted the
+        path entirely, so it raises for every step type. Either way the
+        dispatch error path fails the step with a message naming the value,
+        and nothing runs locally: no silent fallback in EITHER direction.
         """
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(
@@ -466,11 +433,10 @@ class TestRoutingDispatch:
         assert "execution routing failed" in step.error
         assert "executor='legacy'" in step.error
         assert step.executor is None
-        assert enqueue_spy.calls == []
         assert env.local.calls == []
         assert await fetch_all(env, Job) == []
 
-    async def test_routing_failure_fails_step_and_run_loudly(self, env, enqueue_spy):
+    async def test_routing_failure_fails_step_and_run_loudly(self, env):
         env.executor._router = ExplodingRouter()
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(env.factory, repo, [script_step()])
@@ -483,30 +449,57 @@ class TestRoutingDispatch:
         assert "execution routing failed" in step.error
         assert step.executor is None
         # No silent fallback: nothing enqueued, nothing executed locally
-        assert enqueue_spy.calls == []
         assert env.local.calls == []
 
-    async def test_remote_mode_rejected_until_12_6(self, env, enqueue_spy):
-        """A router returning 'remote' (valid enum, no execution path yet)
-        must fail the step loudly - never fall through to a queue nothing
-        dequeues (failure_01 landmine 5)."""
+    async def test_remote_mode_is_accepted_at_12_6(self, env):
+        """A router returning 'remote' now has an execution path.
+
+        This test asserted the OPPOSITE until 12.6 ("no execution path yet,
+        fail the step loudly"). RemoteExecutor is that path: the step runs on
+        the remote executor, `StepRun.executor` records "remote" (R1), the
+        LOCAL executor is never touched, and nothing is enqueued.
+        """
+
+        class RemoteRouter:
+            def decide(self, step_type, step_config):
+                return Decision(ExecutorMode.REMOTE.value, "testing-remote")
+
+        remote = FakeLocalExecutor()
+        env.executor._router = RemoteRouter()
+        env.executor._remote_executor = remote
+        repo = await make_repo(env.factory)
+        pipeline = await make_linear_pipeline(env.factory, repo, [script_step()])
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        step = run.step_runs[0]
+        assert step.executor == ExecutorMode.REMOTE.value
+        assert len(remote.calls) == 1
+        assert env.local.calls == []
+        # run.status is deliberately not asserted here: a remote step is
+        # always control-mode (12.6), and this fake does not model the
+        # CONTAINER's own POST to /api/steps/*, so the control-layer
+        # reconciliation has nothing to reconcile. The full round trip lives
+        # in tdd/unit/services/test_remote_step_dispatch.py.
+
+    async def test_remote_step_does_not_provision_a_local_workspace(self, env):
+        """A remote host cannot see the backend's volume - the AGENT
+        provisions its own (section 3.4). Cloning a repo into a volume
+        nobody will mount is waste the backend pays for on every step."""
 
         class RemoteRouter:
             def decide(self, step_type, step_config):
                 return Decision(ExecutorMode.REMOTE.value, "testing-remote")
 
         env.executor._router = RemoteRouter()
+        env.executor._remote_executor = FakeLocalExecutor()
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(env.factory, repo, [script_step()])
 
-        run = await start_and_wait(env, pipeline, repo)
+        await start_and_wait(env, pipeline, repo)
 
-        assert run.status == RunStatus.FAILED.value
-        step = run.step_runs[0]
-        assert step.status == RunStatus.FAILED.value
-        assert "12.6" in step.error
-        assert enqueue_spy.calls == []
-        assert env.local.calls == []
+        assert "get_or_create" not in env.workspace.op_names()
+        assert "acquire" not in env.workspace.op_names()
 
 
 # -----------------------------------------------------------------------------
@@ -829,19 +822,18 @@ class TestGraphLocalDispatch:
             "entry_points": ["a", "b"],
         }
 
-    async def test_graph_local_steps_fan_out_and_never_enqueue(self, env, enqueue_spy):
+    async def test_graph_local_steps_fan_out_and_never_enqueue(self, env):
         repo = await make_repo(env.factory)
         pipeline = await make_graph_pipeline(env.factory, repo, self._two_entry_graph())
 
         run = await start_and_wait(env, pipeline, repo)
 
         assert run.status == RunStatus.PASSED.value
-        assert enqueue_spy.calls == []
         assert sorted(json.loads(run.completed_step_ids)) == ["a", "b"]
         assert all(sr.executor == "local" for sr in run.step_runs)
         assert len(env.local.calls) == 2
 
-    async def test_graph_mixed_routing_agent_runs_local(self, env, enqueue_spy):
+    async def test_graph_mixed_routing_agent_runs_local(self, env):
         graph = {
             "version": 2,
             "steps": {
@@ -870,7 +862,6 @@ class TestGraphLocalDispatch:
         assert by_id["build"].executor == "local"
         assert by_id["build"].status == RunStatus.PASSED.value
         assert by_id["agent"].executor == "local"
-        assert enqueue_spy.calls == []
 
 
 # -----------------------------------------------------------------------------
@@ -1396,7 +1387,7 @@ class TestTypedPublishApi:
 
 class TestImagePreflight:
     async def test_missing_images_fail_run_before_any_dispatch(
-        self, env, enqueue_spy, caplog
+        self, env, caplog
     ):
         """A run naming unresolvable images fails with ONE message listing
         every missing tag - no StepRun is created, nothing dispatches."""
@@ -1414,7 +1405,6 @@ class TestImagePreflight:
         assert run.status == RunStatus.FAILED.value
         assert run.step_runs == []  # failed BEFORE dispatching step 0
         assert env.local.calls == []
-        assert enqueue_spy.calls == []
         # Distinct images resolved ONCE, in one query
         assert env.local.preflight_queries == [["ghost:one", "ghost:two"]]
         # ONE message naming every missing tag

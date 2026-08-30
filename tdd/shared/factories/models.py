@@ -16,7 +16,8 @@ from faker import Faker
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
 sys.path.insert(0, str(backend_path))
 
-from app.models import Card, CardStatus, Job, JobStatus, Repo, Runner, RunnerStatus
+from app.models import Card, CardStatus, Job, JobStatus, Repo, Runner
+from app.services.execution.runner_state import RunnerState
 
 from .base import BaseFactory, generate_branch_name, generate_uuid
 
@@ -141,32 +142,47 @@ class JobFactory(BaseFactory):
 
 
 class RunnerFactory(BaseFactory):
-    """Factory for creating Runner instances."""
+    """Factory for creating Runner instances (Phase 12.6 registry shape).
+
+    The default is a runner that is KNOWN but not connected - the honest
+    resting state of a row after a backend restart. Traits move it into the
+    connected states; there is no "offline" any more (RunnerState calls that
+    `disconnected`, and it is the single status vocabulary).
+    """
 
     class Meta:
         model = Runner
 
     id = factory.LazyFunction(generate_uuid)
-    container_id = factory.LazyFunction(
-        lambda: fake.hexify(text="^^^^^^^^^^^^", upper=False)
-    )
-    status = RunnerStatus.IDLE.value
-    current_job_id = None
+    name = factory.Sequence(lambda n: f"runner-{n}")
+    runner_type = "claude-code"
+    status = RunnerState.DISCONNECTED.value
+    labels = None
+    current_step_execution_id = None
+    websocket_id = None
+    protocol_version = 1
+    agent_version = "test"
+    connected_at = None
     last_heartbeat = factory.LazyFunction(datetime.utcnow)
+    created_at = factory.LazyFunction(datetime.utcnow)
+    # Polling-stack leftovers; dropped in migration 0007.
 
     class Params:
         """Parameters for creating runners in specific states."""
 
+        idle = factory.Trait(
+            status=RunnerState.IDLE.value,
+            connected_at=factory.LazyFunction(datetime.utcnow),
+            websocket_id=factory.LazyFunction(generate_uuid),
+        )
         busy = factory.Trait(
-            status=RunnerStatus.BUSY.value,
-            current_job_id=factory.LazyFunction(generate_uuid),
+            status=RunnerState.BUSY.value,
+            connected_at=factory.LazyFunction(datetime.utcnow),
+            websocket_id=factory.LazyFunction(generate_uuid),
+            current_step_execution_id=factory.LazyFunction(generate_uuid),
         )
-        offline = factory.Trait(
-            status=RunnerStatus.OFFLINE.value,
-            container_id=None,
-        )
-        no_container = factory.Trait(
-            container_id=None,
+        dead = factory.Trait(
+            status=RunnerState.DEAD.value,
         )
 
 

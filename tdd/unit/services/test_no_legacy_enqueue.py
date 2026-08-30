@@ -1,23 +1,23 @@
 """
-Phase 12.5: nothing enqueues to the legacy runner queue any more.
+Card start, card retry, the playground and agent pipeline steps all run as
+AD-HOC CONTROL-LAYER RUNS (Phase 12.5, kept honest through 12.6).
 
-After 12.5 the polling runners keep their compose services and their replica
-counts - setting them to 0 would be deletion-by-config and would make 12.6's
-acceptance untestable - but no DEFAULT path feeds them. Card start, card
-retry, the playground and agent pipeline steps all run on the control layer
-as local, control-mode containers.
+12.5 moved every one of those paths off the polling runner queue and this
+module asserted the move by spying on the real ``job_queue.enqueue``: a
+silent fallback to the queue is indistinguishable from success everywhere
+else (R1) - the job is enqueued, a runner picks it up, the work happens, the
+card goes green, and the phase quietly did not land.
 
-Idleness is ASSERTED here rather than assumed, because a silent fallback to
-the legacy queue is indistinguishable from success everywhere else (R1): the
-job is enqueued, a runner picks it up, the work happens, the card goes green
-- and the phase quietly did not land. The spy wraps the REAL
-``job_queue.enqueue`` on the REAL singleton (R6), so a caller that reaches
-the queue through any import path is caught.
+12.6 DELETED that queue, so there is nothing left to spy on and "nothing
+enqueues" became structurally true. `tdd/unit/services/test_no_legacy_code.py`
+asserts it once, unconditionally, at the module level where it now belongs.
 
-The one deliberately-kept exception is the ``executor: legacy`` escape hatch
-on an agent step (R2, deleted in 12.6). It is exercised at the bottom of this
-module: the escape hatch must keep working, and it must be the ONLY thing
-that still enqueues.
+What this module keeps is the half a deletion cannot prove: that each of
+those paths produces a REAL AD-HOC RUN on the control layer - one
+PipelineRun with the right trigger, backed by a hidden single-step agent
+pipeline, recording ``executor='local'`` on its StepRun. "Nothing went to the
+old place" and "the work went to the right new place" are different claims,
+and only the second one survives its subject being deleted.
 """
 import asyncio
 import json
@@ -32,38 +32,8 @@ from app.services import agent_run
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture
-def enqueue_spy(monkeypatch):
-    """Record every job that reaches the real queue, then enqueue it.
-
-    Wrapping rather than replacing keeps the legacy escape-hatch test honest:
-    the job really does land in the real queue, so that test asserts the path
-    still WORKS instead of only that it was called.
-    """
-    from app.services.job_queue import job_queue
-
-    calls: list = []
-    original = job_queue.enqueue
-
-    async def spy(job):
-        calls.append(job)
-        return await original(job)
-
-    monkeypatch.setattr(job_queue, "enqueue", spy)
-    return calls
-
-
-@pytest.fixture(autouse=True)
-async def _drain_queue():
-    """The queue is a process-wide singleton; leave it as we found it."""
-    yield
-    from app.services.job_queue import job_queue
-
-    await job_queue.clear()
-
-
 async def _settle():
-    """Let dispatched step tasks run far enough to enqueue, if they would."""
+    """Let dispatched step tasks run far enough to reach a dispatch decision."""
     for _ in range(20):
         await asyncio.sleep(0.01)
 
@@ -89,23 +59,9 @@ async def adhoc_runs(db_session, trigger_type: str) -> list[PipelineRun]:
     return list(result.scalars().all())
 
 
-class TestCardsDoNotEnqueue:
-    async def test_card_start_enqueues_nothing(
-        self, client, ingested_repo, db_session, enqueue_spy
-    ):
-        card = await create_agent_card(client, ingested_repo["id"])
-
-        response = await client.post(f"/api/cards/{card['id']}/start")
-        assert response.status_code == 200, response.text
-        await _settle()
-
-        assert enqueue_spy == [], (
-            "starting a card enqueued a legacy job - card work runs as an "
-            "ad-hoc agent run on the control layer since 12.5"
-        )
-
+class TestCardsRunOnTheControlLayer:
     async def test_card_start_creates_an_adhoc_run(
-        self, client, ingested_repo, db_session, enqueue_spy
+        self, client, ingested_repo, db_session
     ):
         card = await create_agent_card(client, ingested_repo["id"])
         await client.post(f"/api/cards/{card['id']}/start")
@@ -122,13 +78,10 @@ class TestCardsDoNotEnqueue:
         assert [s["type"] for s in steps] == ["agent"]
         assert steps[0]["config"]["agent"] == "mock"
 
-    async def test_card_retry_enqueues_nothing(
-        self, client, ingested_repo, db_session, enqueue_spy
-    ):
+    async def test_card_retry_creates_a_second_adhoc_run(self, client, ingested_repo, db_session):
         card = await create_agent_card(client, ingested_repo["id"])
         await client.post(f"/api/cards/{card['id']}/start")
         await _settle()
-        enqueue_spy.clear()
 
         # Retry is only legal from failed/in_review.
         await client.patch(f"/api/cards/{card['id']}", json={"status": "failed"})
@@ -137,12 +90,17 @@ class TestCardsDoNotEnqueue:
         assert response.status_code == 200, response.text
         await _settle()
 
-        assert enqueue_spy == [], "retrying a card enqueued a legacy job"
+        runs = await adhoc_runs(db_session, agent_run.TRIGGER_CARD_WORK)
+        assert len(runs) == 2, (
+            "retry must take the same ad-hoc control-layer path start does, "
+            f"producing a second run; saw {len(runs)}"
+        )
+        assert {r.trigger_ref for r in runs} == {card["id"]}
 
 
-class TestPlaygroundDoesNotEnqueue:
-    async def test_playground_start_enqueues_nothing(
-        self, client, ingested_repo, db_session, enqueue_spy
+class TestPlaygroundRunsOnTheControlLayer:
+    async def test_playground_start_creates_an_adhoc_run(
+        self, client, ingested_repo, db_session
     ):
         response = await client.post(
             f"/api/repos/{ingested_repo['id']}/playground/test",
@@ -151,17 +109,12 @@ class TestPlaygroundDoesNotEnqueue:
         assert response.status_code == 200, response.text
         await _settle()
 
-        assert enqueue_spy == [], (
-            "the playground enqueued a legacy job - it runs as an ad-hoc "
-            "agent run on the control layer since 12.5"
-        )
-
         runs = await adhoc_runs(db_session, agent_run.TRIGGER_PLAYGROUND)
         assert len(runs) == 1
         assert runs[0].trigger_ref == response.json()["session_id"]
 
 
-class TestAgentPipelineStepDoesNotEnqueue:
+class TestAgentPipelineStepRunsLocal:
     async def _agent_pipeline(self, client, repo_id, *, config_extra=None):
         config = {"agent": "mock", "task": "do the thing"}
         config.update(config_extra or {})
@@ -185,22 +138,8 @@ class TestAgentPipelineStepDoesNotEnqueue:
         assert response.status_code == 201, response.text
         return response.json()
 
-    async def test_agent_step_enqueues_nothing(
-        self, client, ingested_repo, db_session, enqueue_spy
-    ):
-        pipeline = await self._agent_pipeline(client, ingested_repo["id"])
-
-        response = await client.post(f"/api/pipelines/{pipeline['id']}/run", json={})
-        assert response.status_code in (200, 201), response.text
-        await _settle()
-
-        assert enqueue_spy == [], (
-            "an agent pipeline step enqueued a legacy job - agent steps route "
-            "local since 12.5 (ExecutionRouter reason 'agent-default-local')"
-        )
-
     async def test_agent_step_records_executor_local(
-        self, client, ingested_repo, db_session, enqueue_spy
+        self, client, ingested_repo, db_session
     ):
         """R1: the routing decision is observable on the StepRun row."""
         pipeline = await self._agent_pipeline(client, ingested_repo["id"])
@@ -215,33 +154,39 @@ class TestAgentPipelineStepDoesNotEnqueue:
         assert step_runs, "the agent step never produced a StepRun"
         assert [sr.executor for sr in step_runs] == ["local"]
 
-    async def test_explicit_legacy_override_still_enqueues(
-        self, client, ingested_repo, db_session, enqueue_spy
+    async def test_the_legacy_escape_hatch_fails_the_step_loudly(
+        self, client, ingested_repo, db_session
     ):
-        """R2: the ONE remaining escape hatch must not rot.
+        """R2's close-out.
 
-        `executor: legacy` on an agent step is the last caller of the polling
-        queue, kept callable until the 12.6 deletion commit. If this ever
-        stops enqueueing, 12.6's "delete the legacy stack" commit loses the
-        thing it is supposed to be deleting.
+        Until 12.6, `executor: legacy` on an agent step was the ONE remaining
+        caller of the polling queue and was kept callable on purpose - a phase
+        that moves work off a path must leave the old path usable until the
+        path itself is deleted. The deletion commit removed the path, so the
+        override now FAILS THE STEP with a message naming what happened,
+        rather than being silently downgraded to a local run: a user who asked
+        for a specific executor and got a different one has been lied to.
         """
         pipeline = await self._agent_pipeline(
             client, ingested_repo["id"], config_extra={"executor": "legacy"}
         )
 
-        await client.post(f"/api/pipelines/{pipeline['id']}/run", json={})
+        response = await client.post(f"/api/pipelines/{pipeline['id']}/run", json={})
+        run_id = response.json()["id"]
         await _settle()
 
-        assert len(enqueue_spy) == 1, (
-            "executor: legacy on an agent step must still reach the runner "
-            "queue - it is the R2 escape hatch"
+        result = await db_session.execute(
+            select(StepRun).where(StepRun.pipeline_run_id == run_id)
         )
-        assert enqueue_spy[0].step_type == "agent"
+        step_runs = list(result.scalars().all())
+        assert step_runs, "the step never produced a StepRun"
+        assert step_runs[0].status == "failed"
+        assert "legacy" in (step_runs[0].error or "")
 
 
-class TestFixCardActionDoesNotEnqueue:
+class TestFixCardActionRunsOnTheControlLayer:
     """`trigger:{card_id}` - the pipeline action that clones a card to fix a
-    failed step - was the last live caller of job_queue.enqueue on the card
+    failed step - was the last live caller of the polling queue on the card
     path.
 
     Card start and card retry moved to the ad-hoc agent run in 12.5; this one
@@ -297,38 +242,8 @@ class TestFixCardActionDoesNotEnqueue:
         )
         return result.scalars().first()
 
-    async def test_fix_card_action_enqueues_nothing(
-        self, client, ingested_repo, db_session, enqueue_spy
-    ):
-        from app.services.pipeline_executor import pipeline_executor
-
-        template, repo, pipeline = await self._fixture_rows(
-            client, db_session, ingested_repo["id"]
-        )
-        run = PipelineRun(
-            id=str(uuid4()),
-            pipeline_id=pipeline.id,
-            status="running",
-            trigger_type="manual",
-            steps_total=2,
-        )
-        db_session.add(run)
-        await db_session.commit()
-        enqueue_spy.clear()
-
-        steps = json.loads(pipeline.steps)
-        await pipeline_executor._trigger_card(
-            db_session, run, repo, steps, 0, template["id"]
-        )
-        await _settle()
-
-        assert enqueue_spy == [], (
-            "the trigger:{card_id} fix action enqueued a legacy job - it "
-            "takes the ad-hoc agent run path like card start since 12.5"
-        )
-
     async def test_fix_card_action_starts_an_adhoc_card_work_run(
-        self, client, ingested_repo, db_session, enqueue_spy
+        self, client, ingested_repo, db_session
     ):
         from app.models import Card
         from app.services.pipeline_executor import pipeline_executor
@@ -363,7 +278,7 @@ class TestFixCardActionDoesNotEnqueue:
         assert cloned.branch_name and cloned.branch_name.startswith("lazyaf/")
 
     async def test_the_parent_run_is_not_left_waiting(
-        self, client, ingested_repo, db_session, enqueue_spy
+        self, client, ingested_repo, db_session
     ):
         """The legacy shape blocked the parent on a runner callback that no
         longer comes. The action now continues the parent immediately, like
@@ -453,19 +368,14 @@ class TestSynchronousStartFailureDoesNotFallBack:
         finally:
             pipeline_executor._local_executor = previous
 
-    async def test_preflight_failure_enqueues_nothing_and_fails_the_card(
-        self, client, ingested_repo, db_session, enqueue_spy, missing_image_executor
+    async def test_a_preflight_failure_fails_the_card_instead_of_falling_back(
+        self, client, ingested_repo, db_session, missing_image_executor
     ):
         card = await create_agent_card(client, ingested_repo["id"])
 
         response = await client.post(f"/api/cards/{card['id']}/start")
         assert response.status_code == 200, response.text
         await _settle()
-
-        assert enqueue_spy == [], (
-            "a card whose ad-hoc run failed preflight fell back to the legacy "
-            "runner queue"
-        )
 
         runs = await adhoc_runs(db_session, agent_run.TRIGGER_CARD_WORK)
         assert [r.status for r in runs] == ["failed"]

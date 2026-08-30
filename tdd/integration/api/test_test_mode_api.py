@@ -12,6 +12,7 @@ in-memory singletons too, not just the database:
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -29,19 +30,18 @@ from shared.assertions import assert_status_code
 
 
 @pytest.fixture(autouse=True)
-def _restore_singletons():
+async def _restore_singletons():
     """These tests exercise the real module-level singletons; leave them
     empty for the rest of the suite no matter how a test exits."""
     yield
-    from app.services.job_queue import job_queue
+    from app.services.execution.runner_dispatcher import runner_dispatcher
+    from app.services.execution.runner_registry import runner_registry
     from app.services.playground_service import playground_service
-    from app.services.runner_pool import runner_pool
     from app.services.trigger_service import trigger_deduplicator
     from app.services.websocket import manager
 
-    job_queue._jobs.clear()
-    job_queue._pending.clear()
-    runner_pool._runners.clear()
+    await runner_registry.reset()
+    await runner_dispatcher.reset()
     manager.active_connections = []
     playground_service._sessions.clear()
     trigger_deduplicator._triggers.clear()
@@ -174,47 +174,70 @@ class TestReset:
             count = await db_session.scalar(select(func.count()).select_from(model))
             assert count == 0, f"{model.__name__} rows survived reset"
 
-    async def test_reset_clears_enqueued_job(self, test_client):
-        """A job enqueued before reset must be gone from the queue."""
-        from app.services.job_queue import QueuedJob, job_queue
+    async def test_reset_names_the_runner_singletons_it_wiped(self, test_client):
+        """R6: the reset endpoint must reset in-memory singletons.
 
-        job = QueuedJob(
-            id="job-doomed",
-            card_id="card-doomed",
-            repo_id="repo-doomed",
-            repo_url="",
-            base_branch="main",
-            card_title="Doomed",
-            card_description="Enqueued before reset",
-        )
-        await job_queue.enqueue(job)
-        assert job_queue.queue_size == 1
+        12.6 replaced the polling pool and its queue with the registry and the
+        dispatcher, and BOTH have to be in `memory_reset` - the registry holds
+        live sockets, the dispatcher holds waiters, in-flight assignments and
+        a loop-bound wake event. A reset that wiped the DB and left either
+        behind would hand the next test an assignment for a step row that no
+        longer exists.
 
+        The response's `memory_reset` derives from the resettable REGISTRY,
+        not from a hand-maintained list, so this also pins that the two new
+        singletons actually registered themselves.
+        """
         response = await test_client.post("/api/test/reset")
         assert_status_code(response, 200)
 
-        assert job_queue.queue_size == 0
-        assert job_queue.pending_count == 0
-        assert await job_queue.dequeue() is None
+        reset = response.json()["memory_reset"]
+        assert "runner_registry" in reset, reset
+        assert "runner_dispatcher" in reset, reset
+        # And the names they replaced are gone with their subsystems.
+        assert "runner_pool" not in reset, reset
+        assert "job_queue" not in reset, reset
 
-    async def test_reset_clears_runner_pool_and_websockets(self, test_client):
-        from app.services.runner_pool import runner_pool
+    async def test_reset_closes_websockets(self, test_client):
         from app.services.websocket import manager
-
-        runner_pool.register(runner_id="runner-doomed", name="doomed")
-        assert runner_pool.runner_count == 1
 
         stub = _StubWebSocket()
         manager.active_connections.append(stub)
 
         response = await test_client.post("/api/test/reset")
         assert_status_code(response, 200)
-        assert "runner_pool" in response.json()["memory_reset"]
 
-        assert runner_pool.runner_count == 0
-        assert runner_pool.get_runner("runner-doomed") is None
         assert manager.active_connections == []
         assert stub.closed is True
+
+    async def test_reset_drops_a_registered_runner(self, test_client, db_session):
+        """A runner row and its in-memory connection both go.
+
+        The row is deleted with the rest of the DB; the registry's socket
+        table is wiped by its own reset hook. Asserting only one of the two
+        is how a reset leaves a ghost the next test can dispatch at.
+        """
+        from app.models import Runner
+        from app.services.execution.runner_registry import runner_registry
+
+        db_session.add(
+            Runner(
+                id="runner-doomed",
+                name="doomed",
+                runner_type="generic",
+                status="idle",
+                last_heartbeat=datetime.utcnow(),
+            )
+        )
+        await db_session.commit()
+
+        response = await test_client.post("/api/test/reset")
+        assert_status_code(response, 200)
+
+        assert await db_session.scalar(
+            select(func.count()).select_from(Runner)
+        ) == 0
+        assert not runner_registry.is_connected("runner-doomed")
 
     async def test_reset_clears_playground_sessions(self, test_client):
         from app.services.playground_service import playground_service

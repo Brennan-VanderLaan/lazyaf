@@ -108,8 +108,9 @@ on_failure: next      # Continue anyway
 ```
 backend/          # FastAPI app
 frontend/         # Svelte SPA
-runner-claude/    # Claude Code runner
-runner-gemini/    # Gemini runner
+runner-agent/     # lazyaf_runner - remote step execution over /ws/runner
+runner-common/    # agent-step runtime shared by the agent images
+images/           # the lazyaf-*:dev step images (built by scripts/build_images.py)
 cli/              # lazyaf CLI (ingest, land, list)
 ```
 

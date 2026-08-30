@@ -63,12 +63,20 @@ Do not raise `workers` for this tier without per-worker namespacing.
 ## Specs
 
 - `dogfood-live.spec.ts` — **Phase 0c exit-gate spec (R8).** A real pipeline
-  run (script steps executed by `runner-mock-e2e`) appears in the UI; run
+  run (script steps executed by the backend's LocalExecutor) appears in the
+  UI; run
   status and per-step progress are asserted with the browser's REST access to
   `/api/pipeline-runs` blocked, so the updates can only have streamed over the
   WebSocket; the run viewer shows a step's full pending → running → passed
   sequence and log lines containing shell-computed output (proof of real
   execution), all without a reload.
+- `runners.spec.ts` — **Phase 12.6 runner panel (R8).** Proves both halves
+  of the panel's snapshot-then-delta model, each with the OTHER channel
+  neutralized: the runner appears from `GET /api/runners` with the WebSocket
+  blocked, then transitions idle → assigned → busy → idle from
+  `runner_status` frames with the snapshot route serving `[]`, and a reload
+  MID-STEP shows the busy runner immediately. Needs `runner-agent-e2e`; a
+  missing agent fails the spec with the compose command rather than skipping.
 - `card-workflow.spec.ts` — board/card flows (predates the testid sweep; uses
   CSS-class selectors).
 - `graph-pipeline.spec.ts` — graph editor flows (several tests skipped:

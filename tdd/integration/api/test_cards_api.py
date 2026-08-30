@@ -288,7 +288,7 @@ class TestDeleteCard:
 class TestCardLifecycleActions:
     """Tests for card lifecycle endpoints: start, approve, reject."""
 
-    async def test_start_card(self, client, ingested_repo, clean_job_queue):
+    async def test_start_card(self, client, ingested_repo, clean_runner_registry):
         """POST /api/cards/{id}/start moves card to in_progress."""
         create_response = await client.post(
             f"/api/repos/{ingested_repo['id']}/cards",
@@ -308,7 +308,7 @@ class TestCardLifecycleActions:
         response = await client.post("/api/cards/nonexistent/start")
         assert_not_found(response, "Card")
 
-    async def test_start_card_already_started(self, client, ingested_repo, clean_job_queue):
+    async def test_start_card_already_started(self, client, ingested_repo, clean_runner_registry):
         """Returns 400 when starting card that is not in todo status."""
         create_response = await client.post(
             f"/api/repos/{ingested_repo['id']}/cards",
@@ -377,7 +377,7 @@ class TestCardLifecycleActions:
         response = await client.post("/api/cards/nonexistent/reject")
         assert_not_found(response, "Card")
 
-    async def test_retry_failed_card(self, client, ingested_repo, clean_job_queue):
+    async def test_retry_failed_card(self, client, ingested_repo, clean_runner_registry):
         """POST /api/cards/{id}/retry retries a failed card."""
         # Create card and move to failed status
         create_response = await client.post(
@@ -397,7 +397,7 @@ class TestCardLifecycleActions:
         assert result["job_id"] is not None
         assert result["branch_name"] is not None
 
-    async def test_retry_in_review_card(self, client, ingested_repo, clean_job_queue):
+    async def test_retry_in_review_card(self, client, ingested_repo, clean_runner_registry):
         """POST /api/cards/{id}/retry can retry a card in review."""
         create_response = await client.post(
             f"/api/repos/{ingested_repo['id']}/cards",
@@ -453,7 +453,7 @@ class TestScriptDockerCardsRejected:
         ],
     )
     async def test_start_rejects_script_and_docker_cards(
-        self, client, ingested_repo, clean_job_queue, step_type, step_config
+        self, client, ingested_repo, clean_runner_registry, step_type, step_config
     ):
         payload = card_create_payload(title=f"A {step_type} card")
         payload["step_type"] = step_type
@@ -475,7 +475,7 @@ class TestScriptDockerCardsRejected:
 
     @pytest.mark.parametrize("step_type", ["script", "docker"])
     async def test_rejected_card_stays_in_todo(
-        self, client, ingested_repo, clean_job_queue, step_type
+        self, client, ingested_repo, clean_runner_registry, step_type
     ):
         """No silent in_progress -> failed loop: the card never moves."""
         payload = card_create_payload(title=f"Untouched {step_type} card")
@@ -496,7 +496,7 @@ class TestScriptDockerCardsRejected:
 
     @pytest.mark.parametrize("step_type", ["script", "docker"])
     async def test_retry_rejects_script_and_docker_cards(
-        self, client, ingested_repo, clean_job_queue, step_type
+        self, client, ingested_repo, clean_runner_registry, step_type
     ):
         """Retry closes the same loop - a failed script card cannot be
         re-enqueued into the same rejection."""
@@ -519,7 +519,7 @@ class TestScriptDockerCardsRejected:
         assert card["status"] == "failed"
 
     async def test_agent_cards_still_start(
-        self, client, ingested_repo, clean_job_queue
+        self, client, ingested_repo, clean_runner_registry
     ):
         """The guard is narrow: agent cards are unaffected."""
         payload = card_create_payload(title="An agent card")

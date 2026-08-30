@@ -38,11 +38,42 @@ Asserts, for the CURRENT pipeline run:
      StepUsage row in GET /api/pipeline-runs/{run_id}/usage.
      cost_source == 'unknown' is accepted there ("the provider told us
      nothing" is a recorded fact); a MISSING row is not.
-  7. (12.5) GET /api/runners/status reports queued_jobs == 0: after 12.5 no
-     default path enqueues to the polling runners, and the runners sitting
-     idle is asserted, never assumed.
+  7. (RETIRED) 12.5 asserted `GET /api/runners/status` reported
+     queued_jobs == 0 - "nothing enqueues to the polling runners any more".
+     That subsystem was deleted in 12.6, so the assertion was deleted WITH
+     it, in the same commit, and replaced by 9 below. An assertion left
+     pointing at a removed subsystem either 404s the gate or, worse, passes
+     vacuously; leaving one behind is how a gate rots. The numbering is kept
+     so 8-12 still mean what the design says they mean.
+  8. (12.6) every step whose PIPELINE DEFINITION carries a `requires:` block
+     ran on the REMOTE lane (executor == 'remote') and, like every other
+     passed step, delivered non-marker logs. That second half is the whole
+     claim of 12.6's channel split: the step container POSTs its own
+     status/logs/test-results/usage to /api/steps/* over HTTP exactly as it
+     does locally, and only the runner/assignment concerns travel the
+     WebSocket. Non-marker logs on a remote step prove the control layer
+     worked from another host with zero new server code.
+  9. (12.6) GET /api/runners reports at least one runner with
+     status in {'idle','busy'} AND connection == 'websocket'. `connection`
+     is stamped from the registry's live socket table, not from the row, so
+     an 'idle' row left behind by a crashed process cannot satisfy it. NO
+     RUNNERS AT ALL IS A FAILURE, not a vacuous pass: "the fleet is empty"
+     and "the fleet is fine" must not look the same to this gate.
+ 10. (12.6) every remote step's StepExecution carries a non-null runner_id,
+     and that id is a runner in the snapshot from 9. `executor == 'remote'`
+     alone only says which code path ran; this says a real, currently
+     enrolled runner was actually assigned the work.
+ 11. (12.6) every step NOT carrying `requires:` still has
+     executor == 'local'. A global accidental flip to the remote lane is as
+     much a regression as a fallback to the legacy queue was, and it would
+     otherwise pass 1-10 silently.
+ 12. (12.6) the agent step rode the remote lane too (it carries `requires:`,
+     so 8 covers its routing) AND still has a StepUsage row with real token
+     counts (verify_usage below). The usage channel crossing a host boundary
+     is the one thing 12.5 could not prove.
 
-A vacuous pass (no script/docker step runs found) is a failure (R4).
+A vacuous pass is a failure (R4) in four separate ways: no script/docker step
+runs, no agent step run, no REMOTE step run, and no connected runner.
 
 Env contract (injected into every step container by LocalExecutor; the
 backend URL default matches settings.container_backend_url):
@@ -60,6 +91,19 @@ import urllib.request
 DEFAULT_BACKEND_URL = "http://backend:8000"
 EXECUTED_STEP_TYPES = ("script", "docker")
 AGENT_STEP_TYPE = "agent"
+# 12.6 lane vocabulary. A step's LANE is decided by its pipeline definition,
+# not by what happened: a `requires:` block routes remote (ExecutionRouter's
+# "runner-pin" decision, one parser, all step types), everything else routes
+# local. The gate re-derives the expectation from the definition and compares,
+# so "every step flipped to remote" and "the remote step fell back to local"
+# are both regressions rather than both green.
+LOCAL_EXECUTOR = "local"
+REMOTE_EXECUTOR = "remote"
+# A runner in one of these states, holding a live socket, is a runner that can
+# take work. `connection` is stamped by the registry from its own socket
+# table - a row alone cannot say it (assertion 9).
+LIVE_RUNNER_STATES = ("idle", "busy")
+LIVE_RUNNER_CONNECTION = "websocket"
 # Lines the BACKEND appends to StepRun.logs itself (e.g. '[lazyaf] exit
 # code: 0'). They prove nothing about the in-container reporting path, so
 # the log-delivery probe ignores them.
@@ -91,6 +135,39 @@ def has_delivered_logs(logs) -> bool:
     return False
 
 
+def step_requires_remote(step: dict) -> bool:
+    """True iff this pipeline STEP DEFINITION pins itself to a runner.
+
+    `requires:` lives under the step's `config` and is the single routing
+    signal for the remote lane (a top-level `runner_type:` is sugar for
+    `requires.runner_type` on script/docker steps and keeps its 12.5
+    AI-flavor meaning on agent steps, so it deliberately does NOT route
+    remote here). Key PRESENCE is the test, exactly as the router's is: the
+    gate must not grow a second, drifting copy of the requirement grammar.
+    """
+    config = step.get("config") or {}
+    return bool(config.get("requires"))
+
+
+def expected_executor(step: dict) -> str:
+    return REMOTE_EXECUTOR if step_requires_remote(step) else LOCAL_EXECUTOR
+
+
+def step_runner_id(step_run: dict, usage_row: dict | None) -> str | None:
+    """StepExecution.runner_id for a step run (assertion 10).
+
+    `GET /api/pipeline-runs/{id}` lifts it onto each step run from that
+    step's latest StepExecution; the usage rollup is read as a fallback so
+    the gate is not brittle about WHICH read surface exposes the assignment,
+    only that one of them does.
+    """
+    for source in (step_run, usage_row or {}):
+        value = source.get("runner_id")
+        if value:
+            return value
+    return None
+
+
 def fetch_json(base_url: str, path: str, timeout: float = 30.0):
     """GET base_url+path and decode the JSON response body."""
     with urllib.request.urlopen(base_url + path, timeout=timeout) as resp:
@@ -108,26 +185,40 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
     step_types = {
         i: s.get("type", "script") for i, s in enumerate(pipeline["steps"])
     }
+    # 12.6: the EXPECTED lane per step index, re-derived from the pipeline
+    # definition. Comparing against a derived expectation (rather than
+    # against the constant "local") is what makes assertion 11 possible: a
+    # run in which everything flipped to remote fails here just as loudly as
+    # one in which the pinned step fell back to local.
+    expected = {i: expected_executor(s) for i, s in enumerate(pipeline["steps"])}
 
     checked = 0
     agents_checked = 0
+    remote_checked = 0
     bad = []
     silent = []
     for sr in run["step_runs"]:
         step_type = step_types.get(sr["step_index"], "script")
         if step_type == AGENT_STEP_TYPE:
-            # 12.5: agent steps left the legacy queue. They are checked for
-            # executor='local' exactly like script steps - the whole point
-            # of the phase is that there is no longer a difference.
+            # 12.5: agent steps left the legacy queue and are lane-checked
+            # exactly like script steps - the whole point of that phase was
+            # that there is no longer a difference. 12.6: the dogfood agent
+            # step now carries `requires:`, so its expectation is 'remote'
+            # and the same comparison covers it (assertion 12).
             agents_checked += 1
         elif step_type not in EXECUTED_STEP_TYPES:
             continue
         else:
             checked += 1
-        if sr["executor"] != "local":
+        want = expected.get(sr["step_index"], LOCAL_EXECUTOR)
+        if want == REMOTE_EXECUTOR:
+            remote_checked += 1
+        if sr["executor"] != want:
             bad.append(
                 f"step {sr['step_index']} '{sr['step_name']}' ({step_type}) -> "
-                f"executor={sr['executor']!r}"
+                f"executor={sr['executor']!r}, expected {want!r} "
+                f"({'has' if want == REMOTE_EXECUTOR else 'no'} `requires:` "
+                f"block in the pipeline definition)"
             )
         # 12.3 control-path probe: passed steps (other than this one) must
         # have NON-marker logs on record - in control mode those only exist
@@ -152,7 +243,7 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
     # about the pipeline definition rather than about this run's behavior.
     if bad:
         raise SystemExit(
-            "FAIL: steps not executed by LocalExecutor:\n  " + "\n  ".join(bad)
+            "FAIL: steps did not run on the lane their definition asks for (`requires:` -> remote, otherwise local):\n  " + "\n  ".join(bad)
         )
     if not agents_checked:
         raise SystemExit(
@@ -160,6 +251,17 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
             "ratchet requires the zero-cost mock agent step (US-2 continuous "
             "coverage) - a missing agent step means the agent path is not "
             "exercised on push at all (vacuous pass = fail, R4)"
+        )
+    if not remote_checked:
+        raise SystemExit(
+            "FAIL: no step of this pipeline carries a `requires:` block, so "
+            "the 12.6 REMOTE LANE was not exercised at all. Remote execution "
+            "is covered continuously or not at all: without a pinned step "
+            "here the WS protocol, the registry, the assignment CAS and the "
+            "agent's own workspace provisioning can all break while every "
+            "other assertion in this gate still passes (vacuous pass = fail, "
+            "R4). Restore the `remote-probe` step - and the `requires:` block "
+            "on `mock-agent` - in .lazyaf/pipelines/test-suite.yaml"
         )
     if silent:
         raise SystemExit(
@@ -201,18 +303,28 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
             + "\n  ".join(scrape_problems)
         )
 
-    usage_msg = verify_usage(base_url, run, step_types, self_index=self_index)
-    idle_msg = verify_runners_idle(base_url)
+    # ONE rollup read, shared by both gates below: the usage channel gate
+    # and the remote-lane gate ask different questions of the same rows.
+    rollup = fetch_json(base_url, f"/api/pipeline-runs/{run['id']}/usage")
+    usage_msg = verify_usage(
+        base_url, run, step_types, self_index=self_index, rollup=rollup
+    )
+    remote_msg = verify_remote_lane(base_url, run, expected, rollup)
 
     return (
         f"OK: {checked} script step run(s) and {agents_checked} agent step "
-        f"run(s) all have executor='local', passed steps delivered logs, no "
-        f"manifest delivery problems, {usage_msg}, {idle_msg}"
+        f"run(s) ran on the lane their definition asks for "
+        f"({remote_checked} remote), passed steps delivered logs, no "
+        f"manifest delivery problems, {usage_msg}, {remote_msg}"
     )
 
 
 def verify_usage(
-    base_url: str, run: dict, step_types: dict, self_index: int | None = None
+    base_url: str,
+    run: dict,
+    step_types: dict,
+    self_index: int | None = None,
+    rollup: dict | None = None,
 ) -> str:
     """12.5: the usage channel must have written a row for every step.
 
@@ -227,7 +339,8 @@ def verify_usage(
     the runtime it verifies). A stdout-mode step has no control runtime and
     therefore cannot POST usage. It is exempted by index, not by guesswork.
     """
-    rollup = fetch_json(base_url, f"/api/pipeline-runs/{run['id']}/usage")
+    if rollup is None:
+        rollup = fetch_json(base_url, f"/api/pipeline-runs/{run['id']}/usage")
     by_step_run = {
         row["step_run_id"]: row
         for row in rollup.get("steps", [])
@@ -320,26 +433,118 @@ def verify_usage(
     )
 
 
-def verify_runners_idle(base_url: str) -> str:
-    """12.5: nothing enqueues to the polling runners any more.
+def verify_remote_lane(
+    base_url: str, run: dict, expected: dict, rollup: dict
+) -> str:
+    """12.6 assertions 9 and 10: the remote lane is REAL, not just labelled.
 
-    The runners keep their compose services and replica counts (setting them
-    to 0 would be deletion-by-config and would make 12.6's acceptance
-    untestable). They sit IDLE - and idleness is asserted here rather than
-    assumed, because a silent fallback to the legacy queue is
-    indistinguishable from success everywhere else (R1).
+    Assertion 8 (executor == 'remote' on every pinned step) is checked in
+    verify_run against the lane derived from the pipeline definition. That
+    proves which code path ran. It does NOT prove a runner existed: a
+    RemoteExecutor that failed a step with "no runner matched" still writes
+    executor='remote', so a fleet of zero would sail through assertion 8
+    the moment such a step were made non-fatal.
+
+    Two more things are read here, and both are about the FLEET rather than
+    about the step:
+
+      9. GET /api/runners must report at least one runner that is
+         status in {idle, busy} AND connection == 'websocket'. `connection`
+         is stamped by the registry from its own live-socket table, never
+         from the DB row, precisely because a row left behind by a crashed
+         backend process still says 'idle'. NO RUNNERS AT ALL IS A FAILURE:
+         "the fleet is empty" must not be indistinguishable from "the fleet
+         is fine" (R4).
+
+     10. Every remote step's StepExecution carries a non-null runner_id, and
+         that id is one of the runners in the snapshot. This is the link
+         between "a remote code path ran" and "a specific, currently
+         enrolled machine did the work" - the assignment CAS's own output,
+         read back through the API.
     """
-    status = fetch_json(base_url, "/api/runners/status")
-    queued = status.get("queued_jobs")
-    if queued:
+    snapshot = fetch_json(base_url, "/api/runners")
+    if not isinstance(snapshot, list) or not snapshot:
         raise SystemExit(
-            f"FAIL: {queued} job(s) are sitting in the legacy runner queue. "
-            "After 12.5 no default path enqueues - card start/retry, the "
-            "playground and agent pipeline steps all run on the control "
-            "layer. A queued job means something fell back to the polling "
-            "runners (check ExecutionRouter and app/services/agent_run.py)."
+            "FAIL: GET /api/runners reports NO runners at all. The dogfood "
+            "stack runs a `runner-agent` service that enrolls over "
+            "/ws/runner; an empty registry means it never connected (check "
+            "`docker compose ps runner-agent` and its logs for auth or "
+            "protocol-version errors) or that the WS endpoint is not "
+            "mounted. An empty fleet is a FAILURE here, never a vacuous "
+            "pass (R4)"
         )
-    return "runner queue idle (queued_jobs=0)"
+
+    live = [
+        r
+        for r in snapshot
+        if r.get("status") in LIVE_RUNNER_STATES
+        and r.get("connection") == LIVE_RUNNER_CONNECTION
+    ]
+    if not live:
+        raise SystemExit(
+            "FAIL: no runner is both alive and socket-backed. GET /api/runners "
+            f"reports {len(snapshot)} row(s), none with status in "
+            f"{list(LIVE_RUNNER_STATES)} AND connection="
+            f"'{LIVE_RUNNER_CONNECTION}'. A row that says 'idle' with "
+            "connection='none' is a TOMBSTONE - the registry holds no socket "
+            "for it - and dispatching to it is exactly the split-brain the "
+            "connection field exists to make visible:" + "\n  "
+            + "\n  ".join(
+                f"{r.get('id')}: status={r.get('status')!r} "
+                f"connection={r.get('connection')!r}"
+                for r in snapshot
+            )
+        )
+
+    known_ids = {r.get("id") for r in snapshot}
+    # The usage rollup is the second place a step's runner_id can surface
+    # (whichever projection carries it, the gate reads it from there).
+    usage_by_step_run = {
+        row["step_run_id"]: row
+        for row in rollup.get("steps", [])
+        if row.get("step_run_id")
+    }
+
+    unassigned = []
+    strangers = []
+    assigned_to = set()
+    for sr in run["step_runs"]:
+        if expected.get(sr["step_index"]) != REMOTE_EXECUTOR:
+            continue
+        runner_id = step_runner_id(sr, usage_by_step_run.get(sr["id"]))
+        if not runner_id:
+            unassigned.append(f"step {sr['step_index']} '{sr['step_name']}'")
+        elif runner_id not in known_ids:
+            strangers.append(
+                f"step {sr['step_index']} '{sr['step_name']}' -> "
+                f"runner_id={runner_id!r}"
+            )
+        else:
+            assigned_to.add(runner_id)
+
+    if unassigned:
+        raise SystemExit(
+            "FAIL: a remote step has no StepExecution.runner_id. The "
+            "assignment compare-and-swap writes runner_id and status in ONE "
+            "transaction, so a step that ran remotely without one means "
+            "either the CAS was bypassed or the field never reached this "
+            "API (it must appear on the pipeline-run step runs or on the "
+            "usage rollup rows):" + "\n  "
+            + "\n  ".join(unassigned)
+        )
+    if strangers:
+        raise SystemExit(
+            "FAIL: a remote step names a runner the registry has never heard "
+            "of. That is a stale or forged assignment, not a completed one:"
+            + "\n  "
+            + "\n  ".join(strangers)
+            + "\n" + f"(known runners: {sorted(i for i in known_ids if i)})"
+        )
+
+    return (
+        f"{len(live)} socket-backed runner(s) live, remote steps assigned to "
+        f"{sorted(assigned_to)}"
+    )
 
 
 def main() -> None:

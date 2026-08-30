@@ -110,12 +110,26 @@ steps:
   #
   # commit is FALSE: the dogfood run must never push to its own repo. That
   # also means this step needs no git credentials and leaves no branch behind.
+  #
+  # 12.6 MOVES THIS STEP TO THE REMOTE LANE (`requires:` below). 12.5 left a
+  # stated precondition - "US-2 e2e green on the remote path, not just local"
+  # - and this satisfies it on every push at zero cost: the agent config file,
+  # the wrapper, the usage manifest and its POST all have to survive the trip
+  # to another host. tdd/e2e/test_us2_card_loop.py keeps US-2 covered on the
+  # LOCAL path in T3, so both paths are covered continuously rather than one
+  # replacing the other.
+  #
+  # It also proves the thing a script step cannot: that 12.5's usage channel
+  # still writes a StepUsage row with real token counts when the step ran
+  # somewhere else entirely (verify_executor assertion 12).
   - id: "mock-agent"
-    name: "US-2 mock agent step (zero cost)"
+    name: "US-2 mock agent step (zero cost, remote lane)"
     type: agent
     config:
       agent: mock
       commit: false
+      requires:
+        has: ["remote-lane"]
       task: "Write .lazyaf-dogfood/agent-ran into the workspace"
       mock_config:
         response_mode: streaming
@@ -132,9 +146,44 @@ steps:
     on_failure: stop
     timeout: 300
 
-  # Exit-gate ratchet (R1), 12.3 edition: every script step of THIS run must
-  # have executor='local' AND (control-layer probe) show logs that arrived via
-  # the POST /api/steps/* path with a StepExecution row per script step.
+  # 12.6 REMOTE LANE (R7): this step is pinned to the loopback runner-agent by
+  # a capability label only that agent carries. If the agent is down, or the
+  # WS protocol, the registry, the assignment CAS or the agent's workspace
+  # provisioning break, this step FAILS THE PUSH. Remote execution is covered
+  # continuously, not once at an exit gate.
+  #
+  # `ls /workspace/repo/PLAN.md` is not decoration. It is the ONE piece of
+  # remote execution with no local analogue: a remote agent cannot see the
+  # backend's `lazyaf-workspaces` volume, so it has to create its own named
+  # volume on its own daemon and clone the repo into it from the backend's git
+  # server. If that clone silently did nothing, `echo` would still succeed and
+  # the step would still pass - this line is what makes the difference visible.
+  #
+  # The `$(hostname)` echo names the container the agent spawned, so a
+  # failure diff shows WHERE it ran, not just that it ran.
+  - id: "remote-probe"
+    name: "Remote lane: script step via the loopback runner agent"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      requires:
+        has: ["remote-lane"]
+      command: |
+        echo "[remote-probe] executed on $(hostname)"
+        ls /workspace/repo/PLAN.md
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  # Exit-gate ratchet (R1), 12.6 edition: every step of THIS run must have run
+  # on the LANE ITS DEFINITION ASKS FOR - `requires:` means remote, everything
+  # else means local - AND (control-layer probe) show logs that arrived via the
+  # POST /api/steps/* path with a StepExecution row per script step. Checking a
+  # DERIVED expectation rather than the constant 'local' is what makes a global
+  # accidental flip to remote as loud as a pinned step falling back to local.
+  # The gate also requires a live, socket-backed runner in GET /api/runners and
+  # a real runner_id on every remote step: "executor said remote" and "a
+  # machine did the work" are different claims.
   # LAZYAF_PIPELINE_RUN_ID (and friends) are injected into every step
   # container by LocalExecutor; the backend is reachable by service DNS name
   # on the shared lazyaf-network. Runs on lazyaf-base:dev in STDOUT mode

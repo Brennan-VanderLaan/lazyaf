@@ -62,9 +62,13 @@ describe('URL building', () => {
     expect(lastRequest().url).toBe('/api/repos/r1/lazyaf/pipelines/ci%20build?branch=feat%2Fx');
   });
 
-  it('builds the runner docker-command query', async () => {
-    await runners.dockerCommand('gemini', true);
-    expect(lastRequest().url).toBe('/api/runners/docker-command?runner_type=gemini&with_secrets=true');
+  // 12.6: the runners API is READ-ONLY over the registry. `docker-command`
+  // (and register/heartbeat/job/logs) served the polling pool and left with
+  // it; `list()` is the snapshot half of the panel's snapshot-then-delta
+  // model, so it is the whole client surface now.
+  it('fetches the runner snapshot from the read-only runners route', async () => {
+    await runners.list();
+    expect(lastRequest().url).toBe('/api/runners');
   });
 
   it('streamUrl is a plain string for EventSource use', () => {

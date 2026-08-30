@@ -149,22 +149,6 @@ def agent_container(api_client):
         pipeline_executor._local_executor = previous
 
 
-@pytest.fixture
-def enqueue_spy(monkeypatch):
-    """Every job that reaches the legacy queue during this test."""
-    from app.services.job_queue import job_queue
-
-    calls: list = []
-    original = job_queue.enqueue
-
-    async def spy(job):
-        calls.append(job)
-        return await original(job)
-
-    monkeypatch.setattr(job_queue, "enqueue", spy)
-    return calls
-
-
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
@@ -285,7 +269,7 @@ class TestUS2CardLoop:
     """card -> agent -> gate -> review -> merge, on ephemeral containers."""
 
     async def test_full_loop(
-        self, api_client, test_repo, clean_git_repos, agent_container, enqueue_spy
+        self, api_client, test_repo, clean_git_repos, agent_container
     ):
         repo_id = test_repo["id"]
         default_branch = test_repo["default_branch"]
@@ -387,14 +371,26 @@ class TestUS2CardLoop:
         assert merged is not None, "the agent's file never reached the trunk"
         assert AGENT_CONTENT.encode() in merged
 
-        # --- and the runners never moved ----------------------------------
-        assert enqueue_spy == [], (
-            "the US-2 loop enqueued a legacy job. After 12.5 the whole chain "
-            "runs on the control layer; the polling runners sit idle."
+        # --- and every step of the chain ran on the control layer ---------
+        # 12.5 asserted this by spying on the polling queue; 12.6 deleted the
+        # queue, so the durable form of the same claim is the executor field
+        # every StepRun records at dispatch (R1). A silent handoff to some
+        # other path would show up here as a different value or as no
+        # StepRun at all.
+        runs = (await api_client.get("/api/pipeline-runs")).json()
+        executors = {
+            sr["executor"]
+            for run in runs
+            for sr in (await api_client.get(f"/api/pipeline-runs/{run['id']}")).json()[
+                "step_runs"
+            ]
+        }
+        assert executors <= {"local"}, (
+            f"the US-2 loop ran a step somewhere unexpected: {executors}"
         )
 
     async def test_failed_agent_run_fails_the_card_without_gating(
-        self, api_client, test_repo, clean_git_repos, agent_container, enqueue_spy
+        self, api_client, test_repo, clean_git_repos, agent_container
     ):
         """The other half of the gate: a failed agent must not reach review.
 
@@ -442,4 +438,3 @@ class TestUS2CardLoop:
             "the verification pipeline ran for a card that never reached "
             "in_review"
         )
-        assert enqueue_spy == []

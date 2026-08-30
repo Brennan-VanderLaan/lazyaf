@@ -237,8 +237,8 @@ container's own IP when the suite runs inside a container (the CI path), or
 The `@pytest.mark.slow` e2e tests (control layer, real card execution,
 graph pipeline full-stack in `tdd/e2e/`) are **not run by any tier today** —
 this is a stated exclusion under standing rule R4, not a silent cap. They
-need the compose e2e stack (`backend-e2e` + `runner-mock-e2e`), which the
-legacy runner hosting dogfood CI cannot start. They remain runnable on the
+need the compose e2e stack (`backend-e2e` + `runner-agent-e2e`), which a
+step container hosting dogfood CI cannot start. They remain runnable on the
 host via the `scripts/test.ps1 slow` / `scripts/test.sh slow` lane (which
 brings the stack up, runs `pytest /tdd/e2e -m slow` inside the backend-e2e
 container, and tears the stack down), and they enter dogfood CI at Phase

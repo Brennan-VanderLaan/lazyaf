@@ -345,48 +345,36 @@ def _mark_test(request):
 
 
 # -----------------------------------------------------------------------------
-# Runner Pool and Job Queue Fixtures
+# Runner Fixtures
 # -----------------------------------------------------------------------------
 
 @pytest_asyncio.fixture
-async def clean_runner_pool():
-    """Clean runner pool state before and after each test.
+async def clean_runner_registry():
+    """Wipe the process-wide runner singletons around each test.
 
-    Uses the pool's own reset()/stop() (the same hooks the test-mode API
-    uses) instead of hand-assigning private attributes, so the fixture
-    cannot drift from the pool's real internals.
+    Replaces the 12.5 `clean_runner_pool` / `clean_job_queue` pair: 12.6
+    deleted the in-memory pool and the job queue, and the state that now
+    survives between tests lives in the REGISTRY (connections, machines,
+    per-runner locks) and the DISPATCHER (waiters, in-flight assignments,
+    its wake event).
+
+    Both are reset through their OWN reset() hooks - the same ones
+    `POST /api/test/reset` registers - rather than by hand-assigning private
+    attributes, so the fixture cannot drift from the real internals. That is
+    also why the dispatcher's reset rebuilds its wake event instead of
+    clearing it: an asyncio.Event binds to the loop it is first awaited on,
+    and every test here gets a fresh loop.
     """
-    from app.services.runner_pool import runner_pool
+    from app.services.execution.runner_dispatcher import runner_dispatcher
+    from app.services.execution.runner_registry import runner_registry
 
-    # Clear before
-    if runner_pool._running:
-        await runner_pool.stop()
-    runner_pool.reset()
+    await runner_registry.reset()
+    await runner_dispatcher.reset()
 
-    yield runner_pool
+    yield runner_registry
 
-    # Clear after
-    if runner_pool._running:
-        await runner_pool.stop()
-    runner_pool.reset()
-
-
-@pytest_asyncio.fixture
-async def clean_job_queue():
-    """Clean job queue state before and after each test.
-
-    Uses the queue's own clear() (the same hook the test-mode API uses)
-    instead of hand-assigning private attributes.
-    """
-    from app.services.job_queue import job_queue
-
-    # Clear before
-    await job_queue.clear()
-
-    yield job_queue
-
-    # Clear after
-    await job_queue.clear()
+    await runner_registry.reset()
+    await runner_dispatcher.reset()
 
 
 # -----------------------------------------------------------------------------

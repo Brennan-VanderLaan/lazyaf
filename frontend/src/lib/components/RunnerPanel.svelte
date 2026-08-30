@@ -1,161 +1,116 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
-  import { poolStatus, runnersStore } from '../stores/runners';
-  import { runners as runnersApi } from '../api/client';
-  import type { DockerCommand, Runner } from '../api/types';
+  /**
+   * RunnerPanel - Phase 12.6.
+   *
+   * Two whole features left with the polling stack rather than being ported:
+   *
+   *  - the DOCKER-COMMAND modal handed an operator a `docker run` line for a
+   *    polling runner image. Those images are gone; a 12.6 runner is a
+   *    `lazyaf-runner` agent enrolled over `/ws/runner` with a shared secret,
+   *    and pasting a half-configured command out of the UI is not how a host
+   *    joins a fleet.
+   *  - the LOG modal polled `GET /api/runners/{id}/logs`, an endpoint that
+   *    served the polling pool's in-memory ring buffer. A runner's output is
+   *    now its steps' output, read on the pipeline run where it belongs.
+   *
+   * What replaces them is what an operator actually needs to answer "can this
+   * fleet take my pinned step": state, labels, the step being executed, and
+   * how long the socket has been up.
+   *
+   * Data flow is SNAPSHOT-THEN-DELTA: one `GET /api/runners` on mount, then
+   * `runner_status` frames merged by the store (see stores/runners.ts). There
+   * is no interval in this component.
+   */
+  import { onMount } from 'svelte';
+  import { runnersStore, connectedRunners, busyRunners, idleRunners } from '../stores/runners';
+  import type { Runner, RunnerState } from '../api/types';
 
   let showRunners = true;
-  let showDockerModal = false;
-  let showLogsModal = false;
-  let dockerCommand: DockerCommand | null = null;
-  let copyFeedback = '';
-  let selectedRunner: Runner | null = null;
-  let logs: string[] = [];
-  let logsLoading = false;
-  let logPollInterval: ReturnType<typeof setInterval> | null = null;
+  /** Ticks once a second purely so "connected 4m ago" stays honest. */
+  let now = Date.now();
 
-  // Group runners by type
+  // The store's list is the default export value; loading/loaded/error are
+  // sibling stores on it, so they have to be bound to locals for `$` to
+  // auto-subscribe.
+  const runnersLoading = runnersStore.loading;
+  const runnersLoaded = runnersStore.loaded;
+  const runnersError = runnersStore.error;
+
   $: groupedRunners = $runnersStore.reduce((acc, runner) => {
     const type = runner.runner_type || 'unknown';
-    if (!acc[type]) {
-      acc[type] = [];
-    }
-    acc[type].push(runner);
+    (acc[type] ||= []).push(runner);
     return acc;
   }, {} as Record<string, Runner[]>);
 
   $: runnerTypes = Object.keys(groupedRunners).sort();
 
   onMount(() => {
-    poolStatus.startPolling(2000);
-    runnersStore.startPolling(2000);
+    // The snapshot. Without it a reload renders an empty panel over a live
+    // fleet until some runner happens to change state.
+    runnersStore.load();
+    const tick = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(tick);
   });
 
-  onDestroy(() => {
-    poolStatus.stopPolling();
-    runnersStore.stopPolling();
-    stopLogPolling();
-  });
-
-  let selectedRunnerType: string = 'claude-code';
-
-  async function openDockerModal() {
-    showDockerModal = true;
-    try {
-      dockerCommand = await runnersApi.dockerCommand(selectedRunnerType, false);
-    } catch (e) {
-      console.error('Failed to get docker command:', e);
-    }
-  }
-
-  async function copyCommand(withSecrets: boolean) {
-    if (!dockerCommand) return;
-    try {
-      if (withSecrets) {
-        dockerCommand = await runnersApi.dockerCommand(selectedRunnerType, true);
-      }
-      const cmd = withSecrets ? dockerCommand.command_with_secrets : dockerCommand.command;
-      await navigator.clipboard.writeText(cmd);
-      copyFeedback = withSecrets ? 'Copied with secrets!' : 'Copied!';
-      setTimeout(() => copyFeedback = '', 2000);
-    } catch (e) {
-      console.error('Failed to copy:', e);
-    }
-  }
-
-  async function changeRunnerType(runnerType: string) {
-    selectedRunnerType = runnerType;
-    try {
-      dockerCommand = await runnersApi.dockerCommand(runnerType, false);
-    } catch (e) {
-      console.error('Failed to get docker command:', e);
-    }
-  }
-
-  async function openLogsModal(runner: Runner) {
-    selectedRunner = runner;
-    showLogsModal = true;
-    logs = [];
-    await loadLogs();
-    startLogPolling();
-  }
-
-  function closeLogsModal() {
-    showLogsModal = false;
-    selectedRunner = null;
-    stopLogPolling();
-  }
-
-  async function loadLogs() {
-    if (!selectedRunner) return;
-    logsLoading = true;
-    try {
-      const result = await runnersApi.logs(selectedRunner.id);
-      logs = result.logs;
-    } catch (e) {
-      console.error('Failed to load logs:', e);
-    } finally {
-      logsLoading = false;
-    }
-  }
-
-  function startLogPolling() {
-    if (logPollInterval) return;
-    logPollInterval = setInterval(loadLogs, 2000);
-  }
-
-  function stopLogPolling() {
-    if (logPollInterval) {
-      clearInterval(logPollInterval);
-      logPollInterval = null;
-    }
-  }
-
-  function getStatusColor(status: string): string {
+  function getStatusColor(status: RunnerState): string {
     switch (status) {
       case 'idle': return 'var(--success-color, #a6e3a1)';
-      case 'busy': return 'var(--warning-color, #f9e2af)';
-      case 'offline': return 'var(--error-color, #f38ba8)';
+      case 'busy':
+      case 'assigned': return 'var(--warning-color, #f9e2af)';
+      case 'connecting': return 'var(--primary-color, #89b4fa)';
+      case 'dead': return 'var(--error-color, #f38ba8)';
+      case 'disconnected': return 'var(--text-muted, #6c7086)';
       default: return 'var(--text-muted, #6c7086)';
     }
+  }
+
+  /** `{arch: 'amd64', has: ['docker','gpio']}` -> ['arch=amd64','has=docker','has=gpio'] */
+  function labelChips(labels: Record<string, unknown> | null | undefined): string[] {
+    if (!labels) return [];
+    const chips: string[] = [];
+    for (const [key, value] of Object.entries(labels)) {
+      if (Array.isArray(value)) {
+        for (const item of value) chips.push(`${key}=${item}`);
+      } else if (value !== null && value !== undefined && value !== '') {
+        chips.push(`${key}=${value}`);
+      }
+    }
+    return chips;
+  }
+
+  function connectionAge(runner: Runner, atMs: number): string {
+    if (!runner.connected_at) return '';
+    const started = Date.parse(runner.connected_at);
+    if (Number.isNaN(started)) return '';
+    const seconds = Math.max(0, Math.floor((atMs - started) / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+    return `${Math.floor(seconds / 86400)}d`;
   }
 </script>
 
 <div class="runner-panel" data-testid="runner-panel">
   <div class="panel-header">
     <h2>Runners</h2>
-    <button class="btn-icon" on:click={openDockerModal} title="Get Docker command">
-      🐳
-    </button>
   </div>
 
-  {#if $poolStatus}
-    <div class="pool-stats" data-testid="pool-stats">
-      <div class="stat">
-        <span class="stat-value">{$poolStatus.total_runners}</span>
-        <span class="stat-label">Total</span>
-      </div>
-      <div class="stat">
-        <span class="stat-value idle">{$poolStatus.idle_runners}</span>
-        <span class="stat-label">Idle</span>
-      </div>
-      <div class="stat">
-        <span class="stat-value busy">{$poolStatus.busy_runners}</span>
-        <span class="stat-label">Busy</span>
-      </div>
-      <div class="stat">
-        <span class="stat-value queued">{$poolStatus.queued_jobs}</span>
-        <span class="stat-label">Queued</span>
-      </div>
+  <div class="pool-stats" data-testid="pool-stats">
+    <div class="stat">
+      <span class="stat-value" data-testid="stat-connected">{$connectedRunners.length}</span>
+      <span class="stat-label">Connected</span>
     </div>
-  {:else}
-    <div class="loading">Loading...</div>
-  {/if}
+    <div class="stat">
+      <span class="stat-value idle" data-testid="stat-idle">{$idleRunners.length}</span>
+      <span class="stat-label">Idle</span>
+    </div>
+    <div class="stat">
+      <span class="stat-value busy" data-testid="stat-busy">{$busyRunners.length}</span>
+      <span class="stat-label">Busy</span>
+    </div>
+  </div>
 
-  <button
-    class="btn-toggle"
-    on:click={() => showRunners = !showRunners}
-  >
+  <button class="btn-toggle" on:click={() => (showRunners = !showRunners)}>
     {showRunners ? '▼' : '▶'} Runners ({$runnersStore.length})
   </button>
 
@@ -163,8 +118,15 @@
     <div class="runner-list">
       {#if $runnersStore.length === 0}
         <div class="no-runners" data-testid="no-runners">
-          <p>No runners connected</p>
-          <p class="hint">Click 🐳 to get the Docker command</p>
+          {#if $runnersLoading && !$runnersLoaded}
+            <p>Loading runners…</p>
+          {:else}
+            <p>No runners connected</p>
+            <p class="hint">
+              Start one with <code>lazyaf-runner --backend-url …</code>; it enrolls
+              over the runner WebSocket.
+            </p>
+          {/if}
         </div>
       {:else}
         {#each runnerTypes as runnerType (runnerType)}
@@ -174,155 +136,65 @@
               <span class="runner-count">{groupedRunners[runnerType].length}</span>
             </div>
             {#each groupedRunners[runnerType] as runner (runner.id)}
-              <button
+              <div
                 class="runner-item"
                 data-testid="runner-item"
                 data-runner-id={runner.id}
                 data-status={runner.status}
-                on:click={() => openLogsModal(runner)}
+                data-connection={runner.connection}
               >
-                <span
-                  class="status-dot"
-                  style="background: {getStatusColor(runner.status)}"
-                ></span>
+                <span class="status-dot" style="background: {getStatusColor(runner.status)}"></span>
                 <div class="runner-info">
                   <div class="runner-main">
-                    <span class="runner-name">{runner.name}</span>
-                    <span class="runner-status">{runner.status}</span>
+                    <span class="runner-name">{runner.name || runner.id}</span>
+                    <span class="runner-status" data-testid="runner-status">{runner.status}</span>
                   </div>
-                  {#if runner.current_job_title}
-                    <div class="runner-job">
+
+                  {#if runner.current_step_execution_id}
+                    <div class="runner-job" data-testid="runner-current-step">
                       <span class="job-icon">⚡</span>
-                      <span class="job-title">{runner.current_job_title}</span>
+                      <span class="job-title">step {runner.current_step_execution_id.slice(0, 8)}</span>
                     </div>
                   {/if}
+
+                  {#if labelChips(runner.labels).length}
+                    <div class="runner-labels" data-testid="runner-labels">
+                      {#each labelChips(runner.labels) as chip (chip)}
+                        <span class="label-chip">{chip}</span>
+                      {/each}
+                    </div>
+                  {/if}
+
+                  <div class="runner-meta">
+                    {#if runner.connection === 'websocket'}
+                      <span class="meta-item" data-testid="runner-connection" title="live WebSocket held by this backend process">
+                        ws {connectionAge(runner, now)}
+                      </span>
+                    {:else}
+                      <span class="meta-item stale" data-testid="runner-connection" title="no live socket in this backend process - the row is stale">
+                        no socket
+                      </span>
+                    {/if}
+                    {#if runner.agent_version}
+                      <span class="meta-item">agent {runner.agent_version}</span>
+                    {/if}
+                    {#if runner.protocol_version !== null}
+                      <span class="meta-item">v{runner.protocol_version}</span>
+                    {/if}
+                  </div>
                 </div>
-                {#if runner.log_count > 0}
-                  <span class="log-count">{runner.log_count} lines</span>
-                {/if}
-              </button>
+              </div>
             {/each}
           </div>
         {/each}
       {/if}
     </div>
   {/if}
+
+  {#if $runnersError}
+    <div class="panel-error" data-testid="runner-error">{$runnersError}</div>
+  {/if}
 </div>
-
-<!-- Docker Command Modal -->
-{#if showDockerModal}
-  <div
-    class="modal-backdrop"
-    on:click={() => showDockerModal = false}
-    on:keydown={(e) => e.key === 'Escape' && (showDockerModal = false)}
-    role="dialog"
-    aria-modal="true"
-    tabindex="-1"
-  >
-    <div class="modal" on:click|stopPropagation role="document">
-      <div class="modal-header">
-        <h3>Start a Runner</h3>
-        <button class="btn-close" on:click={() => showDockerModal = false}>✕</button>
-      </div>
-
-      <div class="modal-body">
-        <p class="modal-description">
-          Run this command to start a runner that will connect to the backend and wait for jobs.
-        </p>
-
-        <div class="runner-type-selector">
-          <label>Runner Type:</label>
-          <div class="runner-type-buttons">
-            <button
-              class="runner-type-btn"
-              class:selected={selectedRunnerType === 'claude-code'}
-              on:click={() => changeRunnerType('claude-code')}
-            >
-              Claude Code
-            </button>
-            <button
-              class="runner-type-btn"
-              class:selected={selectedRunnerType === 'gemini'}
-              on:click={() => changeRunnerType('gemini')}
-            >
-              Gemini CLI
-            </button>
-          </div>
-        </div>
-
-        {#if dockerCommand}
-          <div class="command-box">
-            <code>{dockerCommand.command}</code>
-          </div>
-
-          <div class="modal-actions">
-            <button class="btn-secondary" on:click={() => copyCommand(false)}>
-              📋 Copy
-            </button>
-            <button class="btn-primary" on:click={() => copyCommand(true)}>
-              🔐 Copy with Secrets
-            </button>
-          </div>
-
-          {#if copyFeedback}
-            <div class="copy-feedback">{copyFeedback}</div>
-          {/if}
-
-          <div class="env-vars">
-            <h4>Environment Variables</h4>
-            <ul>
-              <li><code>BACKEND_URL</code> - Backend API URL (default: http://host.docker.internal:8000)</li>
-              {#if selectedRunnerType === 'claude-code'}
-                <li><code>ANTHROPIC_API_KEY</code> - Your Anthropic API key (required)</li>
-              {:else}
-                <li><code>GEMINI_API_KEY</code> - Your Gemini API key (required)</li>
-              {/if}
-            </ul>
-          </div>
-        {:else}
-          <div class="loading">Loading command...</div>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
-
-<!-- Logs Modal -->
-{#if showLogsModal && selectedRunner}
-  <div
-    class="modal-backdrop"
-    on:click={closeLogsModal}
-    on:keydown={(e) => e.key === 'Escape' && closeLogsModal()}
-    role="dialog"
-    aria-modal="true"
-    tabindex="-1"
-  >
-    <div class="modal modal-logs" on:click|stopPropagation role="document">
-      <div class="modal-header">
-        <div class="logs-header-info">
-          <h3>{selectedRunner.name}</h3>
-          <span
-            class="status-badge"
-            style="background: {getStatusColor(selectedRunner.status)}20; color: {getStatusColor(selectedRunner.status)}"
-          >
-            {selectedRunner.status}
-          </span>
-        </div>
-        <button class="btn-close" on:click={closeLogsModal}>✕</button>
-      </div>
-
-      <div class="logs-container">
-        {#if logs.length > 0}
-          <pre class="logs-content">{logs.join('\n')}</pre>
-        {:else if logsLoading}
-          <div class="logs-empty">Loading logs...</div>
-        {:else}
-          <div class="logs-empty">No logs yet</div>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
 
 <style>
   .runner-panel {
@@ -345,27 +217,9 @@
     color: var(--text-color, #cdd6f4);
   }
 
-  .btn-icon {
-    background: none;
-    border: 1px solid var(--border-color, #45475a);
-    border-radius: 4px;
-    color: var(--text-color, #cdd6f4);
-    cursor: pointer;
-    width: 28px;
-    height: 28px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 1rem;
-  }
-
-  .btn-icon:hover {
-    background: var(--hover-color, #313244);
-  }
-
   .pool-stats {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 0.5rem;
     margin-bottom: 0.75rem;
   }
@@ -386,7 +240,6 @@
 
   .stat-value.idle { color: var(--success-color, #a6e3a1); }
   .stat-value.busy { color: var(--warning-color, #f9e2af); }
-  .stat-value.queued { color: var(--primary-color, #89b4fa); }
 
   .stat-label {
     font-size: 0.7rem;
@@ -452,21 +305,14 @@
 
   .runner-item {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.5rem;
     padding: 0.5rem;
     border-radius: 4px;
     font-size: 0.8rem;
     width: 100%;
-    background: none;
-    border: none;
-    cursor: pointer;
     text-align: left;
     color: inherit;
-  }
-
-  .runner-item:hover {
-    background: var(--hover-color, #313244);
   }
 
   .status-dot {
@@ -474,307 +320,106 @@
     height: 8px;
     border-radius: 50%;
     flex-shrink: 0;
-    margin-top: 0.2rem;
+    margin-top: 0.3rem;
     align-self: flex-start;
   }
 
   .runner-info {
     flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    min-width: 0;
+    gap: 0.2rem;
   }
 
   .runner-main {
     display: flex;
-    align-items: center;
+    justify-content: space-between;
+    align-items: baseline;
     gap: 0.5rem;
   }
 
   .runner-name {
-    font-family: monospace;
     color: var(--text-color, #cdd6f4);
-    font-size: 0.8rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .runner-status {
+    font-size: 0.7rem;
     color: var(--text-muted, #6c7086);
-    text-transform: capitalize;
-    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    flex-shrink: 0;
   }
 
   .runner-job {
     display: flex;
     align-items: center;
     gap: 0.3rem;
-    padding: 0.15rem 0.4rem;
-    background: rgba(137, 180, 250, 0.1);
-    border-radius: 3px;
-    border-left: 2px solid var(--primary-color, #89b4fa);
-  }
-
-  .job-icon {
-    font-size: 0.7rem;
+    font-size: 0.72rem;
+    color: var(--warning-color, #f9e2af);
   }
 
   .job-title {
-    font-size: 0.75rem;
-    color: var(--text-color, #cdd6f4);
-    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .log-count {
-    margin-left: auto;
-    font-size: 0.7rem;
+  .runner-labels {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+  }
+
+  .label-chip {
+    font-size: 0.65rem;
+    font-family: var(--font-mono, monospace);
+    color: var(--primary-color, #89b4fa);
+    background: var(--surface-alt, #181825);
+    border-radius: 3px;
+    padding: 0.05rem 0.3rem;
+  }
+
+  .runner-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    font-size: 0.65rem;
     color: var(--text-muted, #6c7086);
-    flex-shrink: 0;
+  }
+
+  .meta-item.stale {
+    color: var(--error-color, #f38ba8);
   }
 
   .no-runners {
-    padding: 1rem;
     text-align: center;
+    padding: 1rem 0.5rem;
     color: var(--text-muted, #6c7086);
+    font-size: 0.8rem;
   }
 
   .no-runners p {
-    margin: 0 0 0.25rem;
+    margin: 0.2rem 0;
   }
 
   .no-runners .hint {
-    font-size: 0.8rem;
-    opacity: 0.7;
+    font-size: 0.72rem;
   }
 
-  .loading {
-    padding: 1rem;
-    text-align: center;
-    color: var(--text-muted, #6c7086);
-  }
-
-  /* Modal styles */
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.7);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-  }
-
-  .modal {
-    background: var(--surface-color, #1e1e2e);
-    border-radius: 12px;
-    width: 100%;
-    max-width: 600px;
-    max-height: 90vh;
-    overflow: hidden;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-    display: flex;
-    flex-direction: column;
-  }
-
-  .modal-logs {
-    max-width: 800px;
-    height: 80vh;
-  }
-
-  .modal-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 1rem 1.25rem;
-    border-bottom: 1px solid var(--border-color, #45475a);
-    flex-shrink: 0;
-  }
-
-  .modal-header h3 {
-    margin: 0;
-    font-size: 1.1rem;
-    color: var(--text-color, #cdd6f4);
-  }
-
-  .logs-header-info {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-  }
-
-  .status-badge {
-    padding: 0.2rem 0.5rem;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    font-weight: 500;
-    text-transform: capitalize;
-  }
-
-  .btn-close {
-    background: none;
-    border: none;
-    color: var(--text-muted, #6c7086);
-    font-size: 1.25rem;
-    cursor: pointer;
-  }
-
-  .modal-body {
-    padding: 1.25rem;
-    overflow-y: auto;
-  }
-
-  .logs-container {
-    flex: 1;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-  }
-
-  .logs-content {
-    flex: 1;
-    margin: 0;
-    padding: 1rem;
+  .no-runners code {
+    font-family: var(--font-mono, monospace);
     background: var(--surface-alt, #181825);
-    font-family: 'Fira Code', 'Consolas', monospace;
-    font-size: 0.8rem;
-    color: var(--text-color, #cdd6f4);
-    overflow: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
-  .logs-empty {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: var(--text-muted, #6c7086);
-  }
-
-  .modal-description {
-    margin: 0 0 1rem;
-    color: var(--text-muted, #6c7086);
-    font-size: 0.9rem;
-  }
-
-  .command-box {
-    background: var(--surface-alt, #181825);
-    border: 1px solid var(--border-color, #45475a);
-    border-radius: 6px;
-    padding: 1rem;
-    margin-bottom: 1rem;
-    overflow-x: auto;
-  }
-
-  .command-box code {
-    font-family: 'Fira Code', 'Consolas', monospace;
-    font-size: 0.85rem;
-    color: var(--text-color, #cdd6f4);
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-
-  .modal-actions {
-    display: flex;
-    gap: 0.5rem;
-    margin-bottom: 1rem;
-  }
-
-  .btn-primary, .btn-secondary {
-    flex: 1;
-    padding: 0.6rem 1rem;
-    border-radius: 6px;
-    font-size: 0.85rem;
-    font-weight: 500;
-    cursor: pointer;
-    border: none;
-  }
-
-  .btn-primary {
-    background: var(--primary-color, #89b4fa);
-    color: var(--primary-text, #1e1e2e);
-  }
-
-  .btn-secondary {
-    background: var(--surface-alt, #313244);
-    color: var(--text-color, #cdd6f4);
-  }
-
-  .btn-primary:hover, .btn-secondary:hover {
-    opacity: 0.9;
-  }
-
-  .copy-feedback {
-    text-align: center;
-    color: var(--success-color, #a6e3a1);
-    font-size: 0.85rem;
-    margin-bottom: 1rem;
-  }
-
-  .env-vars {
-    border-top: 1px solid var(--border-color, #45475a);
-    padding-top: 1rem;
-  }
-
-  .env-vars h4 {
-    margin: 0 0 0.5rem;
-    font-size: 0.9rem;
-    color: var(--text-color, #cdd6f4);
-  }
-
-  .env-vars ul {
-    margin: 0;
-    padding-left: 1.25rem;
-    font-size: 0.85rem;
-    color: var(--text-muted, #6c7086);
-  }
-
-  .env-vars li {
-    margin-bottom: 0.25rem;
-  }
-
-  .env-vars code {
-    background: var(--surface-alt, #181825);
-    padding: 0.1rem 0.3rem;
     border-radius: 3px;
-    font-size: 0.8rem;
+    padding: 0 0.2rem;
   }
 
-  .runner-type-selector {
-    margin-bottom: 1rem;
-  }
-
-  .runner-type-selector label {
-    display: block;
-    margin-bottom: 0.5rem;
-    font-size: 0.9rem;
-    color: var(--text-color, #cdd6f4);
-  }
-
-  .runner-type-buttons {
-    display: flex;
-    gap: 0.5rem;
-  }
-
-  .runner-type-btn {
-    flex: 1;
-    padding: 0.6rem 1rem;
-    background: var(--surface-alt, #181825);
-    border: 2px solid var(--border-color, #45475a);
-    border-radius: 6px;
-    color: var(--text-color, #cdd6f4);
-    font-size: 0.85rem;
-    cursor: pointer;
-    transition: border-color 0.15s, background 0.15s;
-  }
-
-  .runner-type-btn:hover {
-    border-color: var(--primary-color, #89b4fa);
-  }
-
-  .runner-type-btn.selected {
-    border-color: var(--primary-color, #89b4fa);
-    background: rgba(137, 180, 250, 0.1);
+  .panel-error {
+    margin-top: 0.5rem;
+    font-size: 0.72rem;
+    color: var(--error-color, #f38ba8);
   }
 </style>

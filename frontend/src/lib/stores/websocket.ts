@@ -1,9 +1,10 @@
 import { writable } from 'svelte/store';
-import type { Card, Pipeline, PipelineRun, StepRun, Repo } from '../api/types';
+import type { Card, Pipeline, PipelineRun, StepRun, Repo, Runner } from '../api/types';
 import { cardsStore } from './cards';
 import { jobsStore, type JobStatusUpdate } from './jobs';
 import { pipelinesStore, activeRunsStore, liveStepLogsStore } from './pipelines';
 import { reposStore } from './repos';
+import { runnersStore } from './runners';
 
 export type WebSocketStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
@@ -111,7 +112,11 @@ export function handleServerMessage(message: WebSocketMessage) {
       jobsStore.updateFromWebSocket(message.payload as JobStatusUpdate);
       break;
     case 'runner_status':
-      // Runner status is handled by polling in runnersStore
+      // 12.6: the runner panel is snapshot-then-delta, so this frame is the
+      // ONLY live update path - the 2000ms polls it used to sit behind are
+      // gone. The payload is one full runner projection (the same shape a
+      // row of GET /api/runners carries), not a patch.
+      runnersStore.applyDelta(message.payload as Runner);
       break;
     case 'pipeline_updated':
       pipelinesStore.updateLocal(message.payload as Pipeline);

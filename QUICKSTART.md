@@ -50,8 +50,9 @@ git cherry-pick <commit-sha>
 
 **Pipelines** - Automate multi-step workflows
 
-**Scale runners** - Set `CLAUDE_RUNNERS=3` or `GEMINI_RUNNERS=2` in `.env`
-
-**Just one runner type** - `docker compose up -d backend frontend runner-claude`
+**Remote runners** - `docker compose up -d runner-agent` starts a runner
+agent that enrols over `/ws/runner`. Pin a step to it with a `requires:`
+block in the pipeline definition; anything without one runs on the backend's
+own local executor.
 
 See `PLAN.md` for architecture details.

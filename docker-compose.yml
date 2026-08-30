@@ -32,45 +32,60 @@ services:
       - lazyaf-network
     restart: unless-stopped
 
-  runner-claude:
-    build: ./runner-claude
+  # 12.6 REMOTE LANE, loopback edition (R7).
+  #
+  # Remote hardware is manual (owner decision), so the TESTED remote path is a
+  # real `lazyaf_runner` agent process on THIS host speaking the real
+  # WebSocket protocol to the real backend. Nothing here is a simulation: same
+  # protocol, same shared-secret handshake, same registry, same assignment
+  # compare-and-swap, same control-mode step container. The only thing it does
+  # not exercise is physical network latency.
+  #
+  # It carries a `remote-lane` capability label that NOTHING ELSE carries, and
+  # the dogfood pipeline pins two steps to it (`remote-probe` and
+  # `mock-agent`). If this service is down, or the protocol / registry / CAS /
+  # workspace provisioning break, those steps FAIL THE PUSH - remote execution
+  # is covered continuously rather than once at an exit gate.
+  #
+  # DooD, deliberately and for the same reason the T2 tier step already does
+  # it: the agent's docker orchestrator spawns step containers on the host
+  # daemon. Host-root-equivalent for this service. A real remote host would run
+  # this same image against ITS OWN daemon, which is the whole point.
+  runner-agent:
+    build: ./runner-agent
     environment:
-      - BACKEND_URL=http://backend:8000
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - LAZYAF_BACKEND_URL=http://backend:8000
+      # STABLE across restarts. A fresh uuid4 per process orphans a registry
+      # row on every restart and leaves the fleet looking twice its real size.
+      - LAZYAF_RUNNER_ID=dogfood-loopback
+      - LAZYAF_RUNNER_NAME=dogfood loopback agent
+      - LAZYAF_RUNNER_TYPE=generic
+      # `arch` is NOT set here: the agent reports platform.machine() raw and
+      # the backend normalizes it, so there is exactly one implementation of
+      # that mapping (runner_protocol.normalize_arch).
+      - LAZYAF_RUNNER_LABELS=has=docker,has=remote-lane,lane=dogfood
+      - LAZYAF_ORCHESTRATOR=docker
+      # Step containers this agent spawns must reach the backend and the git
+      # server by service DNS, so they join the shared network too.
+      - LAZYAF_STEP_NETWORK=lazyaf-network
+      - LAZYAF_STEP_BACKEND_URL=http://backend:8000
+      # REQUIRED, and it is not a formality: the agent refuses plaintext
+      # ws:// to a NON-LOOPBACK host by default (section 4.3) because
+      # execute_step.config carries the step JWT and secret_environment.
+      # `backend` is a compose service name, not loopback, so without this
+      # the agent exits before `register` and GET /api/runners is empty -
+      # which fails verify_executor assertion 9 and the whole dogfood
+      # remote lane. Accepting it here is bounded: lazyaf-network is a
+      # private bridge on ONE host and the frame never leaves the daemon.
+      # A REAL remote host must use wss:// instead of setting this.
+      - LAZYAF_RUNNER_ALLOW_INSECURE=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - backend
     networks:
       - lazyaf-network
     restart: unless-stopped
-    deploy:
-      replicas: ${CLAUDE_RUNNERS:-1}
-
-  runner-gemini:
-    build: ./runner-gemini
-    environment:
-      - BACKEND_URL=http://backend:8000
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-    depends_on:
-      - backend
-    networks:
-      - lazyaf-network
-    restart: unless-stopped
-    deploy:
-      replicas: ${GEMINI_RUNNERS:-1}
-
-  runner-mock:
-    build: ./runner-mock
-    environment:
-      - BACKEND_URL=http://backend:8000
-    depends_on:
-      - backend
-    networks:
-      - lazyaf-network
-    restart: unless-stopped
-    deploy:
-      replicas: ${MOCK_RUNNERS:-0}
-    profiles:
-      - testing
 
   # E2E Testing Services
   backend-e2e:
@@ -105,10 +120,31 @@ services:
       retries: 15
       start_period: 5s
 
-  runner-mock-e2e:
-    build: ./runner-mock
+  # The e2e twin of the dev `runner-agent`: same image, same labels, pointed at
+  # backend-e2e. frontend/e2e/runners.spec.ts needs an enrolled agent to prove
+  # the runner panel's snapshot-then-delta model against a live registry, and
+  # the loopback integration suite dispatches pinned steps at it.
+  runner-agent-e2e:
+    build: ./runner-agent
     environment:
-      - BACKEND_URL=http://backend-e2e:8000
+      - LAZYAF_BACKEND_URL=http://backend-e2e:8000
+      - LAZYAF_RUNNER_ID=e2e-loopback
+      - LAZYAF_RUNNER_NAME=e2e loopback agent
+      - LAZYAF_RUNNER_TYPE=generic
+      - LAZYAF_RUNNER_LABELS=has=docker,has=remote-lane,lane=e2e
+      - LAZYAF_ORCHESTRATOR=docker
+      - LAZYAF_STEP_NETWORK=lazyaf-network
+      # Same service-name reasoning as backend-e2e's own overrides: step
+      # containers must call back into THIS backend, not the (possibly absent)
+      # dev "backend" service.
+      - LAZYAF_STEP_BACKEND_URL=http://backend-e2e:8000
+      # Same reason as the dev `runner-agent` above: `backend-e2e` is a
+      # compose service name, so the plaintext-ws guard would otherwise
+      # stop this agent before it registers and runners.spec.ts would have
+      # no fleet to render.
+      - LAZYAF_RUNNER_ALLOW_INSECURE=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       backend-e2e:
         condition: service_healthy
@@ -116,8 +152,6 @@ services:
       - lazyaf-network
     profiles:
       - e2e
-    deploy:
-      replicas: 2
 
 networks:
   lazyaf-network:

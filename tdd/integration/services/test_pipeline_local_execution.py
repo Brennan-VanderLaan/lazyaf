@@ -338,30 +338,25 @@ class TestImagePreflight:
         assert leftovers == []
 
 
-class TestNoEnqueueOnLocalPath:
-    async def test_local_steps_never_touch_job_queue(self, env, monkeypatch):
-        """R1 spy at the integration level: the full real local stack makes
-        zero job_queue.enqueue calls and creates no Card/Job rows."""
-        calls = []
+class TestNoHandoffOnLocalPath:
+    async def test_local_steps_hand_no_job_to_any_runner(self, env):
+        """R1 at the integration level, against the full real local stack.
 
-        class EnqueueSpy:
-            async def enqueue(self, job):
-                calls.append(job)
-                return job.id
-
-        import app.services.pipeline_executor as pe
-
-        monkeypatch.setattr(pe, "job_queue", EnqueueSpy())
-
+        Until 12.6 this spied on `job_queue.enqueue`. The queue was deleted in
+        the deletion commit, so the assertion moved to the DB rows a runner
+        used to be handed: a locally-routed step creates NO Card and NO Job.
+        That is the durable half of the same claim - it stays checkable after
+        its subject is gone, which is exactly what a spy on a deleted module
+        cannot do.
+        """
         repo, pipeline = await make_repo_and_pipeline(env.factory, [
-            script_step("OnlyLocal", "echo never-enqueued"),
+            script_step("OnlyLocal", "echo no-handoff"),
         ])
 
         run = await start_and_wait(env, pipeline, repo)
 
         assert run.status == RunStatus.PASSED.value
         assert run.step_runs[0].executor == "local"
-        assert calls == []
         async with env.factory() as db:
             assert (await db.execute(select(Card))).scalars().all() == []
             assert (await db.execute(select(Job))).scalars().all() == []

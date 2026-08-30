@@ -25,8 +25,8 @@ cleanup() {
     # The vite dev server is Playwright-owned (see playwright.config.ts) and
     # torn down by Playwright itself - this script only manages the compose stack.
     echo "Stopping E2E backend containers..."
-    docker compose stop backend-e2e runner-mock-e2e 2>/dev/null || true
-    docker compose rm -f backend-e2e runner-mock-e2e 2>/dev/null || true
+    docker compose stop backend-e2e runner-agent-e2e 2>/dev/null || true
+    docker compose rm -f backend-e2e runner-agent-e2e 2>/dev/null || true
 }
 
 wait_for_service() {
@@ -60,7 +60,7 @@ start_e2e_backend() {
     docker compose $compose_files --profile e2e build
 
     # Start backend container with e2e profile
-    docker compose $compose_files --profile e2e up -d backend-e2e runner-mock-e2e
+    docker compose $compose_files --profile e2e up -d backend-e2e runner-agent-e2e
 
     # Wait for container health check
     echo "Waiting for backend container to be healthy..."

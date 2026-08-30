@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, PoolStatus, DockerCommand, RunnerLogs, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, Feature, FeatureCreate, FeatureUpdate, UserStory, UserStoryCreate, UserStoryUpdate, AcceptanceCriterion, AcceptanceCriterionCreate, AcceptanceCriterionUpdate, PromptTemplate, PromptTemplateCreate, PromptTemplateUpdate } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, Feature, FeatureCreate, FeatureUpdate, UserStory, UserStoryCreate, UserStoryUpdate, AcceptanceCriterion, AcceptanceCriterionCreate, AcceptanceCriterionUpdate, PromptTemplate, PromptTemplateCreate, PromptTemplateUpdate } from './types';
 
 const BASE_URL = '/api';
 
@@ -142,14 +142,14 @@ export const jobs = {
   logs: (id: string) => request<JobLogs>(`/jobs/${id}/logs`),
 };
 
-// Runners
+// Runners (Phase 12.6): a READ-ONLY projection of the registry. Register /
+// heartbeat / claim-a-job / logs / docker-command were the polling pool's
+// surface and left with it; a runner now enrolls over `/ws/runner` and its
+// logs are step logs, read through the pipeline-run step log routes like
+// every other step's. `list()` is the SNAPSHOT half of the store's
+// snapshot-then-delta model - there is deliberately no polling helper here.
 export const runners = {
   list: () => request<Runner[]>('/runners'),
-  status: () => request<PoolStatus>('/runners/status'),
-  logs: (runnerId: string, offset: number = 0) =>
-    request<RunnerLogs>(`/runners/${runnerId}/logs?offset=${offset}`),
-  dockerCommand: (runnerType: string = 'claude-code', withSecrets: boolean = false) =>
-    request<DockerCommand>(`/runners/docker-command?runner_type=${runnerType}&with_secrets=${withSecrets}`),
 };
 
 // Agent Files

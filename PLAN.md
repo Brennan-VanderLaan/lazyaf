@@ -590,7 +590,20 @@ unit tests green; last stable commit `69f3ef0`, pushed to origin.
 | 12.3 — Control layer & step images | COMPLETE | Real `lazyaf-{base,claude,test-runner}:dev` images, in-container runtime reporting to `/api/steps/*`, run #11 passed the gate |
 | 12.2.6 — Test result tie-back | COMPLETE | A push-triggered run wrote a TestRun joined to criterion fb95f11d: `passed / commit 2a513dd4 / main / us1.pipeline-outcome-gates-branch` |
 | 12.4 — Script/docker steps fully ephemeral | COMPLETE | Runners agent-only; script/docker deleted from the three images AND runner-common; DooD anchor retired |
-| 12.5 / 12.6 / 12.6.5 / 12.6.6 / 12.7 / 12.8 | NOT STARTED | 12.6's 137-test contract suite sits dormant in-tree, self-activating when its modules land |
+| 12.5 — Agent steps via the control layer | COMPLETE | Runners idle on every default path (asserted); StepUsage live at 1163/7 tokens on the gate |
+| 12.6 — RemoteExecutor + runner agents | COMPLETE | 74 dormant contract tests now execute (0 skipped), polling stack DELETED, all 7 polling endpoints 404 on a live probe |
+| 12.6.5 / 12.6.6 / 12.7 | IN PROGRESS | Three parallel lanes (experiments, spec-curated context, debug re-run) |
+| 12.8 — Cleanup & polish | NOT STARTED | Epilogue; needs the owner's v1-format call |
+
+**Phase 12.6: COMPLETE (2026-08-30).** The 74 contract tests ported dormant in
+Phase 0 all execute now, zero skipped, and git diff proves neither file was
+edited to fit the implementation - the spec came first by two months and won.
+The polling stack is DELETED: no job_queue, no runner_pool (importing them
+raises ModuleNotFoundError, policed by test_no_legacy_code with two mechanisms
+that cannot silently skip), all seven polling endpoints 404 on a live probe,
+and the three monolithic runner images are gone. Steps now run local OR remote
+over a WebSocket runner protocol, with the step container still POSTing to
+/api/steps/* either way because the step JWT is location-independent.
 
 **Execution today**: script/docker steps flow pipeline_executor -> ExecutionRouter ->
 LocalExecutor -> ephemeral control-mode container on a persistent workspace volume,
@@ -918,7 +931,7 @@ is available here, and Milestone 13's entire cost axis depends on this channel.
    pipeline DOES include a mock-agent step from now on (zero-cost, every
    push); playground works with job_queue idle.
 
-#### Phase 12.6 — RemoteExecutor + runner agents (loopback first)  [A]
+#### Phase 12.6 — RemoteExecutor + runner agents (loopback first)  [A]  ✅ COMPLETE
 
 The ported 137-test contract suite is the spec. RunnerStateMachine (ported in
 0b) wired to a DB-backed runner registry with labels + matches_requirements

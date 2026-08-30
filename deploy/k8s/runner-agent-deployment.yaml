@@ -1,0 +1,105 @@
+# LazyAF runner agent - EXAMPLE FRAGMENT, not a production deployment.
+#
+# Shows one thing properly: the agent consuming the SAME enrollment secret as
+# the backend, through the same _FILE convention. Read deploy/k8s/README.md for
+# what this deliberately does not solve.
+#
+# You do not need this to use LazyAF. Without any agent, every pipeline step
+# runs on the backend's own executor. An agent exists so steps can run on a
+# machine the backend does not own - which in Kubernetes usually means a node
+# that has a docker daemon the agent may drive.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lazyaf-runner-agent
+  namespace: lazyaf
+  labels:
+    app.kubernetes.io/name: lazyaf
+    app.kubernetes.io/component: runner-agent
+spec:
+  # One pod per runner IDENTITY. LAZYAF_RUNNER_ID must be stable across
+  # restarts - a fresh id per process orphans a registry row every restart and
+  # makes the fleet look twice its real size. Two replicas sharing one id is a
+  # duplicate connection, which the backend rejects. Want more capacity? Give
+  # each agent its own Deployment and its own id (or use a StatefulSet and
+  # derive the id from the pod ordinal).
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lazyaf
+      app.kubernetes.io/component: runner-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lazyaf
+        app.kubernetes.io/component: runner-agent
+    spec:
+      containers:
+        - name: runner-agent
+          image: ghcr.io/brennan-vanderlaan/lazyaf/runner-agent:latest
+          env:
+            - name: LAZYAF_BACKEND_URL
+              value: http://lazyaf-backend.lazyaf.svc.cluster.local:8000
+
+            # ---------------------------------------------------------------
+            # THE ENROLLMENT SECRET. Must EQUAL the backend's
+            # LAZYAF_RUNNER_AUTH_SECRET, which is why both workloads project the
+            # SAME key of the SAME Secret. If they drift, the /ws/runner upgrade
+            # is rejected before accept() and this host simply never appears in
+            # the runner list - there is no half-working state to debug.
+            #
+            # The agent reads the first of these that is set:
+            #   LAZYAF_RUNNER_TOKEN_FILE        <- used here
+            #   LAZYAF_RUNNER_TOKEN
+            #   LAZYAF_RUNNER_AUTH_SECRET_FILE
+            #   LAZYAF_RUNNER_AUTH_SECRET
+            # The last two exist so one Secret key can serve both workloads
+            # unchanged. There is no default: with nothing set the agent refuses
+            # to start and says so, instead of dialling and being rejected.
+            # ---------------------------------------------------------------
+            - name: LAZYAF_RUNNER_TOKEN_FILE
+              value: /run/secrets/lazyaf/runner-auth-secret
+
+            # STABLE across restarts. See the replicas note above.
+            - name: LAZYAF_RUNNER_ID
+              value: k8s-runner-1
+            - name: LAZYAF_RUNNER_NAME
+              value: kubernetes runner 1
+            - name: LAZYAF_RUNNER_TYPE
+              value: generic
+            # Advertised capabilities. Pin a step to this agent with a
+            # `requires:` block naming one of these labels.
+            # `arch` is never set here: the agent reports platform.machine() raw
+            # and the backend normalizes it, so there is one alias table.
+            - name: LAZYAF_RUNNER_LABELS
+              value: has=docker,zone=cluster
+            - name: LAZYAF_ORCHESTRATOR
+              value: docker
+
+            # PLAINTEXT GUARD. The agent refuses ws:// to a non-loopback host by
+            # default, because the step-dispatch frame carries the step JWT and
+            # the step's secret environment. A cluster-internal Service over
+            # http:// trips this. Either terminate TLS in front of the backend
+            # and use https:// above, or accept the risk explicitly:
+            # - name: LAZYAF_RUNNER_ALLOW_INSECURE
+            #   value: "1"
+          volumeMounts:
+            - name: lazyaf-secrets
+              mountPath: /run/secrets/lazyaf
+              readOnly: true
+      volumes:
+        - name: lazyaf-secrets
+          secret:
+            secretName: lazyaf-secrets
+            defaultMode: 0400
+            items:
+              # Only the key this workload needs. The step-auth secret is the
+              # backend's business; there is no reason for it to be readable
+              # from an agent pod.
+              - key: runner-auth-secret
+                path: runner-auth-secret
+# ROTATION: after changing runner-auth-secret in the Secret, the projected file
+# updates on its own but the RUNNING agent has already read it. Restart the
+# agents and the backend together; until both sides match, agents reconnect and
+# are rejected.

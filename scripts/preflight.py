@@ -49,6 +49,11 @@ FALLBACK_STEP_IMAGES = [
 ]
 STEP_TAG = "dev"
 
+# The GHCR path already ends in /lazyaf, so a step image published there drops
+# this prefix: lazyaf-base:dev is pulled as <prefix>/base. check_step_images()
+# strips it to build the remote reference.
+STEP_NAME_PREFIX = "lazyaf-"
+
 # Free space we want available to docker. Images plus a couple of workspaces.
 DISK_WARN_GB = 15
 DISK_FAIL_GB = 5
@@ -230,9 +235,11 @@ def check_env():
         report(
             FAIL,
             ".env not found",
-            "Create it from the template, then fill in your API keys:",
-            "  cp .env.example .env" if os.name != "nt" else "  copy .env.example .env",
-            "(The stack will start without keys, but no AI agent will run.)"
+            "One command creates it AND generates the shared auth secrets the",
+            "backend refuses to start without:",
+            "  python scripts/bootstrap_secrets.py",
+            "Then open .env and paste in your API keys.",
+            "(The stack starts without API keys, but no AI agent will run.)"
             if example.exists()
             else "",
         )
@@ -270,21 +277,116 @@ def check_env():
             "  GEMINI_API_KEY    -> https://aistudio.google.com/apikey",
         )
 
-    secret_defaults = {
-        "LAZYAF_STEP_AUTH_SECRET": "lazyaf-step-auth-secret-key-change-in-production",
-        "LAZYAF_RUNNER_AUTH_SECRET": "lazyaf-runner-auth-secret-key-change-in-production",
-    }
-    unset = [n for n, d in secret_defaults.items() if values.get(n, "") in ("", d)]
-    if unset:
-        report(
-            WARN,
-            "Using the public default value for: {}".format(", ".join(unset)),
-            "Fine for a stack bound to localhost. If anyone else can reach this",
-            "machine, set them to random strings:",
-            '  python -c "import secrets;print(secrets.token_urlsafe(48))"',
-        )
+    check_shared_secrets(values)
 
     return values
+
+
+# --------------------------------------------------------------- secrets ----
+
+# The constants LazyAF shipped before 12.7. They are public - git history,
+# image layers, every fork - so a .env still holding one is NOT configured.
+RETIRED_PUBLIC_SECRETS = frozenset([
+    "lazyaf-step-auth-secret-key-change-in-production",
+    "lazyaf-runner-auth-secret-key-change-in-production",
+])
+
+# Kept in sync, by eye, with backend/app/config.py and
+# scripts/bootstrap_secrets.py. Duplicated because preflight must run on a
+# bare interpreter with nothing installed and no package on sys.path.
+PLACEHOLDER_SECRETS = frozenset([
+    "change-in-production", "change-me", "change_me", "changeme",
+    "generate-me", "generateme", "none", "null", "placeholder",
+    "replace-me", "replaceme", "secret", "tbd", "todo", "unset",
+    "your-secret-here", "<generate>",
+])
+
+SHARED_SECRETS = [
+    ("LAZYAF_STEP_AUTH_SECRET", "signs the JWTs step containers use for /api/steps/*"),
+    ("LAZYAF_RUNNER_AUTH_SECRET", "enrols runner agents at /ws/runner"),
+]
+
+MIN_SECRET_LENGTH = 32
+
+
+def secret_is_placeholder(value):
+    """True when a value means 'not configured'. Shape only, never printed."""
+    candidate = (value or "").strip()
+    if not candidate:
+        return True
+    if candidate in RETIRED_PUBLIC_SECRETS:
+        return True
+    lowered = candidate.lower()
+    if lowered in PLACEHOLDER_SECRETS:
+        return True
+    if set(lowered) == set("x"):
+        return True
+    return False
+
+
+def check_shared_secrets(values):
+    """The two secrets the backend now REFUSES to start without.
+
+    This was a warning until 12.7, when the public defaults were removed. It is
+    a FAIL now because it is no longer advice: the stack does not come up.
+    """
+    missing = []
+    retired = []
+    short = []
+
+    for name, purpose in SHARED_SECRETS:
+        file_var = name + "_FILE"
+        # The _FILE form wins at resolution time, so it satisfies the check.
+        # Whether the PATH resolves inside the container is not knowable from
+        # here; the backend says so clearly at startup if it does not.
+        pointer = (values.get(file_var) or os.environ.get(file_var) or "").strip()
+        if pointer:
+            report(OK, "{} supplied by {} ({})".format(name, file_var, pointer))
+            continue
+
+        value = (values.get(name) or os.environ.get(name) or "").strip()
+        if value in RETIRED_PUBLIC_SECRETS:
+            retired.append(name)
+        elif secret_is_placeholder(value):
+            missing.append(name)
+        elif len(value) < MIN_SECRET_LENGTH:
+            short.append(name)
+        else:
+            report(OK, "{} is set ({})".format(name, purpose))
+
+    if retired:
+        report(
+            FAIL,
+            "Retired PUBLIC default still in .env for: {}".format(", ".join(retired)),
+            "That value shipped in LazyAF's source, so it is published - anyone",
+            "can use it to mint credentials this backend would trust. The backend",
+            "treats it as unset and will not start.",
+            "Replace it with a generated value:",
+            "  python scripts/bootstrap_secrets.py",
+            "(it replaces the retired default and leaves everything else alone)",
+        )
+    if missing:
+        report(
+            FAIL,
+            "Not set: {}".format(", ".join(missing)),
+            "The backend REFUSES TO START without these. There is deliberately no",
+            "default: a default compiled into the source is a published secret.",
+            "Generate them - it is one command, it never overwrites anything you",
+            "already set, and it prints no values:",
+            "  python scripts/bootstrap_secrets.py",
+            "Delivering secrets by mounted file instead? Set the _FILE form",
+            "(LAZYAF_STEP_AUTH_SECRET_FILE=...) - it takes precedence.",
+        )
+    if short:
+        report(
+            WARN,
+            "Under {} characters: {}".format(MIN_SECRET_LENGTH, ", ".join(short)),
+            "Set, so the stack will start - but these mint credentials the",
+            "backend trusts, and a short one is guessable. Prefer a generated",
+            "value:  python scripts/bootstrap_secrets.py",
+            "(it will NOT replace what you have; clear the line first if you",
+            "want it regenerated)",
+        )
 
 
 # ---------------------------------------------------------------- ports ----

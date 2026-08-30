@@ -9,10 +9,26 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional
 
-# Secret key for signing tokens - in production, load from config
-# For now, use a placeholder that can be overridden
-_SECRET_KEY = "lazyaf-step-auth-secret-key-change-in-production"
+# The signing secret is resolved at CALL time, never captured at import.
+#
+# It used to be a module-level constant with a public default, replaced only
+# when main.py's lifespan called set_secret_key(). That meant any process
+# importing this module WITHOUT running the lifespan both signed and accepted
+# /api/steps/* credentials with a value published in git history - and since
+# set_secret_key had no test coverage, deleting that one call would have been
+# silent. Reading from settings on every use makes the fail-closed resolver in
+# app.config the single source of truth (it raises when nothing is configured),
+# and mirrors execution/runner_token.py, which was already correct.
 _ALGORITHM = "HS256"
+_SECRET_OVERRIDE = None  # test-only; set via set_secret_key()
+
+
+def _secret() -> str:
+    """The signing secret, read at call time."""
+    if _SECRET_OVERRIDE is not None:
+        return _SECRET_OVERRIDE
+    from app.config import get_settings
+    return get_settings().step_auth_secret
 
 # Default token expiration (24 hours)
 DEFAULT_EXPIRATION_SECONDS = 86400
@@ -42,7 +58,7 @@ def generate_step_token(
         "exp": now + timedelta(seconds=expires_in_seconds),
     }
 
-    return jwt.encode(payload, _SECRET_KEY, algorithm=_ALGORITHM)
+    return jwt.encode(payload, _secret(), algorithm=_ALGORITHM)
 
 
 def validate_step_token(
@@ -60,7 +76,7 @@ def validate_step_token(
         True if token is valid and matches step_id, False otherwise
     """
     try:
-        payload = jwt.decode(token, _SECRET_KEY, algorithms=[_ALGORITHM])
+        payload = jwt.decode(token, _secret(), algorithms=[_ALGORITHM])
 
         # Check step_id matches
         if payload.get("step_id") != step_id:
@@ -86,7 +102,7 @@ def decode_step_token(token: str) -> Optional[dict]:
         Token payload dict or None if invalid
     """
     try:
-        return jwt.decode(token, _SECRET_KEY, algorithms=[_ALGORITHM])
+        return jwt.decode(token, _secret(), algorithms=[_ALGORITHM])
     except jwt.InvalidTokenError:
         return None
 
@@ -99,5 +115,5 @@ def set_secret_key(key: str) -> None:
     Args:
         key: Secret key string
     """
-    global _SECRET_KEY
-    _SECRET_KEY = key
+    global _SECRET_OVERRIDE
+    _SECRET_OVERRIDE = key

@@ -1,0 +1,151 @@
+# LazyAF backend - EXAMPLE FRAGMENT, not a production deployment.
+#
+# It exists to show the secret wiring. Read deploy/k8s/README.md before you use
+# any of it: this manifest has no persistence (emptyDir loses your database and
+# git repos on restart), no ingress, no TLS, and no answer for the docker socket
+# the local executor wants.
+#
+# replicas: 1 is NOT a placeholder. The runner registry and the job queue are
+# per-process; a second replica routes step assignments to a pod holding no
+# socket for the target runner, and the symptom is intermittent "no runner
+# matched" rather than an error.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lazyaf-backend
+  namespace: lazyaf
+  labels:
+    app.kubernetes.io/name: lazyaf
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 1        # see the note above - do not raise this
+  strategy:
+    type: Recreate   # one writer for the SQLite file at a time
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lazyaf
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lazyaf
+        app.kubernetes.io/component: backend
+    spec:
+      containers:
+        - name: backend
+          image: ghcr.io/brennan-vanderlaan/lazyaf/backend:latest
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              value: sqlite+aiosqlite:////app/data/lazyaf.db
+
+            # ---------------------------------------------------------------
+            # SHARED SECRETS - required, no default exists.
+            #
+            # PREFERRED: the _FILE form. It points at a path whose CONTENTS are
+            # the value, which is exactly what a projected Secret volume gives
+            # you. It takes precedence over the inline variable, and a _FILE
+            # that is set but unreadable or empty is a hard startup error - a
+            # broken mount stops the pod instead of silently signing with
+            # something else.
+            #
+            # Why not valueFrom.secretKeyRef? That puts the value in the pod's
+            # environment, where `kubectl describe pod`, any sidecar, and
+            # /proc/<pid>/environ can read it. A mounted file is narrower and is
+            # re-projected when the Secret changes.
+            # ---------------------------------------------------------------
+            - name: LAZYAF_STEP_AUTH_SECRET_FILE
+              value: /run/secrets/lazyaf/step-auth-secret
+            - name: LAZYAF_RUNNER_AUTH_SECRET_FILE
+              value: /run/secrets/lazyaf/runner-auth-secret
+
+            # ALTERNATIVE (inline). Works, and is what most charts do. Use it
+            # only if a projected volume is awkward in your setup; delete the
+            # two _FILE variables above if you switch, because _FILE wins.
+            #
+            # - name: LAZYAF_STEP_AUTH_SECRET
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: lazyaf-secrets
+            #       key: step-auth-secret
+            # - name: LAZYAF_RUNNER_AUTH_SECRET
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: lazyaf-secrets
+            #       key: runner-auth-secret
+
+            # NEVER set LAZYAF_DEV_EPHEMERAL_SECRETS here. It generates a
+            # per-process value: step tokens stop verifying on every restart and
+            # no runner agent in another pod can ever authenticate.
+
+            # Provider keys. Optional - everything except agent steps works
+            # without them. Kept in a separate Secret so the auth secrets and
+            # the API keys can be rotated independently.
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: lazyaf-api-keys
+                  key: anthropic-api-key
+                  optional: true
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: lazyaf-api-keys
+                  key: gemini-api-key
+                  optional: true
+          volumeMounts:
+            - name: lazyaf-secrets
+              mountPath: /run/secrets/lazyaf
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+      volumes:
+        - name: lazyaf-secrets
+          secret:
+            secretName: lazyaf-secrets
+            defaultMode: 0400
+            items:
+              - key: step-auth-secret
+                path: step-auth-secret
+              - key: runner-auth-secret
+                path: runner-auth-secret
+        - name: data
+          # EXAMPLE ONLY. emptyDir discards the SQLite database and every bare
+          # git repo when the pod restarts. Replace with a PersistentVolumeClaim
+          # before you put anything in here you would miss.
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lazyaf-backend
+  namespace: lazyaf
+spec:
+  selector:
+    app.kubernetes.io/name: lazyaf
+    app.kubernetes.io/component: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+# ROTATION (not automated, and not free):
+#   Changing step-auth-secret invalidates every step JWT already issued - a step
+#   container running right now starts getting 401s from /api/steps/* and its
+#   run fails. Changing runner-auth-secret disconnects every runner agent until
+#   its own copy is updated to match. Roll the backend and the agents together,
+#   with no pipeline runs in flight.

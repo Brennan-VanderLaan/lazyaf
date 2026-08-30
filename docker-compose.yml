@@ -18,6 +18,13 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
+      # SHARED SECRETS (12.7). No default, here or in the source: the constants
+      # that used to live in backend/app/config.py were public, and they mint
+      # step JWTs and enrol runner agents. Compose cannot generate a value for
+      # you, so it refuses to start and tells you the one command that can.
+      # `bootstrap_secrets.py` is idempotent - it never touches a value you set.
+      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
     networks:
       - lazyaf-network
     restart: unless-stopped
@@ -79,6 +86,11 @@ services:
       # private bridge on ONE host and the frame never leaves the daemon.
       # A REAL remote host must use wss:// instead of setting this.
       - LAZYAF_RUNNER_ALLOW_INSECURE=1
+      # The SAME secret the backend checks at the /ws/runner upgrade. Until
+      # 12.7 both sides silently defaulted to the same public constant, so this
+      # line did not need to exist and the handshake "worked" for everyone on
+      # earth. It is explicit now, and the agent refuses to dial without it.
+      - 'LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -105,6 +117,12 @@ services:
       # Same service-name reasoning: step containers must call back into THIS
       # backend, not the (possibly absent) dev "backend" service.
       - CONTAINER_BACKEND_URL=http://backend-e2e:8000
+      # Same requirement as the dev backend (12.7). The e2e lane shares the
+      # host's .env, so one bootstrap run covers both stacks - and the pair
+      # below must match, or runner-agent-e2e never enrols and the runner-panel
+      # browser spec renders an empty fleet.
+      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
     volumes:
       - ./tdd:/tdd  # Mount test directory for running e2e tests
       - /var/run/docker.sock:/var/run/docker.sock  # Docker socket - e2e lane exercises LocalExecutor
@@ -143,6 +161,8 @@ services:
       # stop this agent before it registers and runners.spec.ts would have
       # no fleet to render.
       - LAZYAF_RUNNER_ALLOW_INSECURE=1
+      # Must equal backend-e2e's LAZYAF_RUNNER_AUTH_SECRET above.
+      - 'LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:

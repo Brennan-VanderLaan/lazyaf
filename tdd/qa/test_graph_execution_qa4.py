@@ -109,17 +109,17 @@ def test_run_endpoint_returns_promptly_for_a_large_graph(create_pipeline):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.containers
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA4-03 (BLOCKER): entry a -> b -> c -> b. Step b's "
-        "_all_upstream_satisfied sees upstream [a, c]; c can never complete "
-        "first, so b never becomes ready. Nothing is active and nothing was "
-        "dispatched, so the run is stamped PASSED with 1 of 3 steps run. A "
-        "green CI badge for a pipeline that ran one third of itself."
-    ),
-)
 def test_cycle_reports_pass_having_run_one_step(create_pipeline, seeded_repo_id):
+    """FIXED (QA4-03). Entry a -> b -> c -> b. Step b's
+    `_all_upstream_satisfied` sees upstream [a, c]; c can never complete
+    first, so b never becomes ready - and the run used to be stamped PASSED
+    with 1 of 3 steps run, a green CI badge for a pipeline that ran one third
+    of itself.
+
+    `PipelineExecutor._verify_graph_coverage` is now the gate in front of
+    every success verdict: the run fails, `graph_definition_errors` names the
+    cycle `b -> c -> b`, and step b gets a FAILED StepRun saying it was
+    selected by edge e1 and never ran."""
     run = run_to_completion(create_pipeline, {
         "name": "qa4-exec-cycle",
         "steps_graph": graph(
@@ -139,15 +139,12 @@ def test_cycle_reports_pass_having_run_one_step(create_pipeline, seeded_repo_id)
 
 
 @pytest.mark.containers
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA4-04: a step no edge reaches is counted in steps_total "
-        "but never executed, and the run still reports PASSED - '1/2 steps, "
-        "passed'."
-    ),
-)
 def test_unreachable_step_does_not_produce_a_green_run(create_pipeline, seeded_repo_id):
+    """FIXED (QA4-04). A step no edge reaches was counted in steps_total,
+    never executed, and the run still reported PASSED - "1/2 steps, passed".
+
+    The run now fails, and `orphan` gets a FAILED StepRun reading "no entry
+    point names it and no edge leads to it, so it could never have run"."""
     run = run_to_completion(create_pipeline, {
         "name": "qa4-exec-orphan",
         "steps_graph": graph([step("a", "echo A"), step("orphan", "echo NEVER")], [], ["a"]),
@@ -162,18 +159,19 @@ def test_unreachable_step_does_not_produce_a_green_run(create_pipeline, seeded_r
 
 
 @pytest.mark.containers
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA4-02 (BLOCKER): on_success/on_failure are free-text "
-        "strings in PipelineStepConfig and PipelineStepYaml. _handle_action "
-        "(pipeline_executor.py:3543) logs 'Unknown action, treating as stop' "
-        "and completes the run with success=step_success - so a ONE-CHARACTER "
-        "typo ('nextt') stops a 3-step pipeline after step 1 and reports "
-        "PASSED. Nothing surfaces the typo to the user."
-    ),
-)
 def test_typo_in_on_success_does_not_produce_a_green_truncated_run(create_pipeline, seeded_repo_id):
+    """FIXED (QA4-02). `on_success`/`on_failure` are still free-text strings in
+    PipelineStepConfig and PipelineStepYaml, but the ACTION VOCABULARY IS NOW
+    CLOSED at the executor: `_handle_action` used to log "Unknown action,
+    treating as 'stop'" and complete with success=step_success, so a
+    one-character typo stopped a 3-step pipeline after step 1 and reported
+    PASSED with nothing surfacing the typo.
+
+    `describe_step_action` now refuses it, the run fails, and step 1's StepRun
+    carries "unknown step action 'nextt'" plus the whole vocabulary. Closing
+    the same vocabulary at the SCHEMA (a 422 at definition time, the way
+    `trigger_type` already is) is the requested edit to
+    `app/schemas/pipeline.py` in the phase report."""
     run = run_to_completion(create_pipeline, {
         "name": "qa4-typo-action",
         "steps": [

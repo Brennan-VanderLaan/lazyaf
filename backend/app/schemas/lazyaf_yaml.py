@@ -9,6 +9,7 @@ These schemas define the structure for .lazyaf/ directory content:
 from typing import Any, Optional
 from pydantic import BaseModel, Field
 
+from app.schemas._strings import Body, Name
 from app.schemas.pipeline import TriggerConfig
 
 
@@ -26,8 +27,8 @@ class AgentYaml(BaseModel):
       {{description}}
     ```
     """
-    name: str = Field(..., description="Display name of the agent")
-    description: Optional[str] = Field(None, description="Brief description of what this agent does")
+    name: Name = Field(..., description="Display name of the agent")
+    description: Optional[Body] = Field(None, description="Brief description of what this agent does")
     prompt_template: str = Field(..., description="Prompt template with {{variable}} placeholders")
 
 
@@ -49,7 +50,7 @@ class PipelineStepYaml(BaseModel):
     ```
     """
     id: Optional[str] = Field(None, description="Optional stable ID for context directory references")
-    name: str = Field(..., description="Display name of the step")
+    name: Name = Field(..., description="Display name of the step")
     type: str = Field("script", description="Step type: agent, script, or docker")
     config: dict[str, Any] = Field(default_factory=dict, description="Type-specific configuration")
     on_success: str = Field("next", description="Action on success: next, stop, trigger:{id}, merge:{branch}")
@@ -92,8 +93,8 @@ class PipelineYaml(BaseModel):
         on_failure: stop
     ```
     """
-    name: str = Field(..., description="Display name of the pipeline")
-    description: Optional[str] = Field(None, description="Brief description of the pipeline")
+    name: Name = Field(..., description="Display name of the pipeline")
+    description: Optional[Body] = Field(None, description="Brief description of the pipeline")
     # Same shape as the platform Pipeline.triggers JSON (TriggerConfig) so
     # materialized rows can store it verbatim and trigger matching just works.
     triggers: list[TriggerConfig] = Field(default_factory=list, description="Trigger bindings synced onto the materialized platform pipeline")

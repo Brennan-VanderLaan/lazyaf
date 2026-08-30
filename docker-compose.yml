@@ -99,6 +99,54 @@ services:
       - lazyaf-network
     restart: unless-stopped
 
+  # M14 (wave8 s8.1): CI MUST NOT NEED A GPU.
+  #
+  # A stdlib OpenAI-compatible server that speaks the same wire format ollama
+  # and vLLM do, deterministically. The backend probes it, step containers run
+  # the agent harness against it, and the dogfood pipeline drives two agent
+  # steps through it on every push at zero cost and with no GPU anywhere.
+  #
+  # It serves ALL NINE scenarios at once, one per URL prefix, so a single
+  # process backs every endpoint anyone needs:
+  #   http://mock-endpoint:8099/happy_tools/v1   <- tool-calling model
+  #   http://mock-endpoint:8099/happy_text/v1    <- model that CANNOT tool-call
+  #   http://mock-endpoint:8099/no_usage/v1      <- model that reports no usage
+  #   ... plus never_finishes, malformed, malformed_forever, lying_tools,
+  #       slow and flaky_5xx (see tdd/shared/mock_openai/scenarios.py).
+  #
+  # 8099 is published to the host as well, so `curl localhost:8099/health` and
+  # the hands-on guide in upcoming/m14-testing.md work without exec'ing in.
+  #
+  # No build: it is stdlib-only Python, so the stock python image plus a
+  # read-only mount of ./tdd is the whole service. Nothing here is a lazyaf
+  # image, so the no-phantom-:latest rule about lazyaf-*:dev tags does not
+  # apply - this is the same public base the backend Dockerfile already uses.
+  mock-endpoint:
+    image: python:3.12-slim
+    working_dir: /app
+    command: ["python", "-m", "tdd.shared.mock_openai", "--host", "0.0.0.0", "--port", "8099"]
+    environment:
+      # The scenario served at the BARE /v1 prefix (every scenario is also
+      # reachable at /<scenario>/v1 regardless of this).
+      - LAZYAF_MOCK_SCENARIO=happy_tools
+    volumes:
+      - ./tdd:/app/tdd:ro
+    ports:
+      - "8099:8099"
+    networks:
+      - lazyaf-network
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8099/health',timeout=3).status==200 else 1)"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 3s
+
   # E2E Testing Services
   backend-e2e:
     build:

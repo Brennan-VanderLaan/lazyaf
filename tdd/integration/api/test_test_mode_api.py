@@ -197,6 +197,10 @@ class TestReset:
         # And the names they replaced are gone with their subsystems.
         assert "runner_pool" not in reset, reset
         assert "job_queue" not in reset, reset
+        # M14: the capability probe holds one asyncio.Lock per endpoint id.
+        # Those locks are loop-bound and keyed by rows the DB reset deletes -
+        # the same failure_01 shape - so they register as a resettable too.
+        assert "model_endpoint_probes" in reset, reset
 
     async def test_reset_closes_websockets(self, test_client):
         from app.services.websocket import manager
@@ -312,7 +316,14 @@ class TestSeed:
         body = response.json()
 
         assert body["success"] is True
-        assert set(body.keys()) == {"success", "repo", "pipeline", "cards"}
+        # M14 added `model_endpoints`: the e2e lane gets the same two mock
+        # OpenAI endpoints the dogfood pipeline uses, so a self-hosted step can
+        # be exercised with NO GPU. The key set is pinned rather than merely
+        # checked for the ones we care about, because a seed response that
+        # quietly grows a field is a seed response consumers cannot rely on.
+        assert set(body.keys()) == {
+            "success", "repo", "pipeline", "cards", "model_endpoints",
+        }
         assert body["repo"]["name"] == "e2e-seed-repo"
         assert body["repo"]["default_branch"] == "main"
         assert body["repo"]["git_initialized"] is True
@@ -345,6 +356,68 @@ class TestSeed:
         second = (await test_client.post("/api/test/seed")).json()
 
         assert head_sha(second) == first_sha
+
+    async def test_seeded_review_card_branch_actually_exists(
+        self, test_client, clean_git_repos
+    ):
+        """The in-review card's branch is a real ref, not just a string.
+
+        It used to be only a string: the card row claimed
+        'lazyaf/seed-review' and nothing ever created that ref, so the first
+        thing a demo does on the seeded board - press Approve - merged a
+        branch that did not exist and came back a red toast (T16).
+        """
+        from dulwich.repo import Repo as DulwichRepo
+
+        from app.routers.test_api import SEED_REVIEW_BRANCH
+
+        body = (await test_client.post("/api/test/seed")).json()
+        git = DulwichRepo(str(clean_git_repos.get_repo_path(body["repo"]["id"])))
+
+        review_ref = f"refs/heads/{SEED_REVIEW_BRANCH}".encode()
+        assert review_ref in git.refs, (
+            f"seed created no {SEED_REVIEW_BRANCH} ref; refs are "
+            f"{sorted(git.refs.keys())}"
+        )
+
+        # And it is a DESCENDANT of the default branch, so the merge is real
+        # work landing rather than a no-op fast-forward to the same commit.
+        default_sha = git.refs[b"refs/heads/main"]
+        review_sha = git.refs[review_ref]
+        assert review_sha != default_sha
+        assert git[review_sha].parents == [default_sha]
+
+    async def test_seeded_review_card_can_be_approved(
+        self, test_client, client, clean_git_repos
+    ):
+        """The demo's first Approve merges for real and moves the card to done."""
+        body = (await test_client.post("/api/test/seed")).json()
+        card = next(c for c in body["cards"] if c["status"] == "in_review")
+
+        response = await client.post(f"/api/cards/{card['id']}/approve")
+
+        assert_status_code(response, 200)
+        assert response.json()["card"]["status"] == "done"
+
+    async def test_seed_review_branch_sha_is_deterministic(
+        self, test_client, clean_git_repos
+    ):
+        """Same fixed author/timestamps rule as the seed commit."""
+        from dulwich.repo import Repo as DulwichRepo
+
+        from app.routers.test_api import SEED_REVIEW_BRANCH
+
+        ref = f"refs/heads/{SEED_REVIEW_BRANCH}".encode()
+
+        def review_sha(body: dict) -> bytes:
+            path = clean_git_repos.get_repo_path(body["repo"]["id"])
+            return DulwichRepo(str(path)).refs[ref]
+
+        first = review_sha((await test_client.post("/api/test/seed")).json())
+        await test_client.post("/api/test/reset")
+        second = review_sha((await test_client.post("/api/test/seed")).json())
+
+        assert second == first
 
     async def test_reset_seed_cycle_is_repeatable(
         self, test_client, db_session, clean_git_repos

@@ -40,6 +40,12 @@ from app.services.workspace_service import workspace_service
 
 logger = logging.getLogger(__name__)
 
+# The branch the in-review seed card points at. One name, two users: the
+# git ref created by _init_seed_git_repo and the card row that claims it.
+# They drifted once (the ref was never created) and the seeded demo's first
+# Approve was a red toast - so they share a constant now.
+SEED_REVIEW_BRANCH = "lazyaf/seed-review"
+
 
 # -----------------------------------------------------------------------------
 # Resettable singleton registry
@@ -95,6 +101,24 @@ from app.services.execution.debug_terminal import debug_terminal_service
 register_resettable("debug_sessions", debug_session_service.reset)
 register_resettable("debug_terminals", debug_terminal_service.reset)
 
+# M14: the capability probe keeps one asyncio.Lock per endpoint id so two
+# probes of one endpoint cannot race. Those locks are LOOP-BOUND and keyed by
+# rows the DB reset deletes - the failure_01 shape exactly - so they are wiped
+# with the database like every other singleton.
+from app.services.model_endpoints import probe as _endpoint_probe
+
+
+async def _reset_model_endpoint_probes() -> None:
+    # REQUESTED EDIT (owner: Agent A): `probe.py` should expose a public
+    # `reset_probe_state()` and this should call it, the way
+    # `runner_registry.reset` and `debug_terminal_service.reset` do. Reaching
+    # into the module's private dict is the honest stopgap, not the shape this
+    # should keep.
+    _endpoint_probe._probe_locks.clear()
+
+
+register_resettable("model_endpoint_probes", _reset_model_endpoint_probes)
+
 
 def require_test_mode():
     if not get_settings().test_mode:
@@ -135,11 +159,113 @@ class SeededCard(BaseModel):
     status: str
 
 
+class SeededEndpoint(BaseModel):
+    id: str
+    name: str
+    base_url: str
+    model: str
+    probe_status: str
+
+
 class SeedResponse(BaseModel):
     success: bool
     repo: SeededRepo
     pipeline: SeededPipeline
     cards: list[SeededCard]
+    #: M14. Empty only if the ModelEndpoint table is not present.
+    model_endpoints: list[SeededEndpoint] = []
+
+
+# -----------------------------------------------------------------------------
+# M14: the two mock model endpoints (wave8 s8.2)
+#
+# CI must not need a GPU, so the e2e lane gets the same two endpoints the
+# dogfood pipeline uses, pointed at the `mock-endpoint` compose service. Both
+# carry a real `rate_usd_hour`, which is what puts the 12.5 `gpu-node` pricing
+# branch on a lane that runs continuously.
+#
+# The probe is BEST EFFORT here and deliberately so: a seed call must not fail
+# because a mock server is not up yet, and an unprobed endpoint is not a silent
+# downgrade - dispatch REFUSES it with a message naming the probe endpoint.
+# `probe_status` is returned so the caller can see which it got.
+# -----------------------------------------------------------------------------
+
+DEFAULT_MOCK_ENDPOINT_URL = "http://mock-endpoint:8099"
+
+SEED_MODEL_ENDPOINTS = [
+    {
+        "name": "dogfood-mock",
+        "description": "M14 seed: tool-calling mock OpenAI server (happy_tools).",
+        "scenario": "happy_tools",
+        "model": "mock-model",
+    },
+    {
+        "name": "dogfood-mock-notools",
+        "description": (
+            "M14 seed: a model that CANNOT tool-call (happy_text). Probes "
+            "`degraded`, which is USABLE - it routes the fallback protocol."
+        ),
+        "scenario": "happy_text",
+        "model": "mock-model-notools",
+    },
+]
+
+
+async def _seed_model_endpoints(db: AsyncSession) -> list[SeededEndpoint]:
+    """Register (and best-effort probe) the two mock endpoints."""
+    import os
+    from decimal import Decimal
+
+    from app.models.model_endpoint import ModelEndpoint, default_gpu_node_id
+    from app.services.model_endpoints.probe import probe_endpoint
+
+    mock_url = os.environ.get(
+        "LAZYAF_MOCK_ENDPOINT_URL", DEFAULT_MOCK_ENDPOINT_URL
+    ).rstrip("/")
+
+    rows = []
+    for spec in SEED_MODEL_ENDPOINTS:
+        endpoint = ModelEndpoint(
+            name=spec["name"],
+            description=spec["description"],
+            base_url=f"{mock_url}/{spec['scenario']}/v1",
+            model=spec["model"],
+            server_kind="vllm",
+            auth_style="none",
+            reach="direct",
+            rate_usd_hour=Decimal("0.010000"),
+            gpu_node_id=default_gpu_node_id(spec["name"]),
+            max_concurrency=1,
+            request_timeout_seconds=60,
+            probe_status="unprobed",
+            probe_detail="{}",
+            consecutive_failures=0,
+            enabled=True,
+        )
+        db.add(endpoint)
+        rows.append(endpoint)
+    await db.commit()
+
+    seeded = []
+    for endpoint in rows:
+        await db.refresh(endpoint)
+        try:
+            await probe_endpoint(db, endpoint, force=True)
+            await db.refresh(endpoint)
+        except Exception as e:  # noqa: BLE001 - a probe never fails a seed
+            logger.warning(
+                "Seed probe of model endpoint %s failed: %s", endpoint.name, e
+            )
+        seeded.append(
+            SeededEndpoint(
+                id=endpoint.id,
+                name=endpoint.name,
+                base_url=endpoint.base_url,
+                model=endpoint.model,
+                probe_status=endpoint.probe_status,
+            )
+        )
+    return seeded
 
 
 def _delete_git_storage(repo_ids: list[str]) -> None:
@@ -211,7 +337,7 @@ def _init_seed_git_repo(repo_id: str, default_branch: str) -> bool:
         from dulwich.repo import Repo as DulwichRepo
 
         if not git_repo_manager.repo_exists(repo_id):
-            git_repo_manager.create_bare_repo(repo_id)
+            git_repo_manager.create_bare_repo(repo_id, default_branch)
 
         dulwich_repo = DulwichRepo(str(git_repo_manager.get_repo_path(repo_id)))
 
@@ -234,6 +360,34 @@ def _init_seed_git_repo(repo_id: str, default_branch: str) -> bool:
         branch_ref = f"refs/heads/{default_branch}".encode()
         dulwich_repo.refs[branch_ref] = commit.id
         dulwich_repo.refs.set_symbolic_ref(b"HEAD", branch_ref)
+
+        # The in-review seed card claims a branch. Give it a REAL one, with a
+        # real commit on top of the default branch, or the very first thing a
+        # demo does on the seeded board - press Approve - is a red toast,
+        # because approve MERGES and there was nothing to merge (T16). One
+        # extra commit buys a working merge AND a diff worth looking at on the
+        # review screen.
+        review_blob = Blob.from_string(
+            b"# Seed Repository\n\nCreated by the test-mode API.\n\n"
+            b"Reviewed change: this line came from the seeded agent branch.\n"
+        )
+        dulwich_repo.object_store.add_object(review_blob)
+
+        review_tree = Tree()
+        review_tree.add(b"README.md", 0o100644, review_blob.id)
+        dulwich_repo.object_store.add_object(review_tree)
+
+        review_commit = Commit()
+        review_commit.tree = review_tree.id
+        review_commit.parents = [commit.id]
+        review_commit.author = review_commit.committer = b"LazyAF Test <test@lazyaf.local>"
+        review_commit.author_time = review_commit.commit_time = 0
+        review_commit.author_timezone = review_commit.commit_timezone = 0
+        review_commit.encoding = b"UTF-8"
+        review_commit.message = b"Seed review commit"
+        dulwich_repo.object_store.add_object(review_commit)
+
+        dulwich_repo.refs[f"refs/heads/{SEED_REVIEW_BRANCH}".encode()] = review_commit.id
         return True
     except Exception as e:
         logger.warning(f"Seed git init failed for repo {repo_id}: {e}")
@@ -291,7 +445,7 @@ async def seed_state(db: AsyncSession = Depends(get_db)):
         status=CardStatus.IN_REVIEW.value,
         step_type=StepType.SCRIPT.value,
         step_config=json.dumps({"command": "echo seed-card-ran"}),
-        branch_name="lazyaf/seed-review",
+        branch_name=SEED_REVIEW_BRANCH,
     )
     db.add(card_todo)
     db.add(card_review)
@@ -302,8 +456,16 @@ async def seed_state(db: AsyncSession = Depends(get_db)):
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Seeding failed: {e}")
 
+    try:
+        model_endpoints = await _seed_model_endpoints(db)
+    except Exception as e:  # noqa: BLE001 - endpoint seeding never fails a seed
+        await db.rollback()
+        logger.warning("Model endpoint seeding skipped: %s", e)
+        model_endpoints = []
+
     return SeedResponse(
         success=True,
+        model_endpoints=model_endpoints,
         repo=SeededRepo(
             id=repo.id,
             name=repo.name,

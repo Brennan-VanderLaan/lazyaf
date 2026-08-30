@@ -25,6 +25,7 @@ different modules (router / model) owned by different agents.
 """
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -302,5 +303,45 @@ class TestSingleParser:
             for line in result.stdout.splitlines()
             if line.strip()
         }
-        allowed = {"backend/app/services/workspace/execution_router.py"}
+        allowed = {
+            "backend/app/services/workspace/execution_router.py",
+            # M14 (cross-agent contract #8). `pipeline_executor
+            # .inject_endpoint_requirements` WRITES one `has:` label for a
+            # `runner-local` model endpoint before `decide()` runs, merging
+            # into whatever the author declared. It is not a second PARSER:
+            # it never interprets the grammar, it never matches against a
+            # runner, and `parse_requirements` still normalizes everything it
+            # produced. The whole reason the injection lives here rather than
+            # in the router is that it needs a DB-resolved endpoint, which a
+            # stateless router must not grow a dependency on. Note that
+            # `agent_run.start_endpoint_probe_run` deliberately does NOT
+            # appear here: it builds its runner pin by CALLING that one
+            # writer, because the probe run and the real harness step must
+            # land on the same runner and two spellings of one pin is how
+            # they drift apart.
+            "backend/app/services/pipeline_executor.py",
+        }
         assert hits <= allowed, f"a second `requires:` parser appeared: {hits - allowed}"
+
+    def test_the_endpoint_injection_still_routes_through_the_one_parser(self, router):
+        """The label M14 injects is parsed by `parse_requirements` like any
+        other requirement - no new grammar key, no second normalizer."""
+        step_config = {
+            "agent": "openai-harness",
+            "requires": {"has": ["docker"], "arch": "x86_64"},
+        }
+        from app.services.pipeline_executor import inject_endpoint_requirements
+
+        endpoint = SimpleNamespace(
+            reach="runner-local", runner_label="endpoint:local-4090", name="local-4090"
+        )
+        routed = inject_endpoint_requirements(step_config, endpoint)
+        decision = router.decide("agent", routed)
+
+        assert decision.mode == "remote" and decision.reason == "runner-pin"
+        assert decision.requirements == router.parse_requirements(routed, "agent")
+        assert decision.requirements["has"] == ["docker", "endpoint:local-4090"]
+        # The operator's own requirement survives - merged, never replaced.
+        assert decision.requirements["arch"] == "amd64"
+        # And the caller's dict was not mutated.
+        assert step_config["requires"]["has"] == ["docker"]

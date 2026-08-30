@@ -28,11 +28,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import app.models  # noqa: F401  (register all tables on Base.metadata)
+# M14: model_endpoints is registered on Base.metadata by importing its module.
+# This line becomes redundant the moment `app/models/__init__.py` exports
+# ModelEndpoint (the registration edit A's report asks the integrator for) —
+# but WITHOUT it, create_all here builds a schema missing the table that 0011
+# creates, and the parity assertions below would fail for a reason that has
+# nothing to do with the migration.
+import app.models.model_endpoint  # noqa: F401
 from app.database import ALEMBIC_BASELINE_REVISION, Base, _alembic_config, _run_migrations
 
 # Tip of the migration chain. Every startup path (fresh upgrade, legacy
 # adoption stamp-then-upgrade) must end here.
-ALEMBIC_HEAD_REVISION = "0010"
+ALEMBIC_HEAD_REVISION = "0011"
 
 EXPECTED_TABLES = {
     "repos",
@@ -68,6 +75,10 @@ EXPECTED_TABLES = {
     "experiments",
     "experiment_runs",
     "prompt_versions",
+    # 0011 (Milestone 14): self-hosted OpenAI-compatible endpoints. Adds one
+    # table plus step_executions.model_endpoint_id; deliberately adds NOTHING
+    # to step_usages (the endpoint join goes through gpu_node_id).
+    "model_endpoints",
 }
 
 SPEC_TABLES = {"features", "user_stories", "acceptance_criteria", "prompt_templates"}
@@ -827,6 +838,158 @@ class TestTieBackSchemaShape:
                 False,
             ),
         }
+
+
+class TestModelEndpointsMigration:
+    """0011 (Milestone 14): the endpoint registry.
+
+    The three decisions this revision makes irreversible are asserted here,
+    not merely commented: the endpoint join goes through `gpu_node_id` (so
+    `step_usages` gains NOTHING), the admission gate's column and composite
+    index exist on `step_executions`, and no column can hold a secret VALUE.
+    """
+
+    async def test_model_endpoints_table_and_indexes(self, engine_factory):
+        engine = engine_factory("endpoints_schema.db")
+        await _migrate(engine)
+
+        snapshot = await _snapshot(engine)
+        assert snapshot["model_endpoints"]["indexes"] == {
+            "ix_model_endpoints_name": (("name",), True),
+            "ix_model_endpoints_gpu_node_id": (("gpu_node_id",), False),
+            "ix_model_endpoints_enabled_reach": (("enabled", "reach"), False),
+        }
+        columns = snapshot["model_endpoints"]["columns"]
+        # The join key into step_usages.gpu_node_id is NOT NULL: an endpoint
+        # without a node coordinate could never be priced.
+        assert columns["gpu_node_id"][1] is False
+        # Money is NUMERIC, never a float column that silently loses cents.
+        assert "NUMERIC" in columns["rate_usd_hour"][0].upper()
+
+    async def test_capability_booleans_are_nullable(self, engine_factory):
+        """THREE-STATE, at the DDL level. A NOT NULL `supports_tools` would
+        force a default of False, which silently routes every new endpoint
+        down the no-tools fallback protocol - the exact invisible downgrade
+        R1 exists to forbid."""
+        engine = engine_factory("endpoints_threestate.db")
+        await _migrate(engine)
+
+        columns = (await _snapshot(engine))["model_endpoints"]["columns"]
+        for name in ("supports_tools", "supports_streaming", "reports_usage"):
+            assert columns[name][1] is True, name
+
+    async def test_no_column_can_hold_a_secret_value(self, engine_factory):
+        """The database stores a REFERENCE (an env var NAME) and nothing
+        else. A column called anything like `api_key`/`token`/`secret_value`
+        appearing here later is the regression this pins."""
+        engine = engine_factory("endpoints_secrets.db")
+        await _migrate(engine)
+
+        columns = set((await _snapshot(engine))["model_endpoints"]["columns"])
+        assert "auth_secret_ref" in columns
+        for forbidden in ("api_key", "auth_secret", "secret", "token", "auth_value"):
+            assert forbidden not in columns, forbidden
+
+    async def test_step_executions_gained_the_admission_gate_column(
+        self, engine_factory
+    ):
+        """Contract #9: the in-flight count is READ FROM THE DATABASE, so the
+        column and its composite index have to exist."""
+        engine = engine_factory("endpoints_gate.db")
+        await _migrate(engine)
+
+        snapshot = await _snapshot(engine)
+        assert "model_endpoint_id" in snapshot["step_executions"]["columns"]
+        assert snapshot["step_executions"]["indexes"][
+            "ix_step_executions_endpoint_status"
+        ] == (("model_endpoint_id", "status"), False)
+
+    async def test_step_usages_is_untouched_by_this_revision(self, engine_factory):
+        """The endpoint join goes through `step_usages.gpu_node_id`. A
+        materialized `model_endpoint_id` here would be a second writer for a
+        fact the join already carries - and would make historical usage
+        unpriceable once the endpoint row is deleted."""
+        engine = engine_factory("endpoints_usage.db")
+        await _migrate(engine)
+
+        columns = (await _snapshot(engine))["step_usages"]["columns"]
+        assert "model_endpoint_id" not in columns
+        assert "gpu_node_id" in columns
+
+    async def test_downgrade_to_0010_removes_this_revision_only(self, engine_factory):
+        engine = engine_factory("endpoints_down.db")
+        reference = engine_factory("endpoints_ref.db")
+        await _migrate(engine)
+        await _upgrade_to(reference, "0010")
+
+        await _downgrade_to(engine, "0010")
+
+        snapshot = await _snapshot(engine)
+        assert "model_endpoints" not in snapshot
+        assert "model_endpoint_id" not in snapshot["step_executions"]["columns"]
+        assert "experiments" in snapshot
+        assert snapshot["step_executions"] == (await _snapshot(reference))[
+            "step_executions"
+        ]
+        assert await _alembic_versions(engine) == ["0010"]
+
+    async def test_0011_roundtrip_restores_head(self, engine_factory):
+        engine = engine_factory("endpoints_rt.db")
+        await _migrate(engine)
+        head = await _snapshot(engine)
+
+        await _downgrade_to(engine, "0010")
+        await _upgrade_to(engine, "head")
+
+        assert await _snapshot(engine) == head
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
+
+    async def test_upgrade_is_idempotent_over_a_healed_schema(self, engine_factory):
+        """The adopt path: create_all builds the CURRENT model schema, the DB
+        is stamped behind head, and 0011 then runs over objects that already
+        exist. Every add is guarded, so this must not raise."""
+        engine = engine_factory("endpoints_idem.db")
+        await _create_all(engine)
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda c: command.stamp(_alembic_config(c), "0010"))
+
+        await _upgrade_to(engine, "0011")
+
+        assert await _alembic_versions(engine) == ["0011"]
+
+    async def test_endpoint_name_is_unique(self, engine_factory):
+        """The name is the handle every other surface uses
+        (`model: "endpoint:<name>"`), so two rows sharing one is a
+        constraint violation rather than an application convention."""
+        engine = engine_factory("endpoints_unique.db")
+        await _migrate(engine)
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO model_endpoints (id, name, base_url, model, "
+                    "server_kind, auth_style, reach, gpu_node_id, max_concurrency, "
+                    "request_timeout_seconds, probe_status, probe_detail, "
+                    "consecutive_failures, enabled, created_at, updated_at) VALUES "
+                    "('e1', 'local-4090', 'http://x/v1', 'qwen', 'ollama', 'none', "
+                    "'direct', 'endpoint:local-4090', 1, 300, 'unprobed', '{}', 0, 1, "
+                    "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                )
+            )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO model_endpoints (id, name, base_url, model, "
+                        "server_kind, auth_style, reach, gpu_node_id, max_concurrency, "
+                        "request_timeout_seconds, probe_status, probe_detail, "
+                        "consecutive_failures, enabled, created_at, updated_at) VALUES "
+                        "('e2', 'local-4090', 'http://y/v1', 'llama', 'ollama', 'none', "
+                        "'direct', 'endpoint:other', 1, 300, 'unprobed', '{}', 0, 1, "
+                        "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                    )
+                )
 
 
 class TestLoggingIsUntouched:

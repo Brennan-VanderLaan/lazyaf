@@ -175,6 +175,81 @@ steps:
     on_failure: stop
     timeout: 300
 
+  # 14.x SELF-HOSTED LANE (R7). CI MUST NOT NEED A GPU, so these three steps
+  # run against the `mock-endpoint` compose service: a stdlib
+  # OpenAI-compatible server (tdd/shared/mock_openai) that speaks the same
+  # wire format ollama and vLLM do, deterministically, at zero cost.
+  #
+  # This step registers the two endpoints the harness steps name. It uses the
+  # ordinary public API rather than /api/test/seed, because the DEV stack this
+  # pipeline runs against deliberately has LAZYAF_TEST_MODE off - and because
+  # the same two POSTs are what a human does by hand (see
+  # upcoming/m14-testing.md). It is idempotent: an existing row is PATCHed
+  # back into shape and re-probed.
+  #
+  # If the mock service is down, or the endpoint registry / capability probe
+  # broke, this step FAILS THE PUSH here rather than 300 seconds later inside
+  # an agent step whose only symptom would be "no endpoint named dogfood-mock".
+  - id: "seed-endpoints"
+    name: "14.1 register + probe the mock model endpoints"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        python3 scripts/seed_dogfood_endpoints.py
+    on_success: next
+    on_failure: stop
+    timeout: 180
+
+  # 14.2 harness coverage (R7): the REAL harness through the REAL control
+  # runtime against a REAL OpenAI-compatible server. If the loop, the tool
+  # sandbox, the token accumulator, the gpu-node pricing path or the endpoint
+  # registry break, this step FAILS THE PUSH.
+  #
+  # The mock's happy_tools script is SIX turns (list_files, run_shell mkdir,
+  # write_file, apply_patch, read_file, finish), and every turn reports
+  # growing usage - which is what makes verify_executor assertion 13's
+  # "the accumulator SUMMED across turns" a checkable claim. max_iterations
+  # must therefore stay strictly above 6.
+  #
+  # commit is FALSE for the same reason the mock-agent step's is: the dogfood
+  # run must never push to its own repo.
+  - id: "harness-probe"
+    name: "14.2 agent harness (tools mode, mock endpoint)"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "dogfood-mock"
+      commit: false
+      task: "Create .lazyaf-dogfood/harness-ran naming the endpoint you used"
+      harness:
+        max_iterations: 8
+        time_budget_seconds: 120
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  # The fallback protocol is the part most likely to rot, because nothing
+  # exercises it once a tool-capable model is plugged in. It runs every push.
+  # `mode: text` is PINNED rather than inferred: forcing the no-tools loop is
+  # also how M13 makes loop shape an independent variable, so the pin is the
+  # feature, not a workaround.
+  - id: "harness-probe-notools"
+    name: "14.2 agent harness (no-tools fallback, mock endpoint)"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "dogfood-mock-notools"
+      commit: false
+      task: "Create .lazyaf-dogfood/harness-fallback-ran"
+      harness:
+        mode: text
+        max_iterations: 8
+        time_budget_seconds: 120
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
   # Exit-gate ratchet (R1), 12.6 edition: every step of THIS run must have run
   # on the LANE ITS DEFINITION ASKS FOR - `requires:` means remote, everything
   # else means local - AND (control-layer probe) show logs that arrived via the

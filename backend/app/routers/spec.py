@@ -12,6 +12,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -91,16 +92,69 @@ async def _get_prompt_template_or_404(
     return template
 
 
+def _name_taken(name: str) -> HTTPException:
+    """THE answer to a duplicate prompt-template name (R3: one spelling).
+
+    Raised from the pre-check and from the race absorber below, so the loser
+    of a concurrent create is told exactly what a sequential duplicate is told.
+    """
+    return HTTPException(
+        status_code=409,
+        detail=f"Prompt template named '{name}' already exists",
+    )
+
+
 async def _ensure_template_name_unique(db: AsyncSession, name: str) -> None:
     """Raise 409 if a prompt template with this name already exists."""
     result = await db.execute(
         select(PromptTemplate).where(PromptTemplate.name == name)
     )
     if result.scalar_one_or_none():
-        raise HTTPException(
-            status_code=409,
-            detail=f"Prompt template named '{name}' already exists",
+        raise _name_taken(name)
+
+
+async def _insert_template_absorbing_race(
+    db: AsyncSession, payload: PromptTemplateCreate
+) -> PromptTemplate:
+    """Create a PromptTemplate, absorbing the check-then-insert race on `name`.
+
+    ``_ensure_template_name_unique`` is a SELECT, and ``prompt_templates.name``
+    is UNIQUE: between that SELECT and the INSERT a concurrent request can take
+    the name, and the constraint then fires at COMMIT. Measured by the QA pass
+    at 20 simultaneous creates of one name: 4-11 bare 500s per trial and ZERO
+    rows written - the winner's insert died along with the losers'.
+
+    Absorbed with the rollback/re-select idiom this codebase already uses in
+    usage and test-results ingestion (``app/services/usage_ingestion.py``,
+    ``app/services/test_ingestion.py``): the race costs a re-read, never the
+    record. Bounded at two passes - the second re-select answers 409 in the
+    normal case, and inserts in the rare one where the winner was deleted in
+    between; a third collision is answered, not retried forever.
+    """
+    for attempt in (1, 2):
+        await _ensure_template_name_unique(db, payload.name)
+        db_template = PromptTemplate(
+            name=payload.name,
+            description=payload.description,
+            content=payload.content,
         )
+        db.add(db_template)
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            logger.info(
+                "Concurrent prompt-template insert for name %r (pass %d) — "
+                "re-resolving",
+                payload.name,
+                attempt,
+            )
+            continue
+        await db.refresh(db_template)
+        return db_template
+
+    await _ensure_template_name_unique(db, payload.name)
+    raise _name_taken(payload.name)
 
 
 async def _create_feature(
@@ -776,16 +830,7 @@ async def list_prompt_templates(db: AsyncSession = Depends(get_db)):
 async def create_prompt_template(
     template: PromptTemplateCreate, db: AsyncSession = Depends(get_db)
 ):
-    await _ensure_template_name_unique(db, template.name)
-    db_template = PromptTemplate(
-        name=template.name,
-        description=template.description,
-        content=template.content,
-    )
-    db.add(db_template)
-    await db.commit()
-    await db.refresh(db_template)
-    return db_template
+    return await _insert_template_absorbing_race(db, template)
 
 
 @router.get("/api/prompt-templates/{template_id}", response_model=PromptTemplateRead)
@@ -801,11 +846,25 @@ async def update_prompt_template(
 
     update_data = req.model_dump(exclude_unset=True)
     new_name = update_data.get("name")
-    if new_name and new_name != template.name:
+    renaming = bool(new_name) and new_name != template.name
+    if renaming:
         await _ensure_template_name_unique(db, new_name)
     for key, value in update_data.items():
         setattr(template, key, value)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Same check-then-write race as the create path, one row later: a
+        # concurrent request took `new_name` between the SELECT above and this
+        # UPDATE. Answer what a sequential duplicate would get instead of
+        # letting the constraint escape as a 500.
+        await db.rollback()
+        if not renaming:
+            raise
+        logger.info(
+            "Concurrent prompt-template rename to %r — re-resolving", new_name
+        )
+        raise _name_taken(new_name) from None
     await db.refresh(template)
     return template
 

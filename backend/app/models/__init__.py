@@ -9,6 +9,11 @@ from app.models.testref import TestRef, TestRun, TestRefStatus, TestRunStatus
 from app.models.usage import StepUsage, UsageCostSource, UsageProvider
 from app.models.workspace import Workspace
 from app.models.debug import DebugSession
+from app.models.model_endpoint import (
+    ModelEndpoint,
+    ENDPOINT_FAILURE_THRESHOLD,
+    IN_FLIGHT_STEP_STATUSES,
+)
 from app.models.experiment import (
     Experiment,
     ExperimentRun,
@@ -54,4 +59,7 @@ __all__ = [
     "ExperimentStatus",
     "ExperimentRunStatus",
     "PromptVersion",
+    "ModelEndpoint",
+    "ENDPOINT_FAILURE_THRESHOLD",
+    "IN_FLIGHT_STEP_STATUSES",
 ]

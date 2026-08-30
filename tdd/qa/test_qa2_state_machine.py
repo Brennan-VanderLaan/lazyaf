@@ -51,15 +51,7 @@ def repo():
 # QA2-01  approve has no status guard at all
 # ===========================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-01: POST /api/cards/{id}/approve has no status guard "
-        "(backend/app/routers/cards.py approve_card). A card in 'todo' that "
-        "was never started, has no branch, no job and no diff is marked "
-        "'done' with 200 OK and fires card_complete triggers."
-    ),
-)
+# QA2-01 FIXED (12.7): approve requires 'in_review' AND a branch.
 def test_approve_refuses_a_card_that_never_ran(repo):
     card_id = make_card(repo, "approve-never-ran")
     status, body = api("POST", f"/api/cards/{card_id}/approve", {})
@@ -69,14 +61,8 @@ def test_approve_refuses_a_card_that_never_ran(repo):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-01b: approving an already-'done' card succeeds again "
-        "and re-fires its card_complete triggers, so a double-click on "
-        "Approve produces two identical verification runs."
-    ),
-)
+# QA2-01b FIXED (12.7): the second approve loses the status claim, so the
+# card_complete gate fires once.
 def test_repeated_approve_does_not_refire_card_complete_triggers(repo):
     pipeline_id = make_pipeline(
         repo,
@@ -105,17 +91,7 @@ def test_repeated_approve_does_not_refire_card_complete_triggers(repo):
 # QA2-02  reject has no status guard, and abandons a live run
 # ===========================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-02: POST /api/cards/{id}/reject has no status guard "
-        "(backend/app/routers/cards.py reject_card). Rejecting an "
-        "in_progress card sends it back to 'todo' and clears branch_name "
-        "while the agent run keeps executing; the Job row is then stranded "
-        "at 'running' forever because agent_run._complete_card_work's "
-        "stale-completion guard returns early without landing the Job."
-    ),
-)
+# QA2-02 FIXED (12.7): reject cancels the run and lands the Job.
 def test_reject_of_a_running_card_does_not_strand_its_job(repo):
     card_id = make_card(repo, "reject-mid-run", seconds=30)
     start_card(card_id)
@@ -136,15 +112,8 @@ def test_reject_of_a_running_card_does_not_strand_its_job(repo):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-02b: reject sends an in_progress card to 'todo' "
-        "without cancelling its run, so /start accepts it again and a second "
-        "agent container runs concurrently against the same repo, leaving an "
-        "orphan lazyaf/<jobid> branch no card references."
-    ),
-)
+# QA2-02b FIXED (12.7): reject cancels the run before unwinding the card,
+# so a restart cannot run beside it.
 def test_reject_then_restart_does_not_run_two_agents_at_once(repo):
     card_id = make_card(repo, "reject-restart", seconds=25)
     start_card(card_id)
@@ -171,16 +140,8 @@ def test_reject_then_restart_does_not_run_two_agents_at_once(repo):
 # QA2-03  start / retry are read-check-write races (double click)
 # ===========================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-03: start_card checks `card.status != 'todo'` and "
-        "then writes, with no row lock or conditional UPDATE "
-        "(backend/app/routers/cards.py start_card). Two concurrent POSTs "
-        "both pass the check, so one double-click starts two agent runs, "
-        "two Jobs and two branches; the card keeps only one job_id."
-    ),
-)
+# QA2-03 FIXED (12.7): start claims the card with a conditional UPDATE;
+# the losers get 400.
 def test_double_click_start_creates_only_one_job(repo):
     card_id = make_card(repo, "double-start", seconds=10)
     results = concurrent(lambda: api("POST", f"/api/cards/{card_id}/start"), n=2)
@@ -191,14 +152,7 @@ def test_double_click_start_creates_only_one_job(repo):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-03b: retry_card has the same read-check-write race "
-        "as start (backend/app/routers/cards.py retry_card); double-clicking "
-        "Retry on an in_review card starts two agent runs."
-    ),
-)
+# QA2-03b FIXED (12.7): retry uses the same atomic claim as start.
 def test_double_click_retry_creates_only_one_job(repo):
     card_id = make_card(repo, "double-retry", seconds=8)
     start_card(card_id)
@@ -215,17 +169,8 @@ def test_double_click_retry_creates_only_one_job(repo):
 # QA2-04  PATCH status is an unguarded state-machine bypass (the kanban drag)
 # ===========================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-04: PATCH /api/cards/{id} writes `status` straight "
-        "through (backend/app/routers/cards.py update_card), and the kanban "
-        "board's drag handler calls exactly that "
-        "(frontend/src/lib/components/Board.svelte handleDrop). Dragging a "
-        "running card into the Done column marks it done without merging "
-        "anything and strands its Job at 'running' forever."
-    ),
-)
+# QA2-04 FIXED (12.7): PATCH cannot enter or leave 'in_progress' or 'done'
+# - approve/start/reject own those transitions.
 def test_patching_a_running_card_to_done_lands_its_job(repo):
     card_id = make_card(repo, "drag-to-done", seconds=25)
     start_card(card_id)
@@ -275,36 +220,26 @@ def test_patching_a_card_to_done_merges_its_branch(repo):
 # ===========================================================================
 
 @pytest.mark.parametrize("field", ["status", "runner_type", "step_type", "title", "description"])
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-05: update_card applies model_dump(exclude_unset=True) "
-        "verbatim (backend/app/routers/cards.py update_card), so an explicit "
-        "JSON null on a NOT NULL column reaches the UPDATE and raises an "
-        "unhandled sqlite3.IntegrityError -> 500 with a plain-text "
-        "'Internal Server Error' body."
-    ),
-)
 def test_patch_null_on_a_required_field_is_a_client_error(repo, field):
+    """FIXED at the schema, not at update_card: CardUpdate now declares those
+    five fields under `not_null()` (backend/app/schemas/_patch.py), so an
+    explicit JSON null is refused in validation with a 422 that names the
+    field, and never reaches the UPDATE."""
     card_id = make_card(repo, f"null-{field}")
     status, body = api("PATCH", f"/api/cards/{card_id}", {field: None})
-    assert status < 500, f"PATCH {field}=null returned {status}: {body!r}"
+    assert status == 422, f"PATCH {field}=null returned {status}: {body!r}"
+    assert ["body", field] in [e["loc"] for e in body["detail"]], body
 
 
 # ===========================================================================
 # QA2-06  resolve-conflicts merges with no conflict, on any card status
 # ===========================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-06: POST /api/cards/{id}/resolve-conflicts never "
-        "checks that a conflict exists, nor the card's status "
-        "(backend/app/routers/cards.py resolve_conflicts). It force-merges "
-        "the caller's file contents into the default branch - including "
-        "files that exist in no branch - on a card that is already 'done'."
-    ),
-)
+# QA2-06 PARTLY FIXED (12.7): resolve-conflicts now takes the same state
+# gate as approve (in_review + a branch), which is what this assertion
+# exercises. The OTHER half of the finding - that it force-merges
+# caller-invented content when no conflict exists - is still open and is
+# not covered by any test.
 def test_resolve_conflicts_refuses_when_there_is_no_conflict(repo):
     card_id = make_card(repo, "no-conflict", files={"clean.txt": "agent wrote this"})
     start_card(card_id)

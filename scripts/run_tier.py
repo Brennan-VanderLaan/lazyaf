@@ -12,6 +12,12 @@ Stdlib only: runs on the bare python3 of a Linux runner container and on a
 Windows host alike. Paths are derived from this file's location, so the
 current working directory does not matter.
 
+SELECTION COVERAGE (12.7): every test directory in the repo that a tier can
+host is now named by a tier. The last hold-out was `runner-common/tests`,
+which lives outside tdd/ because it ships with the package - it joined T1.
+The remaining unselected suites are the frontend's (vitest / Playwright, run
+by their own lanes) and the @slow e2e tests below.
+
 KNOWN EXCLUSION (stated per R4, not a silent cap): the @slow e2e tests
 (control layer, real card execution, graph pipeline full-stack) run in NO
 tier - they need the compose e2e stack, which the legacy runner cannot host.
@@ -34,6 +40,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND_DIR = REPO_ROOT / "backend"
 CI_GATE = REPO_ROOT / "scripts" / "ci_gate.py"
 
+# runner-common is on the PYTHONPATH for TWO reasons now, and the second one
+# is new at 12.7: the manifest plugin below is imported from it, AND T1's
+# selection includes `../runner-common/tests` so the package's own 181 tests
+# are gated by the ratchet instead of running in no tier at all.
+#
 # 12.2.6 test tie-back: every tier loads the manifest plugin explicitly
 # (`-p runner_common.pytest_lazyaf` — DECISION: no pytest11 entry point, see
 # runner-common/pyproject.toml). The backend uv env does NOT install
@@ -61,11 +72,27 @@ def _tier_env() -> dict:
 # selection runs from, matching `cd backend && uv run pytest ...`).
 TIERS: dict[str, dict] = {
     "T1": {
-        "name": "Unit + Demos + Integration (no Docker)",
+        "name": "Unit + Demos + Integration + runner-common (no Docker)",
         "pytest_args": [
             "../tdd/unit",
             "../tdd/demos",
             "../tdd/integration",
+            # runner-common's OWN suite. It lives outside tdd/ because it
+            # ships with the package (a user repo installs runner-common and
+            # can run it), and until now that meant NO tier selected it: 181
+            # tests - including the only package-local cover for the
+            # spec-curated context consumer and for the 12.2.6 manifest
+            # plugin - ran in no gate at all. It is pure-Python and touches no
+            # Docker, so it belongs in T1 and the tier stays the no-Docker
+            # tier.
+            #
+            # Two things make this work and both are already here: the
+            # package is importable through the PYTHONPATH `_tier_env()` sets
+            # for the manifest plugin, and pytest still resolves rootdir /
+            # configfile from the FIRST argument (tdd/pytest.ini), so
+            # asyncio_mode and the marker set are unchanged. Keep ../tdd
+            # first for that reason.
+            "../runner-common/tests",
             # The whole services/ subtree is Docker-real (12.2-INT: workspace
             # lifecycle on named volumes, local pipeline execution, WS round
             # trips) and runs in T2 - T1 stays the no-Docker tier.

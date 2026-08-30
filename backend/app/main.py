@@ -1,8 +1,16 @@
 import logging
+import math
+import re
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as SATimeoutError
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.config import get_settings
 
@@ -15,6 +23,7 @@ from app.database import init_db
 from app.routers import repos, cards, jobs, runners, agent_files, pipelines, lazyaf_files
 from app.routers import git, playground, models, steps, spec, test_results
 from app.routers import experiments, debug
+from app.routers import model_endpoints
 from app.routers import ws_runners
 from app.services.websocket import manager
 
@@ -150,6 +159,93 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# =============================================================================
+# The error boundary
+# =============================================================================
+#
+# Before this existed, an exception that escaped a route escaped the whole
+# ASGI app, and that cost the UI TWO requests, not one:
+#
+#   1. uvicorn answered the failed request with the literal bytes
+#      ``Internal Server Error`` and ``content-type: text/plain``. A frontend
+#      on the error path does ``res.json()``, which throws a SECOND time - so
+#      the user is shown "Unknown error" instead of what actually failed.
+#   2. uvicorn then CLOSED the transport. The response carried no
+#      ``Connection: close``, so the client's next request went out on a socket
+#      the server had already torn down and died with ``RemoteDisconnected``.
+#      Measured 6/6 by the QA pass (0/6 on the 200 control).
+#
+# So every handler below has two jobs: say something structured and true, and
+# keep the connection alive. Registered ``exception_handler``s run inside
+# Starlette's ExceptionMiddleware and satisfy both. A handler registered for
+# bare ``Exception`` does NOT - Starlette routes that one to ServerErrorMiddleware,
+# which re-raises after responding and lands back on the transport-closing path
+# above - so the last-resort net is an ASGI middleware instead.
+#
+# Nothing here swallows anything: every branch logs the exception with its full
+# traceback server-side before answering. What the client stops receiving is the
+# stack trace, not the fact of the error.
+#
+# ORDERING: the boundary is registered BEFORE CORSMiddleware so that CORS ends
+# up OUTERMOST (``add_middleware`` prepends). An error response produced outside
+# CORS carries no ``Access-Control-Allow-Origin``, and the browser refuses to
+# let the app read it - which would reproduce the "Unknown error" symptom by a
+# different route.
+
+logger = logging.getLogger(__name__)
+
+
+class UnhandledErrorBoundary:
+    """Last resort: turn an escaped exception into a JSON 500, in-band.
+
+    A plain ASGI middleware rather than ``BaseHTTPMiddleware``: no task group,
+    no interaction with background tasks or WebSockets, and it can tell whether
+    the response had already started (in which case the only honest thing left
+    is to let the exception through and let the server close the stream).
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        response_started = False
+
+        async def _send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        except Exception:
+            logger.exception(
+                "Unhandled exception serving %s %s",
+                scope.get("method", "?"),
+                scope.get("path", "?"),
+            )
+            if response_started:
+                # Headers are already on the wire; there is no status left to
+                # change. Re-raise so the server tears down the half-sent body
+                # rather than silently truncating it.
+                raise
+            response = JSONResponse(
+                status_code=500,
+                content={
+                    "detail": "Internal server error",
+                    "error": "internal_error",
+                },
+            )
+            await response(scope, receive, _send)
+
+
+app.add_middleware(UnhandledErrorBoundary)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -157,6 +253,148 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# SQLite spells its constraint failures "<KIND> constraint failed: table.column".
+# The column name is part of the public API surface (it is the field the client
+# sent), the table name and the driver's wording are not - so only the column
+# travels, and only when the message actually matches.
+_CONSTRAINT_RE = re.compile(
+    r"(?P<kind>NOT NULL|UNIQUE|CHECK|FOREIGN KEY) constraint failed"
+    r"(?::\s*(?P<table>\w+)\.(?P<column>\w+))?",
+    re.IGNORECASE,
+)
+
+# kind -> (status, error code, message template). A NOT NULL or CHECK violation
+# means the client sent a value the column cannot hold: 422. UNIQUE and FOREIGN
+# KEY mean the row conflicts with the rest of the database: 409.
+_CONSTRAINT_RULES = {
+    "NOT NULL": (422, "not_null_violation", "must not be null"),
+    "CHECK": (422, "check_violation", "failed a database constraint"),
+    "UNIQUE": (409, "unique_violation", "is already taken"),
+    "FOREIGN KEY": (409, "foreign_key_violation", "references a row that does not exist"),
+}
+
+
+@app.exception_handler(IntegrityError)
+async def integrity_error_handler(request: Request, exc: IntegrityError):
+    """A constraint violation is the CLIENT's error, not a server crash.
+
+    Sources the QA pass hit, all of which were bare 500s: ``PATCH`` with an
+    explicit ``null`` on a NOT NULL column (nine endpoints), and concurrent
+    creates that lose the check-then-insert race on a unique name
+    (prompt-templates, agent-files).
+    """
+    logger.warning(
+        "IntegrityError serving %s %s: %s",
+        request.method,
+        request.url.path,
+        exc.orig,
+        exc_info=exc,
+    )
+    match = _CONSTRAINT_RE.search(str(exc.orig or exc))
+    kind = match.group("kind").upper() if match else None
+    status, code, phrase = _CONSTRAINT_RULES.get(
+        kind, (409, "constraint_violation", "violates a database constraint")
+    )
+    column = match.group("column") if match else None
+    body = {
+        "detail": f"'{column}' {phrase}" if column else f"Request {phrase}",
+        "error": code,
+    }
+    if column:
+        body["field"] = column
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.exception_handler(StaleDataError)
+async def stale_data_handler(request: Request, exc: StaleDataError):
+    """Someone else changed or deleted the row mid-flight.
+
+    ``expected to update 1 row(s); 0 were matched`` — e.g. `start` racing
+    `delete` on the same card. 409, because retrying against fresh state is the
+    action that can succeed.
+    """
+    logger.warning(
+        "Concurrent modification serving %s %s: %s",
+        request.method,
+        request.url.path,
+        exc,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "The record changed while this request was in flight; "
+                      "re-read it and try again.",
+            "error": "concurrent_modification",
+        },
+    )
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_error_handler(request: Request, exc: SQLAlchemyError):
+    """Everything else the database layer can raise.
+
+    ``OperationalError: database is locked`` and ``TimeoutError: QueuePool
+    limit ... reached`` are transient and retryable, so they answer 503 with a
+    ``Retry-After``; anything else is ours to fix and answers 500. Either way
+    the traceback is logged in full here and none of it reaches the client.
+    """
+    transient = isinstance(exc, (OperationalError, SATimeoutError))
+    logger.error(
+        "Database error serving %s %s (%s)",
+        request.method,
+        request.url.path,
+        type(exc).__name__,
+        exc_info=exc,
+    )
+    if transient:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "The database is temporarily unavailable. Retry shortly.",
+                "error": "database_unavailable",
+            },
+            headers={"Retry-After": "1"},
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Database error", "error": "database_error"},
+    )
+
+
+def _json_safe(value):
+    """Replace non-finite floats so a 422 body can actually be rendered.
+
+    Starlette's ``JSONResponse`` renders with ``allow_nan=False``. A request
+    body containing the JSON literal ``NaN`` / ``Infinity`` (which Python's
+    json parser accepts) therefore made FastAPI's own validation handler blow
+    up while echoing the offending value back — turning a would-be 422 into a
+    500 on EVERY endpoint. The value is preserved as its text so the message
+    still names what was rejected.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """FastAPI's own 422, with non-finite floats scrubbed from the echo.
+
+    Same status and same body shape as the default handler — this exists only
+    so the body can always be serialized.
+    """
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+    )
+
 
 app.include_router(repos.router)
 app.include_router(cards.router)
@@ -173,6 +411,10 @@ app.include_router(steps.router)
 app.include_router(spec.router)
 app.include_router(test_results.router)
 app.include_router(experiments.router)
+# M14: the model endpoint registry, its probe, its usage rollup and the
+# reach=proxy broker. Registered here so the operator API can reach it at all;
+# without this line the whole milestone is dark.
+app.include_router(model_endpoints.router)
 # The debug router carries both the 12.7 HTTP surface and the terminal
 # WebSocket (/ws/debug/...); like ws_runners it declares its own paths.
 app.include_router(debug.router)

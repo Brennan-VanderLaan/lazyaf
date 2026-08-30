@@ -71,9 +71,43 @@ Asserts, for the CURRENT pipeline run:
      so 8 covers its routing) AND still has a StepUsage row with real token
      counts (verify_usage below). The usage channel crossing a host boundary
      is the one thing 12.5 could not prove.
+ 13. (14.2) every `agent: openai-harness` StepRun has a StepUsage row with
+     provider == 'openai-compatible' and token counts that were SUMMED ACROSS
+     TURNS rather than taken from the last response. The mock endpoint reports
+     growing per-turn usage (turn N declares 100*N prompt / 20*N completion
+     tokens), so with T turns a summing accumulator lands on
+     100*T*(T+1)/2 and a last-response-wins bug lands on exactly 100*T. The
+     gate asserts the row is STRICTLY GREATER than the largest single turn.
+     This is the only genuinely new accounting logic in the milestone and it
+     has no other alarm: a harness that silently kept the last turn would
+     under-report every self-hosted step forever and every other assertion
+     here would still pass.
+ 14. (14.2/12.5) that row has cost_source == 'gpu-node' and a non-null
+     cost_usd. The dogfood endpoints carry a real rate_usd_hour, so the
+     gpu-node pricing branch - which 12.5 shipped and stated was "reached only
+     by API tests with a hand-built manifest" - is exercised on every push.
+ 15. (14.2) `SCRAPE_FAILED_LOG_MARKER` appears in NO step's logs for this run.
+     verify_run already refuses a run containing it; 15 restates it as a
+     named, independently testable assertion because the harness is the first
+     executor whose usage comes from N accumulated responses rather than one
+     scraped report, and "no turn reported usage" is a shape only it can
+     produce.
+ 16. (14.2) the FORCED-TEXT harness step succeeded and its usage row records
+     raw.harness.mode == 'text' with a `malformed_responses` key present.
+     The no-tools fallback protocol is the part most likely to rot, because
+     nothing exercises it once a tool-capable model is plugged in.
+ 17. (14.1) GET /api/model-endpoints reports the endpoint each harness step
+     named, the tools-mode one with probe_status == 'ok', all of them probed
+     inside PROBE_TTL_SECONDS. An endpoint whose capability record went stale
+     or unprobed is one a step should have refused to dispatch against.
+ 18. (14.2, section 5.2 invariant) NO StepUsage row in this run carries
+     cost_source == 'cli-reported' together with provider ==
+     'openai-compatible'. That value is what the board reads as "the provider
+     billed us this amount", and no self-hosted endpoint can make that claim.
 
-A vacuous pass is a failure (R4) in four separate ways: no script/docker step
-runs, no agent step run, no REMOTE step run, and no connected runner.
+A vacuous pass is a failure (R4) in six separate ways: no script/docker step
+runs, no agent step run, no REMOTE step run, no connected runner, no HARNESS
+step run, and no forced-text harness step run.
 
 Env contract (injected into every step container by LocalExecutor; the
 backend URL default matches settings.container_backend_url):
@@ -119,6 +153,41 @@ SCRAPE_FAILED_LOG_MARKER = "[agent] WARNING: usage scrape failed"
 RAW_SCRAPE_FAILED = "_scrape_failed"
 RAW_SCRAPE_ERROR = "_scrape_error"
 
+# -----------------------------------------------------------------------------
+# 14.x harness lane (assertions 13-18)
+# -----------------------------------------------------------------------------
+# The agent vocabulary for a self-hosted OpenAI-compatible endpoint. A step's
+# lane is derived from its PIPELINE DEFINITION here exactly as the local/remote
+# expectation is: `config.agent == 'openai-harness'`.
+HARNESS_AGENT = "openai-harness"
+# UsageProvider.OPENAI_COMPATIBLE - constant for this executor.
+HARNESS_USAGE_PROVIDER = "openai-compatible"
+# UsageCostSource values. `gpu-node` is what the 12.5 pricing path writes when
+# a node rate resolves; `cli-reported` is the one a harness row may NEVER carry.
+GPU_NODE_COST_SOURCE = "gpu-node"
+CLI_REPORTED_COST_SOURCE = "cli-reported"
+# Capability records older than this are stale (probe.PROBE_TTL_SECONDS).
+PROBE_TTL_SECONDS = 86_400
+
+# THE MOCK ENDPOINT'S PER-TURN TOKEN LAW. Turn N of any scenario in
+# tdd/shared/mock_openai declares prompt_tokens = 100*N and
+# completion_tokens = 20*N, so over T turns:
+#
+#     a SUMMING accumulator reports  100 * T*(T+1)/2   /  20 * T*(T+1)/2
+#     a LAST-RESPONSE-WINS bug reports        100 * T   /          20 * T
+#
+# and the first is strictly larger for every T >= 2. Assertion 13 is that
+# inequality. These two integers are DUPLICATED from
+# tdd/shared/mock_openai/scenarios.py because this script is stdlib-only and
+# runs in a bare step container that cannot import `tdd`; the duplication is
+# pinned by tdd/unit/scripts/test_verify_executor.py, which imports BOTH and
+# asserts they are equal (R3).
+MOCK_PROMPT_TOKENS_PER_TURN = 100
+MOCK_COMPLETION_TOKENS_PER_TURN = 20
+# One turn is the degenerate case: summed and last-response are the same
+# number, so the inequality proves nothing. The gate requires a real loop.
+MIN_HARNESS_TURNS = 2
+
 
 def has_delivered_logs(logs) -> bool:
     """True iff logs contain at least one non-blank, NON-marker line.
@@ -151,6 +220,38 @@ def step_requires_remote(step: dict) -> bool:
 
 def expected_executor(step: dict) -> str:
     return REMOTE_EXECUTOR if step_requires_remote(step) else LOCAL_EXECUTOR
+
+
+def step_harness_endpoint(step: dict) -> str | None:
+    """The endpoint name an `agent: openai-harness` STEP DEFINITION names.
+
+    Two legal spellings, both resolved by the ONE backend resolver
+    (`resolve_step_endpoint`): an explicit `endpoint:` key, or the
+    `model: "endpoint:<name>"` sugar every model picker already emits. The
+    gate reads the definition, never the outcome, so "the step silently ran
+    against a different endpoint" is a detectable regression.
+    """
+    config = step.get("config") or {}
+    if (config.get("agent") or "") != HARNESS_AGENT:
+        return None
+    explicit = config.get("endpoint")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    model = config.get("model")
+    if isinstance(model, str) and model.startswith("endpoint:"):
+        return model[len("endpoint:"):].strip() or None
+    return None
+
+
+def step_harness_mode(step: dict) -> str:
+    """The harness LOOP SHAPE this step pins: 'tools', 'text' or 'auto'."""
+    config = step.get("config") or {}
+    harness = config.get("harness")
+    if isinstance(harness, dict):
+        mode = harness.get("mode")
+        if isinstance(mode, str) and mode:
+            return mode
+    return "auto"
 
 
 def step_runner_id(step_run: dict, usage_row: dict | None) -> str | None:
@@ -310,12 +411,13 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
         base_url, run, step_types, self_index=self_index, rollup=rollup
     )
     remote_msg = verify_remote_lane(base_url, run, expected, rollup)
+    harness_msg = verify_harness_lane(base_url, run, pipeline, rollup)
 
     return (
         f"OK: {checked} script step run(s) and {agents_checked} agent step "
         f"run(s) ran on the lane their definition asks for "
         f"({remote_checked} remote), passed steps delivered logs, no "
-        f"manifest delivery problems, {usage_msg}, {remote_msg}"
+        f"manifest delivery problems, {usage_msg}, {remote_msg}, {harness_msg}"
     )
 
 
@@ -544,6 +646,272 @@ def verify_remote_lane(
     return (
         f"{len(live)} socket-backed runner(s) live, remote steps assigned to "
         f"{sorted(assigned_to)}"
+    )
+
+
+def _harness_record(detail: dict) -> dict:
+    """`raw.harness` from a StepUsage detail, or {} when it is absent."""
+    raw = detail.get("raw")
+    if not isinstance(raw, dict):
+        return {}
+    record = raw.get("harness")
+    return record if isinstance(record, dict) else {}
+
+
+def verify_harness_lane(
+    base_url: str, run: dict, pipeline: dict, rollup: dict
+) -> str:
+    """14.x assertions 13-18: the self-hosted lane is REAL and HONESTLY PRICED.
+
+    Every question here is asked of the PIPELINE DEFINITION first (which steps
+    claim to be `agent: openai-harness`, which endpoint each names, which one
+    pins `harness.mode: text`) and only then of what happened. That is the same
+    discipline assertion 11 uses, and it is what makes "the harness steps
+    silently disappeared from the pipeline" a failure rather than a green run
+    with nothing in it.
+    """
+    steps = pipeline.get("steps") or []
+    harness_steps = {
+        index: step
+        for index, step in enumerate(steps)
+        if (step.get("config") or {}).get("agent") == HARNESS_AGENT
+    }
+    if not harness_steps:
+        raise SystemExit(
+            "FAIL: no `agent: openai-harness` step in this pipeline, so the "
+            "14.2 AGENT HARNESS was not exercised at all. The harness is the "
+            "only executor LazyAF drives itself - the loop, the tool sandbox, "
+            "the token accumulator, the no-tools fallback and the gpu-node "
+            "pricing path have no other continuous coverage, and a GPU is "
+            "deliberately not required to run them (the mock endpoint is a "
+            "compose service). A vacuous pass is a failure (R4). Restore the "
+            "`harness-probe` and `harness-probe-notools` steps in "
+            ".lazyaf/pipelines/test-suite.yaml"
+        )
+
+    # 15. The scrape marker must appear NOWHERE in this run. For the harness
+    # this specifically means "no turn of any step reported a usage block",
+    # which is the shape only an N-turn accumulator can produce.
+    scrape_lines = [
+        f"step {sr.get('step_index')} '{sr.get('step_name')}': {line.strip()}"
+        for sr in run["step_runs"]
+        for line in (sr.get("logs") or "").splitlines()
+        if SCRAPE_FAILED_LOG_MARKER in line
+    ]
+    if scrape_lines:
+        raise SystemExit(
+            "FAIL (13-18/15): a step announced a usage scrape failure. For an "
+            "openai-harness step that means the endpoint returned no `usage` "
+            "block on ANY turn, so the tokens recorded for it are an absence "
+            "rather than a measurement:\n  " + "\n  ".join(scrape_lines)
+        )
+
+    by_step_run = {
+        row["step_run_id"]: row
+        for row in rollup.get("steps", [])
+        if row.get("step_run_id")
+    }
+
+    # 18. Run-wide, every row - not just the harness ones. A self-hosted
+    # provider row that claims `cli-reported` is claiming a bill nobody sent.
+    liars = [
+        f"step_run {row.get('step_run_id')} provider={row.get('provider')!r} "
+        f"cost_source={row.get('cost_source')!r}"
+        for row in rollup.get("steps", [])
+        if row.get("provider") == HARNESS_USAGE_PROVIDER
+        and row.get("cost_source") == CLI_REPORTED_COST_SOURCE
+    ]
+    if liars:
+        raise SystemExit(
+            "FAIL (18): a StepUsage row claims provider "
+            f"'{HARNESS_USAGE_PROVIDER}' with cost_source "
+            f"'{CLI_REPORTED_COST_SOURCE}'. That value means 'the provider "
+            "billed us this amount' and no self-hosted endpoint can make that "
+            "claim - a node-priced figure is an ESTIMATE from a rate and a "
+            "duration, and the two must never be mistaken for each other on "
+            "the board:\n  " + "\n  ".join(liars)
+        )
+
+    problems = []
+    text_mode_verified = []
+    endpoints_named = {}
+    checked = 0
+
+    for index, step in sorted(harness_steps.items()):
+        name = step.get("name") or step.get("id") or f"step {index}"
+        endpoint_name = step_harness_endpoint(step)
+        mode = step_harness_mode(step)
+        if endpoint_name:
+            endpoints_named.setdefault(endpoint_name, mode)
+
+        runs = [sr for sr in run["step_runs"] if sr.get("step_index") == index]
+        if not runs:
+            problems.append(f"step {index} '{name}': the harness step never ran")
+            continue
+        step_run = runs[-1]
+        if step_run.get("status") != "passed":
+            problems.append(
+                f"step {index} '{name}': status={step_run.get('status')!r}, "
+                "expected 'passed'"
+            )
+            continue
+
+        row = by_step_run.get(step_run["id"])
+        if row is None:
+            problems.append(
+                f"step {index} '{name}': no StepUsage row (the harness wrote "
+                "no usage manifest, or it never reached POST "
+                "/api/steps/{id}/usage)"
+            )
+            continue
+        detail = fetch_json(
+            base_url, f"/api/steps/{row['step_execution_id']}/usage"
+        )
+
+        # 13a. provider
+        if detail.get("provider") != HARNESS_USAGE_PROVIDER:
+            problems.append(
+                f"step {index} '{name}': provider="
+                f"{detail.get('provider')!r}, expected "
+                f"{HARNESS_USAGE_PROVIDER!r}"
+            )
+
+        record = _harness_record(detail)
+        turns = record.get("turns")
+        input_tokens = detail.get("input_tokens")
+        output_tokens = detail.get("output_tokens")
+
+        if not isinstance(turns, int) or turns < MIN_HARNESS_TURNS:
+            problems.append(
+                f"step {index} '{name}': raw.harness.turns={turns!r}. The gate "
+                f"needs at least {MIN_HARNESS_TURNS} turns for the summation "
+                "check to mean anything - with one turn 'summed' and 'last "
+                "response' are the same number"
+            )
+        elif input_tokens is None or output_tokens is None:
+            problems.append(
+                f"step {index} '{name}': input_tokens={input_tokens!r} "
+                f"output_tokens={output_tokens!r} - a harness step that ran "
+                f"{turns} turns against a usage-reporting endpoint must have "
+                "both"
+            )
+        else:
+            # 13b. THE SUMMATION CHECK.
+            largest_in = MOCK_PROMPT_TOKENS_PER_TURN * turns
+            largest_out = MOCK_COMPLETION_TOKENS_PER_TURN * turns
+            if input_tokens <= largest_in or output_tokens <= largest_out:
+                problems.append(
+                    f"step {index} '{name}': usage was NOT summed across "
+                    f"turns. Over {turns} turns the mock endpoint's largest "
+                    f"single turn declares {largest_in} prompt / {largest_out} "
+                    f"completion tokens; this row records {input_tokens} / "
+                    f"{output_tokens}, which is at or below it. A summing "
+                    f"accumulator would record "
+                    f"{MOCK_PROMPT_TOKENS_PER_TURN * turns * (turns + 1) // 2}"
+                    f" / "
+                    f"{MOCK_COMPLETION_TOKENS_PER_TURN * turns * (turns + 1) // 2}"
+                    ". Check the per-turn accumulator in "
+                    "runner_common/harness (it must ADD every response's "
+                    "usage, not replace)"
+                )
+
+        # 14. gpu-node pricing.
+        if detail.get("cost_source") != GPU_NODE_COST_SOURCE:
+            problems.append(
+                f"step {index} '{name}': cost_source="
+                f"{detail.get('cost_source')!r}, expected "
+                f"{GPU_NODE_COST_SOURCE!r}. The dogfood endpoints carry a real "
+                "rate_usd_hour, so the 12.5 gpu-node pricing branch must have "
+                "priced this row (check usage_pricing.resolve_node_rate and "
+                "that gpu_node_id/gpu_fraction reached the container env)"
+            )
+        elif detail.get("cost_usd") is None:
+            problems.append(
+                f"step {index} '{name}': cost_source is "
+                f"{GPU_NODE_COST_SOURCE!r} but cost_usd is null - a priced "
+                "source with no price is the one combination that means "
+                "nothing"
+            )
+
+        # 16. the forced-text step recorded the fallback protocol.
+        if mode == "text":
+            if record.get("mode") != "text":
+                problems.append(
+                    f"step {index} '{name}': pinned harness.mode='text' but "
+                    f"raw.harness.mode={record.get('mode')!r}. The step did "
+                    "not run the no-tools fallback protocol it was told to"
+                )
+            elif "malformed_responses" not in record:
+                problems.append(
+                    f"step {index} '{name}': raw.harness has no "
+                    "'malformed_responses' key. The fallback parser must "
+                    "record its own miss count (0 is a fine value; the KEY "
+                    "missing means the path did not account for itself)"
+                )
+            else:
+                text_mode_verified.append(name)
+        checked += 1
+
+    if not text_mode_verified and not problems:
+        problems.append(
+            "no step of this pipeline pins `harness: {mode: text}`. The "
+            "no-tools FALLBACK PROTOCOL is the part most likely to rot - "
+            "nothing exercises it once a tool-capable model is plugged in - "
+            "so it runs on every push or it is not covered at all (vacuous "
+            "pass = fail, R4). Restore the `harness-probe-notools` step in "
+            ".lazyaf/pipelines/test-suite.yaml"
+        )
+
+    # 17. the capability records the steps dispatched against.
+    if endpoints_named:
+        registry = fetch_json(base_url, "/api/model-endpoints")
+        by_name = {
+            e.get("name"): e for e in registry if isinstance(e, dict)
+        }
+        for endpoint_name, mode in sorted(endpoints_named.items()):
+            endpoint = by_name.get(endpoint_name)
+            if endpoint is None:
+                problems.append(
+                    f"endpoint '{endpoint_name}' is named by a harness step "
+                    "but GET /api/model-endpoints does not report it "
+                    f"(known: {sorted(n for n in by_name if n)})"
+                )
+                continue
+            capabilities = endpoint.get("capabilities") or {}
+            status = capabilities.get("probe_status") or endpoint.get("probe_status")
+            age = capabilities.get("probe_age_seconds")
+            if age is None:
+                age = endpoint.get("probe_age_seconds")
+            if mode != "text" and status != "ok":
+                problems.append(
+                    f"endpoint '{endpoint_name}': probe_status={status!r}, "
+                    "expected 'ok' for the tools-mode dogfood endpoint (the "
+                    "mock server answers the tool probe, reports usage and "
+                    "streams, so anything else means the probe or the mock "
+                    "regressed)"
+                )
+            elif status == "unprobed":
+                problems.append(
+                    f"endpoint '{endpoint_name}': probe_status is 'unprobed', "
+                    "which dispatch is supposed to REFUSE - a step ran "
+                    "against an endpoint whose capabilities are unknown"
+                )
+            if age is None or age >= PROBE_TTL_SECONDS:
+                problems.append(
+                    f"endpoint '{endpoint_name}': probe_age_seconds={age!r}, "
+                    f"expected a fresh record under {PROBE_TTL_SECONDS}s"
+                )
+
+    if problems:
+        raise SystemExit(
+            "FAIL: the 14.x self-hosted harness lane did not behave the way "
+            "the pipeline definition says it must:\n  " + "\n  ".join(problems)
+        )
+
+    return (
+        f"{checked} openai-harness step run(s) summed their tokens across "
+        f"turns, priced node-side, against {len(endpoints_named)} probed "
+        f"endpoint(s) (forced-text: {', '.join(text_mode_verified) or 'none'})"
     )
 
 

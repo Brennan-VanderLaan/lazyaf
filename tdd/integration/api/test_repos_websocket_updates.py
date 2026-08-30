@@ -206,6 +206,23 @@ class TestRepoUpdateWebSocketBroadcast:
 
         # Verify timestamps are present
         assert "created_at" in payload
+
+    async def test_broadcast_timestamps_match_the_http_response(
+        self, client, repo, mock_ws
+    ):
+        """The WS payload and the HTTP body must spell the same instant the
+        same way — the frontend reads both and computes durations from either."""
+        mock_ws.clear_messages()
+
+        response = await client.patch(
+            f"/api/repos/{repo['id']}",
+            json={"remote_url": "https://github.com/updated/repo.git"},
+        )
+        updated_repo = response.json()
+
+        await asyncio.sleep(0.1)
+
+        payload = mock_ws.get_last_message()["payload"]
         assert payload["created_at"] == updated_repo["created_at"]
 
 

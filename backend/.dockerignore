@@ -1,0 +1,51 @@
+# Build context filter for backend/Dockerfile.
+#
+# Added with the release CI (.github/workflows). backend/Dockerfile COPYs
+# selectively (pyproject.toml, uv.lock, app/, alembic.ini, alembic/), so this
+# file is defence in depth rather than a bug fix - but it matters for two
+# reasons:
+#
+# 1. A developer's local state lives in this directory: .venv/ (hundreds of
+#    MB), lazyaf.db (their actual cards, repos and history), build/ and
+#    *.egg-info/. All of it was being uploaded to the daemon on every build,
+#    and any of it becoming COPY'd later would put private data in a PUBLIC
+#    image.
+#
+# 2. A stray `.env` in here must never reach a published image.
+#    .github/scripts/scan_image_secrets.py fails the build if one does; this
+#    stops it getting that far.
+#
+# What the image build needs is NOT excluded: pyproject.toml, uv.lock, app/,
+# alembic.ini and alembic/ (migrations ship in the image so a fresh volume
+# boots to head).
+
+# Local virtualenv and packaging residue.
+.venv
+build
+*.egg-info
+.python-version
+
+# Developer database and git-server storage - this is real user data.
+*.db
+*.sqlite
+data
+git_repos
+
+# Python bytecode and tool caches.
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Credentials. Never in a build context, never in a published image.
+.env
+.env.*
+
+# Docker's own files and local noise.
+Dockerfile
+.dockerignore
+*.log
+.DS_Store

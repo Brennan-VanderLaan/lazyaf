@@ -36,6 +36,7 @@ from uuid import uuid4
 from sqlalchemy import select, update
 
 from app.models.runner import DEFAULT_RUNNER_TYPE, Runner
+from app.schemas._datetime import utc_isoformat
 from app.services.execution.runner_protocol import (
     BackendMessage,
     DrainMessage,
@@ -394,6 +395,14 @@ class RunnerRegistry:
         return [self._as_dict(runner) for runner in result.scalars().all()]
 
     def _as_dict(self, runner: Runner) -> dict:
+        """The runner wire shape, for both GET /api/runners and the WS frame.
+
+        ``utc_isoformat``, not ``.isoformat()``: this dict IS the response body
+        (the router declares ``response_model=list[dict]``, so the annotated
+        ``RunnerRead`` never runs), and the runner panel renders a live
+        connection age off ``connected_at``. A naive string there is read as
+        local time and the age comes out hours wrong or negative.
+        """
         machine = self._machines.get(runner.id)
         return {
             "id": runner.id,
@@ -404,11 +413,9 @@ class RunnerRegistry:
             "current_step_execution_id": runner.current_step_execution_id,
             "protocol_version": runner.protocol_version,
             "agent_version": runner.agent_version,
-            "connected_at": runner.connected_at.isoformat() if runner.connected_at else None,
-            "last_heartbeat": (
-                runner.last_heartbeat.isoformat() if runner.last_heartbeat else None
-            ),
-            "created_at": runner.created_at.isoformat() if runner.created_at else None,
+            "connected_at": utc_isoformat(runner.connected_at),
+            "last_heartbeat": utc_isoformat(runner.last_heartbeat),
+            "created_at": utc_isoformat(runner.created_at),
             "connection": "websocket" if runner.id in self._connections else "none",
             "current_step_id": machine.current_step_id if machine else None,
         }

@@ -45,15 +45,7 @@ def _runs_for_card(card_id: str) -> list[dict]:
     return [run for run in body if run.get("trigger_ref") == card_id]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-3 (BLOCKER): concurrent POST /api/cards/{id}/start "
-        "all pass the `status != todo` check (no row lock), so N simultaneous "
-        "requests create N Jobs and N PipelineRuns for one card. "
-        "backend/app/routers/cards.py:296-354"
-    ),
-)
+# QA3-3 FIXED (12.7): the card claim is one conditional UPDATE.
 def test_simultaneous_card_start_creates_exactly_one_run():
     require_stack()
     repo_id = ensure_repo()
@@ -76,15 +68,7 @@ def test_simultaneous_card_start_creates_exactly_one_run():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-4 (MAJOR): POST /api/cards/{id}/retry has the same "
-        "unguarded read-then-check as start; 10 simultaneous retries were "
-        "all accepted and produced 10 extra runs for one card. "
-        "backend/app/routers/cards.py:559"
-    ),
-)
+# QA3-4 FIXED (12.7): retry takes the same claim.
 def test_simultaneous_card_retry_creates_exactly_one_run():
     require_stack()
     repo_id = ensure_repo()
@@ -137,15 +121,9 @@ def test_simultaneous_agent_file_create_yields_exactly_one_row():
     assert 500 not in counts, f"a concurrent create returned 500: {counts}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-5 (MAJOR): concurrent POST /api/prompt-templates with "
-        "the same name loses the pre-check race and the UNIQUE violation "
-        "escapes as a bare 500 'Internal Server Error' instead of the 409 the "
-        "sequential path returns."
-    ),
-)
+# QA3-5 FIXED (12.7): @app.exception_handler(IntegrityError) in
+# backend/app/main.py turns the lost check-then-insert race into a 409
+# instead of a bare 500. Marker removed, assertion kept.
 def test_simultaneous_prompt_template_create_never_returns_500():
     require_stack()
     name = f"qa3-tpl-{uuid.uuid4().hex[:8]}"

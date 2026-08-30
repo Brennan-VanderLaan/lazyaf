@@ -44,8 +44,18 @@ class GitRepoManager:
         self._ensure_dir()
         return self.get_repo_path(repo_id).exists()
 
-    def create_bare_repo(self, repo_id: str) -> Path:
-        """Create a new bare git repository."""
+    def create_bare_repo(self, repo_id: str, default_branch: str | None = None) -> Path:
+        """Create a new bare git repository.
+
+        ``default_branch`` names the branch HEAD should point at. dulwich's
+        ``init_bare`` hardcodes ``refs/heads/master``, so without this the repo
+        row said ``main`` while git said ``master`` - and ``list_branches``
+        then "synced" the row to a branch that does not exist, which is how the
+        sidebar came to read ``master`` while the board header read ``main``
+        (QA-API-08 / T19). HEAD on a fresh bare repo is an UNBORN branch: it
+        names where the first push will land, it is not a ref, so pointing it
+        somewhere else is free and costs no object.
+        """
         self._ensure_dir()
         repo_path = self.get_repo_path(repo_id)
         if repo_path.exists():
@@ -55,8 +65,23 @@ class GitRepoManager:
         # needs the directory to exist before initializing
         repo_path.mkdir(parents=True, exist_ok=True)
 
-        # Create bare repo using dulwich
-        DulwichRepo.init_bare(str(repo_path))
+        # Create bare repo using dulwich. Always close the handle it returns:
+        # on Windows a live pack/ref handle is what makes delete_repo need its
+        # retry-with-backoff dance.
+        repo = DulwichRepo.init_bare(str(repo_path))
+        try:
+            if default_branch:
+                # Best effort: a repo that exists with the wrong HEAD is
+                # recoverable (the first push rewrites it), a create that
+                # raises is not.
+                try:
+                    repo.refs.set_symbolic_ref(
+                        b"HEAD", f"refs/heads/{default_branch}".encode()
+                    )
+                except Exception as e:  # pragma: no cover - defensive
+                    print(f"[git_server] could not point HEAD at {default_branch!r}: {e}")
+        finally:
+            repo.close()
         return repo_path
 
     def delete_repo(self, repo_id: str) -> bool:

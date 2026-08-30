@@ -20,10 +20,11 @@ with a reason the salvage audit or the wiring design named:
   that never fired because its step's upstream failed is a visible fact.
 """
 
-from datetime import datetime
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+from app.schemas._datetime import UTCDateTime
 
 
 class DebugRerunRequest(BaseModel):
@@ -110,9 +111,9 @@ class DebugSessionInfo(BaseModel):
     runtime: DebugRuntimeInfo = Field(default_factory=DebugRuntimeInfo)
     logs: str = Field(default="", description="Paused step's logs so far")
     join_command: str = Field(description="CLI command that attaches to the session")
-    expires_at: Optional[datetime] = None
-    created_at: Optional[datetime] = None
-    ended_at: Optional[datetime] = None
+    expires_at: Optional[UTCDateTime] = None
+    created_at: Optional[UTCDateTime] = None
+    ended_at: Optional[UTCDateTime] = None
     breakpoints: list[str] = Field(default_factory=list)
     breakpoints_hit: list[str] = Field(default_factory=list)
     breakpoints_pending: list[str] = Field(default_factory=list)
@@ -135,7 +136,7 @@ class DebugJoinTokenResponse(BaseModel):
     """A freshly minted, short-lived terminal credential."""
 
     token: str = Field(description="JWT bounding the terminal socket")
-    expires_at: datetime = Field(description="Token expiry (<= session expires_at)")
+    expires_at: UTCDateTime = Field(description="Token expiry (<= session expires_at)")
     join_command: str = Field(description="CLI command carrying the token")
 
 
@@ -171,7 +172,7 @@ class DebugExtendRequest(BaseModel):
 class DebugExtendResponse(BaseModel):
     """Response after extending the deadline."""
 
-    expires_at: datetime = Field(description="New expiration time")
+    expires_at: UTCDateTime = Field(description="New expiration time")
     clamped: bool = Field(
         default=False,
         description="True when the request was clamped to max_timeout_seconds",

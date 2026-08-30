@@ -1,17 +1,24 @@
 import json
-from datetime import datetime
 from typing import Any
 from pydantic import BaseModel, field_validator
 
 from app.models.card import CardStatus, RunnerType, StepType
+from app.schemas._datetime import UTCDateTime
+from app.schemas._patch import not_null
+from app.schemas._strings import Body, Name
 
 
 class CardBase(BaseModel):
+    # Bare `str` on purpose: CardRead inherits this and must keep serializing
+    # rows written before the bound existed. The bound goes on the INPUT
+    # schemas below. See app/schemas/_strings.py.
     title: str
     description: str = ""
 
 
 class CardCreate(CardBase):
+    title: Name
+    description: Body = ""
     runner_type: RunnerType = RunnerType.ANY
     step_type: StepType = StepType.AGENT
     step_config: dict[str, Any] | None = None  # {command: str} for script, {image: str, command: str} for docker
@@ -20,8 +27,8 @@ class CardCreate(CardBase):
 
 
 class CardUpdate(BaseModel):
-    title: str | None = None
-    description: str | None = None
+    title: Name | None = None
+    description: Body | None = None
     status: CardStatus | None = None
     runner_type: RunnerType | None = None
     step_type: StepType | None = None
@@ -31,6 +38,13 @@ class CardUpdate(BaseModel):
     # Spec layer links (Phase 12.2.5) — explicit None unlinks, absent leaves unchanged
     feature_id: str | None = None
     user_story_id: str | None = None
+
+    # NOT NULL columns: null is a client error (422), not a 500. The rest
+    # (step_config, prompt_template, agent_file_ids, feature_id,
+    # user_story_id) are nullable and null is how a client clears them.
+    _reject_nulls = not_null(
+        "title", "description", "status", "runner_type", "step_type"
+    )
 
 
 class CardRead(CardBase):
@@ -52,8 +66,8 @@ class CardRead(CardBase):
     # Spec layer links (Phase 12.2.5)
     feature_id: str | None = None
     user_story_id: str | None = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     @field_validator("step_config", mode="before")
     @classmethod

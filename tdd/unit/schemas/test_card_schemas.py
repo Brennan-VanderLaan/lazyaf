@@ -43,13 +43,16 @@ class TestCardCreateSchema:
         data = {"description": "Some description"}
         assert_schema_invalid(CardCreate, data)
 
-    def test_card_create_empty_title_allowed(self):
-        """CardCreate allows empty string title (UI validation should prevent)."""
+    def test_card_create_empty_title_rejected(self):
+        """CardCreate refuses a blank title at the edge, not in the UI.
+
+        This test used to assert the opposite ("document current behavior" -
+        an empty title was accepted and rendered as an unlabelled, invisible
+        card). `CardCreate.title` is now `app.schemas._strings.Name`, so a
+        blank title is a 422 naming the field instead of a blank row.
+        """
         data = {"title": ""}
-        # This may or may not be valid depending on schema constraints
-        # Document current behavior
-        schema = CardCreate(**data)
-        assert schema.title == ""
+        assert_schema_invalid(CardCreate, data)
 
 
 class TestCardUpdateSchema:

@@ -131,12 +131,7 @@ def feature(api):
 # QA-API-01  BLOCKER - approve has no state machine guard
 # =============================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA-API-01: POST /api/cards/{id}/approve marks a 'todo' "
-           "card with no branch as 'done' without merging anything "
-           "(backend/app/routers/cards.py:435-462)",
-)
+# QA-API-01 FIXED (12.7): approve requires 'in_review' and a branch.
 def test_approve_rejects_a_card_that_never_ran(api, repo):
     card = api.post(f"/api/repos/{repo}/cards", json={"title": "never-started"}).json()
     assert card["status"] == "todo"
@@ -153,17 +148,11 @@ def test_approve_rejects_a_card_that_never_ran(api, repo):
     assert after["status"] == "todo"
 
 
-def test_approve_on_todo_card_is_currently_a_silent_done(api, repo):
-    """Documents the CURRENT (wrong) behaviour so the blast radius is explicit.
-
-    This test passes today. It is the mirror of the xfail above: when the guard
-    lands, this one must be deleted along with it.
-    """
-    card = api.post(f"/api/repos/{repo}/cards", json={"title": "silent-done"}).json()
-    r = api.post(f"/api/cards/{card['id']}/approve", json={})
-    assert r.status_code == 200
-    assert r.json()["card"]["status"] == "done"
-    assert r.json().get("merge_result") is None, "nothing was merged, yet the card is done"
+# (`test_approve_on_todo_card_is_currently_a_silent_done` lived here. It
+# pinned the CURRENT wrong behaviour - approve on a todo card returning
+# 200/done with nothing merged - and said of itself: "when the guard
+# lands, this one must be deleted along with it". The guard landed in
+# 12.7; the xfail above is now the lock.)
 
 
 # =============================================================================
@@ -195,19 +184,23 @@ def _patch_null_targets(api, repo, feature):
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA-API-02: every *Update schema types its required "
-           "column as `str | None = None`, so an explicit JSON null passes "
-           "validation and hits NOT NULL at commit -> 500 "
-           "(e.g. backend/app/schemas/card.py:23)",
-)
 def test_patch_explicit_null_on_required_field_is_a_4xx(api, repo, feature):
+    """FIXED: `not_null()` in backend/app/schemas/_patch.py refuses an explicit
+    null on any field backed by a NOT NULL column, so the client gets a 422
+    naming the field instead of an IntegrityError 500."""
     offenders = []
     for path, field in _patch_null_targets(api, repo, feature):
         r = api.patch(path, json={field: None})
         if r.status_code >= 500:
             offenders.append(f"{path} {{{field}: null}} -> {r.status_code}")
+        elif r.status_code != 422:
+            offenders.append(
+                f"{path} {{{field}: null}} -> {r.status_code} (expected 422)"
+            )
+        else:
+            locations = [tuple(e["loc"]) for e in r.json()["detail"]]
+            if ("body", field) not in locations:
+                offenders.append(f"{path} 422 does not name {field}: {locations}")
     assert not offenders, "explicit null produced a 5xx on:\n  " + "\n  ".join(offenders)
 
 
@@ -224,13 +217,10 @@ def test_patch_explicit_null_leaves_the_row_intact(api, repo, feature):
 # QA-API-03  MAJOR - concurrent create of the same prompt-template name -> 500
 # =============================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA-API-03: create_prompt_template does check-then-insert "
-           "with no IntegrityError handler, so concurrent creates of one name "
-           "return 500 instead of 409 (backend/app/routers/spec.py:776-788)",
-)
 def test_concurrent_duplicate_prompt_template_name_never_500s(api, base_url):
+    """FIXED: create_prompt_template absorbs the lost race with the codebase's
+    rollback/re-select idiom, so the losers get the same 409 a sequential
+    duplicate gets and the winner's row survives."""
     name = unique("race-pt")
     codes = []
     lock = threading.Lock()
@@ -291,15 +281,10 @@ def test_largest_safe_integer_still_works(api, feature):
 # QA-API-05  MAJOR - JSON NaN/Infinity literals turn any 422 into a 500
 # =============================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA-API-05: python's json parser accepts the non-standard "
-           "NaN/Infinity literals; FastAPI echoes the offending value into the "
-           "422 body and JSONResponse.render() refuses to serialise it, so the "
-           "response becomes a plain-text 500",
-)
 @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
 def test_nonfinite_json_literal_is_a_4xx_not_a_500(api, literal):
+    """FIXED: the RequestValidationError handler in backend/app/main.py scrubs
+    non-finite floats out of the echoed body, so the 422 can be rendered."""
     body = '{"name":"nonfinite-probe","content":%s}' % literal
     r = api.post(
         "/api/agent-files", data=body, headers={"Content-Type": "application/json"}
@@ -307,16 +292,22 @@ def test_nonfinite_json_literal_is_a_4xx_not_a_500(api, literal):
     assert r.status_code < 500, f"{literal} -> {r.status_code} {r.text[:200]}"
 
 
-def test_nonfinite_literal_500_is_bare_text_not_json(api):
-    """Demo risk: the 500 body is not even JSON, so a UI toast shows raw text."""
+def test_nonfinite_literal_error_body_is_json(api):
+    """The mirror of the test above, flipped with it.
+
+    It used to assert the demo risk: a 500 whose body is not even JSON, so a UI
+    toast shows raw text. The scrubber makes the answer a renderable 422, so
+    this now asserts the property the UI actually needs - the error path
+    returns JSON a client can read.
+    """
     r = api.post(
         "/api/agent-files",
         data='{"name":"nf","content":NaN}',
         headers={"Content-Type": "application/json"},
     )
-    assert r.status_code == 500
-    with pytest.raises(ValueError):
-        r.json()
+    assert r.status_code == 422, f"{r.status_code}: {r.text[:200]}"
+    assert r.headers["content-type"].startswith("application/json")
+    assert isinstance(r.json()["detail"], list)
 
 
 # =============================================================================
@@ -409,13 +400,8 @@ def test_yaml_export_round_trips_step_settings_and_triggers(api, plain_repo):
 # QA-API-08  MAJOR - ingest reports default_branch 'main' but git HEAD is master
 # =============================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA-API-08: GitRepoManager.create_bare_repo calls "
-           "dulwich init_bare, which sets HEAD to refs/heads/master, while the "
-           "Repo row keeps RepoCreate's 'main' default "
-           "(backend/app/services/git_server.py:59)",
-)
+# FIXED: create_bare_repo now takes the requested default branch and points
+# HEAD at it, and list_branches refuses to adopt an unborn HEAD over the row.
 @pytest.mark.parametrize("requested", ["main", "trunk"])
 def test_ingested_repo_git_head_matches_its_default_branch(api, requested):
     rid = api.post(

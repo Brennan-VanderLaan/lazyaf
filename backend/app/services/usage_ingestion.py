@@ -59,7 +59,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import StepExecution, StepRun, StepUsage, UsageCostSource
 from app.schemas.usage import UsageManifest
-from app.services.usage_pricing import CENTS, gpu_node_cost_usd, node_rate_usd_hour
+from app.services.usage_pricing import CENTS, gpu_node_cost_usd, resolve_node_rate
 
 logger = logging.getLogger(__name__)
 
@@ -87,15 +87,53 @@ def _quantize(value: Decimal | None) -> Decimal | None:
         return None
 
 
-def _resolve_cost(manifest: UsageManifest) -> tuple[Decimal | None, str]:
-    """api-surface 2.5 precedence. Returns (cost_usd, cost_source)."""
-    if manifest.cost_usd is not None:
+#: Providers whose runtime CANNOT have received a bill, so `cli-reported` is
+#: structurally unavailable to them (M14 s5.2). Only the harness's own
+#: provider is listed: `self-hosted` predates this rule and is written by the
+#: mock agent, which reports no cost at all, so adding it would be a rule with
+#: no case behind it.
+UNBILLABLE_PROVIDERS = frozenset({"openai-compatible"})
+
+
+def _may_claim_a_bill(provider: str | None) -> bool:
+    """Can a manifest from this provider legitimately state `cost_usd`?"""
+    return (provider or "") not in UNBILLABLE_PROVIDERS
+
+
+async def _resolve_cost(
+    db: AsyncSession, manifest: UsageManifest
+) -> tuple[Decimal | None, str]:
+    """api-surface 2.5 precedence. Returns (cost_usd, cost_source).
+
+    M14: the rate lookup goes through `resolve_node_rate` (contract #7), which
+    reads the model endpoint ROW first and `settings.gpu_node_rates` second.
+    The PRECEDENCE ITSELF is unchanged - manifest cost, then node rate, then
+    unknown - because that is what makes a `cli-reported` row mean "the
+    provider billed us this amount".
+    """
+    if manifest.cost_usd is not None and not _may_claim_a_bill(manifest.provider):
+        # M14 s5.2, and the reason it is enforced HERE rather than trusted:
+        # `cli-reported` is what the board reads as "THE PROVIDER BILLED US
+        # THIS AMOUNT", and no self-hosted OpenAI-compatible endpoint can make
+        # that claim - there is no invoice behind it. A runtime that sends one
+        # anyway (a fork, a hand-built manifest, a future executor that
+        # borrows the provider) must not be able to launder an estimate into
+        # a bill. The claim is DROPPED and SAID OUT LOUD, and the row falls
+        # through to node pricing, which is the honest basis.
+        logger.warning(
+            "usage manifest for provider %r claims cost_usd=%s; a self-hosted "
+            "endpoint cannot report a provider bill, so the claim is dropped "
+            "and the row is priced from its gpu node instead",
+            manifest.provider,
+            manifest.cost_usd,
+        )
+    elif manifest.cost_usd is not None:
         priced = _quantize(manifest.cost_usd)
         if priced is not None:
             return priced, UsageCostSource.CLI_REPORTED.value
 
     if manifest.gpu_node_id and manifest.container_seconds is not None:
-        rate = node_rate_usd_hour(manifest.gpu_node_id)
+        rate = await resolve_node_rate(db, manifest.gpu_node_id)
         if rate is not None:
             fraction = (
                 manifest.gpu_fraction if manifest.gpu_fraction is not None else 1.0
@@ -223,13 +261,18 @@ async def _load_run_refs(db: AsyncSession, execution: StepExecution) -> _RunRefs
     )
 
 
-def _apply(usage: StepUsage, manifest: UsageManifest, refs: _RunRefs) -> StepUsage:
+async def _apply(
+    db: AsyncSession, usage: StepUsage, manifest: UsageManifest, refs: _RunRefs
+) -> StepUsage:
     """Write every wire-owned and every derived field onto the row.
 
     Shared by insert and update so a re-POST cannot leave a stale field
     behind: an idempotent write replaces the record, it does not merge it.
+
+    Async since M14 only because the cost resolution reads the model endpoint
+    row for a node rate; nothing else here touches the session.
     """
-    cost_usd, cost_source = _resolve_cost(manifest)
+    cost_usd, cost_source = await _resolve_cost(db, manifest)
 
     usage.step_run_id = refs.step_run_id
     usage.pipeline_run_id = refs.pipeline_run_id
@@ -270,11 +313,15 @@ async def ingest_usage(
     # Every scalar the recovery path below needs, materialized BEFORE any
     # rollback can expire the objects it came from (F3.2).
     refs = await _load_run_refs(db, execution)
+    # Materialized BEFORE any rollback for the same F3.2 reason as `refs`: the
+    # endpoint health fold runs at the very end, long after `execution` may
+    # have been expired.
+    model_endpoint_id = execution.model_endpoint_id
 
     usage = await _select_existing(db, refs.step_execution_id)
     if usage is None:
         usage = StepUsage(step_execution_id=refs.step_execution_id)
-        _apply(usage, manifest, refs)
+        await _apply(db, usage, manifest, refs)
         db.add(usage)
         try:
             await db.flush()
@@ -294,10 +341,44 @@ async def ingest_usage(
             existing = await _select_existing(db, refs.step_execution_id)
             if existing is None:
                 raise
-            usage = _apply(existing, manifest, refs)
+            usage = await _apply(db, existing, manifest, refs)
     else:
-        _apply(usage, manifest, refs)
+        await _apply(db, usage, manifest, refs)
 
     await db.commit()
     await db.refresh(usage)
+
+    await _fold_endpoint_health(db, model_endpoint_id, manifest)
     return usage
+
+
+async def _fold_endpoint_health(
+    db: AsyncSession, model_endpoint_id: str | None, manifest: UsageManifest
+) -> None:
+    """Let the WORK correct the endpoint's capability record (M14 s5.4).
+
+    A probe is one observation taken at one moment from one network position;
+    the work itself is a much better instrument. This is where an endpoint that
+    passed the tool probe and then never emitted `tool_calls` gets demoted, and
+    where a healthy endpoint's `consecutive_failures` is zeroed so it never
+    drifts into stale-and-failing through disuse of the probe button alone.
+
+    AFTER the usage commit and inside a try/except that logs and swallows: the
+    never-fail-a-step rule reaches here too, and a health update is not worth a
+    500 on a telemetry POST that has already stored the accounting record.
+    """
+    if not model_endpoint_id:
+        return
+    raw_harness = ((manifest.raw or {}).get("harness") or {})
+    if not isinstance(raw_harness, dict) or not raw_harness:
+        return
+    try:
+        from app.services.model_endpoints.health import record_step_outcome
+
+        await record_step_outcome(db, model_endpoint_id, raw_harness)
+    except Exception:
+        logger.exception(
+            "endpoint health update failed for endpoint %s (the usage row is "
+            "already committed)",
+            model_endpoint_id,
+        )

@@ -34,7 +34,9 @@ class TestCardWorkflowDemo:
     This test documents the happy path for feature development.
     """
 
-    async def test_complete_card_lifecycle(self, client, clean_git_repos, clean_runner_registry):
+    async def test_complete_card_lifecycle(
+        self, client, db_session, clean_git_repos, clean_runner_registry
+    ):
         """
         SCENARIO: Feature Development Lifecycle
 
@@ -87,28 +89,46 @@ class TestCardWorkflowDemo:
         print(f"Card status after start: {card['status']}")
         assert card["status"] == "in_progress"
 
-        # Step 4: Simulate work completion (in real scenario, agent does this)
+        # Step 4: The agent finishes and leaves a branch behind.
+        #
+        # This used to be a PATCH to `in_review`, and step 5 a PATCH straight
+        # to `done`. Both are refused since 12.7 (MANUAL_STATUSES in
+        # app/routers/cards.py, QA finding T2): a card that never ran could
+        # otherwise be clicked to Done with nothing merged. So the agent's
+        # output is staged the way a real run leaves it - a real commit on a
+        # real branch on the internal git server - and step 5 then runs the
+        # REAL approve, which is what this demo always claimed to document.
         print("\n=== Step 4: Simulating Work Completion ===")
-        # Move to in_review (simulating agent completing work and creating PR)
-        update_response = await client.patch(
-            f"/api/cards/{card['id']}",
-            json={"status": "in_review"},
+        from tdd.integration.api.test_cards_api import seed_branch, stage_card
+
+        # /api/repos/ingest answers with the clone URLs, not the whole row.
+        default_branch = (await client.get(f"/api/repos/{repo['id']}")).json()[
+            "default_branch"
+        ]
+        base = seed_branch(
+            repo["id"], default_branch, path="README.md", content=b"base\n"
         )
-        assert update_response.status_code == 200
-        card = update_response.json()
+        branch = f"lazyaf/{card['id'][:8]}"
+        seed_branch(repo["id"], branch, parent=base)
+        await stage_card(
+            db_session, card["id"], status="in_review", branch_name=branch
+        )
+
+        card = (await client.get(f"/api/cards/{card['id']}")).json()
         print(f"Card status after work: {card['status']}")
         assert card["status"] == "in_review"
+        assert card["branch_name"] == branch
 
-        # Step 5: Complete the work
-        # Note: In real workflow, approve endpoint merges git branches.
-        # In tests without a runner, we simulate completion by setting status directly.
+        # Step 5: Approve - the branch really merges into the default branch.
         print("\n=== Step 5: Completing Work ===")
-        done_response = await client.patch(
-            f"/api/cards/{card['id']}",
-            json={"status": "done"},
+        done_response = await client.post(
+            f"/api/cards/{card['id']}/approve",
+            json={"target_branch": None},
         )
-        assert done_response.status_code == 200
-        card = done_response.json()
+        assert done_response.status_code == 200, done_response.text
+        result = done_response.json()
+        assert result["merge_result"]["success"] is True, result["merge_result"]
+        card = result["card"]
         print(f"Final card status: {card['status']}")
         assert card["status"] == "done"
 
@@ -165,7 +185,7 @@ class TestMultiCardBoardDemo:
     Demonstrates managing multiple cards on a Kanban board.
     """
 
-    async def test_kanban_board_state(self, client):
+    async def test_kanban_board_state(self, client, db_session):
         """
         SCENARIO: Kanban Board with Cards in Multiple States
 
@@ -191,6 +211,15 @@ class TestMultiCardBoardDemo:
             {"title": "Feature D - Completed", "target_status": "done"},
         ]
 
+        # `in_progress` and `done` are not writable through PATCH since 12.7
+        # (MANUAL_STATUSES in app/routers/cards.py, QA finding T2) - they mean
+        # "an agent is running" and "a branch was merged", and this demo is
+        # about the BOARD, not about how a card earns those. So the two
+        # guarded columns are staged through the ORM, the same way
+        # tdd/integration/api/test_cards_api.py stages a precondition, and the
+        # unguarded one still goes through the API it really uses.
+        from tdd.integration.api.test_cards_api import stage_card
+
         created_cards = []
         for card_data in cards_data:
             response = await client.post(
@@ -200,12 +229,17 @@ class TestMultiCardBoardDemo:
             card = response.json()
 
             # Transition to target status
-            if card_data["target_status"] != "todo":
-                await client.patch(
+            target = card_data["target_status"]
+            if target in ("in_progress", "done"):
+                await stage_card(db_session, card["id"], status=target)
+                card["status"] = target
+            elif target != "todo":
+                patched = await client.patch(
                     f"/api/cards/{card['id']}",
-                    json={"status": card_data["target_status"]},
+                    json={"status": target},
                 )
-                card["status"] = card_data["target_status"]
+                assert patched.status_code == 200, patched.text
+                card["status"] = target
 
             created_cards.append(card)
             print(f"  [{card_data['target_status'].upper():12}] {card_data['title']}")

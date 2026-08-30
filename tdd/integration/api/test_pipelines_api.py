@@ -404,3 +404,110 @@ class TestPipelineIsolation:
         pipelines = response.json()
         assert len(pipelines) == 1
         assert pipelines[0]["name"] == "Repo1 Pipeline"
+
+
+class TestDeletePipelineWithLiveRun:
+    """DELETE must refuse while a run is still in flight (QA2-07).
+
+    Pipeline.runs cascades, so deleting mid-run does not stop the run - it
+    erases the row the executor and /cancel steer by, leaving the step
+    container behind exited. The endpoint refuses with 409 instead.
+    """
+
+    async def _make_run(self, db_session, pipeline_id, status):
+        from app.models import PipelineRun
+
+        run = PipelineRun(pipeline_id=pipeline_id, status=status)
+        db_session.add(run)
+        await db_session.commit()
+        return run
+
+    async def test_delete_refused_while_a_run_is_running(
+        self, client, db_session, pipeline
+    ):
+        """409, and BOTH the run and the pipeline survive."""
+        run = await self._make_run(db_session, pipeline["id"], "running")
+
+        response = await client.delete(f"/api/pipelines/{pipeline['id']}")
+        assert_status_code(response, 409)
+
+        detail = response.json()["detail"]
+        assert run.id in detail, f"refusal does not name the live run: {detail}"
+        assert "cancel" in detail.lower(), f"refusal gives no way forward: {detail}"
+
+        # The run is still reachable - so /cancel can still reach it.
+        assert_status_code(await client.get(f"/api/pipeline-runs/{run.id}"), 200)
+        assert_status_code(await client.get(f"/api/pipelines/{pipeline['id']}"), 200)
+
+    async def test_delete_refused_while_a_run_is_pending(
+        self, client, db_session, pipeline
+    ):
+        """A queued run owns the pipeline too - pending blocks the delete."""
+        run = await self._make_run(db_session, pipeline["id"], "pending")
+
+        response = await client.delete(f"/api/pipelines/{pipeline['id']}")
+        assert_status_code(response, 409)
+        assert run.id in response.json()["detail"]
+
+    @pytest.mark.parametrize("status", ["passed", "failed", "cancelled"])
+    async def test_finished_runs_do_not_block_delete(
+        self, client, db_session, pipeline, status
+    ):
+        """The guard is about live work only, not about history."""
+        await self._make_run(db_session, pipeline["id"], status)
+
+        response = await client.delete(f"/api/pipelines/{pipeline['id']}")
+        assert_deleted_response(response)
+
+
+class TestExportContentDisposition:
+    """The export header is built from a user-supplied name (RFC 6266)."""
+
+    async def _pipeline_named(self, client, repo, name):
+        response = await client.post(
+            f"/api/repos/{repo['id']}/pipelines",
+            json=pipeline_create_payload(name=name),
+        )
+        assert response.status_code in (200, 201), response.text
+        return response.json()["id"]
+
+    async def test_export_with_a_unicode_name(self, client, repo):
+        """A non-Latin-1 name used to 500 on header encoding."""
+        pipeline_id = await self._pipeline_named(
+            client, repo, "Café 日本語 Pipeline"
+        )
+
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        assert_status_code(response, 200)
+
+        disposition = response.headers["content-disposition"]
+        # Headers are latin-1 on the wire; this is the encode that used to blow up.
+        disposition.encode("latin-1")
+        assert "filename*=UTF-8''" in disposition
+        assert "%C3%A9" in disposition, disposition
+        assert disposition.endswith(".yaml")
+
+    async def test_export_with_control_characters_in_the_name(self, client, repo):
+        """CR/LF/NUL in a name made h11 refuse the response entirely."""
+        pipeline_id = await self._pipeline_named(
+            client, repo, "Bad\r\nName\x00Here"
+        )
+
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        assert_status_code(response, 200)
+
+        disposition = response.headers["content-disposition"]
+        assert not any(c in disposition for c in "\r\n\x00"), repr(disposition)
+        disposition.encode("latin-1")
+        assert disposition.startswith("attachment; filename=")
+
+    async def test_export_keeps_an_ascii_filename_fallback(self, client, repo):
+        """Old clients read `filename=`; it must stay plain ASCII."""
+        pipeline_id = await self._pipeline_named(client, repo, "My Nice Pipeline")
+
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        assert_status_code(response, 200)
+        assert (
+            'filename="My_Nice_Pipeline.yaml"'
+            in response.headers["content-disposition"]
+        )

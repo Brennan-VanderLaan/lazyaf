@@ -10,8 +10,11 @@ Optionally joined to an AcceptanceCriterion — that join is what turns a spec
 criterion into something measurable.
 
 TestRun: one observed execution of a TestRef, joined to the pipeline run,
-step run, commit and branch it ran under (model / prompt_template_id are
-reserved for Phase 12.6.5 experiment context and stay NULL until then).
+step run, commit and branch it ran under. Since Phase 12.6.5 a run that
+belongs to an experiment cell also carries that cell's coordinates
+(experiment_run_id / model / prompt_template_id / prompt_version), stamped
+server-side from the cell row — NULL on every ordinary CI run, which is the
+true value rather than a hole.
 
 Statuses are plain string columns (Card/spec idiom); validation happens in
 the pydantic schemas (app/schemas/testref.py).
@@ -89,6 +92,10 @@ class TestRun(Base):
         # ingestion idempotency lookup is by step_run_id.
         Index("ix_test_runs_test_ref_id_created_at", "test_ref_id", "created_at"),
         Index("ix_test_runs_step_run_id", "step_run_id"),
+        # Phase 12.6.5: the leaderboard's per-criterion aggregation walks
+        # (experiment_run_id, test_ref_id). Mirrors M13's
+        # test_runs (trial_iteration_id, test_ref_id).
+        Index("ix_test_runs_experiment_run_id_test_ref_id", "experiment_run_id", "test_ref_id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
@@ -105,11 +112,21 @@ class TestRun(Base):
     branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Experiment context (Phase 12.6.5) — NULL until experiments land.
+    # Experiment context (Phase 12.6.5). NULL on ordinary CI runs — that is
+    # the honest value, not a gap: those runs measured the repo, not a
+    # variant. All four are DERIVED SERVER-SIDE from the experiment cell that
+    # owns the run (app/services/test_ingestion.py), never trusted from the
+    # wire: a container cannot mislabel which variant it was.
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     prompt_template_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("prompt_templates.id"), nullable=True
     )
+    # Deliberately NOT an FK, for the same reason pipeline_run_id is not:
+    # runs are provenance records that must survive pruning. One link, not
+    # two — every experiment-scoped read joins experiment_runs, which is
+    # already indexed on (experiment_id, status) and (experiment_id, cell_index).
+    experiment_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    prompt_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Ordering column of the (test_ref_id, created_at) composite index.
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

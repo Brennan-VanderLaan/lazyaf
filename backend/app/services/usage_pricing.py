@@ -30,6 +30,8 @@ only by API tests with a hand-built manifest — real code on a real path
 import logging
 from decimal import Decimal, InvalidOperation
 
+from sqlalchemy import select
+
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -101,3 +103,72 @@ def node_rate_usd_hour(node_id: str | None) -> Decimal | None:
         return None
 
     return rate
+
+
+async def resolve_node_rate(db, node_id: str | None) -> Decimal | None:
+    """THE hourly rate for a node: the endpoint ROW first, the env table second.
+
+    Cross-agent contract #7 (M14). A `ModelEndpoint` whose `gpu_node_id`
+    matches and whose `rate_usd_hour` is non-null WINS: the operator who set a
+    rate on the endpoint they created should not also have to edit
+    `LAZYAF_GPU_NODE_RATES` in the backend's environment and restart for it to
+    take effect.
+
+    Falls back to the pure `node_rate_usd_hour(node_id)` so nodes that are not
+    model endpoints — a runpod pod running a script step, the 12.5 rate table —
+    keep working completely unchanged. `node_rate_usd_hour` stays sync and pure
+    and keeps its own tests; this function is the only place the two are
+    ordered.
+
+    `rate_usd_hour = 0.000000` on the row is a REAL answer and beats the env
+    table: "owned hardware, marginal cash cost" is a claim, and `None` is
+    "we do not know". Keeping those two distinguishable is the entire point of
+    the cost decision, so this must test `is not None`, never truthiness.
+
+    NEVER RAISES. A pricing lookup must not 500 a telemetry POST — the
+    never-fail-a-step rule reaches all the way back here — so a database error
+    degrades to the env table rather than losing the whole accounting record.
+    """
+    if not node_id:
+        return None
+
+    try:
+        from app.models.model_endpoint import ModelEndpoint
+
+        result = await db.execute(
+            select(ModelEndpoint.rate_usd_hour).where(
+                ModelEndpoint.gpu_node_id == node_id
+            )
+        )
+        rows = [row[0] for row in result.all() if row[0] is not None]
+        if len(rows) > 1:
+            # Two endpoints sharing one gpu_node_id with different rates is an
+            # operator decision the platform cannot arbitrate. Say so and take
+            # the lowest, which under-attributes rather than over-bills.
+            logger.warning(
+                "gpu node %r is claimed by %d model endpoints with different "
+                "rates; pricing at the lowest (%s). Give them distinct "
+                "gpu_node_id values to price them separately.",
+                node_id,
+                len(rows),
+                min(rows),
+            )
+        if rows:
+            rate = Decimal(min(rows))
+            if rate < 0:
+                logger.warning(
+                    "Negative rate_usd_hour %s on the model endpoint for node "
+                    "%r — pricing this node as unknown",
+                    rate,
+                    node_id,
+                )
+                return None
+            return rate.quantize(CENTS)
+    except Exception:
+        logger.exception(
+            "model endpoint rate lookup failed for node %r — falling back to "
+            "LAZYAF_GPU_NODE_RATES",
+            node_id,
+        )
+
+    return node_rate_usd_hour(node_id)

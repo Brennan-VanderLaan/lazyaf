@@ -168,6 +168,34 @@ class TestStepRunToWsDict:
         assert result["completed_at"] is None
 
 
+def _fake_step_run(mock_db, *, step_index=0, status=None):
+    """Wire `mock_db.execute` to return one StepRun-shaped row.
+
+    `_fail_run_on_undispatchable_action` looks the offending step up so it can
+    put the reason where a user will see it; an AsyncMock session hands back
+    coroutines for the sync `.scalars()` call, so the shape has to be stated.
+    """
+    step_run = MagicMock()
+    step_run.id = "step-run-1"
+    step_run.pipeline_run_id = "run-123"
+    step_run.step_index = step_index
+    step_run.step_id = None
+    step_run.step_name = "Step 1"
+    step_run.status = status or RunStatus.PASSED.value
+    step_run.job_id = None
+    step_run.executor = "local"
+    step_run.error = None
+    step_run.started_at = datetime.utcnow()
+    step_run.completed_at = None
+
+    result = MagicMock()
+    result.scalars.return_value.first.return_value = step_run
+    result.scalars.return_value.all.return_value = [step_run]
+    result.scalar_one_or_none.return_value = step_run
+    mock_db.execute.return_value = result
+    return step_run
+
+
 class TestPipelineExecutorActionHandlers:
     """Tests for PipelineExecutor action handling logic."""
 
@@ -314,12 +342,37 @@ class TestPipelineExecutorActionHandlers:
             )
 
     @pytest.mark.asyncio
-    async def test_handle_action_unknown_acts_as_stop(self, executor, mock_db, mock_pipeline_run, mock_repo):
-        """Unknown action should be treated as 'stop'."""
+    @pytest.mark.parametrize(
+        "action",
+        [
+            "nextt",          # the one-character typo from QA finding T4
+            "invalid_action",
+            "b",              # an edge TARGET, which the YAML exporter emits
+            "merge:",         # a prefix with no target
+            "trigger:",
+            "",
+            None,
+            42,
+        ],
+    )
+    async def test_an_undispatchable_action_fails_the_run(
+        self, executor, mock_db, mock_pipeline_run, mock_repo, action
+    ):
+        """QA finding T4: an action outside the vocabulary FAILS the run.
+
+        This used to log `Unknown action '<x>', treating as 'stop'` and then
+        complete with the STEP's verdict - so `on_success: "nextt"` reported
+        PASSED for a three-step pipeline that ran one step. A false green is
+        the worst defect class a CI product has; an action the executor cannot
+        dispatch is a failure, and the reason has to be somewhere a user
+        looks.
+        """
         steps = [{"name": "Step 1", "type": "script"}]
+        step_run = _fake_step_run(mock_db)
 
         with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
             mock_manager.send_pipeline_run_status = AsyncMock()
+            mock_manager.send_step_run_status = AsyncMock()
 
             await executor._handle_action(
                 db=mock_db,
@@ -327,12 +380,76 @@ class TestPipelineExecutorActionHandlers:
                 repo=mock_repo,
                 steps=steps,
                 current_step=0,
-                action="invalid_action",
+                action=action,
+                step_success=True,   # the STEP passed; the RUN still must not
+            )
+
+        assert mock_pipeline_run.status == RunStatus.FAILED.value
+        assert mock_pipeline_run.completed_at is not None
+        # The offending step carries the explanation: a red run with nothing
+        # red in it is the same "why?" from the other direction.
+        assert step_run.status == RunStatus.FAILED.value
+        assert "step 0" in step_run.error
+        assert "'next', 'stop'" in step_run.error
+
+    @pytest.mark.asyncio
+    async def test_a_route_error_reason_is_not_overwritten_by_the_action_check(
+        self, executor, mock_db, mock_pipeline_run, mock_repo
+    ):
+        """`_execute_step`'s routing-failure branch reaches `_handle_action`
+        with the step already failed and the real cause recorded. The action
+        complaint is APPENDED, never substituted for it."""
+        step_run = _fake_step_run(mock_db)
+        step_run.error = "execution routing failed: no such executor 'legacy'"
+
+        with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
+            mock_manager.send_pipeline_run_status = AsyncMock()
+            mock_manager.send_step_run_status = AsyncMock()
+
+            await executor._handle_action(
+                db=mock_db,
+                pipeline_run=mock_pipeline_run,
+                repo=mock_repo,
+                steps=[{"name": "Step 1", "type": "script"}],
+                current_step=0,
+                action="onfailure",
+                step_success=False,
+            )
+
+        assert "routing failed" in step_run.error
+        assert "unknown step action" in step_run.error
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action",
+        ["next", "stop", "trigger:card-1", "trigger:pipeline:p1", "merge:main"],
+    )
+    async def test_the_whole_vocabulary_still_dispatches(
+        self, executor, mock_db, mock_pipeline_run, mock_repo, action
+    ):
+        """The gate must reject only what `_handle_action` genuinely cannot
+        run. Every vocabulary member reaches a handler."""
+        with patch.object(executor, "_execute_step", new_callable=AsyncMock), \
+             patch.object(executor, "_trigger_card", new_callable=AsyncMock), \
+             patch.object(executor, "_trigger_pipeline", new_callable=AsyncMock), \
+             patch.object(executor, "_merge_branch", new_callable=AsyncMock), \
+             patch.object(executor, "_complete_pipeline", new_callable=AsyncMock), \
+             patch.object(
+                 executor,
+                 "_fail_run_on_undispatchable_action",
+                 new_callable=AsyncMock,
+             ) as refused:
+            await executor._handle_action(
+                db=mock_db,
+                pipeline_run=mock_pipeline_run,
+                repo=mock_repo,
+                steps=[{"name": "Step 1", "type": "script"}],
+                current_step=0,
+                action=action,
                 step_success=True,
             )
 
-            assert mock_pipeline_run.status == RunStatus.PASSED.value
-            assert mock_pipeline_run.completed_at is not None
+        refused.assert_not_called()
 
 
 class TestPipelineExecutorStartPipeline:

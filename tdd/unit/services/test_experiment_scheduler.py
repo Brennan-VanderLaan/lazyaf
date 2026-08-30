@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
 sys.path.insert(0, str(backend_path))
@@ -631,3 +632,259 @@ class TestStallAndResume:
         await db_session.refresh(experiment)
         assert cell.status == ExperimentRunStatus.PASSED.value
         assert experiment.status == ExperimentStatus.COMPLETE.value
+
+
+# -----------------------------------------------------------------------------
+# Finalization under concurrency
+# -----------------------------------------------------------------------------
+
+class TestFinalizeRace:
+    """The last cell to land closes the matrix - exactly once, and never zero.
+
+    Cells complete on their OWN sessions: `on_run_complete` lands each run
+    from the session that ran it. "Count the unfinished cells, then decide"
+    is therefore a read-then-decide ACROSS sessions, and its failure mode is
+    not a double close - it is NO close. Two cells landing together each read
+    `remaining >= 1`, each declines, and the experiment sits `running` with
+    `completed_at NULL` forever: nothing failed, nothing is in flight, and
+    only a manual POST /resume moves it.
+
+    So the decision is one `UPDATE ... WHERE completed_at IS NULL AND NOT
+    EXISTS(unfinished cell)` - the same compare-and-set the dispatcher claims
+    cells with - and every completion that can reach the database runs it
+    rather than delegating it to whoever holds the pump lock.
+    """
+
+    ROUNDS = 25
+
+    @staticmethod
+    def _sessions(async_engine):
+        return async_sessionmaker(
+            async_engine, class_=AsyncSession, expire_on_commit=False
+        )
+
+    async def _running_matrix(self, db, cells: int, *, pending: int = 0):
+        """`cells` RUNNING cells (each with its own run) plus `pending` pending."""
+        repo = await make_repo(db)
+        card = await make_card(db, repo)
+        experiment = await make_experiment(
+            db, repo, card, concurrency=cells + pending, models=cells + pending,
+            status=ExperimentStatus.RUNNING.value,
+        )
+        run_ids = []
+        for index in range(cells + pending):
+            live = index < cells
+            cell = ExperimentRun(
+                id=str(uuid4()), experiment_id=experiment.id, cell_index=index,
+                variant_index=index, agent="mock",
+                status=(
+                    ExperimentRunStatus.RUNNING.value if live
+                    else ExperimentRunStatus.PENDING.value
+                ),
+            )
+            db.add(cell)
+            await db.commit()
+            if live:
+                run = await make_run(
+                    db, repo, status=RunStatus.PASSED.value, trigger_ref=cell.id
+                )
+                cell.pipeline_run_id = run.id
+                await db.commit()
+                run_ids.append(run.id)
+        return experiment.id, run_ids
+
+    @staticmethod
+    async def _land(factory, run_id):
+        """One cell completes the way the hook does: on its own session."""
+        async with factory() as session:
+            run = await session.get(PipelineRun, run_id)
+            await svc.on_cell_complete(session, run, True)
+
+    async def test_the_cas_has_exactly_one_winner(self, db_session, async_engine):
+        """Two settled callers, one close. The `_claim` property, at the other
+        end of a cell's life."""
+        factory = self._sessions(async_engine)
+        experiment_id, _ = await self._running_matrix(db_session, 1)
+        async with factory() as session:
+            cell = (
+                await session.execute(
+                    select(ExperimentRun).where(
+                        ExperimentRun.experiment_id == experiment_id
+                    )
+                )
+            ).scalar_one()
+            cell.status = ExperimentRunStatus.PASSED.value
+            await session.commit()
+
+        async with factory() as one, factory() as two:
+            first = await svc._finalize_cas(one, experiment_id)
+            second = await svc._finalize_cas(two, experiment_id)
+
+        assert first is True
+        assert second is False, "read-then-decide would have closed it twice"
+
+    async def test_the_cas_never_fires_while_a_cell_is_unfinished(
+        self, db_session, async_engine
+    ):
+        """PENDING is not live, but it is unfinished: a matrix with work
+        queued must not close just because nothing is running."""
+        factory = self._sessions(async_engine)
+        running_id, _ = await self._running_matrix(db_session, 1)
+        queued_id, _ = await self._running_matrix(db_session, 0, pending=1)
+
+        async with factory() as session:
+            assert await svc._finalize_cas(session, running_id) is False
+            assert await svc._finalize_cas(session, queued_id) is False
+
+        for experiment_id in (running_id, queued_id):
+            experiment = await db_session.get(Experiment, experiment_id)
+            await db_session.refresh(experiment)
+            assert experiment.completed_at is None
+            assert experiment.status == ExperimentStatus.RUNNING.value
+
+    async def test_concurrent_completions_close_the_matrix_exactly_once(
+        self, db_session, async_engine, monkeypatch
+    ):
+        """N cells land together, over N sessions, many times over.
+
+        One round proves nothing about a race that needs an interleaving, so
+        this runs the whole matrix ROUNDS times and asserts BOTH halves every
+        round: the experiment reached a terminal state (no zero-winner stall)
+        and exactly one caller was the one that closed it.
+        """
+        factory = self._sessions(async_engine)
+        wins = {"n": 0}
+        real_cas = svc._finalize_cas
+
+        async def counting_cas(db, experiment_id):
+            won = await real_cas(db, experiment_id)
+            wins["n"] += int(won)
+            return won
+
+        monkeypatch.setattr(svc, "_finalize_cas", counting_cas)
+
+        stuck, miscounted = [], []
+        for round_index in range(self.ROUNDS):
+            wins["n"] = 0
+            experiment_id, run_ids = await self._running_matrix(db_session, 4)
+
+            await asyncio.gather(*(self._land(factory, r) for r in run_ids))
+
+            async with factory() as session:
+                experiment = await session.get(Experiment, experiment_id)
+                if (
+                    experiment.status != ExperimentStatus.COMPLETE.value
+                    or experiment.completed_at is None
+                ):
+                    stuck.append(
+                        f"round {round_index}: status={experiment.status} "
+                        f"completed_at={experiment.completed_at}"
+                    )
+            if wins["n"] != 1:
+                miscounted.append(f"round {round_index}: {wins['n']} winner(s)")
+
+        assert not stuck, (
+            f"{len(stuck)}/{self.ROUNDS} rounds left the matrix open - no cell "
+            "won the finalize race:\n" + "\n".join(stuck)
+        )
+        assert not miscounted, (
+            "the close is not exactly-once:\n" + "\n".join(miscounted)
+        )
+
+    async def test_a_swallowed_pump_still_closes_the_matrix(
+        self, db_session, async_engine
+    ):
+        """The last cell lands while another pump holds the lock.
+
+        The re-pump flag delegates DISPATCH to the holder, and that is fine -
+        the holder loops until the flag is clear. Delegating the CLOSE is not:
+        the holder may have already read the board, or be about to die, and
+        the cell that just landed is then decided by nobody. A completion on
+        its own session closes the matrix itself.
+        """
+        factory = self._sessions(async_engine)
+        experiment_id, run_ids = await self._running_matrix(db_session, 1)
+
+        lock = svc._pump_locks.setdefault(experiment_id, asyncio.Lock())
+        await lock.acquire()
+        try:
+            await self._land(factory, run_ids[0])
+        finally:
+            lock.release()
+
+        experiment = await db_session.get(Experiment, experiment_id)
+        await db_session.refresh(experiment)
+        assert experiment.status == ExperimentStatus.COMPLETE.value
+        assert experiment.completed_at is not None
+
+    async def test_a_swallowed_pump_closes_an_aborted_matrix_as_aborted(
+        self, db_session, async_engine
+    ):
+        """The final status is a CASE over the row's own status, so a close
+        decided by a caller that never read the abort still says `aborted`."""
+        factory = self._sessions(async_engine)
+        experiment_id, run_ids = await self._running_matrix(db_session, 1)
+        async with factory() as session:
+            experiment = await session.get(Experiment, experiment_id)
+            experiment.status = ExperimentStatus.ABORTED.value
+            await session.commit()
+
+        lock = svc._pump_locks.setdefault(experiment_id, asyncio.Lock())
+        await lock.acquire()
+        try:
+            await self._land(factory, run_ids[0])
+        finally:
+            lock.release()
+
+        async with factory() as session:
+            experiment = await session.get(Experiment, experiment_id)
+            assert experiment.status == ExperimentStatus.ABORTED.value
+            assert experiment.completed_at is not None
+
+    async def test_a_pump_that_dies_still_closes_the_matrix(
+        self, db_session, async_engine, monkeypatch
+    ):
+        """`pump` swallows its exceptions so a bad dispatch cannot abandon a
+        matrix - which used to mean it also swallowed the close it owed."""
+        factory = self._sessions(async_engine)
+        experiment_id, run_ids = await self._running_matrix(db_session, 1)
+
+        async def _boom(db, eid):
+            raise RuntimeError("the pump died mid-board")
+
+        monkeypatch.setattr(svc, "_pump_once", _boom)
+        await self._land(factory, run_ids[0])
+
+        async with factory() as session:
+            experiment = await session.get(Experiment, experiment_id)
+            assert experiment.status == ExperimentStatus.COMPLETE.value
+            assert experiment.completed_at is not None
+
+    async def test_a_settled_but_unclosed_matrix_reads_as_stalled(
+        self, db_session, async_engine
+    ):
+        """A restart between the last cell's commit and its close leaves a
+        matrix with nothing to do and no completed_at. Nothing is pending, so
+        the old test called it healthy and it read as in-flight forever;
+        reported, never dark."""
+        experiment_id, _ = await self._running_matrix(db_session, 1)
+        experiment = await db_session.get(Experiment, experiment_id)
+        assert await svc.is_stalled(db_session, experiment) is False
+
+        cell = (
+            await db_session.execute(
+                select(ExperimentRun).where(
+                    ExperimentRun.experiment_id == experiment_id
+                )
+            )
+        ).scalar_one()
+        cell.status = ExperimentRunStatus.PASSED.value
+        await db_session.commit()
+
+        assert await svc.is_stalled(db_session, experiment) is True
+
+        svc._pump_locks.clear()
+        await svc.resume(db_session, experiment)
+        await db_session.refresh(experiment)
+        assert experiment.status == ExperimentStatus.COMPLETE.value
+        assert await svc.is_stalled(db_session, experiment) is False

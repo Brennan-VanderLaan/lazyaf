@@ -92,18 +92,9 @@ def _collect_events(run_id_box: dict, pipeline_id: str, seconds: float = 25.0):
     return asyncio.run(run())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA3-10 (MAJOR): a pipeline run that has already broadcast "
-        "a terminal status keeps dispatching its remaining entry points, so "
-        "'step running' events arrive after 'run failed', and the run "
-        "broadcasts its terminal status once per entry point. "
-        "backend/app/services/pipeline_executor.py:1198-1206 (no terminal "
-        "re-check in the entry-point loop) and :838 (_complete_pipeline has "
-        "no already-terminal guard)."
-    ),
-)
+# QA3-10 PASSES against the 12.7 stack (verifier, 2026-08-30): no step frame
+# arrives after the run broadcasts a terminal status. Marker removed rather
+# than re-marked; the assertions below are the lock.
 def test_no_step_starts_after_the_run_broadcasts_a_terminal_status():
     require_stack()
     repo_id = ensure_repo()

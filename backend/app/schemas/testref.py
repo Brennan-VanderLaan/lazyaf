@@ -6,10 +6,11 @@ the pytest plugin (runner_common/pytest_lazyaf.py) writes it, the control
 runtime ships it verbatim, and POST /api/steps/{id}/test-results validates
 it with these models.
 """
-from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel
+
+from app.schemas._datetime import UTCDateTime
 
 
 # -----------------------------------------------------------------------------
@@ -48,8 +49,8 @@ class TestRefRead(BaseModel):
     file_path: str | None = None
     criterion_id: str | None = None
     status: Literal["active", "orphan"]
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     class Config:
         from_attributes = True
@@ -68,7 +69,7 @@ class CriterionHistoryEntry(BaseModel):
     duration_ms: int | None = None
     model: str | None = None
     prompt_template_id: str | None = None
-    created_at: datetime
+    created_at: UTCDateTime
 
 
 # -----------------------------------------------------------------------------

@@ -3,16 +3,30 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Repo
+from app.models import Card, Job, JobStatus, Pipeline, PipelineRun, Repo
 from app.schemas import RepoCreate, RepoRead, RepoUpdate, RepoIngest
+from app.schemas._datetime import utc_isoformat
 from app.services.git_server import git_repo_manager
 from app.services.websocket import manager
+
+# One source of truth for what "still in flight" means and for the wording of
+# the refusal (R3) - the pipeline delete guard owns both.
+from app.routers.pipelines import IN_FLIGHT_RUN_STATUSES, live_run_refusal
+
+IN_FLIGHT_JOB_STATUSES = (JobStatus.QUEUED.value, JobStatus.RUNNING.value)
 
 router = APIRouter(prefix="/api/repos", tags=["repos"])
 
 
 def repo_to_dict(repo: Repo) -> dict:
-    """Convert Repo model to dictionary for WebSocket broadcast."""
+    """Convert Repo model to dictionary for WebSocket broadcast.
+
+    Timestamps go through ``utc_isoformat`` for the same reason the HTTP half
+    uses ``UTCDateTime``: these are two halves of ONE wire contract (R3), and a
+    hand-built payload cannot use the field annotation. A bare ``.isoformat()``
+    here shipped a naive string, which a browser reads as LOCAL time - so the
+    live-update path disagreed with the response the frontend had just parsed.
+    """
     return {
         "id": repo.id,
         "name": repo.name,
@@ -20,7 +34,7 @@ def repo_to_dict(repo: Repo) -> dict:
         "default_branch": repo.default_branch,
         "is_ingested": repo.is_ingested,
         "internal_git_url": repo.internal_git_url,
-        "created_at": repo.created_at.isoformat(),
+        "created_at": utc_isoformat(repo.created_at),
     }
 
 
@@ -64,7 +78,7 @@ async def ingest_repo(repo: RepoCreate, request: Request, db: AsyncSession = Dep
 
     # Initialize bare repo for git storage
     try:
-        git_repo_manager.create_bare_repo(db_repo.id)
+        git_repo_manager.create_bare_repo(db_repo.id, db_repo.default_branch)
 
         # If path provided, push files from local repo
         if repo.path:
@@ -158,6 +172,52 @@ async def delete_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
 
+    # Deleting a repo deletes its git storage and cascade-deletes its Cards and
+    # Pipelines. Doing that mid-run does not stop anything: the agent run keeps
+    # going against storage that is gone, the Job row survives pointing at a
+    # card that no longer exists and stays 'running' forever, and a live
+    # PipelineRun is erased out from under the executor. Refuse loudly at the
+    # edge (R1) and name what is live instead of half-deleting it.
+    live_runs = (
+        await db.execute(
+            select(PipelineRun)
+            .join(Pipeline, Pipeline.id == PipelineRun.pipeline_id)
+            .where(Pipeline.repo_id == repo_id)
+            .where(PipelineRun.status.in_(IN_FLIGHT_RUN_STATUSES))
+            .order_by(PipelineRun.created_at)
+        )
+    ).scalars().all()
+    if live_runs:
+        raise HTTPException(
+            status_code=409,
+            detail=live_run_refusal(f"Repo '{repo.name}'", live_runs),
+        )
+
+    live_jobs = (
+        await db.execute(
+            select(Job)
+            .join(Card, Card.id == Job.card_id)
+            .where(Card.repo_id == repo_id)
+            .where(Job.status.in_(IN_FLIGHT_JOB_STATUSES))
+            .order_by(Job.created_at)
+        )
+    ).scalars().all()
+    if live_jobs:
+        listed = ", ".join(f"{j.id} ({j.status})" for j in live_jobs[:3])
+        if len(live_jobs) > 3:
+            listed += f", and {len(live_jobs) - 3} more"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Repo '{repo.name}' still has work in flight and was not "
+                f"deleted. In-flight: {listed}. Deleting now would "
+                f"remove the git storage and the card underneath a running "
+                f"agent and strand the job at 'running' forever. Cancel it "
+                f"first (POST /api/jobs/{live_jobs[0].id}/cancel), or wait "
+                f"for it to finish, then delete again."
+            ),
+        )
+
     # Delete the git repo storage
     git_repo_manager.delete_repo(repo_id)
 
@@ -187,7 +247,7 @@ async def test_setup_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
     try:
         # Create bare repo if it doesn't exist
         if not git_repo_manager.repo_exists(repo_id):
-            git_repo_manager.create_bare_repo(repo_id)
+            git_repo_manager.create_bare_repo(repo_id, repo.default_branch)
 
         # Initialize with a minimal commit using dulwich
         from dulwich.repo import Repo as DulwichRepo
@@ -249,15 +309,28 @@ async def list_branches(repo_id: str, db: AsyncSession = Depends(get_db)):
     branches = git_repo_manager.list_branches(repo_id)
     git_default_branch = git_repo_manager.get_default_branch(repo_id)
 
-    # Sync default branch from git repo to database if it differs
-    # This handles the case where user pushed with a different default branch
-    if git_default_branch and git_default_branch != repo.default_branch:
+    # Sync default branch from git repo to database if it differs.
+    # This handles the case where user pushed with a different default branch.
+    #
+    # Only when the branch ACTUALLY EXISTS. HEAD on a repo with no matching ref
+    # is an unborn branch - it says where the next push would land, not what the
+    # repo's default is - and adopting it wrote a nonexistent branch name into
+    # the row, so the sidebar read 'master' while the board header read 'main'
+    # (T19). A row the user set is better evidence than an unborn symref.
+    if (
+        git_default_branch
+        and git_default_branch != repo.default_branch
+        and git_default_branch in branches
+    ):
         repo.default_branch = git_default_branch
         await db.commit()
         await db.refresh(repo)
 
-    # Use git repo's default, or fall back to repo model's default, or first branch
-    default_branch = git_default_branch or repo.default_branch
+    # Use git repo's default, or fall back to repo model's default, or first
+    # branch. Same unborn-HEAD rule as above: an existing branch beats a symref.
+    default_branch = (
+        git_default_branch if git_default_branch in branches else None
+    ) or repo.default_branch
     if not default_branch and branches:
         # No HEAD set yet, use first non-lazyaf branch or just first branch
         non_lazyaf = [b for b in branches if not b.startswith("lazyaf/")]

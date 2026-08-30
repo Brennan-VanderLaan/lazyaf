@@ -121,9 +121,35 @@ class TestAgentConfigRoundTrip:
         assert AGENT_CONFIG_VERSION == consumer_module.AGENT_CONFIG_VERSION
 
     def test_agent_vocabulary_is_the_shared_one(self, tmp_path):
-        """Contract #5: every agent the backend can dispatch must load."""
+        """Contract #5: every agent the backend can dispatch must load.
+
+        M14 note: `openai-harness` is the one agent that REQUIRES an endpoint
+        block (there is no default endpoint - guessing which GPU to bill is
+        not a recoverable mistake), and it refuses `agents_json` because the
+        harness runs one loop and subagents belong in the graph. Those two
+        refusals are pinned in
+        `tdd/unit/control_runtime/test_endpoint_config_contract.py`; here the
+        loop just supplies what the agent needs so the vocabulary assertion
+        stays about the VOCABULARY.
+        """
+        from app.services.pipeline_executor import HARNESS_AGENT
+
         for agent in AGENT_TYPES:
-            produced = _producer_payload(agent=agent)
+            extra = {}
+            if agent == HARNESS_AGENT:
+                from tdd.unit.control_runtime.endpoint_contract import (
+                    make_endpoint_payload,
+                    make_harness_payload,
+                )
+
+                endpoint = make_endpoint_payload()
+                extra = {
+                    "endpoint": endpoint,
+                    "harness": make_harness_payload(),
+                    "model": endpoint["model"],
+                    "agents_json": None,
+                }
+            produced = _producer_payload(agent=agent, **extra)
             loaded = load_agent_config(_write(tmp_path, produced))
             assert loaded is not None and loaded.agent == agent
 

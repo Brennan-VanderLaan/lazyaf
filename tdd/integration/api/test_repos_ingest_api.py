@@ -430,3 +430,52 @@ class TestEdgeCases:
         url_response2 = await client.get(f"/api/repos/{repo_id}/clone-url")
 
         assert url_response1.json()["clone_url"] == url_response2.json()["clone_url"]
+
+
+# -----------------------------------------------------------------------------
+# Default branch: the row, git HEAD and /branches must all say one thing
+# -----------------------------------------------------------------------------
+
+class TestDefaultBranchAgreement:
+    """T19 / QA-API-08.
+
+    Three places name a repo's default branch: the ``Repo`` row, git ``HEAD``,
+    and what ``GET /branches`` reports. They disagreed from the moment of
+    creation - dulwich ``init_bare`` writes ``refs/heads/master`` while the row
+    kept ``main`` - and ``/branches`` then resolved the disagreement the WRONG
+    way, overwriting the row with a branch that had no ref. A viewer watched
+    the sidebar say ``master`` and the board header say ``main``, on a repo
+    created as ``main``.
+    """
+
+    @pytest.mark.parametrize("requested", ["main", "trunk"])
+    async def test_git_head_matches_the_requested_default_branch(
+        self, client, git_repo_manager, requested
+    ):
+        payload = repo_create_payload(name="HeadRepo")
+        payload["default_branch"] = requested
+        repo_id = (
+            await client.post("/api/repos/ingest", json=payload)
+        ).json()["id"]
+
+        head = (git_repo_manager.get_repo_path(repo_id) / "HEAD").read_text()
+        assert head.strip() == f"ref: refs/heads/{requested}"
+
+    @pytest.mark.parametrize("requested", ["main", "trunk"])
+    async def test_branches_does_not_overwrite_the_row_with_an_unborn_branch(
+        self, client, git_repo_manager, requested
+    ):
+        """An empty repo has a HEAD but no refs. Reading /branches must not
+        change what the repo's default branch is - it is a GET."""
+        payload = repo_create_payload(name="HeadRepo")
+        payload["default_branch"] = requested
+        repo_id = (
+            await client.post("/api/repos/ingest", json=payload)
+        ).json()["id"]
+
+        branches = await client.get(f"/api/repos/{repo_id}/branches")
+        assert_status_code(branches, 200)
+        assert branches.json()["default_branch"] == requested
+
+        after = await client.get(f"/api/repos/{repo_id}")
+        assert after.json()["default_branch"] == requested

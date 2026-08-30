@@ -71,6 +71,11 @@ from app.services.execution.debug_session_service import (
     DebugGateOutcome,
     debug_session_service,
 )
+# M14 admission gate. Imported at module scope for the same reason the debug
+# gate is: the exception has to be catchable by name in the dispatch path, and
+# `model_endpoints.scheduler` imports only models (no docker, no router), so
+# there is no cycle.
+from app.services.model_endpoints.scheduler import EndpointAdmissionTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +162,21 @@ DEFAULT_AGENT_IMAGE = {
     "claude-code": "lazyaf-claude:dev",
     "gemini": "lazyaf-gemini:dev",
     "mock": "lazyaf-agent-base:dev",
+    # M14: the LazyAF agent harness is python + runner-common driving an HTTP
+    # endpoint. There is no CLI to install, so agent-base IS the image.
+    "openai-harness": "lazyaf-agent-base:dev",
 }
+
+#: The one agent that drives a `ModelEndpoint` (M14). Spelled here and in
+#: `control_layer.workspace.HARNESS_AGENT`; a test pins the two together.
+HARNESS_AGENT = "openai-harness"
+
+#: The container-side variable carrying the step JWT for the runner-local
+#: endpoint probe (`runner_common.endpoint_probe.STEP_TOKEN_ENV`). It is the
+#: ONE step type that authenticates to a route outside /api/steps, so it is the
+#: ONE step that needs its own token inside the container - and it travels in
+#: `secret_environment`, never in inspectable container env.
+PROBE_STEP_TOKEN_ENV = "LAZYAF_STEP_TOKEN"
 
 # Agent vocabulary -> the settings key holding its API key, and the env var
 # name the CLI reads. `mock` needs neither.
@@ -165,6 +184,12 @@ AGENT_SECRET_ENV = {
     "claude-code": ("ANTHROPIC_API_KEY", "anthropic_api_key"),
     "gemini": ("GEMINI_API_KEY", "gemini_api_key"),
     "mock": None,
+    # M14: resolved PER-ENDPOINT, not from settings - the variable name lives
+    # on the endpoint row (`auth_secret_ref`, prefix-allowlisted) and the
+    # container-side name is the fixed `HARNESS_API_KEY_ENV`. `None` here means
+    # "this agent has no platform-wide key"; `agent_secret_environment` takes
+    # the endpoint branch instead.
+    "openai-harness": None,
 }
 
 # Agent vocabulary -> UsageManifest.provider, so even a step that produces no
@@ -174,6 +199,11 @@ AGENT_USAGE_PROVIDER = {
     "claude-code": "anthropic",
     "gemini": "google",
     "mock": "self-hosted",
+    # M14: even a harness step SIGKILLed before the wrapper wrote a manifest
+    # gets run.py's fallback record attributed to the right provider AND the
+    # right node - so an OOM-killed local step still produces a priced row
+    # rather than vanishing from the cost coverage.
+    "openai-harness": "openai-compatible",
 }
 
 # The image label an agent image DECLARES (baked by images/agent-base). Used
@@ -198,6 +228,56 @@ AGENT_WORK_BRANCH_PREFIX = "lazyaf/agent-"
 # owner (the executor's backstop is timeout + grace on top of that).
 DEFAULT_STEP_TIMEOUT = 300
 DEFAULT_AGENT_STEP_TIMEOUT = 1800
+
+# --- Harness budgets on the wire (M14, wave8 s3.2 / s4.1) --------------------
+#
+# The backend image does NOT install runner-common (nothing under `app/`
+# imports it), so these are the backend's spelling of
+# `runner_common.harness.constants`. They are not a second source of truth:
+# `tdd/unit/control_runtime/test_endpoint_config_contract.py` imports BOTH
+# modules in one process and asserts each pair is equal, which is the R3
+# instrument for a constant that has to exist on two sides of a container
+# boundary (the same shape `AGENT_CONFIG_VERSION` and `SPEC_CONTEXT_PATH`
+# already use).
+HARNESS_DEFAULT_MAX_ITERATIONS = 40
+HARNESS_DEFAULT_MAX_TOTAL_TOKENS = 400_000
+HARNESS_MAX_TOOL_CALLS_PER_TURN = 4
+HARNESS_SHELL_TIMEOUT = 120
+HARNESS_TOOL_OUTPUT_MAX_BYTES = 8192
+
+# The commit-plus-push budget the SOFT deadline leaves for the wrapper. The
+# in-container watchdog remains the ONE thing that KILLS anything (12.5's
+# rule); the harness sets a soft deadline strictly inside it and treats
+# crossing it as an ordinary stop, so it still gets to commit its partial
+# work, write the usage manifest and exit with a meaningful code - instead of
+# being SIGKILLed with nothing to show for 30 minutes of GPU time.
+HARNESS_TIME_RESERVE = 60
+
+# Under twice the reserve, `timeout - 60` is zero or negative, so a short step
+# gets half its timeout and a warning.
+HARNESS_MIN_TIMEOUT_FOR_RESERVE = 2 * HARNESS_TIME_RESERVE
+
+
+def harness_soft_deadline(step_timeout: int | None) -> int | None:
+    """`harness.time_budget_seconds` from the step's HARD timeout.
+
+    THE ONE RULE, so the soft deadline and the watchdog's hard one have
+    exactly one source. Mirrors `runner_common.harness.loop
+    .soft_deadline_seconds`; the contract test pins them equal.
+    """
+    if not step_timeout or step_timeout <= 0:
+        return None
+    if step_timeout < HARNESS_MIN_TIMEOUT_FOR_RESERVE:
+        logger.warning(
+            "harness step timeout is %ss, under %ss: the soft deadline is "
+            "half the timeout rather than timeout-%ss, which would be "
+            "negative",
+            step_timeout,
+            HARNESS_MIN_TIMEOUT_FOR_RESERVE,
+            HARNESS_TIME_RESERVE,
+        )
+        return max(int(step_timeout) // 2, 1)
+    return int(step_timeout) - HARNESS_TIME_RESERVE
 
 
 def default_timeout_for(step_type: str) -> int:
@@ -346,8 +426,10 @@ def resolve_agent_type(step_config: dict) -> str:
     return agent
 
 
-def agent_secret_environment(agent: str, step_name: str = "") -> dict[str, str]:
-    """API keys for one agent, read from settings at DISPATCH time.
+def agent_secret_environment(
+    agent: str, step_name: str = "", endpoint=None
+) -> dict[str, str]:
+    """API keys for one agent, read at DISPATCH time.
 
     Returned as `secret_environment`, which the LocalExecutor delivers ONLY
     through the step config file - never through inspectable container env.
@@ -355,7 +437,26 @@ def agent_secret_environment(agent: str, step_name: str = "") -> dict[str, str]:
     A missing key fails the step HERE rather than thirty seconds later
     inside an opaque CLI auth error, and the message names the variable
     without ever putting its value in the logs.
+
+    M14 adds the endpoint branch. `openai-harness` has no platform-wide key:
+    the variable NAME lives on the endpoint row (`auth_secret_ref`,
+    prefix-allowlisted to `LAZYAF_ENDPOINT_*` so a stored row can never
+    reference `ANTHROPIC_API_KEY`), and the container-side name is always
+    `HARNESS_API_KEY_ENV` so the harness never has to be told where to look.
+
+    `auth_style == "none"` returns `{}` - NO `secret_environment` key at all.
+    That is the FIRST-CLASS case, not a degraded one: LAN ollama and vLLM
+    behind a firewall genuinely have no key, and a dispatcher that made "no
+    auth" the exceptional branch is one that will grow a fake key.
+
+    `reach == "proxy"` also returns `{}`: the container authenticates to the
+    broker with the step JWT it already holds and the upstream key is injected
+    server-side, so no endpoint secret ever reaches a proxy-mode container.
+    That is the one genuine advantage of the mode.
     """
+    if agent == HARNESS_AGENT:
+        return _endpoint_secret_environment(endpoint, step_name)
+
     mapping = AGENT_SECRET_ENV.get(agent)
     if mapping is None:
         return {}
@@ -368,6 +469,199 @@ def agent_secret_environment(agent: str, step_name: str = "") -> dict[str, str]:
             "environment"
         )
     return {env_var: value}
+
+
+def _endpoint_secret_environment(endpoint, step_name: str = "") -> dict[str, str]:
+    """The `secret_environment` entry for one model endpoint, or `{}`."""
+    from app.services.model_endpoints.secrets import (
+        HARNESS_API_KEY_ENV,
+        EndpointSecretMissing,
+        endpoint_secret_value,
+    )
+
+    if endpoint is None:  # pragma: no cover - the resolver raises first
+        raise ValueError(
+            f"agent step {step_name!r} uses agent {HARNESS_AGENT!r} but no "
+            f"model endpoint was resolved for it"
+        )
+    if endpoint.auth_style == "none":
+        return {}
+    if endpoint.reach == "proxy":
+        logger.info(
+            "endpoint %s uses reach=proxy: the upstream key is injected "
+            "server-side and never reaches the step container",
+            endpoint.name,
+        )
+        return {}
+    try:
+        value = endpoint_secret_value(endpoint, required=True)
+    except EndpointSecretMissing as exc:
+        # 12.5's precedent verbatim: name the VARIABLE, never the value, and
+        # fail HERE - burning 30 seconds of container start to reach an opaque
+        # 401 is the outcome this rule exists to prevent.
+        raise ValueError(f"agent step {step_name!r}: {exc}") from exc
+    return {HARNESS_API_KEY_ENV: value}
+
+
+def inject_endpoint_requirements(step_config: dict, endpoint) -> dict:
+    """Add a `runner-local` endpoint's label to the step's `requires:` block.
+
+    THE WHOLE OF 14's REMOTE ROUTING (wave8 s6.2, cross-agent contract #8).
+    Everything downstream is 12.6, untouched: `ExecutionRouter.decide` sees a
+    `requires:` block and returns `("remote", "runner-pin", parsed)`,
+    `parse_requirements` normalizes it, the requirements persist on
+    `StepExecution.runner_requirements`, `Runner.matches_requirements` does
+    subset containment on `labels["has"]`, and the dispatcher CASes an
+    assignment. **No new message type, no new grammar key, no edit to
+    `runner_protocol.py`.**
+
+    This is what makes NAT'd home hardware work: 12.6 already pushes work to a
+    runner over an outbound WebSocket the runner opened, so the endpoint's URL
+    never has to be reachable from anywhere except the box hosting the model.
+
+    An operator's existing `requires:` is MERGED, never replaced - a step
+    pinned to `arch: amd64` that also needs a local GPU needs both facts.
+    Returns a NEW dict; the caller's step config is never mutated.
+    """
+    if endpoint is None or endpoint.reach != "runner-local":
+        return step_config
+
+    from app.models.model_endpoint import default_runner_label
+
+    label = endpoint.runner_label or default_runner_label(endpoint.name)
+    requires = dict(step_config.get("requires") or {})
+    raw_has = requires.get("has")
+    if raw_has is None:
+        has = []
+    elif isinstance(raw_has, (list, tuple, set)):
+        has = list(raw_has)
+    else:
+        has = [raw_has]
+    if label not in has:
+        has.append(label)
+    requires["has"] = has
+    return {**step_config, "requires": requires}
+
+
+def endpoint_wire_block(endpoint) -> dict[str, Any]:
+    """The `endpoint` block of the agent config (wave8 s4.1), key for key.
+
+    A SNAPSHOT taken at dispatch, never a live reference: a step must behave
+    identically if someone re-probes the endpoint mid-run, and M13 needs to
+    attribute a result to the capabilities that were actually in force.
+
+    Carries `auth_env` - the NAME of the fixed container-side variable - and
+    never a key value. The value travels only through 12.5's
+    `secret_environment` (config FILE, 0600, consume-once, never
+    `docker inspect`).
+    """
+    from app.schemas._datetime import utc_isoformat
+    from app.services.model_endpoints.secrets import HARNESS_API_KEY_ENV
+
+    needs_key = endpoint.auth_style != "none" and endpoint.reach != "proxy"
+    return {
+        "id": endpoint.id,
+        "name": endpoint.name,
+        "base_url": endpoint.base_url,
+        "model": endpoint.model,
+        "server_kind": endpoint.server_kind,
+        "reach": endpoint.reach,
+        "auth_style": endpoint.auth_style,
+        "auth_env": HARNESS_API_KEY_ENV if needs_key else None,
+        "auth_header": (
+            endpoint.auth_header_name if endpoint.auth_style == "header" else None
+        ),
+        "request_timeout_seconds": endpoint.request_timeout_seconds,
+        "capabilities": {
+            "supports_tools": endpoint.supports_tools,
+            "supports_streaming": endpoint.supports_streaming,
+            "reports_usage": endpoint.reports_usage,
+            "context_window": endpoint.effective_context_window,
+            "max_output_tokens": endpoint.max_output_tokens,
+            "probe_status": endpoint.probe_status,
+            "probed_at": utc_isoformat(endpoint.probed_at),
+            "probed_from": endpoint.probed_from,
+            "probe_age_seconds": endpoint.probe_age_seconds,
+            "stale": endpoint.probe_stale,
+        },
+        "pricing": {
+            "gpu_node_id": endpoint.gpu_node_id,
+            # ONE place computes this (contract #7): the model property. The
+            # node bills by the hour regardless of how many steps share it, so
+            # charging each of K concurrent steps 1.0 would multiply the node's
+            # real cost by K and inflate exactly the measurement M14 exists to
+            # enable.
+            "gpu_fraction": endpoint.gpu_fraction,
+            "priced": endpoint.priced,
+        },
+    }
+
+
+def harness_wire_block(step_config: dict, endpoint, timeout: int) -> dict[str, Any]:
+    """The `harness` block of the agent config (wave8 s4.1), key for key.
+
+    Every value is either the operator's `config.harness.<key>` or the
+    container-side default, so the two sides cannot disagree about a budget.
+
+    `time_budget_seconds` is computed from the step's HARD timeout by
+    `harness_soft_deadline` below - the same rule as
+    `runner_common.harness.loop.soft_deadline_seconds`, pinned against it by
+    `tdd/unit/control_runtime/test_endpoint_config_contract.py` (the backend
+    image does not install runner-common, so the two are pinned rather than
+    shared). The harness stops itself INSIDE the watchdog's deadline so it can
+    still commit its partial work and write telemetry instead of being
+    SIGKILLed with nothing to show for 30 minutes of GPU time.
+    """
+    raw = step_config.get("harness") or {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"step `harness:` must be a mapping of budget keys, got "
+            f"{type(raw).__name__}"
+        )
+
+    def pick(key: str, default):
+        value = raw.get(key, default)
+        return default if value is None and default is not None else value
+
+    # `require_changes` defaults to whether this step commits at all: a
+    # success-with-no-change is the most expensive possible failure in a
+    # benchmark (it looks like a cheap win), but an analysis-only step
+    # (`commit: false`, "review this and report") legitimately changes nothing.
+    commit = step_config.get("commit")
+    if isinstance(commit, dict):
+        commit_enabled = bool(commit.get("enabled", True))
+    else:
+        commit_enabled = bool(commit) if commit is not None else True
+
+    return {
+        "mode": pick("mode", "auto"),
+        "max_iterations": int(pick("max_iterations", HARNESS_DEFAULT_MAX_ITERATIONS)),
+        "max_total_tokens": int(
+            pick("max_total_tokens", HARNESS_DEFAULT_MAX_TOTAL_TOKENS)
+        ),
+        "time_budget_seconds": (
+            raw["time_budget_seconds"]
+            if raw.get("time_budget_seconds") is not None
+            else harness_soft_deadline(timeout)
+        ),
+        "max_tool_calls_per_turn": int(
+            pick("max_tool_calls_per_turn", HARNESS_MAX_TOOL_CALLS_PER_TURN)
+        ),
+        "shell_timeout_seconds": int(
+            pick("shell_timeout_seconds", HARNESS_SHELL_TIMEOUT)
+        ),
+        "tool_output_max_bytes": int(
+            pick("tool_output_max_bytes", HARNESS_TOOL_OUTPUT_MAX_BYTES)
+        ),
+        # The first agent LazyAF has where determinism is actually exposed;
+        # these become UsageManifest.determinism, which has been an honest
+        # empty object for all three CLIs.
+        "temperature": raw.get("temperature", 0),
+        "top_p": raw.get("top_p"),
+        "seed": raw.get("seed"),
+        "require_changes": bool(raw.get("require_changes", commit_enabled)),
+        "debug_transcript": bool(raw.get("debug_transcript", False)),
+    }
 
 
 class LocalStepContextError(RuntimeError):
@@ -458,6 +752,314 @@ def get_downstream_edges(graph: dict, step_id: str, condition: str) -> list[dict
 def count_total_steps(graph: dict) -> int:
     """Count total steps in a graph."""
     return len(graph.get("steps", {}))
+
+
+# =============================================================================
+# Structural integrity of a run (QA finding T4 - "PASSED for work it did not do")
+# =============================================================================
+#
+# THE RULE THIS SECTION EXISTS TO ENFORCE: **"no more steps I can reach" is not
+# success.**
+#
+# Three shapes all used to finish GREEN having run a fraction of the pipeline:
+# a graph cycle (`passed 1/3`), a step no edge reaches (`passed 1/2`), and a
+# one-character typo in `on_success` (`nextt` -> "Unknown action, treating as
+# 'stop'" -> `passed 1/3`). For a CI product a false green is the worst defect
+# class there is: nothing on screen suggests anything is wrong, and every
+# downstream gate - merge-on-pass, card completion, the ratchet - trusts it.
+#
+# The three were one bug at two altitudes:
+#   1. the graph was never checked for structural sense, and
+#   2. completion only ever inspected the StepRuns that were CREATED, so a step
+#      that never ran could not count against the verdict.
+#
+# `graph_definition_errors` answers (1) as a pure function over the graph dict,
+# `unreached_graph_steps` answers (2) as a pure function over the graph plus the
+# run's actual per-step outcomes, and `describe_step_action` closes the legacy
+# action vocabulary. All three are module-level and side-effect free so they can
+# be unit-tested without a database, a container or a run.
+
+
+#: The complete `on_success` / `on_failure` vocabulary for legacy (v1)
+#: pipelines - the exact set `_handle_action` can dispatch. Anything else used
+#: to be logged and treated as "stop", which is how `nextt` shipped a green
+#: badge for a third of a pipeline.
+STEP_ACTIONS = ("next", "stop")
+
+#: Prefixed actions, LONGEST FIRST so `trigger:pipeline:` is recognised before
+#: `trigger:` and an empty target is caught in the right one.
+STEP_ACTION_PREFIXES = ("trigger:pipeline:", "trigger:", "merge:")
+
+_ACTION_VOCABULARY = (
+    "'next', 'stop', 'trigger:{card_id}', 'trigger:pipeline:{pipeline_id}' "
+    "or 'merge:{branch}'"
+)
+
+
+def describe_step_action(action: Any) -> str | None:
+    """None when `action` is dispatchable, else why it is not.
+
+    The message names the offender and the whole vocabulary, because the
+    failure mode this replaces was a user staring at a green run wondering why
+    two of their three steps never happened.
+    """
+    if not isinstance(action, str):
+        return (
+            f"step action must be a string, got {type(action).__name__} "
+            f"({action!r}); valid actions are {_ACTION_VOCABULARY}"
+        )
+    if action in STEP_ACTIONS:
+        return None
+    for prefix in STEP_ACTION_PREFIXES:
+        if action.startswith(prefix):
+            if action[len(prefix):].strip():
+                return None
+            return (
+                f"step action {action!r} names {prefix!r} with an empty "
+                f"target; valid actions are {_ACTION_VOCABULARY}"
+            )
+    return (
+        f"unknown step action {action!r}; valid actions are "
+        f"{_ACTION_VOCABULARY}"
+    )
+
+
+def _first_cycle(
+    step_ids: list[str], successors: dict[str, list[str]]
+) -> list[str] | None:
+    """The first cycle reachable in `successors`, as the path that closes it.
+
+    Iterative DFS on purpose: a pipeline graph is user input and may be
+    hundreds of steps long, and a recursive colouring walk would trade one
+    false-green bug for a RecursionError inside a request handler.
+    """
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = dict.fromkeys(step_ids, WHITE)
+
+    for root in step_ids:
+        if color[root] != WHITE:
+            continue
+        color[root] = GREY
+        path = [root]
+        stack = [(root, iter(successors.get(root, ())))]
+        while stack:
+            node, pending = stack[-1]
+            advanced = False
+            for nxt in pending:
+                if nxt not in color:
+                    continue  # dangling endpoint: reported separately
+                if color[nxt] == GREY:
+                    return path[path.index(nxt):] + [nxt]
+                if color[nxt] == WHITE:
+                    color[nxt] = GREY
+                    path.append(nxt)
+                    stack.append((nxt, iter(successors.get(nxt, ()))))
+                    advanced = True
+                    break
+            if not advanced:
+                color[node] = BLACK
+                path.pop()
+                stack.pop()
+    return None
+
+
+def graph_definition_errors(graph: dict | None) -> list[str]:
+    """Every structural defect in a v2 graph, each naming its offender.
+
+    Empty list == the graph is runnable. This is the DEFINITION-time check:
+    it reads nothing but the graph dict, so `app.schemas.pipeline`'s
+    `validate_graph_integrity` can raise on it at 422 (see the integrator note
+    in the phase report) and the executor can re-assert it at run time without
+    a second implementation (R3).
+
+    Checked here:
+      - an entry point that is not a declared step
+      - steps declared with no entry point at all (nothing can ever run)
+      - an edge whose `from_step` / `to_step` is not a declared step
+      - a self-edge (a step cannot be its own predecessor)
+      - a cycle, reported as the path that closes it
+      - a step no entry point names and no edge leads to (dead on arrival)
+
+    NOT checked here (deliberately - they are other findings' altitude, and
+    inventing rejections this phase did not sign up for would break graphs
+    that run correctly today): duplicate entry points, duplicate parallel
+    edges, timeout bounds, step key/id agreement.
+    """
+    if not graph:
+        return []
+
+    steps = graph.get("steps") or {}
+    if not isinstance(steps, dict):
+        return [
+            "pipeline graph 'steps' must be an object keyed by step id, got "
+            f"{type(steps).__name__}"
+        ]
+
+    step_ids = list(steps.keys())
+    known = set(step_ids)
+    edges = graph.get("edges") or []
+    entry_points = list(graph.get("entry_points") or [])
+    errors: list[str] = []
+
+    for entry in entry_points:
+        if entry not in known:
+            errors.append(
+                f"entry point '{entry}' is not a declared step "
+                f"(declared: {sorted(known)})"
+            )
+    if step_ids and not entry_points:
+        errors.append(
+            f"pipeline graph declares {len(step_ids)} step(s) but no entry "
+            "point, so nothing can ever run"
+        )
+
+    successors: dict[str, list[str]] = {}
+    reached_by_edge: set[str] = set()
+    for index, edge in enumerate(edges):
+        if not isinstance(edge, dict):
+            errors.append(f"edge #{index} is not an object: {edge!r}")
+            continue
+        edge_id = edge.get("id") or f"#{index}"
+        source = edge.get("from_step")
+        target = edge.get("to_step")
+        if source not in known:
+            errors.append(
+                f"edge '{edge_id}' starts at '{source}', which is not a "
+                "declared step"
+            )
+        if target not in known:
+            errors.append(
+                f"edge '{edge_id}' ends at '{target}', which is not a "
+                "declared step"
+            )
+        if source not in known or target not in known:
+            continue
+        if source == target:
+            # A self-edge is silently discarded by the traversal (the target is
+            # already in completed_ids by the time the edge is read), so the
+            # author expressed something the engine threw away. R1.
+            errors.append(
+                f"edge '{edge_id}' is a self-edge on step '{source}': a step "
+                "cannot depend on itself"
+            )
+            continue
+        successors.setdefault(source, []).append(target)
+        reached_by_edge.add(target)
+
+    cycle = _first_cycle(step_ids, successors)
+    if cycle:
+        errors.append(
+            "pipeline graph contains a cycle: " + " -> ".join(cycle)
+        )
+
+    entry_set = set(entry_points)
+    for step_id in step_ids:
+        if step_id in entry_set or step_id in reached_by_edge:
+            continue
+        errors.append(
+            f"step '{step_id}' is unreachable: no entry point names it and no "
+            "edge leads to it"
+        )
+
+    return errors
+
+
+def unreached_graph_steps(
+    graph: dict,
+    *,
+    completed_ids: set[str],
+    active_ids: set[str],
+    outcomes: dict[str, bool],
+) -> dict[str, str]:
+    """`{step_id: why this is a defect}` for steps a finished run never ran.
+
+    Called at the moment the executor is about to stamp a run terminal. It is
+    the completion INVARIANT: a run may only be `passed` if every step the
+    graph actually demanded, given the results that actually happened, ran.
+
+    `outcomes` maps a finished step id to whether it PASSED. A step is a
+    defect when:
+
+      * it is an entry point that never dispatched, or
+      * no entry point names it and no edge leads to it (dead on arrival), or
+      * an edge from a FINISHED step SELECTED it - the edge's condition
+        matched that step's real outcome - and it still never ran.
+
+    A step is NOT a defect when its only incoming edges are conditions that did
+    not fire. `a --success--> b` / `a --failure--> c` with a passing `a` leaves
+    `c` unrun, and that is the whole point of a conditional edge; failing runs
+    for it would trade a false green for a false red.
+    """
+    steps = graph.get("steps") or {}
+    edges = graph.get("edges") or []
+    entry_points = set(graph.get("entry_points") or [])
+
+    unreached = [
+        step_id
+        for step_id in steps
+        if step_id not in completed_ids and step_id not in active_ids
+    ]
+    if not unreached:
+        return {}
+
+    verdicts: dict[str, str] = {}
+    for step_id in unreached:
+        incoming = [
+            edge
+            for edge in edges
+            if isinstance(edge, dict) and edge.get("to_step") == step_id
+        ]
+
+        if step_id in entry_points:
+            verdicts[step_id] = (
+                "declared as an entry point but never dispatched"
+            )
+            continue
+
+        if not incoming:
+            verdicts[step_id] = (
+                "no entry point names it and no edge leads to it, so it could "
+                "never have run"
+            )
+            continue
+
+        selected_by = None
+        for edge in incoming:
+            source = edge.get("from_step")
+            if source not in outcomes:
+                continue
+            condition = edge.get("condition", "success")
+            passed = outcomes[source]
+            if (
+                condition == "always"
+                or (condition == "success" and passed)
+                or (condition == "failure" and not passed)
+            ):
+                selected_by = (edge.get("id") or f"{source}->{step_id}", source)
+                break
+
+        if selected_by is None:
+            continue  # a branch that legitimately was not taken
+
+        edge_id, source = selected_by
+        blockers = sorted(
+            {
+                up
+                for up in get_upstream_step_ids(graph, step_id)
+                if up not in completed_ids
+            }
+        )
+        detail = (
+            f"still waiting on upstream {blockers} which never completed"
+            if blockers
+            else "and nothing dispatched it"
+        )
+        verdicts[step_id] = (
+            f"edge '{edge_id}' from finished step '{source}' selected it, but "
+            f"it never ran ({detail})"
+        )
+
+    return verdicts
 
 
 def pipeline_run_to_ws_dict(run: PipelineRun) -> dict:
@@ -850,6 +1452,181 @@ class PipelineExecutor:
         return mode, reason, requirements
 
     # -------------------------------------------------------------------------
+    # Model endpoints (M14): resolution, routing sugar, the admission gate
+    # -------------------------------------------------------------------------
+
+    async def _resolve_step_endpoint(
+        self,
+        db: AsyncSession,
+        step_type: str,
+        step_config: dict,
+        step_name: str,
+        session_factory=None,
+    ):
+        """The `ModelEndpoint` this step runs against, or None.
+
+        None for every step that is not an `openai-harness` agent step - which
+        is every step LazyAF ran before M14, so this is a no-op on the
+        overwhelming majority of dispatches.
+
+        For a harness step it delegates to `resolve_step_endpoint`, THE one
+        resolver (contract #4). That function parses the `endpoint:<name>`
+        sugar out of `step_config["model"]`, which is the field ALL FOUR
+        selection surfaces already populate - the card's model picker, the
+        playground, the pipeline editor's step form and
+        `MatrixModelEntry.model`. That is what makes 14.3 cheap and what lets a
+        12.6.5 matrix mix API and self-hosted models with zero schema change.
+
+        Raises ValueError with the whole fix in the message on an unknown,
+        disabled, unprobed or repeatedly-failing endpoint.
+        """
+        if step_type != "agent":
+            return None
+        try:
+            agent = resolve_agent_type(step_config)
+        except ValueError:
+            # Not our error to raise here: `_build_local_execution_config`
+            # raises it with the step's own context a moment later.
+            return None
+        if agent != HARNESS_AGENT:
+            return None
+
+        from app.services.model_endpoints.resolve import (
+            endpoint_dispatch_warning,
+            resolve_step_endpoint,
+        )
+
+        endpoint = await resolve_step_endpoint(db, step_config, step_name)
+        warning = endpoint_dispatch_warning(endpoint)
+        if warning:
+            # R1: warn plus refresh is the only honest option for a stale
+            # capability record. Blocking on staleness would make a working
+            # endpoint stop working overnight; running blind would hide it.
+            logger.warning("[endpoint] step %r: %s", step_name, warning)
+        if endpoint.probe_stale and session_factory is not None:
+            from app.services.model_endpoints.probe import background_reprobe
+
+            # Fire-and-forget beside the step, never in front of it: a
+            # background capability refresh must not be able to fail the step
+            # that triggered it.
+            background_reprobe(session_factory, endpoint.id)
+        return endpoint
+
+    async def _announce_endpoint(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        step_run: StepRun,
+        endpoint,
+    ) -> None:
+        """Say which endpoint this step will drive, IN THE STEP'S OWN LOG.
+
+        The `[executor]` line names the endpoint, the real model id, the reach
+        and the resolved base URL, so "why can't the step reach the model" is
+        one grep away rather than an inference from a connect error. Every
+        `endpoint_dispatch_warning` (stale capability record, reach=proxy's
+        bottleneck, an unknown context window, an endpoint that reports no
+        usage) is appended as a WARNING line, because each of those changes
+        how the step will behave and a step that behaves differently for a
+        reason nobody stated is dark.
+        """
+        from app.services.model_endpoints.resolve import endpoint_dispatch_warning
+
+        lines = [
+            f"[executor] endpoint {endpoint.name}: model={endpoint.model} "
+            f"reach={endpoint.reach} url={endpoint.base_url} "
+            f"node={endpoint.gpu_node_id} gpu_fraction={endpoint.gpu_fraction}"
+        ]
+        warning = endpoint_dispatch_warning(endpoint)
+        if warning:
+            lines.append(f"[executor] WARNING: {warning}")
+        await self._append_step_logs(db, pipeline_run, step_run, lines)
+
+    async def _admit_to_endpoint(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        step_run: StepRun,
+        exec_context: dict,
+        endpoint,
+    ) -> str | None:
+        """Hold one of the endpoint's concurrency slots before the container
+        starts, and make the WAIT VISIBLE.
+
+        Returns the endpoint id when a slot is held (so the caller can wake the
+        next waiter when the step ends), or None when the gate does not apply.
+
+        R1 on the log channel: the gate runs strictly BEFORE the step container
+        exists, so nothing else is writing `StepRun.logs` yet - which is why
+        these `[executor]` lines can be appended here without breaking 12.3's
+        "the /api/steps router is the sole writer in control mode" rule. A
+        fan-out that is serializing has to look like a queue rather than a
+        hang; silent waiting and hanging are indistinguishable.
+        """
+        from app.services.model_endpoints.scheduler import admit, uses_admission_gate
+
+        if not uses_admission_gate(endpoint):
+            logger.info(
+                "step %s: endpoint %s has reach=runner-local; the endpoint "
+                "admission gate is skipped (the runner's own "
+                "MAX_CONCURRENT_STEPS=1 already serializes it, and two gates "
+                "that can block each other is a deadlock)",
+                step_run.step_index,
+                endpoint.name,
+            )
+            return None
+
+        step_execution_id = exec_context.get("step_execution_id")
+        if not step_execution_id:
+            # No control mode means no StepExecution row, and the gate's CAS
+            # target IS that row. Agent steps always have one (control mode is
+            # mandatory for them since 12.5), so this is unreachable by
+            # construction - and refusing beats admitting nothing silently.
+            raise ValueError(  # pragma: no cover - control mode is mandatory
+                f"endpoint '{endpoint.name}' cannot admit step "
+                f"{step_run.step_name!r}: the admission gate compare-and-swaps "
+                "on the StepExecution row that only control mode creates"
+            )
+
+        lines: list[str] = []
+
+        def _emit(line: str) -> None:
+            lines.append(line)
+
+        try:
+            await admit(db, step_execution_id, endpoint, log=_emit)
+        finally:
+            if lines:
+                await self._append_step_logs(db, pipeline_run, step_run, lines)
+        return endpoint.id
+
+    async def _append_step_logs(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        step_run: StepRun,
+        lines: list[str],
+    ) -> None:
+        """Append executor-owned lines to the step's log stream, loudly but
+        never fatally: a log line must not be able to fail the step it is
+        describing."""
+        try:
+            step_run.logs = (step_run.logs or "") + "".join(
+                f"{line}\n" for line in lines
+            )
+            await db.commit()
+            await manager.publish_step_logs(
+                pipeline_run.id, step_run.step_index, lines
+            )
+        except Exception:
+            logger.exception(
+                "failed to append %d executor log line(s) to step %s of run %s",
+                len(lines),
+                step_run.step_index,
+                pipeline_run.id[:8],
+            )
+
+    # -------------------------------------------------------------------------
     # Completion / trigger actions
     # -------------------------------------------------------------------------
 
@@ -1207,6 +1984,20 @@ class PipelineExecutor:
 
             logger.info(f"Using steps_graph with {total_steps} steps, {len(entry_points)} entry points")
 
+            # R1: a structurally broken graph says so at run START, not only
+            # in the post-mortem. The run is NOT aborted here on purpose - the
+            # reachable part still runs, and `_verify_graph_coverage` fails the
+            # run at the end with this same list plus what it actually
+            # observed. Aborting at dispatch would hide which steps did run,
+            # and this belongs at definition time anyway (see
+            # `graph_definition_errors`).
+            for defect in graph_definition_errors(graph):
+                logger.error(
+                    "Pipeline %s has an invalid graph: %s",
+                    pipeline.name,
+                    defect,
+                )
+
             # Create the pipeline run
             pipeline_run = PipelineRun(
                 id=str(uuid4()),
@@ -1249,13 +2040,34 @@ class PipelineExecutor:
                 return pipeline_run
 
             if not entry_points:
-                # No entry points, mark as passed
-                await self._complete_pipeline(db, pipeline_run, success=True)
+                # Nothing to dispatch. An EMPTY graph is a vacuous pass; a
+                # graph with steps and no entry point is a run that covered
+                # none of them, and `_verify_graph_coverage` fails it rather
+                # than stamping the old unconditional `success=True`.
+                if not await self._verify_graph_coverage(
+                    db, pipeline_run, graph
+                ):
+                    await self._complete_pipeline(
+                        db, pipeline_run, success=True
+                    )
             else:
                 # Execute ALL entry points in parallel. The run lock keeps a
                 # fast-finishing local step from clobbering active_step_ids
                 # while later entry points are still being dispatched.
+                #
+                # RESERVE THEM ALL FIRST. A step that fails to ROUTE completes
+                # synchronously inside `_execute_graph_step`, so with two entry
+                # points the first one's completion used to see an empty
+                # active set and stamp the whole run terminal while the second
+                # had not been dispatched yet. Claiming the whole batch up
+                # front makes "nothing is active" mean what it says.
                 async with self._run_lock(pipeline_run.id):
+                    self._reserve_active_steps(
+                        pipeline_run,
+                        [s for s in entry_points if s in steps_dict],
+                    )
+                    await db.commit()
+                    await db.refresh(pipeline_run)
                     for step_id in entry_points:
                         if step_id in steps_dict:
                             await self._execute_graph_step(
@@ -1537,13 +2349,24 @@ class PipelineExecutor:
         12.6: LOCAL and REMOTE take the SAME dispatch line. That is the test
         of the executor contract - if this method had to learn what "remote"
         is beyond picking the executor instance, the contract was not met.
+
+        M14: a `runner-local` model endpoint injects ONE requirement here,
+        BEFORE `ExecutionRouter.decide` runs (cross-agent contract #8). That is
+        the entire remote story of this milestone - no new message type, no new
+        grammar key, no edit to `runner_protocol.py`. A `direct` endpoint with
+        no operator `requires:` stays LOCAL: a global accidental flip to remote
+        would be as much a regression as the reverse.
         """
         route_error: str | None = None
         mode: ExecutorMode | None = None
         requirements: dict = {}
         try:
+            endpoint = await self._resolve_step_endpoint(
+                db, step_type, step_config, step_name
+            )
+            routed_config = inject_endpoint_requirements(step_config, endpoint)
             mode, _reason, requirements = self._decide_route(
-                step_type, step_config, step_name
+                step_type, routed_config, step_name
             )
         except Exception as e:
             logger.exception(
@@ -1908,6 +2731,13 @@ class PipelineExecutor:
         is_remote = mode is ExecutorMode.REMOTE
         db = session_factory()
         session_abandoned = False
+        # M14: set once this step HOLDS one of an endpoint's slots, so the
+        # outer `finally` can wake the next waiter. The slot itself is released
+        # by the terminal StepExecution status (the gate counts by STATUS, so a
+        # crash cannot leak one); this only spares the waiter its poll interval.
+        # Bound HERE, before the first `return` path, because the `finally`
+        # reads it on every exit.
+        held_endpoint_id: str | None = None
         try:
             try:
                 loaded = await self._load_local_step_context(db, run_id, step_run_id)
@@ -1964,18 +2794,45 @@ class PipelineExecutor:
                     workspace_id = workspace.id
 
                 executor = await self._get_executor(mode)
+                # M14: resolved a SECOND time here, on this task's own session
+                # (`_dispatch_step_run` resolved it on the request's session to
+                # decide the route). Two cheap reads beat threading a
+                # cross-session ORM instance through a task boundary.
+                endpoint = await self._resolve_step_endpoint(
+                    db,
+                    step_type,
+                    step_config,
+                    step_run.step_name or "",
+                    session_factory=session_factory,
+                )
                 exec_config, exec_context = self._build_local_execution_config(
                     pipeline_run, step_run, step_type, step_config, timeout, params,
+                    endpoint=endpoint,
                 )
                 if step_type == "agent":
                     await self._attach_agent_payload(
                         db, pipeline_run, pipeline, repo, step_run,
-                        step_config, exec_config,
+                        step_config, exec_config, endpoint=endpoint,
                     )
                 await self._prepare_control_mode(
                     db, executor, step_run, step_config, exec_config,
                     exec_context, timeout, mode=mode,
                 )
+                if endpoint is not None:
+                    # R1: everything the operator needs to know about WHICH
+                    # endpoint this step is about to drive, and how it will
+                    # behave, goes into the step's own log before the first
+                    # token is spent - not only into the backend's.
+                    await self._announce_endpoint(
+                        db, pipeline_run, step_run, endpoint
+                    )
+                    # AFTER control mode (the gate CASes on the StepExecution
+                    # row that only control mode creates) and BEFORE the
+                    # container starts - the whole point is not to hold a GPU
+                    # slot with a container that is only going to queue.
+                    held_endpoint_id = await self._admit_to_endpoint(
+                        db, pipeline_run, step_run, exec_context, endpoint
+                    )
                 if is_remote:
                     self._build_remote_execution_config(
                         repo, exec_config, exec_context,
@@ -2042,6 +2899,15 @@ class PipelineExecutor:
                 if consumer_task is not None and not consumer_task.done():
                     consumer_task.cancel()
                 raise
+            except EndpointAdmissionTimeout as e:
+                # A pin nobody can satisfy must not hang a pipeline forever -
+                # the same rule as 12.6's NO_RUNNER_TIMEOUT. The message
+                # already names the endpoint, the cap and the holding steps.
+                success = False
+                error = str(e)
+                logger.error(
+                    f"Step {step_run.step_index} of run {run_id[:8]}: {error}"
+                )
             except Exception as e:
                 success = False
                 error = f"local execution error: {e}"
@@ -2078,6 +2944,16 @@ class PipelineExecutor:
                 log_tail,
             )
         finally:
+            # M14: wake the next step waiting on this endpoint. The slot was
+            # already released by the terminal StepExecution status; this only
+            # spares the waiter its poll interval. Never raises.
+            try:
+                if held_endpoint_id:
+                    from app.services.model_endpoints.scheduler import notify_release
+
+                    notify_release(held_endpoint_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("endpoint slot wakeup failed")
             if not session_abandoned:
                 await db.close()
 
@@ -2297,6 +3173,7 @@ class PipelineExecutor:
         step_config: dict,
         timeout: int,
         params: dict[str, Any] | None,
+        endpoint=None,
     ) -> tuple[dict, dict]:
         """Build (step_config, execution_context) for LocalExecutor.execute_step.
 
@@ -2310,6 +3187,15 @@ class PipelineExecutor:
         carrying the provider API key. The DB-sourced half of the agent
         payload is attached afterwards by `_attach_agent_payload`, which can
         await the session this synchronous builder does not have.
+
+        M14: an `openai-harness` step additionally stamps `gpu_node_id` and
+        `gpu_fraction` into the execution context. Those are the THREE LINES
+        wave 5 named and deliberately did not write against zero real
+        hardware: `local_executor` (and `runner_protocol` on the remote path)
+        already copies them into non-secret container env, `run.py` already
+        copies them onto the usage manifest, and `usage_ingestion` already
+        prices them through `gpu_node_cost_usd`. **Nothing about the cost story
+        is new machinery; this is the phase that finally SETS the inputs.**
         """
         environment = dict(step_config.get("environment") or {})
         if params:
@@ -2330,7 +3216,7 @@ class PipelineExecutor:
             # Secrets travel in the config FILE only; a missing key raises
             # HERE, at dispatch, with the variable named.
             exec_step_config["secret_environment"] = agent_secret_environment(
-                agent, step_run.step_name or ""
+                agent, step_run.step_name or "", endpoint=endpoint
             )
             exec_step_config["usage_provider"] = AGENT_USAGE_PROVIDER.get(
                 agent, "self-hosted"
@@ -2385,6 +3271,14 @@ class PipelineExecutor:
             "execution_key": f"{pipeline_run.id}:{step_run.step_index}:{step_run.id}",
             "workspace_volume": generate_volume_name(pipeline_run.id),
         }
+        if endpoint is not None:
+            # The three lines wave 5 named (see the docstring). `gpu_fraction`
+            # is `1.0 / max_concurrency`, computed in ONE place - the model
+            # property (contract #7) - and travels on the wire so `run.py`
+            # needs no DB lookup.
+            exec_context["gpu_node_id"] = endpoint.gpu_node_id
+            exec_context["gpu_fraction"] = endpoint.gpu_fraction
+            exec_context["model_endpoint_id"] = endpoint.id
         return exec_step_config, exec_context
 
     async def _attach_agent_payload(
@@ -2396,6 +3290,7 @@ class PipelineExecutor:
         step_run: StepRun,
         step_config: dict,
         exec_config: dict,
+        endpoint=None,
     ) -> None:
         """Fill `exec_config["agent"]` with the DB-sourced half of the payload.
 
@@ -2458,11 +3353,17 @@ class PipelineExecutor:
         # uncapped log would blow the prompt as well as the wire payload.
         capped_logs, _ = truncate_previous_step_logs(previous_logs)
 
+        card_id = step_config.get("card_id") or context.get("card_id")
+        spec_context = await self._build_step_spec_context(
+            db, pipeline_run, repo, step_run, step_config, card_id
+        )
+
         prompt = render_agent_prompt(
             card_title=card_title,
             card_description=card_description,
             prompt_template=step_config.get("prompt_template"),
             previous_step_logs=capped_logs,
+            spec_context=(spec_context or {}).get("markdown"),
         )
 
         agents_json = await self._resolve_agents_json(
@@ -2502,7 +3403,7 @@ class PipelineExecutor:
             "model": step_config.get("model"),
             "agents_json": agents_json,
             "stream": bool(step_config.get("stream", True)),
-            "card_id": context.get("card_id"),
+            "card_id": card_id,
             "card_title": card_title,
             "card_description": card_description,
             "step_index": step_run.step_index,
@@ -2521,7 +3422,126 @@ class PipelineExecutor:
             "mock_config": step_config.get("mock_config"),
             # M13 seam: on the wire NOW, null everywhere in 12.5.
             "role": step_config.get("role"),
+            # 12.6.6: the curated spec bundle, or None. `generate_agent_config`
+            # takes it verbatim as the top-level `spec_context` key on BOTH
+            # lanes (local: local_executor's `generate_agent_config(**payload)`;
+            # remote: `_build_control_files`), so the remote runner gets it
+            # with no change to remote_executor, runner_protocol or the agent.
+            "spec_context": spec_context,
         }
+
+        if endpoint is not None:
+            # M14 (wave8 s4.1). The endpoint block is a SNAPSHOT and carries
+            # `auth_env` - the NAME of the container-side variable - never a
+            # key. The top-level `model` is overwritten with the endpoint's
+            # real model id: `endpoint:<name>` is the COORDINATE (what the
+            # matrix groups on), `endpoint.model` is what is actually driven
+            # and what `StepUsage.model` records. Two questions, two answers.
+            exec_config["agent"]["endpoint"] = endpoint_wire_block(endpoint)
+            exec_config["agent"]["harness"] = harness_wire_block(
+                step_config, endpoint, exec_config.get("timeout") or 0
+            )
+            exec_config["agent"]["model"] = endpoint.model
+            # The harness runs one loop; subagents belong in the graph where
+            # they are visible and costed per role (wave8 s12). Refused loudly
+            # rather than silently dropped.
+            if exec_config["agent"].get("agents_json"):
+                raise ValueError(
+                    f"agent step {step_run.step_name!r} uses agent "
+                    f"{HARNESS_AGENT!r} with agent_file_ids: the harness runs "
+                    f"one loop and does not do subagents"
+                )
+            exec_config["agent"]["agents_json"] = None
+
+    async def _build_step_spec_context(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        repo: Repo,
+        step_run: StepRun,
+        step_config: dict,
+        card_id: str | None,
+    ) -> dict[str, Any] | None:
+        """The 12.6.6 curated spec bundle for this agent step, or None.
+
+        THE DISPATCH-SIDE CONNECTION. The assembler
+        (`spec_context.build_spec_context`), the producer's `spec_context`
+        kwarg, the wire key and the container-side loader all shipped in
+        12.6.6 and were pinned from both sides - but nothing in production
+        called the assembler, so the whole lane was dark. This is the call.
+
+        `None` is the ONE spelling of "no spec context" (never `{}`, never a
+        bundle with empty markdown, never an empty `## Spec Context` heading),
+        and it produces a prompt byte-identical to the pre-12.6.6 one.
+
+        WHETHER CURATION HAPPENED IS OBSERVABLE (R1). Every outcome logs
+        exactly one line naming the step and what it got, because a curated
+        brief you can only discover by reading a container's stdout after
+        burning a run is dark - and a bundle that silently failed to assemble
+        would otherwise be indistinguishable from a card with no spec links.
+        `GET /api/cards/{card_id}/spec-context` (routers/spec_context.py) is
+        the look-before-you-spend half of the same requirement.
+
+        `spec_context: false` in the step config turns curation off. That is
+        the 12.6.5 A/B lever (with-curation vs without) and the escape hatch
+        for a step whose card links a spec it must not read. Disabled and
+        no-links are the same `null` on the wire - truthfully, both are "no
+        bundle" - and are distinguished in the LOG.
+        """
+        from app.services.spec_context import build_spec_context
+
+        step_label = step_run.step_name or step_run.step_index
+        run_label = pipeline_run.id[:8]
+
+        if not step_config.get("spec_context", True):
+            logger.info(
+                "spec context: DISABLED by step config for step %r of run %s",
+                step_label,
+                run_label,
+            )
+            return None
+
+        if not card_id:
+            logger.info(
+                "spec context: none for step %r of run %s (no card is linked "
+                "to this step, so there is no spec to curate)",
+                step_label,
+                run_label,
+            )
+            return None
+
+        bundle = await build_spec_context(db, card_id=card_id, repo_id=repo.id)
+        if bundle is None:
+            logger.info(
+                "spec context: none for step %r of run %s (card %s has no "
+                "spec links)",
+                step_label,
+                run_label,
+                card_id[:8],
+            )
+            return None
+
+        source = bundle.get("source") or {}
+        logger.info(
+            "spec context: APPLIED to step %r of run %s - card %s, feature "
+            "%s, story %s, %d criteria, %d test refs, ~%d tokens, "
+            "truncated=%s%s",
+            step_label,
+            run_label,
+            card_id[:8],
+            (source.get("feature_id") or "-")[:8],
+            (source.get("user_story_id") or "-")[:8],
+            bundle.get("criteria_count", 0),
+            bundle.get("test_ref_count", 0),
+            bundle.get("estimated_tokens", 0),
+            bundle.get("truncated", False),
+            (
+                " dropped=" + ",".join(bundle.get("dropped") or [])
+                if bundle.get("dropped")
+                else ""
+            ),
+        )
+        return bundle
 
     @staticmethod
     def _agent_repo_workdir(exec_config: dict, settings) -> str:
@@ -2759,6 +3779,27 @@ class PipelineExecutor:
                 timeout + LOCAL_STEP_HARD_TIMEOUT_GRACE + STEP_TOKEN_TTL_SLACK
             ),
         )
+
+        # M14 s2.3: the endpoint-probe step is the ONE step that reports to an
+        # endpoint-scoped route rather than to /api/steps, so it is the one
+        # step that needs its own JWT inside the container. It travels in
+        # `secret_environment` - the 12.5 secret channel (config FILE, 0600,
+        # consume-once) - and never in inspectable container env; the
+        # `model_endpoint_id` stamp is what makes /probe-result's split-brain
+        # fence pass for it.
+        probe_endpoint_id = step_config.get("endpoint_probe")
+        if probe_endpoint_id:
+            secret_env = dict(exec_config.get("secret_environment") or {})
+            secret_env[PROBE_STEP_TOKEN_ENV] = token
+            exec_config["secret_environment"] = secret_env
+            execution.model_endpoint_id = str(probe_endpoint_id)
+            await db.commit()
+            logger.info(
+                "Step %s is an endpoint probe for %s: its step JWT travels in "
+                "the secret channel so it can POST /probe-result",
+                step_run.step_index,
+                str(probe_endpoint_id)[:8],
+            )
 
         exec_context["control_mode"] = True
         exec_context["step_execution_id"] = execution.id
@@ -3492,6 +4533,14 @@ class PipelineExecutor:
         3. For each downstream step, checks if all upstream dependencies are satisfied (fan-in)
         4. Executes ready downstream steps (fan-out)
         5. Completes pipeline when all steps are done
+
+        Step 5 is where QA finding T4 lived. This method used to complete the
+        run the moment nothing was active and nothing new had been dispatched,
+        without ever asking whether the graph had been COVERED - so a cycle, an
+        unreachable step or a typo'd action each finished `passed` with a
+        fraction of the pipeline run. `_verify_graph_coverage` is now the gate
+        in front of every success verdict here: "no more steps I can reach" is
+        not success.
         """
         logger.info(f"[GRAPH] _handle_graph_step_complete called for step '{completed_step_id}' success={step_success}")
         steps_dict = graph.get("steps", {})
@@ -3545,8 +4594,18 @@ class PipelineExecutor:
             else:
                 logger.info(f"[GRAPH] Step {next_step_id} NOT ready - waiting for upstream. Upstream: {upstream_ids}, Completed: {completed_ids}")
 
-        # Execute ready downstream steps (fan-out)
+        # Execute ready downstream steps (fan-out).
+        #
+        # RESERVE THE WHOLE BATCH FIRST, for the same reason start_pipeline
+        # does: a fan-out step that fails to route re-enters this method
+        # synchronously, and it must not see the siblings that have not been
+        # dispatched yet as "nothing is active" (which stamped the run
+        # terminal) or as "never ran" (which would now fail it).
         logger.info(f"[GRAPH] Executing {len(steps_to_execute)} ready steps: {steps_to_execute}")
+        if steps_to_execute:
+            self._reserve_active_steps(pipeline_run, steps_to_execute)
+            await db.commit()
+            await db.refresh(pipeline_run)
         for step_id in steps_to_execute:
             logger.info(f"[GRAPH] Triggering execution of step '{step_id}'")
             await self._execute_graph_step(
@@ -3566,6 +4625,30 @@ class PipelineExecutor:
 
         if not active_ids:
             logger.info(f"[GRAPH] No active steps remaining")
+
+            # A step that failed to route completes SYNCHRONOUSLY inside
+            # `_execute_graph_step` above, re-entering this method in the
+            # caller's own stack. If that inner frame already stamped the run
+            # terminal, this outer frame must not stamp it a second time
+            # (double `_complete_pipeline` = double workspace cleanup, double
+            # trigger action, double card notification).
+            if pipeline_run.status not in (
+                RunStatus.RUNNING.value,
+                RunStatus.PENDING.value,
+            ):
+                logger.info(
+                    f"[GRAPH] Run {pipeline_run.id[:8]} is already "
+                    f"{pipeline_run.status}; leaving it alone"
+                )
+                return
+
+            # THE COMPLETION INVARIANT (QA finding T4). Every path out of this
+            # branch used to be a success verdict computed from the StepRuns
+            # that happened to exist. Steps that never ran cannot fail a check
+            # that only looks at rows, so a truncated run finished green.
+            if await self._verify_graph_coverage(db, pipeline_run, graph):
+                return
+
             # No steps running - check if we're done
             if len(completed_ids) >= total_steps:
                 # All steps completed
@@ -3573,8 +4656,9 @@ class PipelineExecutor:
                 all_passed = await self._check_all_steps_passed(db, pipeline_run)
                 await self._complete_pipeline(db, pipeline_run, success=all_passed)
             elif not steps_to_execute:
-                # No more steps can run (failed branch or dead end)
-                # Pipeline is complete, but may have failed
+                # Every remaining step is a branch this run legitimately did
+                # not take (a `failure` edge on a passing step, say). The graph
+                # is covered; the verdict is the StepRuns'.
                 logger.info(f"[GRAPH] No more steps to execute - marking pipeline complete (dead end or failure)")
                 all_passed = await self._check_all_steps_passed(db, pipeline_run)
                 await self._complete_pipeline(db, pipeline_run, success=all_passed)
@@ -3613,6 +4697,174 @@ class PipelineExecutor:
 
         return True
 
+    @staticmethod
+    def _reserve_active_steps(
+        pipeline_run: PipelineRun, step_ids: list[str]
+    ) -> None:
+        """Claim a whole dispatch batch as active before any of it dispatches.
+
+        Idempotent and order-preserving; the caller commits. `active_step_ids`
+        means "claimed by this run", not "has a container yet" - the two differ
+        by exactly the window a synchronous routing failure re-enters
+        `_handle_graph_step_complete` in, which is the window the run used to
+        be stamped terminal in.
+        """
+        active = parse_json_list(pipeline_run.active_step_ids)
+        for step_id in step_ids:
+            if step_id not in active:
+                active.append(step_id)
+        pipeline_run.active_step_ids = json.dumps(active)
+
+    async def _graph_step_outcomes(
+        self, db: AsyncSession, pipeline_run: PipelineRun
+    ) -> dict[str, bool]:
+        """`{step_id: it passed}` for every graph step this run actually ran.
+
+        A step with several StepRuns (a retry, or the duplicate dispatch of
+        QA4-06) counts as passed only if none of them failed - the pessimistic
+        read, because this feeds a verdict.
+        """
+        result = await db.execute(
+            select(StepRun).where(StepRun.pipeline_run_id == pipeline_run.id)
+        )
+        outcomes: dict[str, bool] = {}
+        for step_run in result.scalars().all():
+            if not step_run.step_id:
+                continue
+            passed = step_run.status == RunStatus.PASSED.value
+            outcomes[step_run.step_id] = (
+                outcomes.get(step_run.step_id, True) and passed
+            )
+        return outcomes
+
+    async def _verify_graph_coverage(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        graph: dict,
+    ) -> bool:
+        """True when the run has been FAILED for not covering its graph.
+
+        The gate in front of every success verdict in
+        `_handle_graph_step_complete` (QA finding T4). Returns False - "carry
+        on, the graph is covered" - for the overwhelmingly common case, and
+        True having already stamped the run `failed` when it is not.
+
+        Two independent reasons to fail here, both reported together so the
+        operator sees the whole picture in one place:
+
+        1. the graph is structurally invalid (`graph_definition_errors`) - a
+           cycle, a self-edge, a dangling endpoint, a step nothing reaches.
+           These belong at definition time and will 422 there once
+           `PipelineGraphModel.validate_graph_integrity` calls the same
+           function; until then a run is the last place to catch them, and
+           catching them silently is what produced the green badge.
+        2. steps the run DEMANDED never ran (`unreached_graph_steps`).
+
+        The explanation is not just logged. Every step that never ran gets a
+        FAILED StepRun carrying its own reason, so the graph view marks it red
+        and the run list shows a real error instead of a green tick - and a
+        structural defect with nothing left unrun gets one synthetic
+        `pipeline graph` StepRun for the same purpose. `PipelineRun` has no
+        error column of its own; a StepRun is the row this product already
+        renders, streams over the websocket and returns from
+        `/api/pipeline-runs/{id}`.
+        """
+        steps_dict = graph.get("steps") or {}
+        if not steps_dict:
+            return False
+
+        completed_ids = set(parse_json_list(pipeline_run.completed_step_ids))
+        active_ids = set(parse_json_list(pipeline_run.active_step_ids))
+        outcomes = await self._graph_step_outcomes(db, pipeline_run)
+
+        defects = graph_definition_errors(graph)
+        unreached = unreached_graph_steps(
+            graph,
+            completed_ids=completed_ids,
+            active_ids=active_ids,
+            outcomes=outcomes,
+        )
+        if not defects and not unreached:
+            return False
+
+        step_ids = list(steps_dict.keys())
+        summary_parts = []
+        if defects:
+            summary_parts.append(
+                "the pipeline graph is structurally invalid: "
+                + "; ".join(defects)
+            )
+        if unreached:
+            summary_parts.append(
+                f"{len(unreached)} of {len(step_ids)} declared steps never "
+                "ran: "
+                + "; ".join(
+                    f"'{step_id}' ({reason})"
+                    for step_id, reason in sorted(unreached.items())
+                )
+            )
+        summary = " | ".join(summary_parts)
+
+        logger.error(
+            "Pipeline run %s did not cover its graph and CANNOT be reported "
+            "passed: %s",
+            pipeline_run.id[:8],
+            summary,
+        )
+
+        now = datetime.utcnow()
+        created: list[StepRun] = []
+        for step_id, reason in sorted(unreached.items()):
+            node = steps_dict.get(step_id) or {}
+            created.append(
+                StepRun(
+                    id=str(uuid4()),
+                    pipeline_run_id=pipeline_run.id,
+                    step_index=(
+                        step_ids.index(step_id)
+                        if step_id in step_ids
+                        else len(step_ids)
+                    ),
+                    step_id=step_id,
+                    step_name=node.get("name") or step_id,
+                    status=RunStatus.FAILED.value,
+                    logs="",
+                    error=f"step never ran: {reason}",
+                    started_at=now,
+                    completed_at=now,
+                )
+            )
+        if defects and not created:
+            # Structurally broken but nothing left unrun - a self-edge the
+            # traversal quietly discarded, say. There is no step to blame, so
+            # the run gets one row that says what is wrong with the graph.
+            created.append(
+                StepRun(
+                    id=str(uuid4()),
+                    pipeline_run_id=pipeline_run.id,
+                    step_index=len(step_ids),
+                    step_id=None,
+                    step_name="pipeline graph",
+                    status=RunStatus.FAILED.value,
+                    logs="",
+                    error=summary,
+                    started_at=now,
+                    completed_at=now,
+                )
+            )
+
+        for step_run in created:
+            db.add(step_run)
+        await db.commit()
+        await db.refresh(pipeline_run)
+        for step_run in created:
+            await db.refresh(step_run)
+            await manager.send_step_run_status(step_run_to_ws_dict(step_run))
+
+        await self._complete_pipeline(db, pipeline_run, success=False)
+        return True
+
     async def _check_all_steps_passed(self, db: AsyncSession, pipeline_run: PipelineRun) -> bool:
         """Check if all completed step runs passed."""
         result = await db.execute(
@@ -3647,10 +4899,27 @@ class PipelineExecutor:
         - "trigger:pipeline:{pipeline_id}": Start another pipeline
         - "merge:{branch}": Merge current branch to target
 
+        THE VOCABULARY IS CLOSED (QA finding T4). Anything outside it used to
+        be logged at WARNING and then treated as "stop", which completed the
+        run with the STEP's verdict: `on_success: "nextt"` - one character -
+        stopped a three-step pipeline after step one and reported PASSED, with
+        nothing user-visible naming the typo. An action the executor cannot
+        dispatch is now a run failure that names the offender and the whole
+        vocabulary. `describe_step_action` is the single definition of that
+        vocabulary, so `PipelineStepConfig.on_success` / `on_failure` can be
+        closed at the schema against the same function.
+
         Args:
             runner_id: The runner that completed the previous step (for continuation affinity)
         """
         logger.info(f"Handling action '{action}' after step {current_step} (success={step_success})")
+
+        problem = describe_step_action(action)
+        if problem is not None:
+            await self._fail_run_on_undispatchable_action(
+                db, pipeline_run, current_step, problem
+            )
+            return
 
         if action == "next":
             # Execute next step, passing runner_id for affinity
@@ -3675,9 +4944,54 @@ class PipelineExecutor:
             target_branch = action[6:]  # Remove "merge:" prefix
             await self._merge_branch(db, pipeline_run, repo, steps, current_step, target_branch)
 
-        else:
-            logger.warning(f"Unknown action '{action}', treating as 'stop'")
-            await self._complete_pipeline(db, pipeline_run, success=step_success)
+        else:  # pragma: no cover - describe_step_action already returned
+            raise ValueError(
+                f"action {action!r} passed validation but has no handler; "
+                "describe_step_action and _handle_action have drifted"
+            )
+
+    async def _fail_run_on_undispatchable_action(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        current_step: int,
+        problem: str,
+    ) -> None:
+        """Fail a run whose step declared an action the executor cannot run.
+
+        The step itself is marked FAILED, not left green: its declared
+        continuation could not be honoured, so the step did not do what it
+        said it would - and a red run with nothing red in it is exactly the
+        "why did this fail?" the old silent 'treating as stop' produced from
+        the other direction. The reason is APPENDED to any error already
+        there, because this path is also reached from `_execute_step`'s
+        routing-failure branch, where the real cause is already recorded.
+        """
+        reason = f"step {current_step}: {problem}"
+        logger.error(
+            "Pipeline run %s cannot continue - %s",
+            pipeline_run.id[:8],
+            reason,
+        )
+
+        result = await db.execute(
+            select(StepRun)
+            .where(StepRun.pipeline_run_id == pipeline_run.id)
+            .where(StepRun.step_index == current_step)
+        )
+        step_run = result.scalars().first()
+        if step_run is not None:
+            step_run.error = (
+                f"{step_run.error}\n{reason}" if step_run.error else reason
+            )
+            step_run.status = RunStatus.FAILED.value
+            if step_run.completed_at is None:
+                step_run.completed_at = datetime.utcnow()
+            await db.commit()
+            await db.refresh(step_run)
+            await manager.send_step_run_status(step_run_to_ws_dict(step_run))
+
+        await self._complete_pipeline(db, pipeline_run, success=False)
 
     async def _trigger_card(
         self,

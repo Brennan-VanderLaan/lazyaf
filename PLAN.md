@@ -1156,6 +1156,48 @@ The work is a new executor plus an endpoint registry, not a re-architecture.
   endpoint, and the Milestone 13 fan-out hypothesis finally runnable:
   expensive planner, K cheap local workers, measured.
 
+### Phase 14.5 — Runner images with inference baked in
+
+> **The ask (owner, 2026-08-30):** "images available as runners with vllm and
+> llama baked in so that you mount your data / cache of models and just go."
+> Chosen shape: the COMBINED runner+inference image (not a local compose
+> profile). Servers: **vLLM** and **ollama**.
+
+One image = one deployable node. `FROM` the upstream inference server, with the
+12.6 runner agent layered on top. You give a pod the model cache, a LazyAF
+server URL and a runner token; it starts the inference server, dials OUT over
+WebSocket, and its steps call the model on `localhost`. **Zero inbound
+connectivity** - which is what makes it work on runpod and behind home NAT
+alike, and why this is a runner image rather than a model image.
+
+- `lazyaf-runner-ollama` FROM `ollama/ollama` - mount `~/.ollama`; ollama pulls
+  models itself, so "mount your data and go" is literally true.
+- `lazyaf-runner-vllm` FROM `vllm/vllm-openai` - mount the HF cache; the
+  throughput option and the right one on a rented GPU.
+
+**We do NOT rebuild the inference servers.** Both upstreams publish official
+images; forking them means multi-GB pushes on every release plus tracking
+CUDA/torch/vLLM compatibility forever. We add a thin layer - the runner agent,
+an entrypoint that supervises two processes, and the endpoint declaration - and
+inherit their release engineering.
+
+Design points the wiring doc must settle:
+- **Two processes, one container.** The entrypoint starts the inference server,
+  waits for it to be healthy, then starts the runner agent, and propagates
+  signals and exit codes so a dead server does not leave a live runner
+  advertising a model that is gone.
+- **How the pod's endpoint gets registered.** 14.1 already has `runner-local`
+  reach mode plus `requires: {has: ["endpoint:<name>"]}` label matching, so the
+  minimum is: the operator registers the endpoint once and the pod advertises
+  the matching label from env. Whether the pod may ALSO self-register through
+  the API is a real decision - it is the difference between "just go" and a
+  node being able to write rows in your control plane.
+- **Image size is a release problem, not a detail.** A CUDA vLLM image is ~10GB.
+  These must not ride the normal per-tag image matrix; they need their own
+  trigger, their own cadence, and a documented "build it yourself" path.
+- **GPU passthrough** differs between runpod (automatic) and local
+  `docker run --gpus`; the docs must not assume either.
+
 ### Open questions
 
 - Which model families are worth pinning as known-good in the docs, and do we

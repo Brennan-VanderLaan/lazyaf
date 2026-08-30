@@ -1082,6 +1082,91 @@ Decisions made DURING implementation (all shipped and gate-verified):
 
 ---
 
+## Milestone 14 — Self-Hosted & OpenAI-Compatible Model Endpoints
+
+> **The ask (owner, 2026-08-30):** run agents against models we host ourselves —
+> ollama and vLLM on bare metal at home, or on runpod.io — so "all sorts of AI
+> models" can be in the mix. Push-style: LazyAF reaches out when it wants work
+> done, never a long-poll loop.
+>
+> **Sequencing:** independently valuable for the product (cheap local models
+> doing routine work), AND a hard prerequisite for Milestone 13's central
+> hypothesis — "a high-end model writes instructions, K cheap models execute in
+> parallel" is unmeasurable without cheap models. It can be built in parallel
+> with 13.1/13.2; 13.3's headline experiment depends on it.
+
+### The thing that is actually hard
+
+The transport is easy and already push: LazyAF is the HTTP client, so calling
+`/v1/chat/completions` involves no polling by anyone. **The hard part is that
+ollama and vLLM are inference servers, not agents.** Claude Code and the Gemini
+CLI ship their own agent loop — read files, edit, run commands, iterate until
+done. A raw OpenAI-compatible endpoint gives you completions and nothing else.
+So LazyAF has to supply the loop.
+
+### Decisions (owner, 2026-08-30)
+
+- **We own the loop.** A minimal tool-calling harness in `runner-common`
+  (read/write/list files, run shell, apply patches, stop conditions) running
+  inside the existing control-mode container, as a new entry in the `EXECUTORS`
+  registry beside claude/gemini/mock. Wrapping an existing OSS agent CLI was
+  rejected for a specific reason: Milestone 13 makes *loop shape* the
+  independent variable, and a loop we do not own is one we cannot vary.
+- **All three reachability modes**, because the deployments genuinely differ:
+  | Mode | For | How |
+  |---|---|---|
+  | `runner-local` | Home bare metal behind NAT | A 12.6 runner agent runs on the box hosting ollama; the backend pushes the step there over WS and the step container calls `localhost`. Zero inbound connectivity, no tunnel. |
+  | `direct` (default) | runpod, any routable endpoint | The step container calls the endpoint URL itself. |
+  | `proxy` | Central auth/logging | The backend brokers the call. Convenient, but it puts inference traffic through the backend and makes it a bottleneck — opt in per endpoint, never the default. |
+- **Capability is probed and recorded, not assumed.** Tool-calling support is
+  inconsistent across self-hosted models (ollama supports it for some; vLLM
+  depends on model plus chat template). Probe at registration, store the result
+  on the endpoint, and let the strategy decide — which turns "does tool support
+  matter?" from an assumption into something Milestone 13 can measure.
+- **Cost: tokens always, dollars when known.** Token counts come from the
+  OpenAI-compatible `usage` field. An endpoint may carry a $/hour rate (a
+  runpod pod rate, or an estimate for home hardware); when set, cost is
+  rate x wall-clock occupancy recorded as `cost_source="gpu-node"`. When unset,
+  tokens are recorded and cost stays null, and the board must show WHICH trials
+  have real cost data rather than silently mixing them.
+
+### What already anticipates this
+
+`StepUsage.provider` already includes `openai-compatible` and `self-hosted`;
+`cost_source` already includes `gpu-node`; and 12.6 deliberately kept the
+runner-agent's executor seam Docker-agnostic and pluggable for exactly this.
+The work is a new executor plus an endpoint registry, not a re-architecture.
+
+### Phases
+
+- **14.1 — Endpoint registry.** A `ModelEndpoint` entity (name, base_url, model,
+  auth style + secret reference, reach mode, optional $/hour, probed
+  capabilities), CRUD, a health/capability probe, and secret handling that
+  reuses the 12.5 `secret_environment` path so a key never reaches
+  `docker inspect`. Endpoints with no auth (typical LAN ollama) are first-class.
+- **14.2 — The agent harness.** The tool-calling loop in `runner-common`, with a
+  no-tools fallback for models that cannot tool-call, bounded iterations and
+  budget, and usage reporting through the existing sidecar so self-hosted runs
+  land in `StepUsage` like every other step.
+- **14.3 — UI category.** A Model Endpoints surface (register, probe, health,
+  capabilities, rate) and endpoint selection wherever an agent is chosen: agent
+  step config, card creation, playground, and the 12.6.5 experiment matrix — the
+  last one is what lets a matrix mix API and self-hosted models in one run.
+- **14.4 — Prove it.** A dogfood step running against a real self-hosted
+  endpoint, and the Milestone 13 fan-out hypothesis finally runnable:
+  expensive planner, K cheap local workers, measured.
+
+### Open questions
+
+- Which model families are worth pinning as known-good in the docs, and do we
+  ship a capability matrix or let the probe speak for itself?
+- Context-window limits vary wildly on local models; does the harness truncate,
+  summarize, or refuse when a repo context exceeds them?
+- Concurrency: one local GPU serving K parallel fan-out workers will queue.
+  Does the endpoint carry a max-concurrency the scheduler respects?
+
+---
+
 ## Milestone 13 — Benchmark & Evaluation Harness
 
 > **The question this answers:** take a repo at a known state, set the AI loop

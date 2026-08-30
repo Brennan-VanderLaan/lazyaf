@@ -1,0 +1,9 @@
+# Mirrors images/base/.dockerignore. scripts/build_images.py already filters
+# STAGE_EXCLUDE out of the staged context (so the content-hash label cannot
+# lie about image content); this is the belt-and-braces copy for anyone who
+# builds the staged directory by hand.
+# NOTE: patterns anchor at the context root — nested directories need **/.
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+**/.venv

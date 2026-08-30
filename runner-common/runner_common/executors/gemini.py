@@ -109,10 +109,23 @@ class GeminiExecutor(AgentExecutor):
             streaming: If True, stream output in real-time.
 
         Returns:
-            ExecutorResult with success status, output, and any errors.
+            ExecutorResult with success status, output, and any errors —
+            with ``usage`` scraped from the CLI's usage summary (Phase 12.5,
+            cross-agent contract #4). The Gemini CLI reports tokens but not
+            dollars, so a successful scrape still yields ``cost_usd=null``
+            and ``cost_source="unknown"``; scraping never changes the
+            result's success or exit code.
         """
+        from ..usage import scrape_gemini_usage
+
         # Ensure config is set up
         self.setup_config(log_callback)
 
         # Call parent execute
-        return super().execute(config, log_callback, streaming)
+        result = super().execute(config, log_callback, streaming)
+        result.usage = scrape_gemini_usage(
+            result.stdout,
+            result.stderr,
+            fallback_model=config.model,
+        )
+        return result

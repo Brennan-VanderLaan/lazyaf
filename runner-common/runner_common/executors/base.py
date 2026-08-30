@@ -30,6 +30,18 @@ class ExecutorResult:
     error: Optional[str] = None
     """Error message if execution failed."""
 
+    usage: Optional[dict] = None
+    """Resource accounting scraped from the agent's own report (Phase 12.5,
+    cross-agent contract #4 — the ONE new field on this dataclass this wave).
+
+    A partial ``UsageManifest`` dict as produced by ``runner_common.usage``:
+    provider / model / token counts / cost_usd / cost_source / raw. The
+    EXECUTOR fills it (it is the only component that knows its CLI's output
+    shape); the wrapper stays dumb and just hands it to
+    ``usage.write_usage_manifest``. ``None`` means "this executor reported
+    nothing", which the wrapper records as ``cost_source="unknown"`` — a
+    fact, not a gap."""
+
 
 @dataclass
 class ExecutorConfig:

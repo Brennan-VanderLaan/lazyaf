@@ -17,6 +17,10 @@ Retry policy is asymmetric on purpose:
 - test-results (12.2.6): same tight budget as logs — manifest delivery runs
   at step shutdown and must never wedge or fail the step; a failed POST is
   surfaced in the final status error by run.py.
+- usage (12.5, protocol channel #4): same tight budget as logs, same reason.
+  Accounting is telemetry ABOUT the work; it must never be able to fail the
+  work. A 409 (the StepExecution already went terminal) is a non-retryable
+  drop, not an error to retry against.
 """
 import threading
 import time
@@ -232,6 +236,35 @@ class BackendClient:
             json=manifest,
         )
         return response is not None and 200 <= response.status_code < 300
+
+    def send_usage(self, manifest: Dict) -> Optional[int]:
+        """
+        POST a usage manifest (12.5, cross-agent contract #2/#3) to
+        /api/steps/{step_id}/usage.
+
+        Returns the HTTP STATUS CODE rather than a bool — unlike
+        /test-results, the caller must distinguish outcomes:
+
+        - 2xx: recorded
+        - 409: the StepExecution already went terminal. A non-retryable
+          DROP: the run is over, the row cannot be written, and re-POSTing
+          would only burn the shutdown budget. run.py WARNs and continues.
+        - other 4xx (e.g. 422 on an unknown version): the manifest was
+          rejected; WARN with the code so the drift is nameable.
+        - None: the tight retry budget was exhausted (network / 5xx).
+
+        Tight budget like /logs on purpose: delivery runs at step shutdown
+        and must never wedge the step behind a flapping backend. NOTHING
+        this method returns ever changes the step's exit code.
+        """
+        response = self._request_with_retry(
+            "POST",
+            "usage",
+            max_retries=self.LOG_MAX_RETRIES,
+            total_timeout=self.LOG_TOTAL_TIMEOUT,
+            json=manifest,
+        )
+        return response.status_code if response is not None else None
 
     def heartbeat(self, extend_seconds: Optional[int] = None) -> bool:
         """

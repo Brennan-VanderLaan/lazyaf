@@ -1347,6 +1347,78 @@ def create_prompt_template(name: str, description: str = "", content: str = "") 
         return template
 
 
+# =============================================================================
+# Test Tie-Back (Phase 12.2.6) Tools
+# =============================================================================
+
+@mcp.tool()
+def list_test_refs(repo_id: str = "", criterion_id: str = "", status: str = "") -> dict:
+    """
+    List test refs (stable test identifiers registered with LazyAF).
+
+    A TestRef joins a repo test (by its lazyaf_test_id marker) to an
+    acceptance criterion; its runs flow in via the pipeline test-result
+    manifest channel.
+
+    A TestRef is identified by the PAIR (repo_id, lazyaf_test_id): the same
+    marker string in two repos is two independent refs. Pass repo_id whenever
+    you know it — without it this lists every repo's refs, and two rows with
+    the same lazyaf_test_id are NOT duplicates.
+
+    Args:
+        repo_id: Filter by repository ID (strongly recommended)
+        criterion_id: Filter by acceptance criterion ID (optional)
+        status: Filter by ref status - "active" or "orphan" (optional)
+
+    Returns test refs in {"test_refs": [...]} format with lazyaf_test_id,
+    repo_id, file_path, criterion_id, and status.
+    """
+    with _get_client() as client:
+        params = {}
+        if repo_id:
+            params["repo_id"] = repo_id
+        if criterion_id:
+            params["criterion_id"] = criterion_id
+        if status:
+            params["status"] = status
+
+        response = client.get("/api/test-refs", params=params)
+        if response.status_code == 404:
+            return {"error": f"Repo {repo_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to list test refs: {response.text}"}
+        return {"test_refs": response.json()}
+
+
+@mcp.tool()
+def get_criterion_history(criterion_id: str, limit: int = 20, branch: str = "") -> dict:
+    """
+    Get the TestRun history for an acceptance criterion.
+
+    Returns the series of test runs (newest first) for tests linked to the
+    criterion via TestRefs — each run carrying commit, branch, status,
+    duration, and (when part of an experiment) model/prompt context.
+
+    Args:
+        criterion_id: The acceptance criterion ID
+        limit: Maximum runs to return (default 20)
+        branch: Filter by branch (optional)
+
+    Returns the run series in {"history": [...]} format.
+    """
+    with _get_client() as client:
+        params = {"limit": limit}
+        if branch:
+            params["branch"] = branch
+
+        response = client.get(f"/api/criteria/{criterion_id}/history", params=params)
+        if response.status_code == 404:
+            return {"error": f"Criterion {criterion_id} not found"}
+        if response.status_code != 200:
+            return {"error": f"Failed to get criterion history: {response.text}"}
+        return {"history": response.json()}
+
+
 @mcp.tool()
 def link_card_to_story(card_id: str, user_story_id: str) -> dict:
     """

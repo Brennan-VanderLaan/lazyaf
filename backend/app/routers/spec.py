@@ -10,6 +10,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -137,29 +138,81 @@ async def _get_criterion_or_404(db: AsyncSession, criterion_id: str) -> Acceptan
 async def _story_done_blocked_by_required_criteria(
     db: AsyncSession, story: UserStory
 ) -> bool:
-    """Required-criterion-blocks-done rule — SHIPPED STUBBED (Phase 12.2.5).
+    """Required-criterion-blocks-done rule — ACTIVATED (Phase 12.2.6).
 
-    A required criterion with no passing TestRun SHOULD block its story from
-    reaching 'done', but TestRef/TestRun do not exist until Phase 12.2.6.
-    Until then this returns False (never blocks) and logs the fact so the
-    stub cannot go dark. The xfail(strict=True) test
-    test_required_criterion_blocks_story_done_requires_testruns documents
-    activation at 12.2.6.
+    A story cannot transition to 'done' while any REQUIRED acceptance
+    criterion is not CURRENTLY green. Non-required criteria never block, and
+    a criterion with no TestRun at all blocks (nothing measures it).
+
+    "Currently green" is deliberately latest-only, not "ever passed": a
+    criterion that passed last month and has been failing since is red, and a
+    historical pass must never unblock it (that is exactly the fake-green the
+    gate exists to catch). Per criterion, the ONE run that decides is:
+
+    - the newest run on the criterion's relevant branch — the default branch
+      of the repo its TestRef belongs to. Runs with no branch recorded
+      (manual runs, triggers without branch context) count as relevant: they
+      make no claim to be scratch work.
+    - if the criterion has no relevant run at all (every run came from a
+      named non-default branch), the newest run overall decides, so a repo
+      that only ever runs CI on feature branches still gets a verdict rather
+      than a permanent block.
+
+    Ordering is (created_at, id) so the verdict is deterministic when two
+    runs share a timestamp.
     """
-    result = await db.execute(
-        select(AcceptanceCriterion.id).where(
-            AcceptanceCriterion.user_story_id == story.id,
-            AcceptanceCriterion.required == True,  # noqa: E712
-        )
+    from app.models import Repo, TestRef, TestRun
+
+    required_ids = list(
+        (
+            await db.execute(
+                select(AcceptanceCriterion.id).where(
+                    AcceptanceCriterion.user_story_id == story.id,
+                    AcceptanceCriterion.required == True,  # noqa: E712
+                )
+            )
+        ).scalars()
     )
-    required_ids = [row[0] for row in result.all()]
-    if required_ids:
-        logger.info(
-            "Story %s marked done with %d required criteria unverified "
-            "(blocks-done rule is stubbed until 12.2.6)",
-            story.id,
-            len(required_ids),
+    if not required_ids:
+        return False
+
+    rows = (
+        await db.execute(
+            select(
+                TestRef.criterion_id,
+                TestRun.status,
+                TestRun.branch,
+                Repo.default_branch,
+            )
+            .join(TestRun, TestRun.test_ref_id == TestRef.id)
+            .join(Repo, Repo.id == TestRef.repo_id, isouter=True)
+            .where(TestRef.criterion_id.in_(required_ids))
+            .order_by(TestRun.created_at.desc(), TestRun.id.desc())
         )
+    ).all()
+
+    # Newest-first walk: the first row seen per criterion IS the latest one.
+    latest_relevant: dict[str, str] = {}
+    latest_any: dict[str, str] = {}
+    for criterion_id, status, branch, default_branch in rows:
+        latest_any.setdefault(criterion_id, status)
+        if branch is None or branch == default_branch:
+            latest_relevant.setdefault(criterion_id, status)
+
+    blocking_ids = [
+        criterion_id
+        for criterion_id in required_ids
+        if latest_relevant.get(criterion_id, latest_any.get(criterion_id)) != "passed"
+    ]
+    if blocking_ids:
+        logger.info(
+            "Story %s blocked from 'done': %d required criteria are not "
+            "currently green (%s)",
+            story.id,
+            len(blocking_ids),
+            ", ".join(blocking_ids),
+        )
+        return True
     return False
 
 
@@ -259,18 +312,161 @@ MILESTONE12_STORIES: list[dict] = [
 ]
 
 
-async def seed_milestone12(db: AsyncSession) -> tuple[Feature, bool]:
+# Starter-set annotation map (Phase 12.2.6): lazyaf_test_id -> the seeded
+# criterion it verifies, addressed as (story_index, criterion_index) into
+# MILESTONE12_STORIES. These ids are the @pytest.mark.lazyaf_test_id markers
+# carried by LazyAF's own tdd suite; seed-milestone12 upserts an active
+# TestRef for each, linked to the matching criterion, so a dogfood run of the
+# suite immediately produces TestRuns joined to the north-star criteria.
+# Two ids may verify the same criterion (a criterion can have many TestRefs).
+MILESTONE12_TEST_REF_SEEDS: list[dict] = [
+    # US-1 Commits land, AI workflows run
+    {
+        "lazyaf_test_id": "us1.push-triggered-run-executes-steps",
+        "file_path": "tdd/integration/api/test_pipeline_sync_on_push.py",
+        "story": 0, "criterion": 0,
+    },
+    {
+        "lazyaf_test_id": "us1.steps-run-in-isolated-containers",
+        "file_path": "tdd/integration/services/test_pipeline_local_execution.py",
+        "story": 0, "criterion": 1,
+    },
+    {
+        "lazyaf_test_id": "us1.step-status-streams-to-ui",
+        "file_path": "tdd/e2e/test_graph_pipeline.py",
+        "story": 0, "criterion": 1,
+    },
+    {
+        "lazyaf_test_id": "us1.pipeline-outcome-gates-branch",
+        "file_path": "tdd/integration/services/test_pipeline_local_execution.py",
+        "story": 0, "criterion": 2,
+    },
+    # US-2 Card dev loop
+    {
+        "lazyaf_test_id": "us2.start-card-begins-implementation",
+        "file_path": "tdd/e2e/test_card_execute.py",
+        "story": 1, "criterion": 0,
+    },
+    {
+        "lazyaf_test_id": "us2.card-completion-reaches-review",
+        "file_path": "tdd/e2e/test_card_execute.py",
+        "story": 1, "criterion": 2,
+    },
+    {
+        "lazyaf_test_id": "us2.review-shows-diff",
+        "file_path": "tdd/e2e/test_card_execute.py",
+        "story": 1, "criterion": 2,
+    },
+    # US-3 Compare bench
+    {
+        "lazyaf_test_id": "us3.prompt-variants-storable",
+        "file_path": "tdd/integration/api/test_spec_api.py",
+        "story": 2, "criterion": 0,
+    },
+    {
+        "lazyaf_test_id": "us3.criteria-queryable-for-scoring",
+        "file_path": "tdd/integration/api/test_spec_api.py",
+        "story": 2, "criterion": 1,
+    },
+]
+
+
+async def _upsert_milestone12_test_refs(
+    db: AsyncSession, feature: Feature, repo_id: str | None
+) -> None:
+    """Upsert active TestRefs for the starter-set annotations (idempotent).
+
+    Looks up each seeded criterion by (story title, criterion text) under the
+    given feature, then upserts a TestRef per MILESTONE12_TEST_REF_SEEDS
+    entry: existing refs (by unique lazyaf_test_id) are re-pointed and
+    flipped active; missing ones are created under repo_id. TestRef.repo_id
+    is NOT NULL, so without a repo_id (the dogfood caller passes LazyAF's own
+    ingested repo) ref seeding is skipped with a log line — the feature/
+    story/criterion seed itself never depends on a repo. Flushes only; the
+    caller commits.
+    """
+    if repo_id is None:
+        logger.info(
+            "seed-milestone12 called without repo_id; skipping starter-set "
+            "TestRef upsert (pass repo_id to link LazyAF's own suite)"
+        )
+        return
+
+    from app.models import TestRef
+
+    result = await db.execute(
+        select(UserStory).where(UserStory.feature_id == feature.id)
+    )
+    stories_by_title = {s.title: s for s in result.scalars().all()}
+
+    # (story title, criterion text) -> criterion id
+    criterion_ids: dict[tuple[str, str], str] = {}
+    for story in stories_by_title.values():
+        result = await db.execute(
+            select(AcceptanceCriterion).where(
+                AcceptanceCriterion.user_story_id == story.id
+            )
+        )
+        for criterion in result.scalars().all():
+            criterion_ids[(story.title, criterion.text)] = criterion.id
+
+    for seed in MILESTONE12_TEST_REF_SEEDS:
+        story_def = MILESTONE12_STORIES[seed["story"]]
+        key = (story_def["title"], story_def["criteria"][seed["criterion"]])
+        criterion_id = criterion_ids.get(key)
+        if criterion_id is None:  # seeded data was hand-edited; skip, don't die
+            logger.warning(
+                "Milestone12 TestRef seed: criterion not found for %s",
+                seed["lazyaf_test_id"],
+            )
+            continue
+
+        result = await db.execute(
+            select(TestRef).where(
+                TestRef.lazyaf_test_id == seed["lazyaf_test_id"]
+            )
+        )
+        ref = result.scalar_one_or_none()
+        if ref:
+            ref.criterion_id = criterion_id
+            ref.file_path = seed["file_path"]
+            ref.status = "active"
+        else:
+            db.add(
+                TestRef(
+                    lazyaf_test_id=seed["lazyaf_test_id"],
+                    repo_id=repo_id,
+                    file_path=seed["file_path"],
+                    criterion_id=criterion_id,
+                    status="active",
+                )
+            )
+    await db.flush()
+
+
+async def seed_milestone12(
+    db: AsyncSession, repo_id: str | None = None
+) -> tuple[Feature, bool]:
     """Idempotently seed the Milestone 12 feature with the three north-star
-    user stories and their acceptance criteria.
+    user stories and their acceptance criteria, plus (when repo_id is given)
+    active TestRefs for the starter-set suite annotations
+    (MILESTONE12_TEST_REF_SEEDS) under that repo.
 
     Idempotent by feature title: if a feature named MILESTONE12_FEATURE_TITLE
-    already exists, nothing is inserted and the existing row is returned.
+    already exists, no feature/story/criterion rows are inserted and the
+    existing row is returned — but the TestRef upsert still runs, so re-seeding
+    repairs missing or orphaned starter-set refs.
     """
+    if repo_id is not None:
+        await _validate_repo_ids(db, [repo_id])
     result = await db.execute(
         select(Feature).where(Feature.title == MILESTONE12_FEATURE_TITLE)
     )
     existing = result.scalar_one_or_none()
     if existing:
+        await _upsert_milestone12_test_refs(db, existing, repo_id)
+        await db.commit()
+        await db.refresh(existing)
         return existing, False
 
     feature = Feature(
@@ -301,15 +497,29 @@ async def seed_milestone12(db: AsyncSession) -> tuple[Feature, bool]:
                 )
             )
 
+    await db.flush()
+    await _upsert_milestone12_test_refs(db, feature, repo_id)
     await db.commit()
     await db.refresh(feature)
     return feature, True
 
 
+class SeedMilestone12Request(BaseModel):
+    """Optional seed context: the repo the starter-set TestRefs belong to
+    (in dogfood, LazyAF's own ingested repo). Without it the feature/story/
+    criterion seed still runs; only the TestRef upsert is skipped."""
+
+    repo_id: str | None = None
+
+
 @router.post("/api/features/seed-milestone12")
-async def seed_milestone12_endpoint(db: AsyncSession = Depends(get_db)):
+async def seed_milestone12_endpoint(
+    req: SeedMilestone12Request | None = None,
+    db: AsyncSession = Depends(get_db),
+):
     """Seed the Milestone 12 feature (idempotent by feature title)."""
-    feature, created = await seed_milestone12(db)
+    repo_id = req.repo_id if req else None
+    feature, created = await seed_milestone12(db, repo_id=repo_id)
     return {
         "feature": FeatureRead.model_validate(feature),
         "created": created,

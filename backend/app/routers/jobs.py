@@ -11,7 +11,6 @@ from app.database import get_db
 from app.models import Job, Card, PipelineRun, RunStatus, StepRun
 from app.schemas import JobRead
 from app.services import agent_run
-from app.services.runner_pool import runner_pool
 from app.services.websocket import manager
 
 logger = logging.getLogger(__name__)
@@ -319,9 +318,10 @@ async def job_callback(job_id: str, callback: JobCallback, db: AsyncSession = De
                 db, card, "in_progress", card.status
             )
 
-    # Mark runner as idle
-    if callback.status in ("completed", "failed"):
-        runner_pool.mark_runner_idle(job_id)
+    # 12.6: nothing to mark idle here any more. A `Job` row is now
+    # written only by the ad-hoc agent path (app/services/agent_run.py),
+    # which never involved a pooled runner; the runner lifecycle lives
+    # entirely on the runner socket and the registry owns it.
 
     # Notify pipeline executor if this job is part of a pipeline (Phase 9)
     if callback.status in ("completed", "failed") and job.step_run_id:

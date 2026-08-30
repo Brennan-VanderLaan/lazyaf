@@ -35,7 +35,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -43,6 +43,11 @@ from app.models import StepExecution, StepRun, StepExecutionStatus, StepUsage
 from app.schemas.testref import TestIngestResponse, TestResultsManifest
 from app.schemas.usage import StepUsageRead, UsageIngestResponse, UsageManifest
 from app.services.control_layer.auth import validate_step_token
+from app.services.execution.step_logs import (
+    SOURCE_CONTAINER,
+    StepRunMissing,
+    append_step_logs as write_step_logs,
+)
 from app.services.test_ingestion import ingest_manifest
 from app.services.usage_ingestion import ingest_usage
 from app.services.websocket import manager
@@ -244,24 +249,16 @@ async def append_step_logs(
     (no newline added) - the control runtime sends lines WITH their trailing
     newline (wire contract with images/base/control/backend_client.py).
 
-    Efficiency (12.3 adversarial review): ONE string join per POST, appended
-    with a targeted SQL expression (logs = COALESCE(logs,'') || :chunk) so
-    the existing log blob is never read-modify-written, ONE commit, and ONE
-    step_log_batch WS frame carrying the whole batch.
+    The append itself lives in
+    ``app.services.execution.step_logs.append_step_logs`` (12.6): this
+    endpoint and the runner WebSocket's ``log`` frame are two channels
+    writing StepRun.logs, and two channels with two writers is precisely the
+    duplication R3 exists to forbid. This handler keeps auth, the
+    terminal-write rejection, and the wire shape; the bytes, the single SQL
+    append and the one step_log_batch frame are the writer's.
     """
     execution = await verify_step_auth(step_id, authorization, db)
     _reject_terminal_writes(execution)
-
-    # Address the StepRun without loading its (potentially large) log blob.
-    result = await db.execute(
-        select(StepRun.pipeline_run_id, StepRun.step_index).where(
-            StepRun.id == execution.step_run_id
-        )
-    )
-    step_run_row = result.one_or_none()
-
-    if step_run_row is None:
-        raise HTTPException(status_code=404, detail="Step run not found")
 
     if request.lines:
         contents = [line.content for line in request.lines]
@@ -270,27 +267,12 @@ async def append_step_logs(
     else:
         contents = []
 
-    lines_appended = len(contents)
-    if contents:
-        chunk = "".join(contents)
-        await db.execute(
-            update(StepRun)
-            .where(StepRun.id == execution.step_run_id)
-            .values(logs=func.coalesce(StepRun.logs, "") + chunk)
-            .execution_options(synchronize_session=False)
-        )
-        await db.commit()
+    try:
+        await write_step_logs(db, execution, contents, source=SOURCE_CONTAINER)
+    except StepRunMissing:
+        raise HTTPException(status_code=404, detail="Step run not found")
 
-        # Sole writer of the step-log frames in control mode (R3): one
-        # step_log_batch frame per POST, lines rstripped of their trailing
-        # newline to match what the frontend renders per line.
-        await manager.publish_step_log_batch(
-            step_run_row.pipeline_run_id,
-            step_run_row.step_index,
-            [content.rstrip("\n") for content in contents],
-        )
-
-    return LogsResponse(lines_appended=lines_appended)
+    return LogsResponse(lines_appended=len(contents))
 
 
 @router.post("/{step_id}/heartbeat", response_model=HeartbeatResponse)

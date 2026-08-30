@@ -3,6 +3,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 from pydantic import BaseModel, field_validator, model_validator
+from sqlalchemy import inspect as sa_inspect
 
 from app.models.card import StepType
 from app.models.pipeline import ExecutorMode, RunStatus
@@ -219,10 +220,62 @@ class StepRunRead(BaseModel):
     # (cross-file contract #3) so an off-vocabulary value is a loud
     # validation error, never a silently misread string.
     executor: ExecutorMode | None = None
+    # Which RUNNER executed this step, when it went remote (12.6). Null on the
+    # local path, where the backend spawned the container itself.
+    #
+    # `executor` says which CODE PATH ran; this says which MACHINE did. They
+    # are different claims: a RemoteExecutor that gave up with "no runner
+    # matched" still records executor='remote', so the dogfood gate
+    # (scripts/verify_executor.py assertion 10) reads this field to tell a
+    # completed remote assignment from a remote step that never found a home.
+    # It is the assignment compare-and-swap's own output, read back.
+    runner_id: str | None = None
     logs: str = ""
     error: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_runner_id(cls, value):
+        """Take runner_id from the step's latest StepExecution.
+
+        A StepRun can have several executions (retries, and a remote requeue
+        after a runner death). The LAST one carrying a runner is the
+        assignment that produced the terminal outcome - the one an operator,
+        and `verify_executor.py` assertion 10, mean by "which runner ran
+        this step".
+
+        ONLY reads the relationship when it is already EAGER-LOADED. Touching
+        an unloaded relationship inside a pydantic validator would emit lazy
+        IO from a sync context and raise MissingGreenlet, turning an endpoint
+        that never asked for this field into a 500. Endpoints that want the
+        field say so with `selectinload(StepRun.executions)`; every other one
+        serializes runner_id as None, exactly as it did before this existed.
+        """
+        if isinstance(value, dict):
+            return value
+        try:
+            state = sa_inspect(value)
+            if "executions" in state.unloaded:
+                return value
+            executions = state.dict.get("executions")
+        except Exception:  # pragma: no cover - not an ORM instance
+            return value
+
+        runner_id = None
+        for execution in executions or ():
+            if execution.runner_id:
+                runner_id = execution.runner_id
+        if runner_id is None:
+            return value
+        data = {
+            field: getattr(value, field, None)
+            for field in cls.model_fields
+            if field != "runner_id"
+        }
+        data["runner_id"] = runner_id
+        return data
 
     class Config:
         from_attributes = True

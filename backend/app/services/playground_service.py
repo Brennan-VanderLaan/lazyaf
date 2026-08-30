@@ -6,8 +6,8 @@ starts an AD-HOC AGENT RUN (``app.services.agent_run``) - an ephemeral hidden
 Pipeline row plus a real PipelineRun with one agent step - so a playground
 test gets the workspace volume, StepRun/StepExecution rows, control mode,
 streamed logs, and a StepUsage row for free, on exactly the same path a
-pipeline agent step takes. Nothing here talks to ``job_queue`` any more
-(asserted by ``tdd/unit/services/test_no_legacy_enqueue.py``).
+pipeline agent step takes. The polling queue this once fed is gone
+entirely as of 12.6 (``tdd/unit/services/test_no_legacy_code.py``).
 
 Two consequences worth stating, because both replaced a race:
 

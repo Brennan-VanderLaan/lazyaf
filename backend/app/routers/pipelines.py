@@ -342,7 +342,7 @@ async def run_pipeline(
     result = await db.execute(
         select(PipelineRun)
         .where(PipelineRun.id == pipeline_run.id)
-        .options(selectinload(PipelineRun.step_runs))
+        .options(selectinload(PipelineRun.step_runs).selectinload(StepRun.executions))
     )
     pipeline_run = result.scalar_one()
 
@@ -363,7 +363,7 @@ async def list_pipeline_runs(
     result = await db.execute(
         select(PipelineRun)
         .where(PipelineRun.pipeline_id == pipeline_id)
-        .options(selectinload(PipelineRun.step_runs))
+        .options(selectinload(PipelineRun.step_runs).selectinload(StepRun.executions))
         .order_by(PipelineRun.created_at.desc())
         .limit(limit)
     )
@@ -378,7 +378,7 @@ async def list_all_pipeline_runs(
     db: AsyncSession = Depends(get_db)
 ):
     """List all pipeline runs with optional filters."""
-    query = select(PipelineRun).options(selectinload(PipelineRun.step_runs))
+    query = select(PipelineRun).options(selectinload(PipelineRun.step_runs).selectinload(StepRun.executions))
 
     if pipeline_id:
         query = query.where(PipelineRun.pipeline_id == pipeline_id)
@@ -397,7 +397,7 @@ async def get_pipeline_run(run_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(PipelineRun)
         .where(PipelineRun.id == run_id)
-        .options(selectinload(PipelineRun.step_runs))
+        .options(selectinload(PipelineRun.step_runs).selectinload(StepRun.executions))
     )
     run = result.scalar_one_or_none()
     if not run:
@@ -411,7 +411,7 @@ async def cancel_pipeline_run(run_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(PipelineRun)
         .where(PipelineRun.id == run_id)
-        .options(selectinload(PipelineRun.step_runs))
+        .options(selectinload(PipelineRun.step_runs).selectinload(StepRun.executions))
     )
     run = result.scalar_one_or_none()
     if not run:
@@ -429,7 +429,7 @@ async def cancel_pipeline_run(run_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(PipelineRun)
         .where(PipelineRun.id == run.id)
-        .options(selectinload(PipelineRun.step_runs))
+        .options(selectinload(PipelineRun.step_runs).selectinload(StepRun.executions))
     )
     run = result.scalar_one()
 

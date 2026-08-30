@@ -1,0 +1,307 @@
+# =============================================================================
+# LazyAF - cut a release (CLI wheel + onboarding assets)
+# =============================================================================
+#
+# THIS WORKFLOW PACKAGES; IT DOES NOT GATE.
+#
+#   LazyAF gates LazyAF. Whether the code deserves to be released is decided
+#   by LazyAF's own dogfood pipeline - PLAN.md's standing decision ("no
+#   external CI ever; self-host ASAP") is about TEST GATING and it still
+#   stands. Tagging is the human act that says "the dogfood pipeline blessed
+#   this revision and I want it published". Everything below is the packing
+#   and shipping that follows that decision.
+#
+#   So: do not add a test job here, and do not make a release conditional on
+#   one. The only things allowed to stop a release are "the artifact could
+#   not be built", "the artifact's version does not match the tag", and "the
+#   tree contains a credential".
+#
+# WHAT A RELEASE CONTAINS
+#   * lazyaf_cli-<version>-py3-none-any.whl  - `pip install` this
+#   * lazyaf_cli-<version>.tar.gz            - the sdist
+#   * docker-compose.release.yml + .env.example + preflight.py - what a
+#     stranger needs to run the whole stack without cloning anything. The
+#     compose header tells them to run preflight, so it has to ship WITH it.
+#
+#   The container images are NOT built here. images.yml publishes those to
+#   GHCR and is triggered by the SAME tag push, so the two run in parallel
+#   and a `v*` tag produces the complete set. They are separate workflows
+#   because they fail for completely different reasons and a broken frontend
+#   build should not withhold the wheel.
+#
+# HOW TO RELEASE
+#   1. Let the dogfood pipeline go green on the revision you want to ship.
+#   2. Bump `__version__` in cli/lazyaf/__init__.py.
+#   3. Tag it: `git tag v0.2.0 && git push origin v0.2.0`.
+#   4. This workflow and images.yml both fire on the tag.
+#
+# SECURITY POSTURE
+#   * Top-level `permissions: contents: read`. Exactly one job widens it, to
+#     `contents: write`, and only so `gh release` can attach files.
+#   * No third-party secret exists in this repository and none is referenced.
+#     The GH release step uses the automatic per-run GITHUB_TOKEN.
+#   * PyPI publishing is OPT-IN, manual, and tokenless - see the `pypi` job.
+#   * Never triggered by `pull_request`/`pull_request_target`, so fork code
+#     can never reach a job that holds a write token.
+#   * Every action is pinned to a commit SHA.
+# =============================================================================
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish_to_pypi:
+        description: >-
+          Also publish to PyPI. OFF by default and deliberately unavailable
+          from a tag push - see the `pypi` job before switching it on.
+        type: boolean
+        default: false
+
+# Least privilege. Overridden per job, upward, only where a write is
+# genuinely required.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Hard gate: no artifact is built, and certainly nothing is uploaded, until
+  # the tree is proven free of live-format credentials. A release is the worst
+  # possible moment to leak a key - it is the artifact people archive.
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    uses: ./.github/workflows/secret-scan.yml
+
+  # ---------------------------------------------------------------------------
+  # Build the wheel, prove it is installable, prove its version matches the
+  # tag, then attach it to the GitHub Release.
+  # ---------------------------------------------------------------------------
+  wheel:
+    name: cli wheel -> GitHub Release
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # The single elevated permission in this file, and the only step that
+      # uses it is `gh release`.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # `gh release create --verify-tag` needs to see the tag object.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          # The floor from cli/pyproject.toml's requires-python. Building on
+          # the oldest supported interpreter is what keeps the pure-python
+          # wheel honestly installable across the whole declared range.
+          python-version: '3.10'
+
+      - name: Build sdist and wheel
+        # Default (isolated) build, so the setuptools>=77 floor that
+        # cli/pyproject.toml needs for its PEP 639 license metadata is
+        # satisfied from the index rather than from whatever the runner
+        # happens to ship.
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --outdir dist cli/
+          ls -l dist/
+
+      - name: Check the wheel version matches the tag
+        # Skipped on a manual dispatch, where there is no tag to match. On a
+        # tag push this is a hard stop: a wheel published under the wrong
+        # version can never be corrected, only superseded.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python .github/scripts/check_release_version.py --tag "${TAG}" --dist dist
+        env:
+          TAG: ${{ github.ref_name }}
+
+      - name: Smoke test the built wheel
+        # A throwaway venv, never the job's python: this is what proves the
+        # wheel declares its own dependencies and installs a working console
+        # script, rather than borrowing something the build left behind.
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --no-cache-dir dist/*.whl
+          /tmp/smoke/bin/lazyaf --version
+          /tmp/smoke/bin/lazyaf --help
+
+      - name: Collect the onboarding assets
+        # Attached to the release so somebody can run the stack from two
+        # downloaded files without cloning the repo at all - the whole point
+        # of "trivial to start playing with".
+        #
+        # Missing files WARN rather than fail: these belong to the compose
+        # lane, and a rename there should not block a wheel release.
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp dist/* release-assets/
+          for asset in docker-compose.release.yml .env.example scripts/preflight.py; do
+            if [ -f "$asset" ]; then
+              cp "$asset" release-assets/
+            else
+              echo "::warning::$asset is missing; releasing without it"
+            fi
+          done
+          ls -l release-assets/
+
+      - name: Write the release notes
+        # Built from a file rather than `--generate-notes` so the body is
+        # deterministic and the onboarding instructions come FIRST - the
+        # commit log is interesting to us and useless to a newcomer.
+        run: |
+          set -euo pipefail
+          # The version as the WHEEL spells it (PEP 440), read off the
+          # filename. That is not always the tag minus its 'v' - `v1.0.0-rc1`
+          # produces `1.0.0rc1` - and the pip commands below have to be
+          # copy-pasteable.
+          WHEEL_NAME="$(basename "$(ls dist/*.whl | head -n1)")"
+          VERSION="$(echo "${WHEEL_NAME}" | cut -d- -f2)"
+          # Registries reject uppercase path segments and github.repository_owner
+          # is mixed case, so the GHCR path printed below has to be lowered or
+          # the copy-pasted `docker pull` fails.
+          OWNER_LC="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "## Install the CLI"
+            echo
+            echo '```bash'
+            echo "pip install https://github.com/${REPO}/releases/download/${TAG}/${WHEEL_NAME}"
+            echo '```'
+            echo
+            echo "## Run the stack"
+            echo
+            echo 'Download `docker-compose.release.yml` and `.env.example` from the assets below, then:'
+            echo
+            echo '```bash'
+            echo 'cp .env.example .env       # add your ANTHROPIC_API_KEY / GEMINI_API_KEY'
+            echo "echo LAZYAF_VERSION=${TAG} >> .env"
+            echo 'docker compose -f docker-compose.release.yml pull'
+            echo 'docker compose -f docker-compose.release.yml up -d'
+            echo '```'
+            echo
+            echo "Images for this release are published to \`ghcr.io/${OWNER_LC}/lazyaf/*\` under the tag \`${TAG}\` by the \`images\` workflow, which the same tag push triggers."
+            echo
+            echo "## Provenance"
+            echo
+            echo "CLI version \`${VERSION}\`, built from commit \`${SHA}\`."
+            echo "LazyAF's own dogfood pipeline is what tested this revision; GitHub Actions only packaged it."
+          } > release-notes.md
+          cat release-notes.md
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+
+      - name: Publish the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        # `gh` rather than a third-party release action: one fewer pinned
+        # dependency in the job that holds the only write token in this repo.
+        #
+        # Re-runnable on purpose. If the release already exists (a rerun after
+        # a transient failure), upload with --clobber instead of failing.
+        run: |
+          set -euo pipefail
+          PRERELEASE=""
+          case "${TAG}" in *-*) PRERELEASE="--prerelease" ;; esac
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists; replacing its assets"
+            gh release upload "${TAG}" release-assets/* --clobber
+          else
+            # shellcheck disable=SC2086
+            gh release create "${TAG}" release-assets/* \
+              --title "${TAG}" \
+              --notes-file release-notes.md \
+              --verify-tag \
+              ${PRERELEASE}
+          fi
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+      - name: Upload the dist for the (optional) PyPI job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lazyaf-cli-dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL: publish to PyPI. OFF unless a human asks for it.
+  #
+  # WHY OPT-IN RATHER THAN AUTOMATIC
+  #   A GitHub Release can be deleted and re-cut; a PyPI version is permanent
+  #   and can never be reused. Automatically pushing every tag to a global
+  #   index is a one-way door that should be opened on purpose, by a person,
+  #   after the wheel above has been built and smoke tested. Hence: reachable
+  #   ONLY through `workflow_dispatch` with publish_to_pypi checked - a tag
+  #   push can never reach this job.
+  #
+  # WHY NO API TOKEN
+  #   This uses PyPI Trusted Publishing (OIDC). The job mints a short-lived
+  #   token from GitHub's identity provider and hands it straight to PyPI;
+  #   nothing long-lived is ever stored in this repository, so there is no
+  #   PyPI credential here to steal, leak, or rotate. `id-token: write` is
+  #   the permission to REQUEST that identity - it grants no repo write.
+  #
+  # BEFORE THIS CAN WORK, once, by hand:
+  #   1. On PyPI: project `lazyaf-cli` -> Publishing -> add a trusted
+  #      publisher: owner `Brennan-VanderLaan`, repository `lazyaf`, workflow
+  #      `release.yml`, environment `pypi`.
+  #   2. On GitHub: Settings -> Environments -> create `pypi`, and add
+  #      yourself as a required reviewer so a publish needs an explicit
+  #      approval click on top of the dispatch input.
+  #   Until step 1 exists this job fails at the upload, which is the correct
+  #   behaviour: nothing half-published.
+  # ---------------------------------------------------------------------------
+  pypi:
+    name: publish to PyPI (opt-in)
+    needs: wheel
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      # Mint an OIDC identity. Deliberately NOT contents: write - this job
+      # publishes a package and touches nothing in the repository.
+      id-token: write
+      contents: read
+    steps:
+      - name: Refuse to publish anything that is not a tagged release
+        # `workflow_dispatch` lets you pick any ref, including a branch. A
+        # wheel built from a branch has whatever version __init__.py happens
+        # to say, which nothing has checked against a tag - and PyPI keeps it
+        # forever. Run the dispatch with a TAG selected in the ref dropdown;
+        # the wheel job then also runs its version check, so the artifact this
+        # job downloads is the one that was verified.
+        if: ${{ github.ref_type != 'tag' }}
+        run: |
+          echo "::error::PyPI publishing requires a tag. Re-run this workflow with a v* tag selected as the ref."
+          exit 1
+
+      - name: Download the dist built above
+        # Republishing the EXACT files that were smoke tested, rather than
+        # rebuilding them. A rebuild could differ from what was verified and
+        # from what the GitHub Release already carries.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: lazyaf-cli-dist
+          path: dist
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          # No `password:`. That absence is the point: the action detects the
+          # OIDC identity granted by `id-token: write` above and exchanges it
+          # for a short-lived PyPI token at publish time.
+          packages-dir: dist
+          print-hash: true

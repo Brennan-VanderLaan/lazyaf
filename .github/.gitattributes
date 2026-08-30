@@ -1,0 +1,13 @@
+# Force LF for everything in .github/, for the same reason images/.gitattributes
+# does it: these files are consumed by Linux.
+#
+# A workflow every `run:` block of which is executed by bash on an ubuntu
+# runner cannot survive a CRLF checkout - a trailing \r becomes part of the
+# last argument on every line, and the failure ("command not found" naming a
+# command that plainly exists) wastes an afternoon. The scanners are executed
+# the same way.
+#
+# core.autocrlf=input on the maintainer's machine already normalises on
+# commit, but that is a per-clone setting and this must not depend on how a
+# contributor happened to configure git.
+* text eol=lf

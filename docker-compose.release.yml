@@ -1,0 +1,163 @@
+# LazyAF - RELEASE compose (pull-only onboarding path).
+#
+# WHAT THIS IS
+#   The fastest way to run LazyAF without building anything. Every service
+#   here uses a PREBUILT image from GHCR; there is not a single `build:`
+#   stanza and not a single source bind-mount. Clone (or just download this
+#   one file plus .env.example), fill in a .env, `pull`, `up`. That is it.
+#
+# WHAT THIS IS NOT
+#   This is not the development stack and it is not a test harness. Use
+#   `docker-compose.yml` when you are working ON LazyAF (it builds from
+#   source, mounts ./backend/app for live reload, and carries the `e2e`
+#   profile). The images referenced here are RELEASE ARTIFACTS: they are
+#   packaged by the GitHub release workflow from a revision that LazyAF's own
+#   dogfood pipeline already tested. GitHub packages; it does not gate.
+#
+# DO NOT RUN THIS ALONGSIDE docker-compose.yml ON THE SAME HOST.
+#   Both stacks own the fixed-name `lazyaf-network` bridge (step and helper
+#   containers attach to it BY NAME, so the name cannot be project-scoped).
+#   Two compose projects cannot both own it. Bring one down before the other
+#   comes up. This file uses the project name `lazyaf-release` so that its
+#   volumes stay distinct from a dev stack's, which means the two also do not
+#   share a database.
+#
+# USAGE
+#   cp .env.example .env          # then edit: put your API keys in
+#   python scripts/preflight.py   # optional but recommended
+#   docker compose -f docker-compose.release.yml pull
+#   docker compose -f docker-compose.release.yml up -d
+#   open http://localhost:5173
+#
+# CHOOSING A VERSION
+#   LAZYAF_VERSION selects the image tag for every service at once. Set it in
+#   .env. See .env.example and QUICKSTART.md for how to pick one.
+#   LAZYAF_IMAGE_PREFIX overrides the registry/namespace if you mirror the
+#   images somewhere else or the published names differ from the defaults.
+
+name: lazyaf-release
+
+services:
+  # ---------------------------------------------------------------- backend
+  # REST API, SSE log streams, the internal git server (bare repos live on
+  # the lazyaf-data volume under /app/data/git_repos), the job queue, and the
+  # local executor that spawns step containers on the host docker daemon.
+  #
+  # Migrations run at startup from inside the image, so a fresh volume boots
+  # to head with no extra command.
+  backend:
+    image: ${LAZYAF_IMAGE_PREFIX:-ghcr.io/brennan-vanderlaan/lazyaf}/backend:${LAZYAF_VERSION:-latest}
+    ports:
+      - "${LAZYAF_BACKEND_PORT:-8000}:8000"
+    volumes:
+      # Database AND git repo storage. Back this up; it is all of your state.
+      - lazyaf-data:/app/data
+      # The local executor spawns step containers on the HOST daemon (DooD).
+      # This grants the backend container host-root-equivalent power over
+      # docker. That is the deliberate tradeoff of running the executor in a
+      # container; do not expose this stack to an untrusted network.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Shared workspace volume: step containers mount it so a repo cloned by
+      # one step, and tools installed into /workspace/home, survive to the next.
+      - lazyaf-workspaces:/workspaces
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/lazyaf.db
+      # Supplied by YOUR .env. Empty is fine until you actually run an AI
+      # agent; everything else in the product works without them.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
+      # These two are NOT secrets today: the values below are the same public
+      # defaults already compiled into backend/app/config.py, repeated here
+      # only so you can override them from .env without editing this file.
+      # Any deployment reachable from outside your machine MUST override both.
+      - LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:-lazyaf-step-auth-secret-key-change-in-production}
+      - LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:-lazyaf-runner-auth-secret-key-change-in-production}
+    networks:
+      - lazyaf-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------- frontend
+  # Svelte SPA served by nginx, which also reverse-proxies /api and /ws to
+  # the backend. That is why the UI works same-origin on one port and why you
+  # do not need to configure CORS.
+  frontend:
+    image: ${LAZYAF_IMAGE_PREFIX:-ghcr.io/brennan-vanderlaan/lazyaf}/frontend:${LAZYAF_VERSION:-latest}
+    ports:
+      - "${LAZYAF_FRONTEND_PORT:-5173}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - lazyaf-network
+    restart: unless-stopped
+
+  # ----------------------------------------------------------- runner-agent
+  # OPTIONAL, and off by default: start it with `--profile runner`.
+  #
+  # You do not need this to use LazyAF. Without it, every pipeline step runs
+  # on the backend's own local executor. A runner agent exists so steps can
+  # run on a machine the backend does not own: it dials the backend over
+  # /ws/runner, enrols itself with a set of capability labels, and executes
+  # steps pinned to those labels via a `requires:` block in the pipeline.
+  #
+  # Enabling this on the SAME host mostly demonstrates the mechanism. The
+  # real payoff is running this image on a different machine, pointed at your
+  # backend's URL.
+  runner-agent:
+    image: ${LAZYAF_IMAGE_PREFIX:-ghcr.io/brennan-vanderlaan/lazyaf}/runner-agent:${LAZYAF_VERSION:-latest}
+    profiles:
+      - runner
+    environment:
+      - LAZYAF_BACKEND_URL=http://backend:8000
+      # STABLE across restarts on purpose. A fresh id per process orphans a
+      # registry row every restart and makes the fleet look twice its size.
+      - LAZYAF_RUNNER_ID=${LAZYAF_RUNNER_ID:-local-runner-1}
+      - LAZYAF_RUNNER_NAME=${LAZYAF_RUNNER_NAME:-local runner}
+      - LAZYAF_RUNNER_TYPE=generic
+      # Advertised capabilities. Pin a step to this agent with
+      # `requires: [has=docker]` (or your own label) in the pipeline YAML.
+      - LAZYAF_RUNNER_LABELS=${LAZYAF_RUNNER_LABELS:-has=docker}
+      - LAZYAF_ORCHESTRATOR=docker
+      # Step containers this agent spawns must reach the backend and the
+      # internal git server by service DNS, so they join the shared network.
+      - LAZYAF_STEP_NETWORK=lazyaf-network
+      - LAZYAF_STEP_BACKEND_URL=http://backend:8000
+      # Must match the backend's LAZYAF_RUNNER_AUTH_SECRET above.
+      - LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:-lazyaf-runner-auth-secret-key-change-in-production}
+      # The agent REFUSES plaintext ws:// to a non-loopback host by default,
+      # because the execute_step frame carries the step JWT and the step's
+      # secret environment. `backend` is a compose service name, not
+      # loopback, so this same-host arrangement needs the opt-out. It is
+      # bounded here: the frame never leaves a private bridge on one machine.
+      # A runner on a REAL remote host must use wss:// instead of this.
+      - LAZYAF_RUNNER_ALLOW_INSECURE=1
+    volumes:
+      # Same DooD tradeoff as the backend: this agent spawns step containers
+      # on the host daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - lazyaf-network
+    restart: unless-stopped
+
+networks:
+  lazyaf-network:
+    # Fixed, project-independent name. Step and workspace-population
+    # containers are spawned by the backend OUTSIDE of compose and attach to
+    # this network by this literal name, so it must not be project-scoped.
+    name: lazyaf-network
+
+volumes:
+  # Named volumes, project-scoped (lazyaf-release_*). `docker compose -f
+  # docker-compose.release.yml down -v` deletes your repos, cards and history.
+  lazyaf-data:
+  lazyaf-workspaces:

@@ -1,58 +1,311 @@
 # LazyAF Quick Start
 
-## 1. Start everything
+Run the whole stack from prebuilt images. No compiler, no Node, no Python
+environment for the services themselves — just Docker.
+
+**Before you start, know this:** LazyAF gives a container access to your
+Docker socket so it can run pipeline steps. That is root-equivalent on your
+machine. Run it on a machine you trust, bound to localhost. Do not put this
+on the open internet.
+
+---
+
+## What you need
+
+- **Docker Engine 24+ with Compose v2** (`docker compose version` must work).
+  Docker Desktop on Windows/macOS includes both.
+- **~15 GB free disk** for images and workspaces.
+- **An API key** for [Anthropic](https://console.anthropic.com/) and/or
+  [Google Gemini](https://aistudio.google.com/apikey) — only if you want AI
+  agents to do work. Everything else runs without one.
+- **Python 3.10+** — only for the optional `lazyaf` CLI and the preflight
+  check. The stack itself does not need it.
+
+---
+
+## 1. Get the repo
 
 ```bash
-cp .env.example .env
-# Edit .env with your API keys (Anthropic and/or Gemini)
-
-docker compose up -d
+git clone https://github.com/Brennan-VanderLaan/lazyaf.git
+cd lazyaf
 ```
 
-Open http://localhost:5173
+You only strictly need `docker-compose.release.yml` and `.env.example`, but
+the clone also gets you the CLI source and the preflight script.
 
-## 2. Import a repo
+## 2. Make your `.env`
 
 ```bash
-pip install -e cli/
+cp .env.example .env          # Windows: copy .env.example .env
+```
+
+Open `.env` and paste in whichever API keys you have. Every other variable is
+optional — the defaults are correct for this compose file.
+
+`.env` is gitignored. Never commit it, and never put a real key in
+`.env.example`.
+
+> **Careful what you paste in public.** `docker compose config` and
+> `docker inspect` print the *interpolated* environment — your API keys in
+> plain text. Redact before sharing either one in an issue. `docker compose
+> logs` is safe; `scripts/preflight.py` never prints a value at all.
+
+## 3. Preflight (optional, recommended)
+
+```bash
+python scripts/preflight.py
+```
+
+It checks Docker, free ports, disk space, whether your `.env` has usable keys
+(it inspects shape only and never prints a value), and whether the images it
+needs are available. Every failure it reports comes with the command that
+fixes it. It changes nothing.
+
+## 4. Pull and start
+
+Pick a version first — put it in `.env` as `LAZYAF_VERSION` (see
+[Choosing a version](#choosing-a-version)). Then:
+
+```bash
+docker compose -f docker-compose.release.yml pull
+docker compose -f docker-compose.release.yml up -d
+```
+
+Open **http://localhost:5173**.
+
+The API is on http://localhost:8000, with interactive docs at
+http://localhost:8000/docs and a health check at http://localhost:8000/health.
+
+> **If `pull` fails with "manifest unknown":** no release has been published
+> at that tag yet. Either pick a tag that exists on the
+> [packages page](https://github.com/Brennan-VanderLaan/lazyaf/pkgs/container/lazyaf%2Fbackend),
+> or [build from source](#building-from-source-instead) — it is one command
+> and works today.
+
+> **Do not run this alongside the development stack** (`docker-compose.yml`).
+> Both own the fixed-name `lazyaf-network` bridge, and only one compose
+> project can. Bring one down before starting the other.
+
+## 5. Get the step images
+
+Pipeline steps and AI agent cards run inside dedicated step images. The
+backend looks them up by their **local** tag — `lazyaf-claude:dev` and
+friends — and it deliberately does **not** pull them for you: a missing image
+fails the step with a clear message rather than downloading something behind
+your back.
+
+The easiest way is to let preflight write the commands for you — it reads the
+image list from `scripts/build_images.py`, so it is right even when the set
+changes between releases:
+
+```bash
+python scripts/preflight.py
+```
+
+It prints a `docker pull` + `docker tag` pair, filled in with your version,
+for every step image you are missing. Copy and run them.
+
+By hand, if you prefer:
+
+```bash
+PREFIX=ghcr.io/brennan-vanderlaan/lazyaf
+VERSION=<the same tag you set as LAZYAF_VERSION>
+
+# Published as $PREFIX/<name> - the registry path already says "lazyaf", so
+# the image name does not repeat it. Locally they are lazyaf-<name>:dev,
+# which is the name the backend looks for, hence the retag.
+for name in base debug-sidecar agent-base claude gemini test-runner; do
+  docker pull $PREFIX/$name:$VERSION
+  docker tag  $PREFIX/$name:$VERSION lazyaf-$name:dev
+done
+```
+
+PowerShell:
+
+```powershell
+$PREFIX = "ghcr.io/brennan-vanderlaan/lazyaf"
+$VERSION = "<the same tag you set as LAZYAF_VERSION>"
+
+# Remote name drops the "lazyaf-" prefix; the local tag keeps it.
+foreach ($name in "base","debug-sidecar","agent-base",
+                  "claude","gemini","test-runner") {
+  docker pull "$PREFIX/${name}:$VERSION"
+  docker tag  "$PREFIX/${name}:$VERSION" "lazyaf-${name}:dev"
+}
+```
+
+That list is a snapshot; the authoritative one is the `IMAGES` table in
+`scripts/build_images.py`.
+
+Building from source instead? `python scripts/build_images.py` builds them
+all and skips any that are already current.
+
+## 6. Install the CLI
+
+The `lazyaf` CLI ingests your local repos into the platform and lands
+finished branches back onto your real remote.
+
+```bash
+pip install ./cli
+```
+
+Or, if a release has published a wheel, download
+`lazyaf_cli-<version>-py3-none-any.whl` from the
+[releases page](https://github.com/Brennan-VanderLaan/lazyaf/releases) and:
+
+```bash
+pip install lazyaf_cli-<version>-py3-none-any.whl
+```
+
+It is not on PyPI. Check it works:
+
+```bash
+lazyaf --version
+lazyaf list          # talks to http://localhost:8000; override with LAZYAF_SERVER
+```
+
+## 7. Ingest a repo
+
+```bash
 lazyaf ingest /path/to/your/repo --name my-project
 ```
 
-## 3. Create and run a card
+This creates the repo inside LazyAF's internal git server, adds a git remote
+called `lazyaf` to your local checkout, and pushes your current branch to it.
+Your real `origin` is never touched — agents only ever work on branches
+inside LazyAF.
 
-1. Select your repo in the UI
-2. Click "New Card"
-3. Title: "Document the project"
-4. Description: "Create a file called rocks-that-think.txt explaining what this project does"
-5. Click "Create", then "Start"
-6. Watch the agent work in real-time
-7. Review the diff when done, then Approve or Reject
+Add `--all-branches` to push everything, or `--branch <name>` to pick one.
 
-## 4. Sync changes
+## 8. Run your first card
 
-The CLI adds `lazyaf` as a git remote. Use standard git commands:
+1. In the UI (**Board**), select your repo.
+2. Add a card. Give it a title and a description — the description is the
+   agent's task.
+   > Title: `Document the project`
+   > Description: `Create a file called rocks-that-think.txt explaining what this project does`
+3. Create it, then **Start**.
+4. Watch the log stream while the agent works on its own branch.
+5. When it finishes, review the diff and **Approve** (merges to the target
+   branch) or **Reject**. **Retry** re-runs it.
+
+No API key set, or the step images missing? The card will fail with a message
+saying which. That is the expected behaviour, not a crash.
+
+## 9. Get the work back
+
+`ingest` left a `lazyaf` remote in your checkout, so plain git works:
 
 ```bash
-# Push local changes to lazyaf
-git push lazyaf main
-
-# Pull agent changes back to local
 git fetch lazyaf
 git merge lazyaf/card-123-feature-name
-
-# Or cherry-pick specific commits
-git cherry-pick <commit-sha>
 ```
 
-## Extras
+Or push a LazyAF branch straight to your real remote:
 
-**Playground** - Test prompts without creating cards
+```bash
+lazyaf branches <repo-id>                       # see what is there
+lazyaf land <repo-id> --branch card-123-name    # pushes to origin
+lazyaf land <repo-id> --branch card-123-name --pr   # ...and opens a PR via gh
+```
 
-**Pipelines** - Automate multi-step workflows
+---
 
-**Remote runners** - `docker compose up -d runner-agent` starts a runner
-agent that enrols over `/ws/runner`. Pin a step to it with a `requires:`
-block in the pipeline definition; anything without one runs on the backend's
-own local executor.
+## Choosing a version
 
-See `PLAN.md` for architecture details.
+`LAZYAF_VERSION` in `.env` sets the image tag for every service at once.
+
+| Tag | What it is |
+|-----|-----------|
+| `v0.1.0`, `v0.2.0`, … | A published release. **Use this.** Reproducible — the tag never moves. |
+| `main` | The tip of the default branch. Moves under you; expect breakage. |
+| `latest` | Whatever the most recent release build pushed. Convenient, not reproducible. |
+
+Published tags are listed on the
+[packages page](https://github.com/Brennan-VanderLaan/lazyaf/pkgs/container/lazyaf%2Fbackend)
+and the [releases page](https://github.com/Brennan-VanderLaan/lazyaf/releases).
+
+Keep the step images (step 5) on the same tag as the services. Mixing
+versions is not tested.
+
+## Everyday commands
+
+```bash
+# logs
+docker compose -f docker-compose.release.yml logs -f backend
+
+# stop, keeping all your data
+docker compose -f docker-compose.release.yml down
+
+# upgrade: change LAZYAF_VERSION in .env, then
+docker compose -f docker-compose.release.yml pull
+docker compose -f docker-compose.release.yml up -d
+
+# DELETE EVERYTHING: repos, cards, pipeline history, workspaces
+docker compose -f docker-compose.release.yml down -v
+```
+
+Your state lives in two named volumes, `lazyaf-release_lazyaf-data` (SQLite
+database + the internal bare git repos) and
+`lazyaf-release_lazyaf-workspaces` (step working directories). `down -v`
+destroys both.
+
+## Optional: a runner agent
+
+By default every pipeline step runs on the backend's own executor. A runner
+agent lets steps run on a machine the backend does not own — it dials the
+backend over `/ws/runner`, advertises capability labels, and picks up steps
+pinned to those labels with a `requires:` block in the pipeline definition.
+
+```bash
+docker compose -f docker-compose.release.yml --profile runner up -d
+```
+
+On the same host this mostly demonstrates the mechanism. The real use is
+running that image on another machine pointed at your backend's URL — in
+which case use `wss://`, because the step dispatch frame carries the step's
+credentials.
+
+## Building from source instead
+
+Everything above assumes published images. If none exist yet, or you are
+working on LazyAF itself, build locally — the dev stack is the same topology
+with live source mounts:
+
+```bash
+cp .env.example .env      # then edit
+docker compose up -d --build
+python scripts/build_images.py     # the lazyaf-*:dev step images
+python scripts/preflight.py --dev  # checks the source-build path
+```
+
+## Troubleshooting
+
+**`docker compose` says "port is already allocated"** — something else owns
+8000 or 5173. Set `LAZYAF_BACKEND_PORT` / `LAZYAF_FRONTEND_PORT` in `.env`,
+or stop the other process. `preflight.py` names the container when a
+container is the culprit.
+
+**"network lazyaf-network was found but has incorrect label"** — the dev
+stack and the release stack are both trying to own that network. Bring the
+other one down first.
+
+**The UI loads but everything is empty** — nothing has been ingested yet.
+Run `lazyaf ingest` (step 7). If `lazyaf list` cannot connect, the backend is
+not up: `docker compose -f docker-compose.release.yml logs backend`.
+
+**A card or step fails with "Image not found: lazyaf-…:dev"** — you skipped
+step 5, or the tags did not get applied. Re-run `python scripts/preflight.py`
+and follow what it prints.
+
+**An agent card fails immediately** — usually a missing or wrong API key.
+Check `preflight.py`, fix `.env`, then recreate the backend so it picks the
+new value up: `docker compose -f docker-compose.release.yml up -d backend`.
+
+**Windows: `git` line endings churn in ingested repos** — set
+`git config core.autocrlf input` in the repo you are ingesting.
+
+---
+
+More detail: [README.md](README.md) for what LazyAF is and how the pieces fit
+together, `PLAN.md` for the project's own roadmap and engineering decisions.

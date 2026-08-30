@@ -6,6 +6,8 @@ Usage:
     lazyaf land <repo_id> --branch feature/foo
     lazyaf tests reconcile <repo_id> --refs refs.json
     lazyaf tests reconcile <repo_id> --from-collect
+    lazyaf debug rerun <run_id> --break build
+    lazyaf debug resume <session_id>
 """
 
 import json
@@ -721,6 +723,274 @@ def reconcile(
             title="Test refs",
         )
     )
+
+
+
+# =============================================================================
+# Debug re-run (Phase 12.7)
+# =============================================================================
+#
+# `lazyaf debug` is a click GROUP, not `lazyaf debug <id> --resume`. Stated as
+# a deliberate deviation from PLAN's flag forms: a flag that changes the verb
+# is not a flag, a group gives real per-verb `--help`, and `lazyaf tests
+# reconcile` is the precedent already in this file.
+#
+# Every verb here is plain HTTP. Controlling a debug session - resuming it,
+# aborting it, extending its deadline - never depends on having a TTY, which
+# is also why the terminal's `@`-commands are a convenience rather than the
+# only way in.
+
+
+DEBUG_ATTACH_NOT_INTERACTIVE = (
+    "This build's `attach` mints and prints the join credential; it does not "
+    "open an interactive shell. The raw-TTY terminal client ships as "
+    "cli/lazyaf/debug_cmd.py with its own `websockets` dependency and "
+    "replaces this subcommand when registered."
+)
+
+
+def _debug_request(method: str, path: str, server: str | None, **kwargs) -> dict:
+    """One HTTP call against the debug API, with this file's error idiom.
+
+    Failures print the SERVER's reason rather than a generic code: every 4xx
+    the debug API emits is a fact the operator needs ("session already ended
+    (aborted by user)", "unknown breakpoint step key(s): build").
+    """
+    server_url = server or get_server_url()
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.request(method, f"{server_url}{path}", **kwargs)
+            response.raise_for_status()
+            return response.json()
+    except httpx.ConnectError:
+        console.print(f"[red]Error:[/red] Could not connect to {server_url}")
+        console.print("Is the LazyAF server running?")
+        sys.exit(1)
+    except httpx.HTTPStatusError as e:
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            detail = e.response.text
+        console.print(f"[red]Error:[/red] API returned {e.response.status_code}")
+        if detail:
+            console.print(f"  {detail}")
+        sys.exit(1)
+
+
+@cli.group()
+def debug():
+    """Debug re-run commands (Phase 12.7)."""
+    pass
+
+
+@debug.command("rerun")
+@click.argument("run_id")
+@click.option(
+    "--break",
+    "breakpoints",
+    multiple=True,
+    metavar="STEP_KEY",
+    help=(
+        "Pause BEFORE this step. A graph step's key is its step_id; a legacy "
+        "step's key is its index. Repeatable. An unknown key is refused."
+    ),
+)
+@click.option("--commit", default=None, help="Re-run at this commit instead of the original")
+@click.option("--branch", default=None, help="Re-run on this branch instead of the original")
+@click.option(
+    "--timeout",
+    "timeout_seconds",
+    default=None,
+    type=int,
+    help="How long a breakpoint pause may wait (seconds, clamped to 4h)",
+)
+@click.option("--server", "-s", default=None, help="LazyAF server URL")
+def debug_rerun(run_id, breakpoints, commit, branch, timeout_seconds, server):
+    """Re-run a pipeline run with breakpoints.
+
+    The re-run carries ONLY the original run's branch and commit. on_pass /
+    on_fail actions and card routing are deliberately dropped, so a debug
+    re-run can never merge a branch and never moves a card.
+    """
+    payload = {
+        "breakpoints": list(breakpoints),
+        "use_original_commit": commit is None and branch is None,
+    }
+    if commit:
+        payload["commit_sha"] = commit
+    if branch:
+        payload["branch"] = branch
+    if timeout_seconds:
+        payload["timeout_seconds"] = timeout_seconds
+
+    data = _debug_request(
+        "POST", f"/api/pipeline-runs/{run_id}/debug-rerun", server, json=payload
+    )
+    console.print()
+    console.print(
+        Panel.fit(
+            "[green]Debug re-run started[/green]\n\n"
+            f"run:     [cyan]{data['run_id']}[/cyan]\n"
+            f"session: [cyan]{data['debug_session_id']}[/cyan]\n\n"
+            f"{data['join_command']}",
+            title="Debug",
+        )
+    )
+
+
+@debug.command("list")
+@click.option("--server", "-s", default=None, help="LazyAF server URL")
+def debug_list(server):
+    """List debug sessions that have not ended."""
+    sessions = _debug_request("GET", "/api/debug", server)
+    if not sessions:
+        console.print("No active debug sessions.")
+        return
+    console.print(f"{len(sessions)} active debug session(s):\n")
+    for session in sessions:
+        step = session.get("current_step") or {}
+        where = f" at [yellow]{step.get('name') or step.get('key')}[/yellow]" if step else ""
+        console.print(f"  [cyan]{session['id']}[/cyan]  {session['status']}{where}")
+
+
+def _print_session(session: dict) -> None:
+    step = session.get("current_step") or {}
+    lines = [
+        f"status:      [cyan]{session['status']}[/cyan]",
+        f"run:         {session['pipeline_run_id']}",
+        f"breakpoints: {', '.join(session['breakpoints']) or '(none)'}",
+        f"  hit:       {', '.join(session['breakpoints_hit']) or '(none)'}",
+        f"  pending:   {', '.join(session['breakpoints_pending']) or '(none)'}",
+    ]
+    if step:
+        lines.append(f"paused at:   {step.get('name')} (key {step.get('key')})")
+    if session.get("expires_at"):
+        lines.append(f"expires:     {session['expires_at']}")
+    if session.get("attach_available"):
+        lines.append("attach:      [green]available[/green]")
+    else:
+        # R1: never a silent "no" - the API always states the reason, and the
+        # CLI is the surface where a remote-step pause has to say so out loud.
+        lines.append(
+            "attach:      [yellow]unavailable[/yellow] - "
+            f"{session.get('attach_unavailable_reason') or 'no reason given'}"
+        )
+    if session.get("end_reason"):
+        lines.append(f"ended:       {session['end_reason']}")
+    console.print(Panel.fit("\n".join(lines), title="Debug session"))
+
+
+@debug.command("status")
+@click.argument("session_id")
+@click.option("--server", "-s", default=None, help="LazyAF server URL")
+def debug_status(session_id, server):
+    """Show one debug session."""
+    _print_session(_debug_request("GET", f"/api/debug/{session_id}", server))
+
+
+@debug.command("attach")
+@click.argument("session_id")
+@click.option(
+    "--sidecar/--shell",
+    "sidecar",
+    default=True,
+    help="Sidecar is the only mode at a breakpoint (see below).",
+)
+@click.option("--server", "-s", default=None, help="LazyAF server URL")
+def debug_attach(session_id, sidecar, server):
+    """Mint a terminal credential for a paused session.
+
+    `--shell` is REFUSED, not downgraded: a breakpoint is a pre-step gate, so
+    the step container does not exist yet. Use the sidecar to inspect the
+    workspace the step is about to run against.
+    """
+    if not sidecar:
+        console.print(
+            "[red]Error:[/red] no step container exists at a pre-step "
+            "breakpoint - the step has not started. Use --sidecar to inspect "
+            "the workspace it is about to run against."
+        )
+        sys.exit(2)
+
+    session = _debug_request("GET", f"/api/debug/{session_id}", server)
+    if not session.get("attach_available"):
+        console.print(
+            "[red]Error:[/red] cannot attach: "
+            f"{session.get('attach_unavailable_reason') or 'unknown reason'}"
+        )
+        sys.exit(2)
+
+    data = _debug_request("POST", f"/api/debug/{session_id}/join-token", server)
+    server_url = (server or get_server_url()).rstrip("/")
+    ws_url = server_url.replace("https://", "wss://").replace("http://", "ws://")
+    console.print()
+    console.print(
+        Panel.fit(
+            f"token:   [cyan]{data['token']}[/cyan]\n"
+            f"expires: {data['expires_at']}\n"
+            f"socket:  {ws_url}/api/debug/{session_id}/terminal?mode=sidecar\n\n"
+            "[yellow]/workspace is mounted READ-WRITE:[/yellow] edits there are "
+            "seen by the resumed step.\n\n"
+            f"{DEBUG_ATTACH_NOT_INTERACTIVE}",
+            title="Debug terminal",
+        )
+    )
+
+
+@debug.command("resume")
+@click.argument("session_id")
+@click.option(
+    "--all",
+    "clear_remaining",
+    is_flag=True,
+    help="Drop the remaining breakpoints and run to completion",
+)
+@click.option("--server", "-s", default=None, help="LazyAF server URL")
+def debug_resume(session_id, clear_remaining, server):
+    """Release a paused step and continue to the next breakpoint."""
+    data = _debug_request(
+        "POST",
+        f"/api/debug/{session_id}/resume",
+        server,
+        json={"clear_remaining": clear_remaining},
+    )
+    nxt = data.get("next_breakpoint")
+    console.print(
+        f"[green]Resumed.[/green] Session is [cyan]{data['status']}[/cyan]; "
+        + (f"next breakpoint: [yellow]{nxt}[/yellow]" if nxt else "no breakpoints left.")
+    )
+
+
+@debug.command("abort")
+@click.argument("session_id")
+@click.option("--server", "-s", default=None, help="LazyAF server URL")
+def debug_abort(session_id, server):
+    """End the session AND cancel its pipeline run."""
+    data = _debug_request("POST", f"/api/debug/{session_id}/abort", server)
+    console.print(
+        f"[green]Aborted.[/green] Session is [cyan]{data['status']}[/cyan] "
+        f"({data['end_reason']}); the run was cancelled."
+    )
+
+
+@debug.command("extend")
+@click.argument("session_id")
+@click.option("--minutes", default=30, type=int, help="Minutes to add (1-180)")
+@click.option("--server", "-s", default=None, help="LazyAF server URL")
+def debug_extend(session_id, minutes, server):
+    """Push out a paused session's deadline."""
+    data = _debug_request(
+        "POST",
+        f"/api/debug/{session_id}/extend",
+        server,
+        json={"additional_minutes": minutes},
+    )
+    console.print(f"[green]Extended.[/green] Expires at [cyan]{data['expires_at']}[/cyan]")
+    if data.get("clamped"):
+        console.print(
+            "[yellow]Clamped[/yellow] to the session's maximum lifetime "
+            "(max_timeout_seconds)."
+        )
 
 
 if __name__ == "__main__":

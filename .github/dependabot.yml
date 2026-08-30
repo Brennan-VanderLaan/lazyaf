@@ -1,0 +1,43 @@
+# Keep the pinned action SHAs from rotting.
+#
+# The release workflows pin every action to a commit SHA rather than a tag,
+# because a tag can be moved by whoever owns the action and a SHA cannot.
+# That is the right trade, but it has a cost: a SHA pin never picks up a
+# security fix on its own, so without something watching them the pins
+# quietly become the stalest thing in the repository.
+#
+# This is that something. It is scoped to `github-actions` and NOTHING ELSE
+# on purpose:
+#
+#   * Python and npm dependencies are LazyAF's own supply chain, and changing
+#     them changes the product. Those belong to the dogfood pipeline, which is
+#     what actually tests this project - not to a bot opening PRs on GitHub.
+#     (See .github/WORKFLOWS.md: GitHub packages LazyAF, it does not gate it.)
+#   * Docker base images are pulled with `--pull` at build time and, for the
+#     step images, tracked by build_images.py's content-hash chain. A
+#     dependabot PR editing a Dockerfile would fight that machinery.
+#
+# So: one ecosystem, one directory, monthly. Each PR bumps a SHA and updates
+# the `# vX.Y.Z` comment beside it, which is exactly the maintenance burden
+# that pinning creates and nothing more. Review the diff of the action itself
+# before merging - a SHA bump is a supply-chain change, not a chore.
+
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    # `/` means .github/workflows/ - the only place actions are referenced.
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # Batch them: five actions arriving as five separate PRs is how people
+    # learn to rubber-stamp SHA bumps without reading them.
+    groups:
+      actions:
+        patterns: ["*"]
+    labels:
+      - "ci"
+      - "dependencies"
+    commit-message:
+      prefix: "ci"
+    open-pull-requests-limit: 3

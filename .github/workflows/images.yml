@@ -1,0 +1,287 @@
+# =============================================================================
+# LazyAF - publish container images to GHCR
+# =============================================================================
+#
+# THIS WORKFLOW PACKAGES; IT DOES NOT GATE.
+#
+#   LazyAF gates LazyAF. Whether a revision is good is decided by LazyAF's
+#   own dogfood pipeline (PLAN.md: "no external CI ever; self-host ASAP"),
+#   and that has not changed. By the time a commit reaches main or carries a
+#   version tag, the dogfood pipeline has already had its say. This workflow
+#   takes such a revision and turns it into pullable artifacts so a stranger
+#   can run the stack without building anything.
+#
+#   Concretely: DO NOT add the test suite here and do not make a release
+#   conditional on it. The only things allowed to block a publish are
+#   "the artifact could not be produced" and "the artifact contains a
+#   credential".
+#
+# WHAT IT PUBLISHES  (ghcr.io/<owner>/lazyaf/<name>)
+#   service images   backend, frontend, runner-agent
+#                    - everything docker-compose.release.yml pulls
+#   step images      every entry in scripts/build_images.py's IMAGES table
+#                    (base, agent-base, claude, gemini, test-runner, the 12.7
+#                    debug sidecar, and anything added later - the list is
+#                    READ from that table, not repeated here)
+#                    - the images pipeline steps execute inside
+#
+# TAGS: see .github/scripts/publish_image.py, which owns the policy and can
+# be run with --dry-run to show exactly what a given ref would produce.
+#
+# ARCHITECTURE: linux/amd64 only, deliberately, for now. Cross-building the
+# agent images for arm64 means emulating a Node toolchain under QEMU, which
+# turns a 20 minute job into an hour or more, and scripts/build_images.py
+# drives the classic build API rather than buildx so multi-arch would need a
+# change there rather than here. An arm64 user builds locally today. Revisit
+# when somebody actually asks.
+#
+# SECURITY POSTURE
+#   * The ONLY credential in scope is the automatic GITHUB_TOKEN, scoped
+#     per-job to `packages: write`. No personal access token, no
+#     organisation secret, nothing an image build could ever read - because
+#     the builds run BEFORE the token is used and need nothing.
+#   * Never triggered by `pull_request` or `pull_request_target`. A fork can
+#     therefore not reach this workflow at all, which is the only airtight
+#     way to keep fork code away from a token that can write packages.
+#   * The token is fed to `docker login` on STDIN. It is never echoed, never
+#     interpolated into a command line, and never written to the build
+#     context.
+#   * No image build receives a `--build-arg` or `secrets:` mount carrying
+#     anything sensitive. An AI key is a RUN-TIME input to LazyAF, supplied
+#     by the operator's .env; it is not, and must never become, a build-time
+#     input.
+#   * The leak scan runs on the built images before a single push, and the
+#     repo scan blocks the whole workflow.
+#   * Every action pinned to a commit SHA.
+# =============================================================================
+
+name: images
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      extra_tag:
+        description: 'Extra tag to publish alongside the computed ones'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Build and scan everything, but push nothing'
+        type: boolean
+        default: false
+
+# A second push to main should not race the first one to the registry and
+# leave `main` pointing at the older build. Never cancel a TAG run, though:
+# a half-published release is worse than a slow one.
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+# Default for every job. The two publishing jobs widen this to add
+# `packages: write` and nothing else.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Hard gate. Nothing is built and nothing is pushed until the source tree is
+  # proven free of live-format credentials. `needs:` on both publish jobs.
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    uses: ./.github/workflows/secret-scan.yml
+
+  # ---------------------------------------------------------------------------
+  # Step images. One job, in dependency order, because they are a CHAIN:
+  # agent-base is `FROM lazyaf-base:dev` and claude/gemini are `FROM
+  # lazyaf-agent-base:dev`, so a parent must exist in the local daemon before
+  # its child can build. A matrix would break that.
+  #
+  # scripts/build_images.py is the only supported way to build these. It owns
+  # the staged build context (runner-common is copied in from the repo root,
+  # not vendored under images/) and the multi-level content-hash chain that
+  # becomes the published `content-<hash>` tag.
+  # ---------------------------------------------------------------------------
+  step-images:
+    name: step images -> GHCR
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io/${{ github.repository_owner }}/lazyaf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The job pushes to a registry; it must not also leave a git
+          # credential lying in .git/config for the build to pick up.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the docker SDK
+        run: python -m pip install --upgrade pip docker
+
+      # Builds happen BEFORE the registry login, on purpose: while any image
+      # is building there is no credential in the environment for it to
+      # capture.
+      - name: Build step images
+        run: python scripts/build_images.py
+
+      - name: Assert the content-hash chain is stable
+        # If a freshly built image is already "stale" on the second pass, the
+        # hash that got stamped into the label does not describe the tree
+        # that was built - and that label is about to become a published
+        # provenance tag. Refuse to publish a tag that would lie.
+        run: python scripts/build_images.py --check
+
+      - name: Scan step images for credentials
+        # The image list comes from scripts/build_images.py's IMAGES table via
+        # step_images.py, never from a list written out here: an image added
+        # to that table must be scanned automatically, not silently skipped
+        # by a workflow nobody remembered to update. Unquoted on purpose -
+        # the helper emits space-separated refs and word splitting is what
+        # turns them into arguments.
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          python .github/scripts/scan_image_secrets.py $(python .github/scripts/step_images.py --refs)
+
+      - name: Log in to GHCR
+        if: ${{ inputs.dry_run != true }}
+        # The built-in per-run token, NOT a personal access token: it expires
+        # when the job ends and it can only write packages belonging to this
+        # repository. Delivered on stdin so it never reaches the log, an
+        # argv listing, or the shell history.
+        run: printf '%s' "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+
+      - name: Tag and push
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ -n "${EXTRA_TAG}" ]; then ARGS+=(--extra-tag "${EXTRA_TAG}"); fi
+          if [ "${DRY_RUN}" = "true" ]; then ARGS+=(--dry-run); fi
+          # `localref=publishedname`, one per line, derived from the IMAGES
+          # table. Written to a file rather than piped, so the loop body runs
+          # in THIS shell and a failure inside it actually fails the step.
+          python .github/scripts/step_images.py --pairs > step-images.txt
+          cat step-images.txt
+          while IFS='=' read -r local_ref published; do
+            [ -n "${local_ref}" ] || continue
+            python .github/scripts/publish_image.py \
+              --local "${local_ref}" \
+              --repo "${REGISTRY}/${published}" \
+              "${ARGS[@]}"
+          done < step-images.txt
+        env:
+          EXTRA_TAG: ${{ inputs.extra_tag || '' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+
+      - name: Explain how to use these images
+        # Step images are NOT compose services. The backend resolves them by
+        # their local `lazyaf-<name>:dev` tag and refuses to pull behind the
+        # operator's back, so a stranger has to pull and retag once. Putting
+        # the exact commands in the run summary means nobody has to go
+        # reading a workflow file to find them.
+        run: |
+          set -euo pipefail
+          # Registries reject uppercase path segments and
+          # github.repository_owner is mixed case. publish_image.py lowers it
+          # before pushing; these printed commands have to be lowered too or
+          # the copy-paste fails for whoever reads the summary.
+          REG="$(echo "${REGISTRY}" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "### Step images"
+            echo
+            echo 'The backend resolves these by their local `:dev` tag and never pulls on its own.'
+            echo 'Pull once, then retag:'
+            echo
+            echo '```bash'
+            echo 'V=${LAZYAF_VERSION:-latest}'
+            while IFS='=' read -r local_ref published; do
+              [ -n "${local_ref}" ] || continue
+              echo "docker pull ${REG}/${published}:\$V && docker tag ${REG}/${published}:\$V ${local_ref}"
+            done < <(python .github/scripts/step_images.py --pairs)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Service images. Independent of one another, so a matrix builds them in
+  # parallel and each gets its own red/green signal.
+  # ---------------------------------------------------------------------------
+  service-images:
+    name: ${{ matrix.name }} -> GHCR
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # Publishing backend but not frontend is a recoverable state (rerun the
+      # failed job); hiding which one broke is not.
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            context: ./backend
+          - name: frontend
+            context: ./frontend
+          - name: runner-agent
+            context: ./runner-agent
+    env:
+      REGISTRY: ghcr.io/${{ github.repository_owner }}/lazyaf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build ${{ matrix.name }}
+        # --pull so a release is built against the current upstream base
+        # image rather than whatever the runner happened to cache.
+        #
+        # No secrets, no sensitive --build-arg. In particular the backend
+        # image is built WITHOUT INCLUDE_DEV: the published image ships
+        # runtime dependencies only, not the test extras.
+        run: docker build --pull -t "lazyaf-${IMAGE_NAME}:ci" "${IMAGE_CONTEXT}"
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+          IMAGE_CONTEXT: ${{ matrix.context }}
+
+      - name: Scan ${{ matrix.name }} for credentials
+        run: python3 .github/scripts/scan_image_secrets.py "lazyaf-${IMAGE_NAME}:ci"
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+
+      - name: Log in to GHCR
+        if: ${{ inputs.dry_run != true }}
+        run: printf '%s' "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+
+      - name: Tag and push ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ -n "${EXTRA_TAG}" ]; then ARGS+=(--extra-tag "${EXTRA_TAG}"); fi
+          if [ "${DRY_RUN}" = "true" ]; then ARGS+=(--dry-run); fi
+          python3 .github/scripts/publish_image.py \
+            --local "lazyaf-${IMAGE_NAME}:ci" \
+            --repo "${REGISTRY}/${IMAGE_NAME}" \
+            "${ARGS[@]}"
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+          EXTRA_TAG: ${{ inputs.extra_tag || '' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}

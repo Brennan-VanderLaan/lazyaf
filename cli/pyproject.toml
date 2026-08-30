@@ -1,23 +1,75 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+# setuptools >= 77 is required for PEP 639 license metadata (`license` as an
+# SPDX expression + `license-files`). Keep this floor in step with the
+# `license`/`license-files` keys below.
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-include = ["lazyaf*"]
 
 [project]
 name = "lazyaf-cli"
-version = "0.1.0"
-description = "CLI tool for LazyAF - ingest repos and land changes"
+description = "Command-line client for LazyAF - ingest repos, land branches, and tie tests back to the platform"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{ name = "Brennan VanderLaan" }]
+keywords = ["lazyaf", "ci", "cd", "agents", "automation", "devtools"]
+
+# SINGLE SOURCE OF TRUTH for the version: cli/lazyaf/__init__.py.
+# Bump it there and nowhere else; setuptools reads it statically (no import,
+# so building never pulls in click/httpx/rich). tdd/unit/packaging asserts
+# that this stays dynamic and that the built wheel carries that same version.
+dynamic = ["version"]
+
 dependencies = [
-    "click>=8.1.0",
-    "httpx>=0.27.0",
-    "rich>=13.0.0",
+    "click>=8.1.0,<9",
+    "httpx>=0.27.0,<1",
+    "rich>=13.0.0,<15",
 ]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
+# NOTE: no "License :: OSI Approved :: ..." classifier on purpose. PEP 639
+# forbids pairing a license expression with license classifiers, and
+# setuptools>=77 rejects the combination outright.
+
+[project.urls]
+Homepage = "https://github.com/Brennan-VanderLaan/lazyaf"
+Repository = "https://github.com/Brennan-VanderLaan/lazyaf"
+Issues = "https://github.com/Brennan-VanderLaan/lazyaf/issues"
+Changelog = "https://github.com/Brennan-VanderLaan/lazyaf/releases"
 
 [project.scripts]
 lazyaf = "lazyaf.cli:cli"
+
+[tool.setuptools.dynamic]
+version = { attr = "lazyaf.__version__" }
+
+[tool.setuptools]
+# Explicit, not discovered. The wheel ships the `lazyaf` package and nothing
+# else - never the repo it lives in (no backend/, no tdd/, no .env).
+packages = ["lazyaf"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+# The CLI is pure Python: no templates, no data files. If that ever changes,
+# list the globs here AND extend tdd/unit/packaging/test_wheel_build.py so the
+# new files are asserted present in the wheel.
+lazyaf = []
 
 [tool.ruff]
 line-length = 100

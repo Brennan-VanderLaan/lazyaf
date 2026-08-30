@@ -72,6 +72,10 @@ CONTAINER_LABEL_PIPELINE_RUN = "lazyaf.pipeline_run_id"
 # declaration by the image author, never inferred from path/name shape (R6).
 # ---------------------------------------------------------------------------
 CONTROL_LAYER_LABEL = "lazyaf.control-layer"
+#: A label is DECLARED only when its value is exactly this. Presence alone is
+#: not a declaration - `LABEL lazyaf.agent-runtime=0` is an image author
+#: saying "no".
+LABEL_DECLARED_VALUE = "1"
 
 # Where per-step config files land inside the workspace volume. The backend
 # writes ONE file per step execution - .control/<step_execution_id>.json -
@@ -81,6 +85,22 @@ CONTROL_LAYER_LABEL = "lazyaf.control-layer"
 # kills the fan-out collision where two parallel steps of one run clobbered
 # each other's step_config.json on the SHARED workspace volume.
 CONTROL_CONFIG_DIR = ".control"
+
+# Agent steps (Phase 12.5) carry a SECOND file in the same tar:
+# .control/agent.<step_execution_id>.json, announced to the wrapper through
+# LAZYAF_AGENT_CONFIG_PATH inside the STEP CONFIG FILE's environment (never
+# container env). Two files, not more keys on one: run.py deletes the step
+# config BEFORE the command runs (consume-once), so an agent payload carried
+# there would be unreadable - and the step JWT / API key must not live in a
+# file the wrapper opens.
+AGENT_CONFIG_PREFIX = "agent."
+AGENT_CONFIG_PATH_ENV = "LAZYAF_AGENT_CONFIG_PATH"
+
+# Usage channel (Phase 12.5 / M13). Provider stamped into the fallback usage
+# record run.py POSTs for every control-mode step, agent or not - a script
+# step's row is `cost_source="unknown"` on a self-hosted provider, which is a
+# recorded fact, not a gap.
+DEFAULT_USAGE_PROVIDER = "self-hosted"
 
 # In control mode the executor no longer ships per-line log events (the
 # router is the sole log writer, R3); it retains this many trailing stdout
@@ -295,17 +315,21 @@ def build_step_command(step_config: dict, home_dir: str) -> Union[list, str]:
     return [shell, "-c", script]
 
 
-def build_step_config_archive(config: dict, filename: str) -> bytes:
-    """Build the in-memory tar delivering `.control/<filename>`.
+def build_control_archive(files: Sequence[tuple[str, dict]]) -> bytes:
+    """Build the in-memory tar delivering one or more `.control/<name>` files.
 
     Extracted by `container.put_archive("/workspace", ...)` onto the
-    created-but-not-started step container, so the token never appears in
-    `docker inspect` env and nothing is written to the backend's CWD.
-    File mode 0600. Tar entries carry no uid/gid: the image entrypoint's
-    chown of /workspace/.control owns in-container readability (setting
-    uid/gid 1000 here was redundant with it).
+    created-but-not-started step container, so secrets (the step JWT, the
+    provider API key) never appear in `docker inspect` env and nothing is
+    written to the backend's CWD. Every file is mode 0600. Tar entries carry
+    no uid/gid: the image entrypoint's chown of /workspace/.control owns
+    in-container readability (setting uid/gid 1000 here was redundant with
+    it), and its `-name '*.json'` sweep already covers the agent payload.
+
+    An agent step ships TWO entries in ONE tar (12.5): the step config and
+    the agent config. One put_archive keeps them atomic with respect to
+    container start.
     """
-    payload = json.dumps(config, indent=2).encode("utf-8")
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         dir_info = tarfile.TarInfo(CONTROL_CONFIG_DIR)
@@ -313,11 +337,18 @@ def build_step_config_archive(config: dict, filename: str) -> bytes:
         dir_info.mode = 0o700
         tar.addfile(dir_info)
 
-        file_info = tarfile.TarInfo(f"{CONTROL_CONFIG_DIR}/{filename}")
-        file_info.size = len(payload)
-        file_info.mode = 0o600
-        tar.addfile(file_info, io.BytesIO(payload))
+        for filename, config in files:
+            payload = json.dumps(config, indent=2).encode("utf-8")
+            file_info = tarfile.TarInfo(f"{CONTROL_CONFIG_DIR}/{filename}")
+            file_info.size = len(payload)
+            file_info.mode = 0o600
+            tar.addfile(file_info, io.BytesIO(payload))
     return buf.getvalue()
+
+
+def build_step_config_archive(config: dict, filename: str) -> bytes:
+    """Single-file convenience wrapper over `build_control_archive`."""
+    return build_control_archive([(filename, config)])
 
 
 def _is_timeout_error(exc: Exception) -> bool:
@@ -354,6 +385,9 @@ class LocalExecutor:
         # Control-layer capability cache keyed by resolved IMAGE ID (never
         # by tag: a rebuilt tag gets a new ID and is re-evaluated fresh).
         self._control_label_cache: dict[str, bool] = {}
+        # Generic label-declaration cache, keyed by (resolved image ID, label)
+        # on the same "never by tag" rule as _control_label_cache above.
+        self._declared_label_cache: dict[tuple[str, str], bool] = {}
 
     def reset(self) -> None:
         """Test-mode reset hook: clear the idempotency cache, the
@@ -364,6 +398,54 @@ class LocalExecutor:
         self._completed_executions.clear()
         self._running_containers.clear()
         self._control_label_cache.clear()
+        self._declared_label_cache.clear()
+
+    async def image_declares_label(self, image: str, label: str) -> bool | None:
+        """Does `image` declare `label` with the value "1"? None = can't tell.
+
+        The generic form of `image_supports_control_layer`'s rule, added so
+        callers that need a DIFFERENT label - the agent-runtime preflight in
+        `pipeline_executor` is the first - go through a public seam on this
+        class instead of reaching into `executor._docker`. A stub or a future
+        remote executor that does not implement this is then visibly missing
+        a method rather than silently turning a preflight off.
+
+        The three-valued return is the whole point: `False` means the image
+        was inspected and does NOT declare the label, `None` means the
+        inspection itself did not happen (unreachable daemon, missing tag).
+        Collapsing `None` into `False` would report an infrastructure problem
+        as "your image is wrong" and send the operator the wrong way, so
+        callers must keep them apart.
+
+        Cached by resolved image ID + label, so a rebuilt tag (new ID) is
+        re-evaluated and repeat dispatches of the same build skip the inspect.
+        """
+        try:
+            img = await run_in_threadpool(self._docker.images.get, image)
+        except ImageNotFound:
+            logger.warning(
+                "Label inspection for %s=%s skipped: image %s is not present",
+                label,
+                LABEL_DECLARED_VALUE,
+                image,
+            )
+            return None
+        except Exception:
+            logger.warning(
+                "Label inspection for %s=%s failed on image %s",
+                label,
+                LABEL_DECLARED_VALUE,
+                image,
+                exc_info=True,
+            )
+            return None
+
+        cache_key = (img.id, label)
+        declared = self._declared_label_cache.get(cache_key)
+        if declared is None:
+            declared = (img.labels or {}).get(label) == LABEL_DECLARED_VALUE
+            self._declared_label_cache[cache_key] = declared
+        return declared
 
     async def image_supports_control_layer(self, image: str) -> bool:
         """Whether `image` bakes `lazyaf.control-layer=1` (label VALUE '1'
@@ -507,6 +589,19 @@ class LocalExecutor:
                   {"addressing": "volume"|"bind", "source": ..., "target": ..., "mode": "rw"|"ro"}
                   Bind sources must be on the allowlist (default: the docker
                   socket only) - anything else fails the step loudly (fix 10).
+                - secret_environment: env vars delivered ONLY through the
+                  step config FILE (12.5). Never merged into the container's
+                  `environment` kwarg, so they are absent from `docker
+                  inspect`. Present WITHOUT control mode = the step fails at
+                  dispatch ("secrets require control mode") rather than
+                  downgrading a key onto the inspectable path.
+                - agent: kwargs for `generate_agent_config` (12.5). When
+                  present in control mode a SECOND file,
+                  .control/agent.<step_execution_id>.json, ships in the same
+                  put_archive tar and its path is announced through
+                  LAZYAF_AGENT_CONFIG_PATH in the config FILE's environment.
+                - usage_provider / role: non-secret usage-channel attribution
+                  stamped into container env for run.py (M13 seam).
 
             execution_context: Execution context including:
                 - pipeline_run_id: Pipeline run UUID
@@ -555,6 +650,13 @@ class LocalExecutor:
         image = step_config.get("image", settings.step_default_image)
         timeout = step_config.get("timeout", 300)  # Default 5 minutes
         user_env = step_config.get("environment", {})
+        # Secrets (12.5): provider API keys travel ONLY in the step config
+        # FILE - the one channel the container runtime reads that never
+        # reaches `docker inspect`. NEVER merged into run_kwargs/create_kwargs
+        # "environment"; the split is enforced below and asserted by a real-
+        # docker T2 test that greps the created container's inspect output.
+        secret_env = step_config.get("secret_environment") or {}
+        agent_payload = step_config.get("agent")
         memory_limit = step_config.get("memory_limit")  # e.g., "512m", "1g"
         working_dir = step_config.get("working_dir", settings.step_working_dir)
         # Control mode: the container runs the image's control entrypoint
@@ -589,6 +691,24 @@ class LocalExecutor:
             "LAZYAF_CONTROL": "1" if control_mode else "0",
         }
 
+        # Usage-channel attribution (12.5 / M13 seam). All NON-SECRET, so
+        # they travel in ordinary container env: run.py reads them when it
+        # composes the usage manifest, and a step that never produces one
+        # still gets a fallback record stamped with the right provider.
+        # LAZYAF_ROLE / LAZYAF_GPU_* are empty in 12.5 - nothing sets them
+        # until strategies (M13) and self-hosted nodes (12.6) exist.
+        environment["LAZYAF_USAGE_PROVIDER"] = str(
+            step_config.get("usage_provider") or DEFAULT_USAGE_PROVIDER
+        )
+        for key, source in (
+            ("LAZYAF_ROLE", step_config.get("role")),
+            ("LAZYAF_GPU_NODE_ID", execution_context.get("gpu_node_id")),
+            ("LAZYAF_GPU_FRACTION", execution_context.get("gpu_fraction")),
+        ):
+            if source not in (None, ""):
+                environment[key] = str(source)
+
+
         # Build mounts via explicit addressing (never inferred from path
         # shape). The workspace volume is internal; step-config mounts go
         # through the bind allowlist gate (fix 10).
@@ -603,6 +723,20 @@ class LocalExecutor:
             deque(maxlen=CONTROL_MODE_LOG_TAIL_LINES) if control_mode else None
         )
         try:
+            if secret_env and not control_mode:
+                # A secret must never be able to silently DOWNGRADE onto the
+                # stdout path, where the only delivery channel left is
+                # container env - i.e. `docker inspect`. Fail at dispatch and
+                # name the reason (the ValueError handler below turns this
+                # into a loud "step config error" result event).
+                raise ValueError(
+                    "secrets require control mode: this step declares "
+                    f"secret_environment ({', '.join(sorted(secret_env))}) "
+                    "but is dispatched in stdout mode, where the only "
+                    "delivery channel is inspectable container environment. "
+                    "Use a control-layer image and do not set `control: false`."
+                )
+
             mount_specs: list = [
                 MountSpec(
                     addressing=MountAddressing.VOLUME,
@@ -654,7 +788,21 @@ class LocalExecutor:
                 raw_command = step_config.get("command", "")
                 # Producer stays the single source of the file shape (R3):
                 # verbatim generate_step_config output.
-                from app.services.control_layer.workspace import generate_step_config
+                from app.services.control_layer.workspace import (
+                    generate_agent_config,
+                    generate_step_config,
+                )
+
+                # The FILE environment is the secret channel (12.5): the
+                # in-container executor does env.update(config.environment)
+                # before Popen, so these reach the step process without ever
+                # entering the container's inspectable env.
+                agent_filename = f"{AGENT_CONFIG_PREFIX}{step_execution_id}.json"
+                file_environment = {**user_env, **secret_env}
+                if agent_payload is not None:
+                    file_environment[AGENT_CONFIG_PATH_ENV] = (
+                        f"/workspace/{CONTROL_CONFIG_DIR}/{agent_filename}"
+                    )
 
                 config_kwargs = dict(
                     step_id=step_execution_id,
@@ -665,7 +813,7 @@ class LocalExecutor:
                         settings, "container_backend_url", "http://backend:8000"
                     ),
                     auth_token=execution_context["step_auth_token"],
-                    environment=user_env,
+                    environment=file_environment,
                     timeout_seconds=timeout,
                     working_directory=working_dir,
                 )
@@ -701,6 +849,18 @@ class LocalExecutor:
                         f"/workspace/{CONTROL_CONFIG_DIR}/{config_filename}"
                     ),
                 }
+                # Agent steps (12.5): the SECOND file, produced by the single
+                # agent-config producer and shipped in the SAME tar. Built
+                # BEFORE `create` so an invalid agent payload fails the step
+                # without leaving a container behind.
+                archive_files: list[tuple[str, dict]] = [
+                    (config_filename, config_payload)
+                ]
+                if agent_payload is not None:
+                    archive_files.append(
+                        (agent_filename, generate_agent_config(**agent_payload))
+                    )
+
                 container = await run_in_threadpool(
                     self._docker.containers.create, image, **create_kwargs
                 )
@@ -708,7 +868,7 @@ class LocalExecutor:
                 await run_in_threadpool(
                     container.put_archive,
                     "/workspace",
-                    build_step_config_archive(config_payload, config_filename),
+                    build_control_archive(archive_files),
                 )
                 await run_in_threadpool(container.start)
             else:

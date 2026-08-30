@@ -13,6 +13,13 @@ dev = [
     "pytest-asyncio>=0.23.0",
 ]
 
+# DECISION (12.2.6): runner_common.pytest_lazyaf ships WITHOUT a pytest11
+# entry point. An entry point would auto-activate the manifest plugin in
+# every environment that installs runner-common (this package's own suite,
+# agent images, user repos); instead it is loaded explicitly with
+# `-p runner_common.pytest_lazyaf` — scripts/run_tier.py does so for the
+# tier lanes. See the plugin module docstring.
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"

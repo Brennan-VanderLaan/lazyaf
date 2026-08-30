@@ -148,31 +148,85 @@ class TestExecutorRegistry:
 class TestJobRouting:
     """Tests for job type routing."""
 
-    def test_execute_job_routes_to_script(self, monkeypatch):
-        """execute_job() routes script type to execute_script_step."""
+    def test_execute_job_rejects_script(self, monkeypatch):
+        """execute_job() REJECTS script jobs - Phase 12.4 deleted the path.
+
+        Nothing here may pin the removed routing: there is no
+        execute_script_step to dispatch to any more, and the runner must fail
+        the job loudly instead of quietly running a shell command the
+        ExecutionRouter never sent it.
+        """
         from runner_common import entrypoint
 
-        mock_script = MagicMock()
-        monkeypatch.setattr(entrypoint, "execute_script_step", mock_script)
+        mock_reject = MagicMock()
+        monkeypatch.setattr(entrypoint, "reject_non_agent_step", mock_reject)
         monkeypatch.setattr(entrypoint, "runner_id", "test-runner")
 
         job = {"id": "test-job-id", "step_type": "script"}
         entrypoint.execute_job(job)
 
-        mock_script.assert_called_once_with(job)
+        mock_reject.assert_called_once_with(job)
 
-    def test_execute_job_routes_to_docker(self, monkeypatch):
-        """execute_job() routes docker type to execute_docker_step."""
+    def test_execute_job_rejects_docker(self, monkeypatch):
+        """execute_job() REJECTS docker jobs - Phase 12.4 deleted the path."""
         from runner_common import entrypoint
 
-        mock_docker = MagicMock()
-        monkeypatch.setattr(entrypoint, "execute_docker_step", mock_docker)
+        mock_reject = MagicMock()
+        monkeypatch.setattr(entrypoint, "reject_non_agent_step", mock_reject)
         monkeypatch.setattr(entrypoint, "runner_id", "test-runner")
 
         job = {"id": "test-job-id", "step_type": "docker"}
         entrypoint.execute_job(job)
 
-        mock_docker.assert_called_once_with(job)
+        mock_reject.assert_called_once_with(job)
+
+    def test_script_and_docker_executors_are_gone(self):
+        """The second source of truth for script/docker semantics is deleted.
+
+        A re-added execute_script_step/execute_docker_step would silently
+        become a competing implementation of what LocalExecutor now owns.
+        """
+        from runner_common import entrypoint
+
+        assert not hasattr(entrypoint, "execute_script_step")
+        assert not hasattr(entrypoint, "execute_docker_step")
+
+    def test_reject_fails_the_job_with_a_clear_error(self, monkeypatch):
+        """reject_non_agent_step reports running, then completes FAILED with
+        a message naming the step type and the reason."""
+        from runner_common import entrypoint
+
+        mock_complete = MagicMock()
+        mock_report = MagicMock()
+        monkeypatch.setattr(entrypoint, "complete_job", mock_complete)
+        monkeypatch.setattr(entrypoint, "report_status", mock_report)
+        monkeypatch.setattr(entrypoint, "runner_id", "test-runner")
+
+        job = {"id": "abcdef1234", "step_type": "script"}
+        entrypoint.reject_non_agent_step(job)
+
+        mock_report.assert_called_once()
+        assert mock_report.call_args[0][1] == "running"
+
+        mock_complete.assert_called_once()
+        assert mock_complete.call_args[0][1] is False
+        error = mock_complete.call_args[1]["error"]
+        assert "script" in error
+        assert "12.4" in error
+        assert "local executor" in error
+
+    def test_reject_covers_docker_too(self, monkeypatch):
+        from runner_common import entrypoint
+
+        mock_complete = MagicMock()
+        monkeypatch.setattr(entrypoint, "complete_job", mock_complete)
+        monkeypatch.setattr(entrypoint, "report_status", MagicMock())
+        monkeypatch.setattr(entrypoint, "runner_id", "test-runner")
+
+        entrypoint.reject_non_agent_step({"id": "abcdef1234", "step_type": "docker"})
+
+        assert mock_complete.call_args[0][1] is False
+        assert "docker" in mock_complete.call_args[1]["error"]
 
     def test_execute_job_routes_to_agent(self, monkeypatch):
         """execute_job() routes agent type to execute_agent_step."""

@@ -561,288 +561,6 @@ def handle_context_directory_end(job: dict, workspace: Path, step_logs: str):
     commit_context_changes(workspace, step_name)
 
 
-def execute_script_step(job: dict):
-    """Execute a script step (run shell command directly)."""
-    import tempfile
-
-    job_id = job['id']
-    step_config = job.get('step_config', {}) or {}
-    command = step_config.get('command', '')
-
-    # Pipeline context flags
-    is_continuation = job.get("is_continuation", False)
-    continue_in_context = job.get("continue_in_context", False)
-    pipeline_run_id = job.get("pipeline_run_id")
-    step_name = job.get("step_name", "unnamed")
-
-    # Log context information
-    log("=" * 50)
-    log("CONTEXT INFO:")
-    if pipeline_run_id:
-        log(f"  - Pipeline run: {pipeline_run_id[:8]}")
-        log(f"  - Step: {job.get('step_index', 0)} ({step_name})")
-    if is_continuation:
-        log("  - Continuing from previous step (workspace preserved)")
-    else:
-        log("  - Fresh execution (no previous step context)")
-    if continue_in_context:
-        log("  - Will preserve workspace for next step")
-    log("=" * 50)
-
-    # Collect logs for context directory
-    step_logs = []
-
-    if not command:
-        log("ERROR: No command specified in step_config")
-        complete_job(success=False, error="No command specified in step_config")
-        return
-
-    # Normalize line endings (Windows -> Unix) and handle escaped newlines from JSON
-    command = command.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\r\n', '\n').replace('\r', '\n')
-
-    # Log script preview (first 200 chars)
-    preview = command[:200] + ('...' if len(command) > 200 else '')
-    log(f"Executing script step:\n{preview}")
-
-    # Report running status
-    report_job_status(job_id, "running")
-
-    try:
-        # Clone repo for context (script may need repo files)
-        repo_id = job.get("repo_id", "")
-        use_internal_git = job.get("use_internal_git", False)
-
-        # Use separate workspace directories per pipeline to avoid conflicts
-        # When multiple pipelines run on the same runner, they won't interfere
-        if pipeline_run_id:
-            workspace = Path(f"/workspace/{pipeline_run_id[:8]}/repo")
-        else:
-            workspace = Path("/workspace/repo")
-
-        # Skip cloning if this is a continuation from a previous step
-        if is_continuation and workspace.exists():
-            log("Continuing from previous step - using existing workspace")
-            working_dir = str(workspace)
-        elif use_internal_git and repo_id:
-            repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
-            log(f"Cloning from internal git: {repo_url}")
-
-            # Configure git
-            run_command(["git", "config", "--global", "user.email", "lazyaf@localhost"])
-            run_command(["git", "config", "--global", "user.name", "LazyAF Agent"])
-
-            if workspace.exists():
-                run_command(["sudo", "rm", "-rf", str(workspace)])
-            workspace.parent.mkdir(parents=True, exist_ok=True)
-            exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
-            if exit_code != 0:
-                raise Exception("Failed to clone repository")
-
-            # Initialize context directory for pipeline steps
-            handle_context_directory_start(job, workspace)
-
-            working_dir = str(workspace)
-        else:
-            working_dir = step_config.get('working_dir', '/workspace')
-
-        # Write script to temp file for reliable multi-line execution
-        script_path = Path(working_dir) / ".lazyaf_script.sh"
-        with open(script_path, 'w') as f:
-            f.write("#!/bin/bash\nset -e\n")  # Exit on first error
-            f.write(command)
-            f.write("\n")
-
-        # Make executable
-        run_command(["chmod", "+x", str(script_path)])
-
-        # Execute the script file
-        log(f"Running script in {working_dir}...")
-        exit_code, stdout, stderr = run_command_streaming(
-            ["bash", str(script_path)],
-            cwd=working_dir,
-        )
-
-        # Clean up script file
-        try:
-            script_path.unlink()
-        except:
-            pass
-
-        # Collect logs for context directory
-        step_output = f"Exit code: {exit_code}\n\n--- STDOUT ---\n{stdout}\n\n--- STDERR ---\n{stderr}"
-
-        if exit_code == 0:
-            log("Script completed successfully")
-            # Write context before completing job
-            if pipeline_run_id:
-                handle_context_directory_end(job, workspace, step_output)
-            complete_job(success=True)
-        else:
-            log(f"Script failed with exit code {exit_code}")
-            # Still write context even on failure
-            if pipeline_run_id:
-                handle_context_directory_end(job, workspace, step_output)
-            complete_job(success=False, error=f"Command failed with exit code {exit_code}")
-
-    except Exception as e:
-        log(f"ERROR: {e}")
-        complete_job(success=False, error=str(e))
-
-    finally:
-        # Clean up workspace unless next step continues in context
-        if continue_in_context:
-            log("Preserving workspace for next pipeline step (continue_in_context=True)")
-        else:
-            cleanup_workspace()
-
-
-def execute_docker_step(job: dict):
-    """Execute a docker step (run command in specified container image)."""
-    job_id = job['id']
-    step_config = job.get('step_config', {}) or {}
-    image = step_config.get('image', '')
-    command = step_config.get('command', '')
-
-    # Pipeline context flags
-    is_continuation = job.get("is_continuation", False)
-    continue_in_context = job.get("continue_in_context", False)
-    pipeline_run_id = job.get("pipeline_run_id")
-    step_name = job.get("step_name", "unnamed")
-
-    # Log context information
-    log("=" * 50)
-    log("CONTEXT INFO:")
-    if pipeline_run_id:
-        log(f"  - Pipeline run: {pipeline_run_id[:8]}")
-        log(f"  - Step: {job.get('step_index', 0)} ({step_name})")
-    if is_continuation:
-        log("  - Continuing from previous step (workspace preserved)")
-    else:
-        log("  - Fresh execution (no previous step context)")
-    if continue_in_context:
-        log("  - Will preserve workspace for next step")
-    log("=" * 50)
-
-    if not image:
-        log("ERROR: No image specified in step_config")
-        complete_job(success=False, error="No image specified in step_config")
-        return
-
-    if not command:
-        log("ERROR: No command specified in step_config")
-        complete_job(success=False, error="No command specified in step_config")
-        return
-
-    # Normalize line endings (Windows -> Unix) and handle escaped newlines from JSON
-    command = command.replace('\\r\\n', '\n').replace('\\n', '\n').replace('\r\n', '\n').replace('\r', '\n')
-
-    # Log script preview (first 200 chars)
-    preview = command[:200] + ('...' if len(command) > 200 else '')
-    log(f"Executing docker step: {image}\n{preview}")
-
-    # Report running status
-    report_job_status(job_id, "running")
-
-    try:
-        # Clone repo first (so we can mount it into the container)
-        repo_id = job.get("repo_id", "")
-        use_internal_git = job.get("use_internal_git", False)
-
-        # Use separate workspace directories per pipeline to avoid conflicts
-        if pipeline_run_id:
-            workspace = Path(f"/workspace/{pipeline_run_id[:8]}/repo")
-        else:
-            workspace = Path("/workspace/repo")
-
-        # Skip cloning if this is a continuation from a previous step
-        if is_continuation and workspace.exists():
-            log("Continuing from previous step - using existing workspace")
-        elif use_internal_git and repo_id:
-            repo_url = f"{BACKEND_URL}/git/{repo_id}.git"
-            log(f"Cloning from internal git: {repo_url}")
-
-            # Configure git
-            run_command(["git", "config", "--global", "user.email", "lazyaf@localhost"])
-            run_command(["git", "config", "--global", "user.name", "LazyAF Agent"])
-
-            if workspace.exists():
-                run_command(["sudo", "rm", "-rf", str(workspace)])
-            workspace.parent.mkdir(parents=True, exist_ok=True)
-            exit_code, _, _ = run_command(["git", "clone", repo_url, str(workspace)])
-            if exit_code != 0:
-                raise Exception("Failed to clone repository")
-
-            # Initialize context directory for pipeline steps
-            handle_context_directory_start(job, workspace)
-
-        # Write script to temp file for reliable multi-line execution
-        script_path = workspace / ".lazyaf_script.sh"
-        with open(script_path, 'w') as f:
-            f.write("#!/bin/bash\nset -e\n")  # Exit on first error
-            f.write(command)
-            f.write("\n")
-
-        # Make executable
-        run_command(["chmod", "+x", str(script_path)])
-
-        # Build docker run command
-        env_vars = step_config.get('env', {})
-        volumes = step_config.get('volumes', [])
-
-        docker_cmd = [
-            "docker", "run", "--rm",
-            "-v", f"{workspace}:/workspace",
-            "-w", "/workspace",
-        ]
-
-        # Add environment variables
-        for key, value in env_vars.items():
-            docker_cmd.extend(["-e", f"{key}={value}"])
-
-        # Add additional volumes
-        for vol in volumes:
-            docker_cmd.extend(["-v", vol])
-
-        docker_cmd.append(image)
-        docker_cmd.extend(["bash", "/workspace/.lazyaf_script.sh"])
-
-        log(f"Running: docker run {image} ...")
-        exit_code, stdout, stderr = run_command_streaming(docker_cmd, cwd=str(workspace))
-
-        # Clean up script file
-        try:
-            script_path.unlink()
-        except:
-            pass
-
-        # Collect logs for context directory
-        step_output = f"Image: {image}\nExit code: {exit_code}\n\n--- STDOUT ---\n{stdout}\n\n--- STDERR ---\n{stderr}"
-
-        if exit_code == 0:
-            log("Docker step completed successfully")
-            # Write context before completing job
-            if pipeline_run_id:
-                handle_context_directory_end(job, workspace, step_output)
-            complete_job(success=True)
-        else:
-            log(f"Docker step failed with exit code {exit_code}")
-            # Still write context even on failure
-            if pipeline_run_id:
-                handle_context_directory_end(job, workspace, step_output)
-            complete_job(success=False, error=f"Docker command failed with exit code {exit_code}")
-
-    except Exception as e:
-        log(f"ERROR: {e}")
-        complete_job(success=False, error=str(e))
-
-    finally:
-        # Clean up workspace unless next step continues in context
-        if continue_in_context:
-            log("Preserving workspace for next pipeline step (continue_in_context=True)")
-        else:
-            cleanup_workspace()
-
-
 def execute_agent_step(job: dict):
     """Execute an agent step (Claude Code implements feature). This is the original execute_job logic."""
     job_id = job['id']
@@ -1429,6 +1147,39 @@ def execute_playground_job(job: dict):
         cleanup_workspace()
 
 
+# ---------------------------------------------------------------------------
+# DEDUP NOTE (Phase 12.4): the function below is byte-for-byte identical in
+# runner-claude/entrypoint.py, runner-gemini/entrypoint.py and
+# runner-mock/entrypoint.py, and semantically identical to the CANONICAL
+# definition, runner_common.entrypoint.reject_non_agent_step (which differs
+# only in the helper call signatures of the runner-common package: it passes
+# runner_id/BACKEND_URL explicitly where these images use module globals).
+#
+# It is not imported because it CANNOT be: the runner images are built from
+# this single-file entrypoint and do not install the runner-common package
+# (see this image's Dockerfile - deliberately unchanged by 12.4). Until an
+# image installs runner-common, keep the copies in sync BY HAND: edit the
+# canonical copy first, then mirror it into all three images.
+# ---------------------------------------------------------------------------
+def reject_non_agent_step(job: dict):
+    """Loudly reject script/docker jobs - dead path since Phase 12.4.
+
+    Script and docker steps run on the local executor since 12.4; runners are
+    agent-only. A job of that type reaching a runner means a stale queue entry
+    or a routing bug - fail it clearly rather than executing silently.
+    """
+    step_type = job.get('step_type', 'unknown')
+    job_id = job.get('id', 'unknown')
+    error = (
+        f"Runner rejected job {job_id[:8]} (step_type={step_type}): "
+        "script steps run on the local executor since 12.4; runners are "
+        "agent-only. This job should not have been enqueued to a runner."
+    )
+    log(f"ERROR: {error}")
+    report_job_status(job_id, "running")
+    complete_job(success=False, error=error)
+
+
 def execute_job(job: dict):
     """Execute a job based on its step type."""
     step_type = job.get('step_type', 'agent')
@@ -1442,10 +1193,8 @@ def execute_job(job: dict):
         execute_playground_job(job)
         return
 
-    if step_type == 'script':
-        execute_script_step(job)
-    elif step_type == 'docker':
-        execute_docker_step(job)
+    if step_type in ('script', 'docker'):
+        reject_non_agent_step(job)
     else:
         # Default to agent step
         execute_agent_step(job)

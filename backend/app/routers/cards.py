@@ -58,6 +58,55 @@ def serialize_agent_file_ids(ids: list[str] | None) -> str | None:
     return json.dumps(ids)
 
 
+# ---------------------------------------------------------------------------
+# Step-type support (Phase 12.4 fallout)
+#
+# Card.step_type still carries the "script" and "docker" values, but Phase
+# 12.4 deleted script/docker execution from the runners: every runner
+# entrypoint's `execute_job` now REJECTS those step types. Cards are started
+# by enqueueing a Job for a runner - there is no local-executor path for a
+# card, because LocalExecutor is driven per PipelineRun/StepRun and a card
+# has neither.
+#
+# So starting a script/docker CARD would enqueue a job that a runner picks
+# up and immediately fails: the card flips to in_progress and then to failed
+# with a message about a routing bug. That silent loop is exactly what this
+# guard exists to prevent - reject at the API instead, with a message that
+# names the reason and the supported alternative.
+#
+# DEPRECATED: CardCreate/CardUpdate/CardRead.step_type values "script" and
+# "docker" (app/schemas/card.py -> app.models.card.StepType). They remain
+# accepted on create/update so existing cards keep round-tripping, but they
+# cannot be STARTED. Script/docker work belongs in a pipeline step, where
+# the ExecutionRouter sends it to the local executor.
+# ---------------------------------------------------------------------------
+RUNNER_ONLY_STEP_TYPES = ("agent",)
+DEPRECATED_CARD_STEP_TYPES = ("script", "docker")
+
+
+def _reject_unrunnable_step_type(card: Card) -> None:
+    """400 on a card whose step_type no longer has an execution path.
+
+    Raises HTTPException(400) for script/docker cards (see the module note
+    above). Called by every card-start entry point (start, retry) so a user
+    can never get a silent in_progress -> failed loop out of one.
+    """
+    step_type = card.step_type
+    if step_type in DEPRECATED_CARD_STEP_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cards with step_type='{step_type}' can no longer be started: "
+                "Phase 12.4 removed script/docker execution from the runners, "
+                "and cards run only on the runner queue (the local executor is "
+                "driven per pipeline step, which a card does not have). "
+                f"step_type='{step_type}' is deprecated for cards - move this "
+                "work into a pipeline step, where it runs on the local "
+                "executor, or change the card to step_type='agent'."
+            ),
+        )
+
+
 def card_to_ws_dict(card: Card) -> dict:
     """Convert a Card model to a dict for websocket broadcast."""
     return {
@@ -232,7 +281,11 @@ async def start_card(
     card_id: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Trigger agent work on this card."""
+    """Trigger agent work on this card.
+
+    Agent cards only: step_type 'script'/'docker' is rejected with 400
+    (deprecated for cards since Phase 12.4 - see _reject_unrunnable_step_type).
+    """
     result = await db.execute(select(Card).where(Card.id == card_id))
     card = result.scalar_one_or_none()
     if not card:
@@ -240,6 +293,10 @@ async def start_card(
 
     if card.status != "todo":
         raise HTTPException(status_code=400, detail="Card must be in 'todo' status to start")
+
+    # 12.4: script/docker cards have no execution path - reject before any
+    # state is mutated (never leave the card stuck in_progress).
+    _reject_unrunnable_step_type(card)
 
     # Get the repo
     result = await db.execute(select(Repo).where(Repo.id == card.repo_id))
@@ -506,6 +563,11 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
             status_code=400,
             detail=f"Can only retry cards in 'failed' or 'in_review' status, current: {card.status}"
         )
+
+    # 12.4: script/docker cards have no execution path (see
+    # _reject_unrunnable_step_type). Retrying one would re-enter the
+    # in_progress -> failed loop, so refuse the same way start does.
+    _reject_unrunnable_step_type(card)
 
     # Get the repo
     result = await db.execute(select(Repo).where(Repo.id == card.repo_id))

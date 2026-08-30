@@ -14,6 +14,9 @@ Retry policy is asymmetric on purpose:
   wedge the step behind its own log stream; failed batches are COUNTED
   (``dropped_log_lines``) and surfaced in the final status error by run.py.
   Container stdout still carries every line for docker-logs forensics.
+- test-results (12.2.6): same tight budget as logs — manifest delivery runs
+  at step shutdown and must never wedge or fail the step; a failed POST is
+  surfaced in the final status error by run.py.
 """
 import threading
 import time
@@ -203,6 +206,32 @@ class BackendClient:
         if not ok:
             self.dropped_log_lines += len(lines)
         return ok
+
+    def send_test_results(self, manifest: Dict) -> bool:
+        """
+        POST a test-results manifest (12.2.6 contract #1) to
+        /api/steps/{step_id}/test-results.
+
+        Tight retry budget like /logs on purpose: manifest delivery runs at
+        step shutdown and must never wedge the step behind a flapping
+        backend. A failed delivery returns False — the caller (run.py)
+        surfaces the drop loudly in the terminal status error, but the step
+        outcome is never changed by it.
+
+        Args:
+            manifest: The manifest dict, sent as the JSON body verbatim.
+
+        Returns:
+            True if the backend accepted it (2xx), False otherwise.
+        """
+        response = self._request_with_retry(
+            "POST",
+            "test-results",
+            max_retries=self.LOG_MAX_RETRIES,
+            total_timeout=self.LOG_TOTAL_TIMEOUT,
+            json=manifest,
+        )
+        return response is not None and 200 <= response.status_code < 300
 
     def heartbeat(self, extend_seconds: Optional[int] = None) -> bool:
         """

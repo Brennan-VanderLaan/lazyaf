@@ -343,7 +343,11 @@ class StrategyTemplate:
                                  #   {"role": "planner"} / {"role": "worker", "fanout": 8}
     roles: list[str]             # ["planner", "worker", "integrator", "reviewer"]
     loop_policy: dict            # {max_iterations, budget_usd, stop_on}
-    parallelism: dict            # {max_concurrent_workers, worker_workspace: "per-worker"|"shared"}
+    parallelism: dict            # {max_concurrent_workers, branch_per_worker: bool}
+    integration: dict            # HOW parallel work rejoins - itself under test:
+                                 # {"policy": "sequential-merge" | "rebase-onto-trunk"
+                                 #            | "cherry-pick" | "agent-composed",
+                                 #  "on_conflict": "fail" | "resolver-agent" | "human"}
     created_at: datetime
 ```
 
@@ -353,13 +357,34 @@ class StrategyTemplate:
 > and "worker" and the *trial* binds those roles to concrete models — otherwise
 > every model mix is a different template and nothing is comparable.
 
-> **Parallel writers need isolation.** Workspaces are per-RUN (12.2-INT); K
-> workers writing `/workspace/repo` concurrently would trample each other.
-> Fan-out templates therefore declare `worker_workspace: "per-worker"`, and the
-> orchestrator gives each worker its own workspace (own branch off the case's
-> base commit), with an integrator step merging the results. **Integration
-> conflict rate is a first-class measured outcome**, not an implementation
-> detail — it may well be the dominant cost of aggressive parallelism.
+> **Parallelism is git-native — LazyAF is the bridge.** K workers do not fight
+> over one checkout: each gets its own workspace cloned at the case's base commit
+> on **its own branch**, works freely, and commits. Integration is then a *git
+> merge*, not a file-level reconciliation — which is precisely the substrate this
+> platform already is:
+>
+> | Needed for fan-out | Already shipped |
+> |---|---|
+> | Per-worker isolation | Internal git server (bare repo per project) + workspace-per-clone at a pinned commit |
+> | Independent work | Branch-per-unit-of-work, the model cards have used since Phase 2 |
+> | Integration | `git_server.merge_branch` / `rebase_branch` |
+> | Conflict handling | `POST /api/cards/{id}/resolve-conflicts` returns STRUCTURED conflicts and accepts resolved contents; `ConflictResolver.svelte` is the human path |
+> | Review before merge | The existing approve/reject diff flow |
+>
+> Two consequences. First, fan-out needs far less new machinery than a
+> from-scratch harness would: the orchestrator allocates branches and calls
+> merges the platform already performs. Second — and more interesting —
+> **conflict resolution is itself an agent-addressable task**, because conflicts
+> come back as structured data rather than as a wall of `<<<<<<<` markers. A
+> strategy can legitimately say "on conflict, spawn a resolver agent", which is a
+> strategy variant nobody can benchmark on a single-sandbox harness.
+>
+> So **integration policy becomes a measured variable, not a fixed detail**:
+> sequential merge, rebase-onto-trunk, cherry-pick, agent-composed integration,
+> resolver-on-conflict. Integration conflict rate and resolution cost are
+> outcomes of the strategy under test — plausibly the dominant cost of aggressive
+> parallelism, and exactly the number that decides whether the pattern is worth
+> it.
 
 ### Trial / TrialIteration  *(Milestone 13)*
 A Trial is one loop run of one case under one (model, prompt, policy) variant.
@@ -390,7 +415,11 @@ class Trial:
                                  # so a cost-only board would rank fan-out as worse
                                  # while hiding the entire point of it
     serial_equivalent_ms: int | None  # summed step time; wall_clock/serial = speedup
-    integration_conflicts: int   # merges the integrator could not take cleanly
+    integration_conflicts: int   # merges that did not apply cleanly
+    conflicts_resolved: int      # of those, how many a resolver agent/human fixed
+    integration_cost_usd: Decimal  # what rejoining the work cost - the tax on
+                                 # parallelism, and the number that decides whether
+                                 # fan-out actually pays
     base_commit_sha: str
     final_commit_sha: str | None
     branch: str
@@ -979,6 +1008,17 @@ Decisions made DURING implementation (all shipped and gate-verified):
 - 2026-08-29 No v0 case study from existing session data — wait for real
   controlled trials with a one-shot baseline. (Owner)
 
+- 2026-08-29 Parallel strategies are GIT-NATIVE: branch + workspace per worker
+  off the case base commit, rejoined through the platform's existing
+  merge/rebase/resolve-conflicts machinery. Workers never share a checkout, so
+  parallelism is not a hazard to engineer around - it is the substrate LazyAF
+  already is. Integration POLICY (sequential-merge / rebase / cherry-pick /
+  agent-composed, and on-conflict: fail | resolver-agent | human) is part of the
+  strategy under test, and integration conflict/resolution cost are measured
+  outcomes. Structured conflicts make conflict resolution itself an
+  agent-addressable step - a strategy variant a single-sandbox harness cannot
+  express. (Owner: "lazyaf is the bridge")
+
 - OPEN: v1 pipeline retirement shape (12.8, owner confirms).
 - OPEN: whether `12.0` counts as done at 12.5 (runner-common adopted by agent
   images) or 12.8 (all runners retired) — resolves itself as those land.
@@ -1104,9 +1144,12 @@ models, reset to `base_commit_sha` on a fresh branch, run iteration pipelines of
 the strategy graph until solved / max_iterations / budget_usd exhausted,
 recording per-iteration cost (by role), diff churn, and oracle progress. Budget
 enforcement is hard (a trial cannot outspend its cap) and applies across the
-whole fan-out, not per worker. Parallel templates get **per-worker workspaces**
-(each worker a branch off the base commit) plus an integrator step; integration
-conflicts are recorded rather than silently dropped.
+whole fan-out, not per worker. Parallel templates allocate **a branch and a workspace per
+worker** off the case's base commit and rejoin through the platform's existing
+merge/rebase/resolve-conflicts machinery; the template's `integration.policy`
+decides how, and `on_conflict` may hand the structured conflict to a resolver
+agent. Conflicts, resolutions and integration cost are recorded as trial
+outcomes rather than silently dropped.
    EXIT GATE: a mock-model trial on a starter case solves at a known iteration
    with a complete per-iteration cost curve; a deliberately-unsolvable case
    terminates at budget_exhausted without overspending.
@@ -1165,6 +1208,15 @@ the case set exactly (results within variance, which is the honest claim).
 - **Does the integrator need to be a strong model?** Cheap planning + cheap
   execution + expensive integration may be the real shape. `cost_by_role` is
   designed to answer this empirically.
+- **Which integration policy wins?** Sequential merge is simplest; rebase keeps
+  history linear but re-runs conflicts per worker; agent-composed integration
+  could dodge conflicts entirely by having one model read K branches and write
+  the union. This is a strategy axis, so the harness answers it rather than the
+  architecture assuming it.
+- **Is conflict rate a function of the PLANNER's quality?** A good instruction
+  split should produce near-disjoint diffs. If conflict rate correlates with
+  planner model strength, that is a strong, publishable result about where to
+  spend intelligence in a fan-out.
 - **Fan-out ceiling:** at what K does added parallelism stop helping (or start
   hurting via conflicts)? A sweep over K on one case is a cheap early experiment
   and probably the first genuinely publishable result this harness can produce.

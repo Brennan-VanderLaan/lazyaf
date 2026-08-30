@@ -5,6 +5,8 @@ Endpoints for container-to-backend communication during step execution:
 - POST /api/steps/{step_id}/status - Update step status
 - POST /api/steps/{step_id}/logs - Append logs
 - POST /api/steps/{step_id}/heartbeat - Extend timeout
+- POST /api/steps/{step_id}/test-results - Ingest a test-results manifest
+- POST /api/steps/{step_id}/usage - Ingest resource accounting (Phase 12.5)
 
 Reporting-path ownership (wave2-123-wiring design, R3): in control mode this
 router is the SOLE writer of StepRun.logs and the step-log WS frames (one
@@ -37,10 +39,12 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import StepExecution, StepRun, StepExecutionStatus
+from app.models import StepExecution, StepRun, StepExecutionStatus, StepUsage
 from app.schemas.testref import TestIngestResponse, TestResultsManifest
+from app.schemas.usage import StepUsageRead, UsageIngestResponse, UsageManifest
 from app.services.control_layer.auth import validate_step_token
 from app.services.test_ingestion import ingest_manifest
+from app.services.usage_ingestion import ingest_usage
 from app.services.websocket import manager
 
 
@@ -357,3 +361,77 @@ async def ingest_step_test_results(
         test_runs_updated=counts.test_runs_updated,
         orphan_refs_created=counts.orphan_refs_created,
     )
+
+
+@router.post("/{step_id}/usage", response_model=UsageIngestResponse)
+async def ingest_step_usage(
+    step_id: str,
+    request: UsageManifest,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+) -> UsageIngestResponse:
+    """
+    Ingest one step's resource accounting (Phase 12.5, contract #3).
+
+    Called by the control runtime after the command exits, from
+    LAZYAF_USAGE_PATH. Same Bearer step token as /logs; terminal
+    StepExecutions answer 409. Idempotent per step_execution: a re-POST
+    updates rather than duplicates. When cost_usd is absent and the step
+    ran on a registered GPU node, the SERVER prices it (node rate x
+    occupancy) and stamps cost_source="gpu-node".
+
+    Ordering vs /status: the runtime POSTs usage BEFORE its terminal
+    /status. A usage POST arriving after terminal is a 409 and is dropped
+    by the runtime with a WARN - telemetry never fails a step, and the
+    step's exit code is ground truth about the work either way.
+
+    EVERY control-mode step produces a row, script steps included: theirs
+    carry cost_source="unknown", which is the recorded fact that nobody
+    reported a cost, not a gap. A dropped usage channel must be visible as
+    a missing row, and it can only be visible if the rows are complete.
+    """
+    execution = await verify_step_auth(step_id, authorization, db)
+    _reject_terminal_writes(execution)
+
+    usage = await ingest_usage(db, execution, request)
+    return UsageIngestResponse(
+        usage_id=usage.id,
+        cost_usd=str(usage.cost_usd) if usage.cost_usd is not None else None,
+        cost_source=usage.cost_source,
+    )
+
+
+@router.get("/{step_id}/usage", response_model=StepUsageRead)
+async def get_step_usage(
+    step_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> StepUsageRead:
+    """
+    Read one step's usage row (api-surface 2.7).
+
+    Operator/UI read: unauthenticated like the rest of the operator API.
+    The step token gates WRITES from the container, not operator reads of
+    what was written.
+
+    404s distinguish "no such execution" from "that execution reported no
+    usage" (api-surface 0: an unknown parent id is a 404, and "no rows" and
+    "no such thing" are different facts).
+    """
+    execution = (
+        await db.execute(select(StepExecution).where(StepExecution.id == step_id))
+    ).scalar_one_or_none()
+    if execution is None:
+        raise HTTPException(status_code=404, detail="Step execution not found")
+
+    usage = (
+        await db.execute(
+            select(StepUsage).where(StepUsage.step_execution_id == step_id)
+        )
+    ).scalar_one_or_none()
+    if usage is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No usage recorded for step execution {step_id}",
+        )
+
+    return StepUsageRead.from_model(usage)

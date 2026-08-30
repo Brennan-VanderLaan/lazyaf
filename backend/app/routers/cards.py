@@ -17,7 +17,7 @@ from app.routers.spec import (
 )
 from app.schemas import CardCreate, CardRead, CardUpdate
 from app.schemas.spec import FeatureCreate, FeatureRead
-from app.services.job_queue import job_queue, QueuedJob
+from app.services import agent_run
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
 
@@ -59,33 +59,35 @@ def serialize_agent_file_ids(ids: list[str] | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Step-type support (Phase 12.4 fallout)
+# Step-type support (Phase 12.4 fallout, revisited at 12.5)
 #
 # Card.step_type still carries the "script" and "docker" values, but Phase
 # 12.4 deleted script/docker execution from the runners: every runner
-# entrypoint's `execute_job` now REJECTS those step types. Cards are started
-# by enqueueing a Job for a runner - there is no local-executor path for a
-# card, because LocalExecutor is driven per PipelineRun/StepRun and a card
-# has neither.
+# entrypoint's `execute_job` now REJECTS those step types.
 #
-# So starting a script/docker CARD would enqueue a job that a runner picks
-# up and immediately fails: the card flips to in_progress and then to failed
-# with a message about a routing bug. That silent loop is exactly what this
-# guard exists to prevent - reject at the API instead, with a message that
-# names the reason and the supported alternative.
+# Phase 12.5 gave AGENT cards a local execution path: starting a card creates
+# an ad-hoc single-agent-step PipelineRun (app/services/agent_run.py), so a
+# card now has exactly the PipelineRun/StepRun the LocalExecutor is driven
+# by. That path is agent-only ON PURPOSE. Script/docker work belongs in a
+# real pipeline step: a card carries no command, no image and no step graph,
+# and inventing an ad-hoc script step here would fork the pipeline step
+# vocabulary into a second, card-shaped dialect (R3).
+#
+# So starting a script/docker CARD is still rejected at the API - with a
+# message that names the reason and the supported alternative - instead of
+# leaving the card stuck in_progress or silently running something the user
+# did not describe.
 #
 # DEPRECATED: CardCreate/CardUpdate/CardRead.step_type values "script" and
 # "docker" (app/schemas/card.py -> app.models.card.StepType). They remain
 # accepted on create/update so existing cards keep round-tripping, but they
-# cannot be STARTED. Script/docker work belongs in a pipeline step, where
-# the ExecutionRouter sends it to the local executor.
+# cannot be STARTED.
 # ---------------------------------------------------------------------------
-RUNNER_ONLY_STEP_TYPES = ("agent",)
 DEPRECATED_CARD_STEP_TYPES = ("script", "docker")
 
 
 def _reject_unrunnable_step_type(card: Card) -> None:
-    """400 on a card whose step_type no longer has an execution path.
+    """400 on a card whose step_type has no execution path.
 
     Raises HTTPException(400) for script/docker cards (see the module note
     above). Called by every card-start entry point (start, retry) so a user
@@ -98,8 +100,8 @@ def _reject_unrunnable_step_type(card: Card) -> None:
             detail=(
                 f"Cards with step_type='{step_type}' can no longer be started: "
                 "Phase 12.4 removed script/docker execution from the runners, "
-                "and cards run only on the runner queue (the local executor is "
-                "driven per pipeline step, which a card does not have). "
+                "and the ad-hoc card run introduced in Phase 12.5 is an AGENT "
+                "step only (a card carries no command or image to run). "
                 f"step_type='{step_type}' is deprecated for cards - move this "
                 "work into a pipeline step, where it runs on the local "
                 "executor, or change the card to step_type='agent'."
@@ -344,35 +346,23 @@ async def start_card(
     card.status = "in_progress"
     card.job_id = job_id
     card.branch_name = f"lazyaf/{job_id[:8]}"
+    # A new run means a new branch: any PR link left over from an earlier
+    # attempt points at work this run is not doing. Retry already clears it;
+    # start clears it too, so the two entry points cannot disagree.
+    card.pr_url = None
     card.completed_runner_type = None  # Clear in case this is a re-start
 
     await db.commit()
     await db.refresh(card)
 
-    # Get prompt template: card-specific > global default > None (runner uses built-in)
+    # Get prompt template: card-specific > global default > None (agent uses built-in)
     settings = get_settings()
     prompt_template = card.prompt_template or settings.default_prompt_template
 
-    # Queue the job for a runner
-    # Use internal git server for ingested repos (runner constructs URL from BACKEND_URL + repo_id)
-    queued_job = QueuedJob(
-        id=job_id,
-        card_id=card.id,
-        repo_id=repo.id,
-        repo_url=repo.remote_url or "",  # Kept for reference, but runner uses internal git
-        base_branch=repo.default_branch,
-        card_title=card.title,
-        card_description=card.description,
-        runner_type=card.runner_type,  # Pass runner type from card
-        use_internal_git=True,  # Always use internal git for ingested repos
-        agent_file_ids=agent_file_ids,
-        prompt_template=prompt_template,
-        step_type=card.step_type,
-        step_config=step_config,
-    )
-    await job_queue.enqueue(queued_job)
-
-    # Broadcast job queued status via WebSocket
+    # Broadcast job queued status via WebSocket BEFORE dispatch: the run
+    # start flips the same Job row to running and broadcasts again, so the UI
+    # sees queued -> running in order rather than a job that appears already
+    # running.
     await manager.send_job_status({
         "id": job_id,
         "card_id": card.id,
@@ -381,10 +371,26 @@ async def start_card(
         "started_at": None,
         "completed_at": None,
     })
-
-    # Broadcast card update via WebSocket
     await manager.send_card_updated(card_to_ws_dict(card))
 
+    # 12.5: card work runs on the control layer as an ad-hoc agent run - an
+    # ephemeral hidden Pipeline + a real PipelineRun with one agent step.
+    # Nothing is enqueued for a polling runner (asserted by
+    # tdd/unit/services/test_no_legacy_enqueue.py).
+    await agent_run.start_card_work(
+        db,
+        card,
+        repo,
+        job_id=job_id,
+        prompt_template=prompt_template,
+        agent_file_ids=agent_file_ids,
+        step_config=step_config,
+    )
+
+    # Return the card as of the START, deliberately un-refreshed. Agent work
+    # is asynchronous now: on_run_complete writes the terminal status from
+    # the step task's OWN session, so refreshing here would make this
+    # response race the run and sometimes answer "failed" to "please start".
     return card
 
 
@@ -608,29 +614,10 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
     # Get agent file IDs from the card
     agent_file_ids = parse_agent_file_ids(card.agent_file_ids) or []
 
-    # Get prompt template: card-specific > global default > None (runner uses built-in)
+    # Get prompt template: card-specific > global default > None (agent uses built-in)
     settings = get_settings()
     prompt_template = card.prompt_template or settings.default_prompt_template
 
-    # Queue the job for a runner
-    queued_job = QueuedJob(
-        id=job_id,
-        card_id=card.id,
-        repo_id=repo.id,
-        repo_url=repo.remote_url or "",
-        base_branch=repo.default_branch,
-        card_title=card.title,
-        card_description=card.description,
-        runner_type=card.runner_type,  # Pass runner type from card
-        use_internal_git=True,
-        agent_file_ids=agent_file_ids,
-        prompt_template=prompt_template,
-        step_type=card.step_type,
-        step_config=step_config,
-    )
-    await job_queue.enqueue(queued_job)
-
-    # Broadcast job queued status via WebSocket
     await manager.send_job_status({
         "id": job_id,
         "card_id": card.id,
@@ -639,10 +626,23 @@ async def retry_card(card_id: str, db: AsyncSession = Depends(get_db)):
         "started_at": None,
         "completed_at": None,
     })
-
-    # Broadcast card update via WebSocket
     await manager.send_card_updated(card_to_ws_dict(card))
 
+    # 12.5: same control-layer path as start (see start_card above).
+    await agent_run.start_card_work(
+        db,
+        card,
+        repo,
+        job_id=job_id,
+        prompt_template=prompt_template,
+        agent_file_ids=agent_file_ids,
+        step_config=step_config,
+    )
+
+    # Return the card as of the START, deliberately un-refreshed. Agent work
+    # is asynchronous now: on_run_complete writes the terminal status from
+    # the step task's OWN session, so refreshing here would make this
+    # response race the run and sometimes answer "failed" to "please start".
     return card
 
 

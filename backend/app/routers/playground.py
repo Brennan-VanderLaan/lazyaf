@@ -19,7 +19,7 @@ from app.schemas.playground import (
     PlaygroundStatus,
     PlaygroundResult,
 )
-from app.services.playground_service import playground_service
+from app.services.playground_service import PlaygroundCancelError, playground_service
 from app.services.agent_resolver import agent_resolver
 
 logger = logging.getLogger(__name__)
@@ -91,9 +91,12 @@ async def start_test(
     # Build the task description for the job
     task_description = request.task_override or "Test agent behavior on this branch"
 
-    # Start the test
+    # Start the test as an ad-hoc agent run (12.5): an ephemeral hidden
+    # Pipeline + a real PipelineRun with one agent step. Nothing is enqueued
+    # for a polling runner any more.
     session_id = await playground_service.start_test(
-        repo_id=repo.id,
+        db,
+        repo,
         branch=request.branch,
         runner_type=request.runner_type,
         model=request.model,
@@ -103,10 +106,16 @@ async def start_test(
         agent_file_ids=agent_file_ids,
     )
 
+    session = playground_service.get_session(session_id)
+    status = session.status if session else "queued"
     return PlaygroundTestResponse(
         session_id=session_id,
-        status="queued",
-        message="Test queued, waiting for runner",
+        status=status,
+        message=(
+            "Test failed to start"
+            if status == "failed"
+            else "Test running in an ephemeral agent container"
+        ),
     )
 
 
@@ -155,9 +164,23 @@ async def get_status(session_id: str):
 
 
 @session_router.post("/{session_id}/cancel")
-async def cancel_test(session_id: str):
-    """Cancel a running test."""
-    success = await playground_service.cancel_test(session_id)
+async def cancel_test(session_id: str, db: AsyncSession = Depends(get_db)):
+    """Cancel a running test.
+
+    12.5: cancelling the session also cancels the ad-hoc run behind it, which
+    kills the agent container and reclaims its workspace volume - the db
+    session is threaded through for that.
+
+    A run that could not be cancelled is a 503, not a 200: the container is
+    what costs money, and answering "cancelled" while the agent keeps working
+    hides the one thing the user asked to stop. The session is left running
+    so the call can be retried.
+    """
+    try:
+        success = await playground_service.cancel_test(session_id, db)
+    except PlaygroundCancelError as e:
+        logger.error("Playground cancel failed for session %s: %s", session_id, e)
+        raise HTTPException(status_code=503, detail=str(e)) from e
     if not success:
         raise HTTPException(status_code=400, detail="Cannot cancel session")
 
@@ -174,7 +197,13 @@ async def get_result(session_id: str):
     return PlaygroundResult(**result)
 
 
-# Internal endpoints for runners
+# Internal endpoints for runners.
+#
+# LEGACY-ONLY since 12.5: the default playground path is an ad-hoc agent run,
+# whose logs arrive via POST /api/steps/{id}/logs and whose diff is computed
+# server-side from the internal git server. These routes stay for the
+# `executor: legacy` escape hatch (R2) and are named in the 12.6 deletion
+# list; nothing on the default path calls them.
 
 
 class InternalStatusUpdate(BaseModel):

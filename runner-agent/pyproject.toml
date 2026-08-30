@@ -1,0 +1,42 @@
+[project]
+name = "lazyaf-runner"
+version = "0.1.0"
+description = "LazyAF remote runner agent - connects to a LazyAF backend over WebSocket and executes pipeline steps on this host"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=15.0.1",
+    "docker>=7.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-timeout>=2.3.0",
+]
+
+[project.scripts]
+lazyaf-runner = "lazyaf_runner.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lazyaf_runner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = ["-ra", "--tb=short", "--strict-markers"]
+markers = [
+    "docker: requires a reachable docker daemon",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

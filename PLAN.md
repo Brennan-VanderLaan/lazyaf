@@ -326,6 +326,14 @@ class BenchmarkCase:
                                  # | "medium" | "low" (self-authored / post-cutoff)
     source_url: str | None       # upstream provenance for public fixtures
     license: str | None          # SPDX id - decides what the public bundle may ship
+    test_command: str            # the PINNED oracle invocation, e.g. "pytest -q"
+    oracle_file_hashes: dict     # {path: sha256} for every file carrying an oracle
+                                 # id - an agent that edits the oracle to pass is
+                                 # cheating, and this is how the trial detects it
+    quarantined_tests: list[str] # ids ejected by the flake screen, kept on the record
+    reference_patch: str | None  # gold patch where upstream has one -> enables the
+                                 # "is this case solvable at all" control
+    solvable_verified: bool      # the gold-patch control passed
     created_at: datetime
 ```
 
@@ -344,6 +352,9 @@ class StrategyTemplate:
     roles: list[str]             # ["planner", "worker", "integrator", "reviewer"]
     loop_policy: dict            # {max_iterations, budget_usd, stop_on}
     parallelism: dict            # {max_concurrent_workers, branch_per_worker: bool}
+    variables: dict              # {"K": {"type":"int","default":4,"min":1,"max":32}} -
+                                 # what makes planner-fanout-4 and -16 the SAME
+                                 # template, so a K-sweep is one template not sixteen
     integration: dict            # HOW parallel work rejoins - itself under test:
                                  # {"policy": "sequential-merge" | "rebase-onto-trunk"
                                  #            | "cherry-pick" | "agent-composed",
@@ -405,7 +416,26 @@ class Trial:
     prompt_version: int | None
     loop_policy: dict            # {max_iterations, budget_usd, stop_on}
     status: str                  # running | solved | failed | budget_exhausted | error
-    solved_at_iteration: int | None   # headline metric; None = never solved
+    template_variables: dict     # {"K": 16} - a trial that does not record the K it
+                                 # ran at cannot be reproduced
+    target_met: bool             # all fail_to_pass green at the final commit
+    clean: bool                  # zero pass_to_pass broken at the final commit
+                                 # solved == target_met AND clean. Storing the halves
+                                 # separately is the only way to compute a regression
+                                 # rate that is not definitionally zero.
+    solved_at_iteration: int | None   # None = never solved (a CENSORED observation,
+                                 # not a missing one - see the metrics spec)
+    budget_overrun_usd: Decimal  # spend already in flight when the cap hit; recorded
+                                 # rather than hidden
+    queued_ms: int               # excluded from wall_clock, never silently folded in
+    machine_profile: str         # "local-16c-64g" | "runpod-a100" | ... - a speedup
+                                 # number is meaningless without the host it ran on
+    host_concurrency_limit: int  # what the fan-out was actually ALLOWED to run, which
+                                 # is not always the K it asked for
+    error_class: str | None      # "infra" | "provider" | "oracle_tampered" |
+                                 # "base_state_invalid" - trials that failed for
+                                 # reasons that are not the strategy's fault must be
+                                 # excludable from denominators, and visibly so
     iterations_used: int
     total_cost_usd: Decimal
     cost_by_role: dict           # {"planner": 0.42, "worker": 1.10, ...}
@@ -1128,6 +1158,34 @@ Decisions made DURING implementation (all shipped and gate-verified):
   than the fix.
 - **Determinism disclosure**: whatever the provider exposes (temperature, seed)
   is recorded per trial, so "we could not pin this" is stated rather than hidden.
+
+### Detailed specifications
+
+The implementable detail lives in `docs/milestone-13/` (PLAN.md keeps the shape
+and the decisions; the companion docs keep the 3,000 lines an implementer needs,
+the same split `historical-documents/` uses for completed phases):
+
+| Document | What it pins |
+|---|---|
+| `docs/milestone-13/strategy-catalog.md` | The StrategyTemplate graph contract (reserved `lazyaf_*` keys, the six-pass `expand_strategy_graph`, strict two-way role-binding, K-parameterization) and a 7-entry catalog with REAL v2 graph JSON: one-shot, test-first, adversarial-review, planner-fanout (expanded at K=4), planner-fanout-resolver, one-shot-gated, composed-full. Plus the integration-policy x on-conflict matrix, including the cells that are rejected as incoherent. |
+| `docs/milestone-13/api-surface.md` | Every endpoint (`/api/bench/*`), the full `POST /api/steps/{id}/usage` contract for Phase 12.5, how the benchmark layer joins the spec layer without double-counting criterion history in the dogfood corpus, MCP tools, `lazyaf bench` CLI, and the indexes the read-heavy board queries need. |
+| `docs/milestone-13/phase-specs-and-metrics.md` | Phase deliverables 13.1-13.5 with contract test files and Definition-of-Done checklists; the metrics defined mathematically; the variance/separability rules; and the `METHOD.md` template that ships in every exported bundle. |
+
+**The one thing from those docs that belongs in the plan itself** — because it
+governs how every number is allowed to be stated:
+
+> **Cost-to-solve is censored data.** A trial stopped by the budget cap is not a
+> missing observation and not infinite cost; it is the statement *"more than what
+> was spent"*. So the board never prints a lone median. It prints three numbers
+> together: the **paired median** over the case set every compared variant solved
+> (difficulty held constant; `INSUFFICIENT` under 5 shared cases), the
+> **amortized cost per solve** over ALL trials including failures (what it
+> actually costs a user to get one working change), and the **Kaplan-Meier
+> censored p50** — which, when survival never reaches 0.5, renders
+> `> $X.XX (only N% solved)` rather than inventing a median. If the paired and
+> amortized numbers rank differently, the board says so in words instead of
+> picking a winner: that variant is cheap when it works and expensive when it
+> does not, and that is the finding.
 
 ### Phase 13.1 — Corpus & fixtures
 `BenchmarkSuite` / `BenchmarkCase` models + CRUD + a `lazyaf bench` CLI to author

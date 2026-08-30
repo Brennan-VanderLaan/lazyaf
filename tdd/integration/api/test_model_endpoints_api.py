@@ -1,0 +1,933 @@
+"""Integration tests for the model endpoint registry API (M14.1, wave8 s1.5).
+
+Endpoints under test:
+- GET    /api/model-endpoints
+- POST   /api/model-endpoints            (creates, then probes SYNCHRONOUSLY)
+- GET    /api/model-endpoints/{id}
+- PATCH  /api/model-endpoints/{id}
+- DELETE /api/model-endpoints/{id}
+- POST   /api/model-endpoints/{id}/probe
+- POST   /api/model-endpoints/{id}/probe-result   (step JWT)
+- GET    /api/model-endpoints/{id}/usage
+
+THE THREE PROPERTIES THIS FILE EXISTS TO PIN:
+
+1. **A no-auth endpoint is the DEFAULT PATH, not a special case.** LAN ollama
+   and vLLM behind a firewall genuinely have no key; most of the tests here
+   register one that way on purpose.
+2. **The secret value never appears anywhere.** A sentinel is planted in the
+   backend environment, echoed back by a hostile stub server, and grepped for
+   across every response body, `probe_detail` and `last_error`.
+3. **A probe is an OBSERVATION.** An endpoint that is down returns 200 with a
+   red record - never a 502, which would make the operator's UI show a
+   request error where it should show a red endpoint.
+
+Router mounting note: `app/main.py`'s `include_router` line is the
+integrator's edit (agent A's report asks for it). This module mounts the
+router if it is not already mounted, so the suite is green both before and
+after that line lands - and identical either way, because it mounts THE SAME
+router object main.py will.
+"""
+import json
+import sys
+from datetime import datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import select
+
+backend_path = Path(__file__).parent.parent.parent.parent / "backend"
+sys.path.insert(0, str(backend_path))
+
+repo_root = Path(__file__).parent.parent.parent.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from app.main import app  # noqa: E402
+from app.models.model_endpoint import ModelEndpoint  # noqa: E402
+from app.models.pipeline import (  # noqa: E402
+    Pipeline,
+    PipelineRun,
+    StepExecution,
+    StepRun,
+)
+from app.models.repo import Repo  # noqa: E402
+from app.models.usage import StepUsage  # noqa: E402
+from app.routers import model_endpoints as model_endpoints_router  # noqa: E402
+from app.services.control_layer.auth import generate_step_token  # noqa: E402
+from app.services.model_endpoints import probe as probe_module  # noqa: E402
+from app.services.model_endpoints.probe import (  # noqa: E402
+    PROBE_TOOL_NAME,
+    ProbeHTTP,
+)
+
+API = "/api/model-endpoints"
+
+if not any(
+    getattr(route, "path", "").startswith(API) for route in app.routes
+):  # pragma: no cover - depends on whether main.py has been wired yet
+    app.include_router(model_endpoints_router.router)
+
+
+# -----------------------------------------------------------------------------
+# A stub OpenAI-compatible server, installed in place of the httpx transport
+# -----------------------------------------------------------------------------
+
+MODEL = "qwen2.5-coder:32b"
+
+
+def _models_payload(max_model_len=None):
+    entry = {"id": MODEL, "object": "model"}
+    if max_model_len is not None:
+        entry["max_model_len"] = max_model_len
+    return {"object": "list", "data": [entry]}
+
+
+def _tools_payload():
+    return {
+        "model": MODEL,
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": PROBE_TOOL_NAME,
+                                "arguments": '{"value": 7}',
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+        "usage": {"prompt_tokens": 61, "completion_tokens": 12},
+    }
+
+
+class StubServer:
+    """Deterministic OpenAI-compatible responses, or an outage."""
+
+    def __init__(self, *, down=False, echo=None, tools=True, context=32768):
+        self.down = down
+        self.echo = echo
+        self.tools = tools
+        self.context = context
+        self.calls: list[str] = []
+
+    async def request(
+        self, method, url, *, json_body=None, timeout=None, stream=False, max_lines=64
+    ):
+        self.calls.append(url)
+        if self.down:
+            raise probe_module.ProbeTransportError(
+                "ConnectError: [Errno 111] Connection refused"
+            )
+        if url.endswith("/models"):
+            return ProbeHTTP(
+                status=200,
+                text=json.dumps(_models_payload()),
+                payload=_models_payload(),
+            )
+        if url.endswith("/api/show"):
+            payload = {"model_info": {"qwen2.context_length": self.context}}
+            return ProbeHTTP(status=200, text=json.dumps(payload), payload=payload)
+        if stream:
+            return ProbeHTTP(
+                status=200,
+                lines=[
+                    'data: {"choices": [{"delta": {"content": "hi"}}]}',
+                    'data: {"choices": [], "usage": {"prompt_tokens": 4, '
+                    '"completion_tokens": 1}}',
+                    "data: [DONE]",
+                ],
+            )
+        if self.echo is not None:
+            # A hostile server that reflects the key back in a 401 body - the
+            # exact failure mode that would otherwise put a secret in the DB.
+            body = json.dumps({"error": f"invalid api key: {self.echo}"})
+            return ProbeHTTP(status=401, text=body, payload=json.loads(body))
+        if not self.tools:
+            body = json.dumps({"error": "this model does not support tools"})
+            return ProbeHTTP(status=400, text=body, payload=json.loads(body))
+        return ProbeHTTP(
+            status=200, text=json.dumps(_tools_payload()), payload=_tools_payload()
+        )
+
+
+@pytest.fixture
+def stub_server(monkeypatch):
+    """Install a stub in place of `HttpxProbeTransport` for one test."""
+    holder = {}
+
+    def _install(**kwargs) -> StubServer:
+        server = StubServer(**kwargs)
+        holder["server"] = server
+        monkeypatch.setattr(
+            probe_module, "HttpxProbeTransport", lambda headers=None: server
+        )
+        return server
+
+    return _install
+
+
+@pytest.fixture
+def captured_frames(monkeypatch):
+    """Record every WS frame the manager broadcasts during one test."""
+    from app.services.websocket import manager
+
+    frames: list[tuple] = []
+    original = manager.broadcast
+
+    async def _spy(message_type, payload):
+        frames.append((message_type, payload))
+        return await original(message_type, payload)
+
+    monkeypatch.setattr(manager, "broadcast", _spy)
+    return frames
+
+
+# -----------------------------------------------------------------------------
+# Payload helpers
+# -----------------------------------------------------------------------------
+
+def lan_ollama(name="local-4090", **overrides) -> dict:
+    """The first-class case: a LAN ollama with NO auth at all."""
+    payload = {
+        "name": name,
+        "base_url": "http://192.168.1.50:11434/v1",
+        "model": MODEL,
+        "server_kind": "ollama",
+    }
+    payload.update(overrides)
+    return payload
+
+
+async def _make_step(db_session, *, status="running", endpoint_id=None, runner_id=None):
+    repo = Repo(id=str(uuid4()), name=f"ep-repo-{uuid4().hex[:8]}", is_ingested=True)
+    db_session.add(repo)
+    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci", steps="[]")
+    db_session.add(pipeline)
+    run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id, status="running")
+    db_session.add(run)
+    step_run = StepRun(
+        id=str(uuid4()),
+        pipeline_run_id=run.id,
+        step_index=0,
+        step_name="agent",
+        status="running",
+        logs="",
+    )
+    db_session.add(step_run)
+    execution = StepExecution(
+        id=str(uuid4()),
+        execution_key=f"{run.id}:0:1",
+        step_run_id=step_run.id,
+        status=status,
+        model_endpoint_id=endpoint_id,
+        runner_id=runner_id,
+    )
+    db_session.add(execution)
+    await db_session.commit()
+    token = generate_step_token(
+        step_id=execution.id, execution_key=execution.execution_key
+    )
+    return {
+        "execution": execution,
+        "execution_id": execution.id,
+        "pipeline_run_id": run.id,
+        "step_run_id": step_run.id,
+        "headers": {"Authorization": f"Bearer {token}"},
+    }
+
+
+# -----------------------------------------------------------------------------
+# Registration
+# -----------------------------------------------------------------------------
+
+class TestRegistration:
+    async def test_no_auth_endpoint_registers_and_probes_in_one_call(
+        self, client, stub_server
+    ):
+        """The demo path, end to end: register a LAN ollama with no key and
+        learn what it can do at the moment of registration - not at the first
+        30-minute step."""
+        stub_server()
+
+        response = await client.post(API, json=lan_ollama())
+
+        assert response.status_code == 201
+        body = response.json()
+        endpoint = body["endpoint"]
+        assert endpoint["auth_style"] == "none"
+        assert endpoint["auth_secret_ref"] is None
+        assert endpoint["secret_present"] is True
+        assert endpoint["capabilities"]["probe_status"] == "ok"
+        assert endpoint["capabilities"]["supports_tools"] is True
+        assert endpoint["capabilities"]["supports_streaming"] is True
+        assert endpoint["capabilities"]["reports_usage"] is True
+        assert endpoint["capabilities"]["context_window"] == 32768
+        assert endpoint["capabilities"]["probed_from"] == "backend"
+        assert endpoint["health"] == "healthy"
+        # Defaults that carry the cost story.
+        assert endpoint["gpu_node_id"] == "endpoint:local-4090"
+        assert endpoint["pricing"]["gpu_fraction"] == 1.0
+        assert endpoint["pricing"]["priced"] is False
+        assert endpoint["max_concurrency"] == 1
+
+    async def test_probe_false_leaves_it_unprobed_and_says_dispatch_will_refuse(
+        self, client, stub_server
+    ):
+        server = stub_server()
+
+        response = await client.post(f"{API}?probe=false", json=lan_ollama())
+
+        body = response.json()
+        assert body["endpoint"]["capabilities"]["probe_status"] == "unprobed"
+        assert body["endpoint"]["capabilities"]["supports_tools"] is None
+        assert body["endpoint"]["health"] == "unprobed"
+        assert "refuse" in body["detail"]
+        assert server.calls == []
+
+    async def test_duplicate_name_is_409(self, client, stub_server):
+        stub_server()
+        await client.post(f"{API}?probe=false", json=lan_ollama())
+
+        response = await client.post(f"{API}?probe=false", json=lan_ollama())
+
+        assert response.status_code == 409
+        assert "endpoint:local-4090" in response.json()["detail"]
+
+    async def test_zero_rate_is_priced_and_null_rate_is_not(self, client, stub_server):
+        """Decision 4's whole point: `$0.00/hr` (owned hardware, marginal cash
+        cost) and `unpriced` must stay distinguishable."""
+        stub_server()
+        owned = await client.post(
+            f"{API}?probe=false", json=lan_ollama("owned", rate_usd_hour="0.00")
+        )
+        unknown = await client.post(
+            f"{API}?probe=false", json=lan_ollama("unpriced-node")
+        )
+
+        assert owned.json()["endpoint"]["priced"] is True
+        assert owned.json()["endpoint"]["rate_usd_hour"] == "0.000000"
+        assert unknown.json()["endpoint"]["priced"] is False
+        assert unknown.json()["endpoint"]["rate_usd_hour"] is None
+
+    async def test_runner_local_gets_a_default_label(self, client, stub_server):
+        stub_server()
+        response = await client.post(
+            f"{API}?probe=false", json=lan_ollama(reach="runner-local")
+        )
+        assert response.json()["endpoint"]["runner_label"] == "endpoint:local-4090"
+
+    async def test_base_url_without_v1_is_accepted_with_a_warning(
+        self, client, stub_server
+    ):
+        """Stated, never rewritten: guessing at someone's reverse proxy layout
+        is how a working endpoint becomes an unexplainable 404."""
+        stub_server()
+        response = await client.post(
+            f"{API}?probe=false",
+            json=lan_ollama(base_url="http://192.168.1.50:11434"),
+        )
+        assert response.status_code == 201
+        assert "/v1" in response.json()["endpoint"]["warning"]
+
+    async def test_unknown_vocabulary_values_are_422(self, client):
+        for field, value in (
+            ("reach", "carrier-pigeon"),
+            ("auth_style", "basic"),
+            ("server_kind", "skynet"),
+        ):
+            response = await client.post(
+                f"{API}?probe=false", json=lan_ollama(**{field: value})
+            )
+            assert response.status_code == 422, field
+
+
+# -----------------------------------------------------------------------------
+# Secrets
+# -----------------------------------------------------------------------------
+
+class TestSecretRefs:
+    @pytest.mark.parametrize(
+        "ref", ["ANTHROPIC_API_KEY", "LAZYAF_STEP_AUTH_SECRET", "GEMINI_API_KEY"]
+    )
+    async def test_forbidden_refs_are_422_at_create(self, client, ref):
+        """A stored config must not be an exfiltration route: without the
+        allowlist, a row could point the platform's own credentials at a
+        container the operator does not control."""
+        response = await client.post(
+            f"{API}?probe=false",
+            json=lan_ollama(auth_style="bearer", auth_secret_ref=ref),
+        )
+        assert response.status_code == 422
+        assert ref in json.dumps(response.json())
+
+    async def test_bearer_without_a_ref_is_422(self, client):
+        response = await client.post(
+            f"{API}?probe=false", json=lan_ollama(auth_style="bearer")
+        )
+        assert response.status_code == 422
+
+    async def test_header_style_requires_a_header_name(self, client):
+        response = await client.post(
+            f"{API}?probe=false",
+            json=lan_ollama(
+                auth_style="header", auth_secret_ref="LAZYAF_ENDPOINT_DEMO"
+            ),
+        )
+        assert response.status_code == 422
+
+    async def test_a_valid_ref_that_resolves_to_nothing_is_not_an_error(
+        self, client, stub_server, monkeypatch
+    ):
+        """The operator may legitimately register before setting the variable.
+        `secret_present: false` is how the UI says so IN RED, without the
+        create call failing."""
+        monkeypatch.delenv("LAZYAF_ENDPOINT_NOT_SET", raising=False)
+        stub_server()
+
+        response = await client.post(
+            f"{API}?probe=false",
+            json=lan_ollama(
+                auth_style="bearer", auth_secret_ref="LAZYAF_ENDPOINT_NOT_SET"
+            ),
+        )
+
+        assert response.status_code == 201
+        assert response.json()["endpoint"]["secret_present"] is False
+        assert response.json()["endpoint"]["auth_secret_ref"] == "LAZYAF_ENDPOINT_NOT_SET"
+
+    async def test_the_sentinel_never_appears_on_any_surface(
+        self, client, stub_server, monkeypatch, db_session
+    ):
+        """Plant a real value in the backend env, have a hostile server echo
+        it back in a 401, then grep EVERY surface for it."""
+        sentinel = "sk-sentinel-must-never-be-stored-0001"
+        monkeypatch.setenv("LAZYAF_ENDPOINT_SENTINEL", sentinel)
+        stub_server(echo=sentinel)
+
+        created = await client.post(
+            API,
+            json=lan_ollama(
+                auth_style="bearer", auth_secret_ref="LAZYAF_ENDPOINT_SENTINEL"
+            ),
+        )
+        endpoint_id = created.json()["endpoint"]["id"]
+        listing = await client.get(API)
+        single = await client.get(f"{API}/{endpoint_id}")
+        probed = await client.post(f"{API}/{endpoint_id}/probe?force=true")
+
+        for response in (created, listing, single, probed):
+            assert sentinel not in response.text, response.url
+
+        row = (
+            await db_session.execute(
+                select(ModelEndpoint).where(ModelEndpoint.id == endpoint_id)
+            )
+        ).scalar_one()
+        assert sentinel not in (row.probe_detail or "")
+        assert sentinel not in (row.last_error or "")
+        # ...and the scrubber left the shape visible, so the operator can see
+        # that a 401 happened at all.
+        assert "***" in row.probe_detail
+
+
+# -----------------------------------------------------------------------------
+# Probing
+# -----------------------------------------------------------------------------
+
+class TestProbe:
+    async def test_unreachable_returns_200_with_a_red_record(
+        self, client, stub_server
+    ):
+        stub_server(down=True)
+
+        created = await client.post(API, json=lan_ollama())
+
+        assert created.status_code == 201
+        endpoint = created.json()["endpoint"]
+        assert endpoint["capabilities"]["probe_status"] == "unreachable"
+        assert endpoint["health"] == "unhealthy"
+        assert endpoint["consecutive_failures"] == 1
+        assert "Connection refused" in endpoint["last_error"]
+        # Never probed AND unreachable -> we do not know how to drive it.
+        assert endpoint["capabilities"]["supports_tools"] is None
+
+    async def test_a_reboot_does_not_erase_a_good_capability_record(
+        self, client, stub_server, monkeypatch
+    ):
+        """THE rule of section 2.3, over the API."""
+        healthy = stub_server()
+        created = await client.post(API, json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        assert created.json()["endpoint"]["capabilities"]["supports_tools"] is True
+
+        healthy.down = True
+        response = await client.post(f"{API}/{endpoint_id}/probe?force=true")
+
+        assert response.status_code == 200
+        caps = response.json()["endpoint"]["capabilities"]
+        assert caps["probe_status"] == "unreachable"
+        assert caps["supports_tools"] is True, "previous capabilities survive"
+        assert caps["supports_streaming"] is True
+        assert caps["context_window"] == 32768
+        assert response.json()["endpoint"]["consecutive_failures"] == 1
+
+    async def test_two_probes_inside_the_floor_make_one_upstream_call(
+        self, client, stub_server
+    ):
+        server = stub_server()
+        created = await client.post(API, json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        calls_after_create = len(server.calls)
+
+        response = await client.post(f"{API}/{endpoint_id}/probe")
+
+        assert response.status_code == 200
+        assert response.json()["cached"] is True
+        assert len(server.calls) == calls_after_create
+
+    async def test_force_re_probes(self, client, stub_server):
+        server = stub_server()
+        created = await client.post(API, json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        before = len(server.calls)
+
+        response = await client.post(f"{API}/{endpoint_id}/probe?force=true")
+
+        assert response.json()["cached"] is False
+        assert len(server.calls) > before
+
+    async def test_a_tools_less_model_is_degraded_but_registered(
+        self, client, stub_server
+    ):
+        """`degraded` is USABLE: `supports_tools=False` routes the no-tools
+        fallback protocol, and the status exists so the UI can say why."""
+        stub_server(tools=False)
+
+        created = await client.post(API, json=lan_ollama())
+
+        endpoint = created.json()["endpoint"]
+        assert endpoint["capabilities"]["probe_status"] == "degraded"
+        assert endpoint["capabilities"]["supports_tools"] is False
+        assert endpoint["health"] == "degraded"
+        assert endpoint["probe_detail"]["tools_reason"] == "http_400"
+
+    async def test_runner_local_probe_does_not_probe_from_the_backend(
+        self, client, stub_server
+    ):
+        """A runner-local endpoint is unreachable from the backend BY
+        DEFINITION. Probing it from here would record a reachability fact
+        about the wrong machine, so the API says what it did instead."""
+        server = stub_server()
+        created = await client.post(
+            f"{API}?probe=false", json=lan_ollama(reach="runner-local")
+        )
+        endpoint_id = created.json()["endpoint"]["id"]
+
+        response = await client.post(f"{API}/{endpoint_id}/probe")
+
+        assert response.status_code == 200
+        assert response.json()["cached"] is True
+        detail = response.json()["detail"]
+        assert "runner-local" in detail or "runner" in detail
+        assert response.json()["endpoint"]["capabilities"]["probe_status"] == "unprobed"
+        assert server.calls == []
+
+    async def test_probe_publishes_a_model_endpoint_status_frame(
+        self, client, stub_server, captured_frames
+    ):
+        stub_server()
+        created = await client.post(API, json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+
+        await client.post(f"{API}/{endpoint_id}/probe?force=true")
+
+        endpoint_frames = [f for f in captured_frames if f[0] == "model_endpoint_status"]
+        assert endpoint_frames, "the Endpoints page updates from a delta, not a poll"
+        payload = endpoint_frames[-1][1]
+        assert payload["id"] == endpoint_id
+        assert payload["endpoint"]["capabilities"]["probe_status"] == "ok"
+
+
+# -----------------------------------------------------------------------------
+# Editing
+# -----------------------------------------------------------------------------
+
+class TestPatch:
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"base_url": "http://192.168.1.51:11434/v1"},
+            {"model": "llama3.1:8b"},
+            {"server_kind": "vllm"},
+            {"auth_style": "bearer", "auth_secret_ref": "LAZYAF_ENDPOINT_DEMO"},
+        ],
+    )
+    async def test_capability_invalidating_changes_reset_the_record(
+        self, client, stub_server, changes
+    ):
+        """A capability observed against a different model is not evidence
+        about this one."""
+        stub_server()
+        created = await client.post(API, json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+
+        response = await client.patch(f"{API}/{endpoint_id}", json=changes)
+
+        assert response.status_code == 200
+        caps = response.json()["capabilities"]
+        assert caps["probe_status"] == "unprobed"
+        assert caps["supports_tools"] is None
+        assert caps["supports_streaming"] is None
+        assert caps["reports_usage"] is None
+        assert caps["probed_at"] is None
+        assert response.json()["health"] == "unprobed"
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"description": "the workshop box"},
+            {"rate_usd_hour": "1.89"},
+            {"max_concurrency": 2},
+            {"enabled": False},
+        ],
+    )
+    async def test_harmless_changes_keep_the_record(
+        self, client, stub_server, changes
+    ):
+        stub_server()
+        created = await client.post(API, json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+
+        response = await client.patch(f"{API}/{endpoint_id}", json=changes)
+
+        caps = response.json()["capabilities"]
+        assert caps["probe_status"] == "ok"
+        assert caps["supports_tools"] is True
+
+    async def test_patch_cannot_assemble_a_refused_auth_combination(
+        self, client, stub_server
+    ):
+        stub_server()
+        created = await client.post(API, json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+
+        response = await client.patch(f"{API}/{endpoint_id}", json={"auth_style": "bearer"})
+
+        assert response.status_code == 422
+
+    async def test_patch_cannot_reference_a_forbidden_variable(
+        self, client, stub_server
+    ):
+        stub_server()
+        created = await client.post(API, json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+
+        response = await client.patch(
+            f"{API}/{endpoint_id}",
+            json={"auth_style": "bearer", "auth_secret_ref": "ANTHROPIC_API_KEY"},
+        )
+
+        assert response.status_code == 422
+
+    async def test_context_window_override_beats_the_probe(
+        self, client, stub_server
+    ):
+        stub_server()
+        created = await client.post(API, json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        assert created.json()["endpoint"]["capabilities"]["context_window"] == 32768
+
+        response = await client.patch(f"{API}/{endpoint_id}", json={"context_window": 8192})
+
+        assert response.json()["capabilities"]["context_window"] == 8192
+        assert response.json()["context_window_source"] == "override"
+
+
+# -----------------------------------------------------------------------------
+# Deletion
+# -----------------------------------------------------------------------------
+
+class TestDelete:
+    async def test_delete_is_409_while_a_step_is_in_flight(
+        self, client, stub_server, db_session
+    ):
+        stub_server()
+        created = await client.post(f"{API}?probe=false", json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        step = await _make_step(db_session, status="running", endpoint_id=endpoint_id)
+
+        response = await client.delete(f"{API}/{endpoint_id}")
+
+        assert response.status_code == 409
+        assert step["execution_id"] in response.json()["detail"]
+
+    async def test_delete_nulls_the_reference_on_finished_steps(
+        self, client, stub_server, db_session
+    ):
+        """Historical `step_usages` keep their `gpu_node_id` string and stay
+        priceable - which is why the usage join never went through a FK."""
+        stub_server()
+        created = await client.post(f"{API}?probe=false", json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        step = await _make_step(
+            db_session, status="completed", endpoint_id=endpoint_id
+        )
+
+        response = await client.delete(f"{API}/{endpoint_id}")
+
+        assert response.status_code == 204
+        await db_session.refresh(step["execution"])
+        assert step["execution"].model_endpoint_id is None
+        assert (await client.get(f"{API}/{endpoint_id}")).status_code == 404
+
+    async def test_in_flight_is_reported_on_the_row(
+        self, client, stub_server, db_session
+    ):
+        stub_server()
+        created = await client.post(f"{API}?probe=false", json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        await _make_step(db_session, status="running", endpoint_id=endpoint_id)
+
+        response = await client.get(f"{API}/{endpoint_id}")
+
+        assert response.json()["in_flight"] == 1
+
+
+# -----------------------------------------------------------------------------
+# Reads
+# -----------------------------------------------------------------------------
+
+class TestReads:
+    async def test_list_and_fetch_by_id_or_name(self, client, stub_server):
+        stub_server()
+        created = await client.post(f"{API}?probe=false", json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+
+        listing = await client.get(API)
+        by_id = await client.get(f"{API}/{endpoint_id}")
+        by_name = await client.get(f"{API}/local-4090")
+
+        assert listing.status_code == 200
+        assert [row["name"] for row in listing.json()] == ["local-4090"]
+        assert by_id.json()["id"] == by_name.json()["id"] == endpoint_id
+
+    async def test_unknown_endpoint_is_404(self, client):
+        assert (await client.get(f"{API}/nope")).status_code == 404
+
+    async def test_usage_rollup_joins_through_gpu_node_id(
+        self, client, stub_server, db_session
+    ):
+        stub_server()
+        created = await client.post(f"{API}?probe=false", json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        step = await _make_step(db_session, status="completed", endpoint_id=endpoint_id)
+
+        db_session.add(
+            StepUsage(
+                id=str(uuid4()),
+                step_execution_id=step["execution_id"],
+                step_run_id=step["step_run_id"],
+                pipeline_run_id=step["pipeline_run_id"],
+                provider="openai-compatible",
+                model=MODEL,
+                input_tokens=1200,
+                output_tokens=340,
+                cost_usd=Decimal("0.000000"),
+                cost_source="gpu-node",
+                wall_clock_ms=42_000,
+                container_seconds=41.5,
+                gpu_node_id="endpoint:local-4090",
+                gpu_fraction=1.0,
+                determinism="{}",
+            )
+        )
+        await db_session.commit()
+
+        response = await client.get(f"{API}/{endpoint_id}/usage")
+
+        body = response.json()
+        assert body["gpu_node_id"] == "endpoint:local-4090"
+        assert body["steps"] == 1
+        assert body["input_tokens"] == 1200
+        assert body["output_tokens"] == 340
+        assert body["by_source"]["gpu-node"] == 1
+        assert body["by_source"]["cli-reported"] == 0
+        assert body["cost_coverage"] == 1.0
+        assert body["median_wall_clock_ms"] == 42_000
+
+    async def test_usage_rollup_reports_null_tokens_not_zero(
+        self, client, stub_server, db_session
+    ):
+        """A zero is a claim; a null is an absence. The cost-coverage story
+        depends on keeping them apart."""
+        stub_server()
+        created = await client.post(f"{API}?probe=false", json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        step = await _make_step(db_session, status="completed", endpoint_id=endpoint_id)
+        db_session.add(
+            StepUsage(
+                id=str(uuid4()),
+                step_execution_id=step["execution_id"],
+                provider="openai-compatible",
+                cost_source="unknown",
+                wall_clock_ms=1000,
+                gpu_node_id="endpoint:local-4090",
+                determinism="{}",
+            )
+        )
+        await db_session.commit()
+
+        body = (await client.get(f"{API}/{endpoint_id}/usage")).json()
+
+        assert body["input_tokens"] is None
+        assert body["output_tokens"] is None
+        assert body["cost_usd"] is None
+        assert body["cost_coverage"] == 0.0
+
+
+# -----------------------------------------------------------------------------
+# probe-result (the runner-local report)
+# -----------------------------------------------------------------------------
+
+RUNNER_RESULT = {
+    "reachable": True,
+    "probe_status": "ok",
+    "model_listed": True,
+    "supports_tools": True,
+    "supports_streaming": True,
+    "reports_usage": True,
+    "context_window": 32768,
+    "context_window_source": "ollama",
+    "detail": {"probe_status": "ok"},
+    "elapsed_ms": 1234,
+}
+
+
+class TestProbeResult:
+    async def test_a_runner_can_report_a_capability_record(
+        self, client, stub_server, db_session
+    ):
+        stub_server()
+        created = await client.post(
+            f"{API}?probe=false", json=lan_ollama(reach="runner-local")
+        )
+        endpoint_id = created.json()["endpoint"]["id"]
+        step = await _make_step(
+            db_session, endpoint_id=endpoint_id, runner_id="workshop-1"
+        )
+
+        response = await client.post(
+            f"{API}/{endpoint_id}/probe-result?step_id={step['execution_id']}",
+            json=RUNNER_RESULT,
+            headers=step["headers"],
+        )
+
+        assert response.status_code == 200
+        caps = response.json()["endpoint"]["capabilities"]
+        assert caps["probe_status"] == "ok"
+        assert caps["supports_tools"] is True
+        assert caps["context_window"] == 32768
+        # Stamped SERVER-SIDE from the step's runner, never from the payload.
+        assert caps["probed_from"] == "runner:workshop-1"
+
+    async def test_no_token_is_401(self, client, stub_server, db_session):
+        stub_server()
+        created = await client.post(f"{API}?probe=false", json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        step = await _make_step(db_session, endpoint_id=endpoint_id)
+
+        response = await client.post(
+            f"{API}/{endpoint_id}/probe-result?step_id={step['execution_id']}",
+            json=RUNNER_RESULT,
+        )
+
+        assert response.status_code == 401
+
+    async def test_a_step_probing_another_endpoint_is_403(
+        self, client, stub_server, db_session
+    ):
+        """The split-brain fence, borrowed from 12.6: a token minted for one
+        step cannot rewrite another endpoint's capability record."""
+        stub_server()
+        mine = await client.post(f"{API}?probe=false", json=lan_ollama("mine"))
+        theirs = await client.post(f"{API}?probe=false", json=lan_ollama("theirs"))
+        step = await _make_step(
+            db_session, endpoint_id=mine.json()["endpoint"]["id"]
+        )
+
+        response = await client.post(
+            f"{API}/{theirs.json()['endpoint']['id']}/probe-result"
+            f"?step_id={step['execution_id']}",
+            json=RUNNER_RESULT,
+            headers=step["headers"],
+        )
+
+        assert response.status_code == 403
+
+    async def test_a_malformed_report_is_422(self, client, stub_server, db_session):
+        stub_server()
+        created = await client.post(f"{API}?probe=false", json=lan_ollama())
+        endpoint_id = created.json()["endpoint"]["id"]
+        step = await _make_step(db_session, endpoint_id=endpoint_id)
+
+        response = await client.post(
+            f"{API}/{endpoint_id}/probe-result?step_id={step['execution_id']}",
+            json={"probe_status": "definitely-fine"},
+            headers=step["headers"],
+        )
+
+        assert response.status_code == 422
+
+
+class TestRunnerVisibility:
+    """R1: a `runner-local` endpoint whose label nobody carries is visible as
+    `runners: 0` BEFORE a step is dispatched to it - which is the same fact
+    the step would otherwise discover at NO_RUNNER_TIMEOUT, 300 seconds late."""
+
+    async def test_runner_local_with_no_labelled_runner_reads_zero(
+        self, client, stub_server
+    ):
+        stub_server()
+        created = await client.post(
+            f"{API}?probe=false", json=lan_ollama(reach="runner-local")
+        )
+        assert created.json()["endpoint"]["runner_count"] == 0
+
+    async def test_a_connected_labelled_runner_is_counted(
+        self, client, stub_server, db_session, monkeypatch
+    ):
+        from app.models.runner import Runner
+        from app.services.execution.runner_registry import runner_registry
+
+        runner = Runner(id="workshop-1", status="idle")
+        runner.set_labels({"arch": "amd64", "has": ["docker", "endpoint:local-4090"]})
+        db_session.add(runner)
+        # An UNLABELLED runner on the same socket table must not be counted.
+        other = Runner(id="laptop-2", status="idle")
+        other.set_labels({"has": ["docker"]})
+        db_session.add(other)
+        await db_session.commit()
+        monkeypatch.setattr(
+            runner_registry, "_connections", {"workshop-1": object(), "laptop-2": object()}
+        )
+
+        stub_server()
+        created = await client.post(
+            f"{API}?probe=false", json=lan_ollama(reach="runner-local")
+        )
+
+        assert created.json()["endpoint"]["runner_count"] == 1
+
+    async def test_a_direct_endpoint_reports_none_not_zero(self, client, stub_server):
+        """None means "not applicable"; 0 would read as "nothing can run it"."""
+        stub_server()
+        created = await client.post(f"{API}?probe=false", json=lan_ollama())
+        assert created.json()["endpoint"]["runner_count"] is None

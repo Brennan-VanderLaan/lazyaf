@@ -588,14 +588,28 @@ unit tests green; last stable commit `69f3ef0`, pushed to origin.
 | 12.2-INT — Workspace persistence + executor wiring | COMPLETE | Steps run in ephemeral containers on persistent volumes; `executor='local'` verified per run |
 | 12.2.5 — Specification data model | COMPLETE | Feature/UserStory/AcceptanceCriterion/PromptTemplate + API + MCP + Specs UI, seeded with the three north-star stories |
 | 12.3 — Control layer & step images | COMPLETE | Real `lazyaf-{base,claude,test-runner}:dev` images, in-container runtime reporting to `/api/steps/*`, run #11 passed the gate |
-| 12.2.6 — Test result tie-back | IN PROGRESS | Wave 3 interrupted mid-implementation (uncommitted tree) |
-| 12.4 — Script/docker steps fully ephemeral | IN PROGRESS | Runner slimming started in the same wave; routing itself already local since 12.2-INT |
+| 12.2.6 — Test result tie-back | COMPLETE | A push-triggered run wrote a TestRun joined to criterion fb95f11d: `passed / commit 2a513dd4 / main / us1.pipeline-outcome-gates-branch` |
+| 12.4 — Script/docker steps fully ephemeral | COMPLETE | Runners agent-only; script/docker deleted from the three images AND runner-common; DooD anchor retired |
 | 12.5 / 12.6 / 12.6.5 / 12.6.6 / 12.7 / 12.8 | NOT STARTED | 12.6's 137-test contract suite sits dormant in-tree, self-activating when its modules land |
 
 **Execution today**: script/docker steps flow pipeline_executor -> ExecutionRouter ->
 LocalExecutor -> ephemeral control-mode container on a persistent workspace volume,
-reporting status/logs to the live steps API. Agent steps still take the legacy
-card -> job -> queue -> polling runner path until 12.5.
+reporting status/logs to the live steps API, and shipping a test-result
+manifest that joins back to acceptance criteria. Agent steps still take the
+legacy card -> job -> queue -> polling runner path until 12.5.
+
+**Phases 12.2.6 + 12.4: COMPLETE (2026-08-30).** The tie-back is proven on real
+data, not just in tests: a push-triggered dogfood run wrote a TestRun joined to
+criterion fb95f11d - `passed | commit 2a513dd4 | branch main |
+us1.pipeline-outcome-gates-branch`. 9 TestRefs seeded and linked, 0 orphans.
+Suite 1731 passed; gates T1 1657 / T2 60 / T3 17. Two second-order lessons, both
+now pinned by tests: 12.3 moved alembic into the image so production boots
+self-sufficiently, which meant DEV silently ran a pre-0004 versions directory
+and believed itself at head (dev now mounts ./backend/alembic like app code);
+and because manifest delivery is deliberately non-fatal to a step, the first
+live run shipped three manifests into 404s and still gated clean - the gate now
+fails on any manifest delivery problem, closing the R7 gap where 12.2.6 landed
+without extending the ratchet to cover itself.
 
 **Still true from the January-era assessment**: Phase 12.0's COMPLETE mark in the
 table above remains aspirational — the three runner images still ship monolithic
@@ -856,7 +870,7 @@ install-uv step dissolves into the image).
    logs/heartbeat feeding the UI (round-trip test over the POST path); tier
    floors hold.
 
-#### Phase 12.2.6 — Test result tie-back  [B, needs 12.3]  🔄 IN PROGRESS (Wave 3, paused)
+#### Phase 12.2.6 — Test result tie-back  [B]  ✅ COMPLETE
 
 Manifest channel `/workspace/.control/test_results.json` picked up at step
 end -> POST /api/test-results/ingest -> TestRef/TestRun joined to criterion +
@@ -869,7 +883,7 @@ runner-common (`lazyaf_test_id` marker). Sparkline/history UI deferred to
    US-1/2/3 criteria; a dogfood run produces TestRuns joined to criteria; the
    history endpoint returns the series.
 
-#### Phase 12.4 — Script/docker steps fully ephemeral  [A]  🔄 IN PROGRESS (routing done in 12.2-INT; runner slimming paused)
+#### Phase 12.4 — Script/docker steps fully ephemeral  [A]  ✅ COMPLETE
 
 All script/docker steps through LocalExecutor + step images by default; step
 config gains a socket/volume option so the T2 Docker tier runs in ephemeral

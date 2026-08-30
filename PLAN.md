@@ -893,7 +893,7 @@ execution from runner entrypoints (own commit, R2).
    dogfood asserts executor='local' for every script/docker step; removal
    commit contains the entrypoint deletions and nothing else; tier floors.
 
-#### Phase 12.5 — Agent steps via control layer  [A]
+#### Phase 12.5 — Agent steps via control layer  [A]  ✅ COMPLETE
 
 agent_wrapper rebuilt as a thin shim over runner-common baked into agent
 images (failure_01's monolith is reference); config-file contract from the

@@ -1209,6 +1209,16 @@ Design points the wiring doc must settle:
   the matching label from env. Whether the pod may ALSO self-register through
   the API is a real decision - it is the difference between "just go" and a
   node being able to write rows in your control plane.
+- **LazyAF builds the heavy images itself** (owner, 2026-08-30). A repo-defined
+  pipeline with docker steps builds and pushes the two runner images on a LazyAF
+  runner agent, not on GitHub compute. This is dogfooding at the top of the
+  stack - the platform ships its own artifacts - and it also sidesteps a real
+  problem: a ~45GB vLLM build does not fit a standard GitHub runner, and a
+  self-hosted Actions runner on a PUBLIC repo would expose the owner's hardware
+  to fork PRs. GitHub keeps the wheel, the small service images, the existing
+  step images, secret-scan and release-please; `pr-build.yml` stays
+  GitHub-hosted for exactly that reason. GHCR credentials reach the build step
+  through 12.5 `secret_environment`, so they never appear in `docker inspect`.
 - **Image size is a release problem, not a detail.** A CUDA vLLM image is ~10GB.
   These must not ride the normal per-tag image matrix; they need their own
   trigger, their own cadence, and a documented "build it yourself" path.

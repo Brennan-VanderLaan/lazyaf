@@ -1,0 +1,29 @@
+
+  LazyAF debug sidecar - the pipeline is PAUSED at a breakpoint.
+
+  /workspace          the paused run's workspace volume (READ-WRITE)
+  /workspace/repo     the checked-out repo at the commit under debug
+  /workspace/home     the persisted HOME shared across the run's steps
+  /workspace/.control step config drop-box (written per step by the backend)
+
+  EDITS UNDER /workspace ARE SEEN BY THE RESUMED STEP.
+  This container shares the volume with the step that is about to run - it is
+  not a copy and there is no undo. That is the point of a debug re-run, and
+  it is also the way to break one.
+
+  You are uid 1000 (lazyaf), the same user the step runs as, so nothing you
+  create here is ownership-poisoned for the step. `sudo` is available.
+
+  The step has NOT started: no step container exists yet. This shell is a
+  sidecar on the workspace, not a shell inside the step.
+
+  Controls (also available as plain `lazyaf debug ...` subcommands):
+    Ctrl-]      drop to the debug> prompt
+    @resume     continue to the next breakpoint
+    @abort      end the session and cancel the run
+    @status     session state, breakpoints hit/pending, time left
+    @help       this list
+
+  The session ends on its own when the timer expires - `@status` shows how
+  much is left and `lazyaf debug extend` buys more.
+

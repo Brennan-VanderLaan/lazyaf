@@ -34,7 +34,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from sqlalchemy import func, select, update
@@ -61,6 +61,16 @@ from app.services.workspace.pipeline_state_machine import (
     PipelineStatus,
 )
 from app.services.workspace.state_machine import generate_volume_name
+# 12.7 debug re-run. Imported at module scope rather than lazily for two
+# reasons: the gate runs on EVERY executor step (a lazy import per step is
+# noise), and this import is what registers `app.models.debug` - and with it
+# the `debug_sessions` table - on Base.metadata wherever the executor is
+# imported, which is everywhere the app is. The service imports this module
+# only from inside function bodies, so there is no cycle.
+from app.services.execution.debug_session_service import (
+    DebugGateOutcome,
+    debug_session_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -644,6 +654,14 @@ class PipelineExecutor:
                     await cancel_all()
                 except Exception:
                     logger.exception("reset: killing in-flight containers failed")
+        # 12.7: wake every paused breakpoint gate BEFORE draining tasks. A
+        # gate parked on its 5s poll would otherwise burn the whole drain
+        # grace and be cancelled as a straggler; woken, it re-reads a row the
+        # reset endpoint is about to delete and returns on its own.
+        try:
+            await debug_session_service.reset()
+        except Exception:
+            logger.exception("reset: waking paused debug gates failed")
         tasks = [t for t in self._tasks.values() if not t.done()]
         if tasks:
             _done, pending = await asyncio.wait(tasks, timeout=RESET_DRAIN_GRACE)
@@ -881,6 +899,12 @@ class PipelineExecutor:
         await db.commit()
         await db.refresh(pipeline_run)
 
+        # 12.7: a run must never leave a live debug session behind. BEFORE
+        # _cleanup_workspace, because ending the session tears down its
+        # sidecar and docker refuses to remove a volume a running container
+        # still mounts (contract C9).
+        await self._end_debug_session(db, run_id, "pipeline completed")
+
         # Workspace cleanup MUST happen on completion AND failure, before
         # trigger actions (salvage audit: hook placement).
         await self._cleanup_workspace(db, run_id)
@@ -935,6 +959,26 @@ class PipelineExecutor:
                 "agent_run.on_run_complete failed for run %s (the run is "
                 "already terminal; card/playground state may be stale)",
                 pipeline_run.id[:8],
+            )
+
+    async def _end_debug_session(
+        self, db: AsyncSession, run_id: str, reason: str
+    ) -> None:
+        """End the run's debug session, loudly but never fatally (12.7).
+
+        The run is already terminal and committed by the time this runs;
+        losing that fact to a debug bookkeeping bug would be worse than the
+        bug. The session's own `end_reason` names any breakpoint that never
+        fired, so an unreachable breakpoint is a visible fact rather than
+        silence.
+        """
+        try:
+            await debug_session_service.end_for_run(db, run_id, reason=reason)
+        except Exception:
+            logger.exception(
+                "Could not end the debug session for run %s (the run itself "
+                "is already terminal)",
+                run_id[:8],
             )
 
     async def _cleanup_workspace(self, db: AsyncSession, run_id: str) -> None:
@@ -1124,6 +1168,9 @@ class PipelineExecutor:
         trigger_ref: str | None = None,
         trigger_context: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        on_run_created: Callable[
+            [AsyncSession, PipelineRun], Awaitable[None]
+        ] | None = None,
     ) -> PipelineRun:
         """
         Start a new pipeline run.
@@ -1140,6 +1187,15 @@ class PipelineExecutor:
         - branch: The branch to work on
         - commit_sha: The specific commit
         - card_id: The card that triggered the pipeline (for card_complete triggers)
+
+        `on_run_created` (12.7) is awaited exactly once, AFTER the run row is
+        committed and BEFORE any step is dispatched. It exists because a
+        debug re-run has an ordering requirement nothing else does: its
+        DebugSession row must be visible to the breakpoint gate before the
+        first step task can reach it, and the row cannot exist before the run
+        it points at. Inserting the session after `start_pipeline` returns is
+        a race the entry step usually wins. Default None: every other caller
+        is byte-for-byte unaffected.
         """
         graph = parse_steps_graph(pipeline.steps_graph)
 
@@ -1169,6 +1225,9 @@ class PipelineExecutor:
             db.add(pipeline_run)
             await db.commit()
             await db.refresh(pipeline_run)
+
+            if on_run_created is not None:
+                await on_run_created(db, pipeline_run)
 
             self._init_state_machine(pipeline_run.id, total_steps)
 
@@ -1226,6 +1285,9 @@ class PipelineExecutor:
             db.add(pipeline_run)
             await db.commit()
             await db.refresh(pipeline_run)
+
+            if on_run_created is not None:
+                await on_run_created(db, pipeline_run)
 
             self._init_state_machine(pipeline_run.id, len(steps))
 
@@ -1733,6 +1795,59 @@ class PipelineExecutor:
             ExecutorMode.LOCAL, session_factory, run_id, step_run_id, params
         )
 
+    async def _debug_gate(
+        self, session_factory, run_id: str, step_run_id: str, mode: ExecutorMode
+    ):
+        """Hold this step if a debug breakpoint names it (Phase 12.7).
+
+        WHY IT SITS IN `_run_executor_step` AND NOWHERE ELSE. The obvious
+        gate is `_dispatch_step_run`, the shared LOCAL/REMOTE dispatch line.
+        It is the wrong place: `_dispatch_step_run` is called from
+        `_execute_graph_step` and `_execute_step`, and BOTH run under
+        `self._run_lock(run_id)` (from `start_pipeline`, and from
+        `_finish_local_step_locked` -> `_handle_graph_step_complete`).
+        Awaiting a human there holds the run lock for up to four hours, so
+        every sibling step of a parallel graph wedges trying to finish - a
+        gate that deadlocks the run it exists to debug.
+
+        `_run_executor_step` is the per-step asyncio task. It runs OUTSIDE
+        the run lock, has its own session scope, and receives `mode`, so a
+        gate at its first statement buys four properties for free:
+
+        1. It fires identically for LOCAL and REMOTE - it is above the
+           `is_remote` fork.
+        2. A paused step CANNOT be reaped as dead. The gate is above
+           `_prepare_control_mode`, so at a breakpoint there is no
+           StepExecution row: no `timeout_at`, no `last_heartbeat`, nothing
+           for `recover_orphaned_executions` to find. It is also above the
+           `asyncio.wait_for(..., hard_deadline)`, so that clock has not
+           started either. "The heartbeat timeout is suspended at a
+           breakpoint" is satisfied BY CONSTRUCTION - there is no suspension
+           flag because there is nothing to suspend (contract C3).
+        3. The pause holds no DB session (the service opens short ones);
+           this method opens its own only after the gate returns.
+        4. Failure and abort reuse the ONE completion path.
+
+        Errors here are logged and read as "not breakpointed": a debug
+        bookkeeping fault must never be able to wedge an ordinary run.
+        """
+        try:
+            return await debug_session_service.gate(
+                session_factory, run_id, step_run_id, mode
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Debug gate failed for step %s of run %s; running the step "
+                "WITHOUT pausing",
+                step_run_id,
+                run_id[:8],
+            )
+            from app.services.execution.debug_session_service import DebugGateResult
+
+            return DebugGateResult(DebugGateOutcome.RESUME)
+
     async def _run_executor_step(
         self,
         mode: ExecutorMode,
@@ -1779,7 +1894,17 @@ class PipelineExecutor:
         killed first; if the consumer still does not end within a bounded
         grace, it is abandoned (logged done-callback, session handed to a
         reaper task) and the step is failed from a FRESH session.
+
+        Debug breakpoints (12.7, contract C1): the gate is the FIRST
+        statement of this method - see `_debug_gate` for why it is here and
+        nowhere else.
         """
+        gate = await self._debug_gate(session_factory, run_id, step_run_id, mode)
+        if gate.outcome is DebugGateOutcome.ABORTED:
+            # cancel_run (or _complete_pipeline) already owns every row for
+            # this run. Touching anything here would race its commits.
+            return
+
         is_remote = mode is ExecutorMode.REMOTE
         db = session_factory()
         session_abandoned = False
@@ -1790,6 +1915,16 @@ class PipelineExecutor:
                 await self._fail_wedged_local_step(db, run_id, err)
                 return
             pipeline_run, pipeline, repo, step_run, graph, steps, step, is_graph = loaded
+
+            if gate.outcome is DebugGateOutcome.FAILED:
+                # A timed-out pause fails the step through the ORDINARY
+                # completion path. No new terminal path exists for debug runs.
+                await self._finish_local_step(
+                    db, pipeline_run, pipeline, repo, step_run,
+                    graph, steps, step, is_graph,
+                    False, None, gate.error, None,
+                )
+                return
 
             step_type = step.get("type", "script")
             step_config = step.get("config", {}) or {}
@@ -3946,6 +4081,11 @@ class PipelineExecutor:
 
         await db.commit()
         await db.refresh(pipeline_run)
+
+        # 12.7: same as _complete_pipeline - end the debug session (and tear
+        # its sidecar down) before the volume is removed. Idempotent: an
+        # abort has already ended the session, so this finds nothing.
+        await self._end_debug_session(db, pipeline_run.id, "run cancelled")
 
         # Workspace cleanup (cancellation is a completion path too)
         await self._cleanup_workspace(db, pipeline_run.id)

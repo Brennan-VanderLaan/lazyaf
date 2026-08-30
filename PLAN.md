@@ -322,6 +322,10 @@ class BenchmarkCase:
     pass_to_pass: list[str]      # lazyaf_test_ids that must STAY green (regression guard)
     user_story_id: UUID | None   # layered criteria: the human-meaningful "why"
     loop_defaults: dict          # {max_iterations, budget_usd, per_step_timeout}
+    contamination_risk: str      # "high" (public repo, likely in training data)
+                                 # | "medium" | "low" (self-authored / post-cutoff)
+    source_url: str | None       # upstream provenance for public fixtures
+    license: str | None          # SPDX id - decides what the public bundle may ship
     created_at: datetime
 ```
 
@@ -349,6 +353,13 @@ class Trial:
     base_commit_sha: str
     final_commit_sha: str | None
     branch: str
+    # --- provenance: what makes this number falsifiable by someone else ---
+    harness_version: str         # git describe of LazyAF at trial time
+    image_hashes: dict           # {"lazyaf-base": "1f9bff1a6d1e", ...} - already
+                                 # stamped as content-hash labels by build_images.py
+    model_version: str | None    # the provider's exact version, not just the family
+    determinism: dict            # {temperature, seed, top_p} where exposed
+    suite_version: str           # corpus revision the case came from
     created_at: datetime
     completed_at: datetime | None
 
@@ -912,6 +923,12 @@ Decisions made DURING implementation (all shipped and gate-verified):
   loop = sequential pipeline runs driven by a Trial orchestrator (the graph is a
   DAG — no cycles); cost = CLI-reported + GPU-node model. (Owner)
 
+- 2026-08-29 Milestone 13 targets a PUBLIC write-up + reproducible bundle:
+  provenance per trial (image hashes, harness/model version, policy), variance
+  over N repeats reported natively, controls (base-state + null-agent), public
+  fixtures with contamination noted, and headline metrics = cost-to-solve,
+  regression rate, iterations-to-solve. (Owner — "I am a scientist at heart")
+
 - OPEN: v1 pipeline retirement shape (12.8, owner confirms).
 - OPEN: whether `12.0` counts as done at 12.5 (runner-common adopted by agent
   images) or 12.8 (all runners retired) — resolves itself as those land.
@@ -959,6 +976,40 @@ Decisions made DURING implementation (all shipped and gate-verified):
   **Trial orchestrator drives N sequential pipeline runs**, one per iteration,
   rather than a cyclic graph. No graph-engine change needed.
 - **Cost sources: CLI-reported + GPU-node model.** See `StepUsage`.
+- **Audience: a public write-up backed by a reproducible bundle** (owner,
+  2026-08-29). Anyone should be able to download the corpus + results and re-run
+  them. This makes provenance (image hashes, harness version, model version,
+  policy) a hard requirement rather than nice-to-have, and it puts fixture
+  LICENSING in scope — the bundle ships git bundles for cases whose license
+  permits redistribution and fetch-instructions + a patch for the rest.
+- **Contamination: public repos, noted** (owner). Fixtures come from real public
+  repos for realism; every case carries `contamination_risk` and the caveat is
+  disclosed in the write-up and the bundle. Deliberate trade: realism now,
+  honesty about the threat to validity, and the door stays open to adding
+  low-risk cases later (the field already distinguishes them).
+- **Variance is a platform feature, not an analysis afterthought** (owner). Every
+  reported figure is over N repeats with its distribution; the board flags
+  comparisons whose intervals overlap instead of ranking noise. `repeat` is
+  already an axis of `Experiment.matrix` — the work is aggregation + honest
+  presentation, not new execution machinery.
+- **Headline metrics** (owner): (1) **cost-to-solve** — median $ per solved case,
+  the one number that answers "what did the solution actually cost"; (2)
+  **regression rate** — how often a loop breaks `pass_to_pass` while fixing the
+  target, i.e. whether you could trust it in real CI; (3) **iterations-to-solve
+  distribution** — whether a loop converges or thrashes, and whether late
+  iterations ever earn their keep. Solve-rate-at-fixed-budget stays available as
+  a normalization but is not the headline.
+
+### Controls (a benchmark without them proves nothing)
+
+- **Base-state control**: at `base_commit_sha` every `fail_to_pass` test MUST
+  fail and every `pass_to_pass` MUST pass — a case whose oracle is already green
+  is broken, and `lazyaf bench validate` refuses it (Phase 13.1).
+- **Null-agent control**: a trial variant that changes nothing must score 0%
+  solved. If it ever scores above zero, the oracle is measuring something other
+  than the fix.
+- **Determinism disclosure**: whatever the provider exposes (temperature, seed)
+  is recorded per trial, so "we could not pin this" is stated rather than hidden.
 
 ### Phase 13.1 — Corpus & fixtures
 `BenchmarkSuite` / `BenchmarkCase` models + CRUD + a `lazyaf bench` CLI to author
@@ -987,20 +1038,40 @@ leaderboard 12.6.5 starts and 13.3 finishes — ranked by evidence, not vibes.
    EXIT GATE: a 2-model x 2-policy matrix over a 3-case suite produces a board
    where the same case is comparable across variants on both axes.
 
-### Phase 13.4 — Reporting & repeatability
-Trial replay (same case, same commit, same policy — how stable is the result?),
-variance across repeats, per-vertical breakdowns, and export. Answers the
-question that makes the whole thing science: *is this difference real or noise?*
+### Phase 13.4 — Variance, controls & the "real or noise" question
+Aggregation over N repeats with distributions (median + spread, not means alone);
+the board refuses to rank variants whose intervals overlap and says so. Null-agent
+and base-state controls run as first-class trial variants. Per-vertical and
+per-complexity breakdowns; split-by-`contamination_risk` views so a skeptic can
+ask "does the gap survive on low-risk cases?" and get an answer.
+   EXIT GATE: a 3-repeat matrix reports distributions, and a deliberately
+   noise-level difference is flagged as not-separable rather than ranked.
+
+### Phase 13.5 — The reproducible bundle (publishability)
+`lazyaf bench export <suite> --with-results` produces a portable bundle:
+corpus (git bundles where licensing permits, fetch-instructions + patch where it
+does not), case metadata incl. oracle ids and contamination tags, all trials with
+their full provenance block, and a `METHOD.md` stating what was measured, the
+controls, the caveats, and the exact commands to re-run it. `lazyaf bench import`
+round-trips it, and re-running a bundle on the same harness version reproduces
+the case set exactly (results within variance, which is the honest claim).
+   EXIT GATE: export -> import on a clean checkout reconstructs the suite and
+   replays a trial; the bundle's stated re-run command works verbatim; a bundle
+   whose harness/image hashes differ from the current tree says so loudly instead
+   of silently comparing apples to oranges.
 
 ### Open questions for Milestone 13
 
-- Repeats needed for signal? (LLM runs are stochastic; N=1 comparisons will lie.)
-- Does a trial get network access? (Dependency installs say yes; reproducibility
-  and cost-control say pin a proxy/cache.)
-- Do we score partial progress (fail_to_pass 3/5) or binary solved? (Model
-  supports both — the board must pick a headline.)
-- Contamination: public fixture repos may be in model training data. Do we need
-  self-authored cases to trust the numbers?
+- **How many repeats** buy enough signal at what cost? (N is a dial; the answer is
+  empirical — measure spread on the starter suite before fixing a default.)
+- **Network access during a trial?** Dependency installs say yes; reproducibility
+  and cost control say pin a proxy/cache. Leaning: allow, but record it as
+  provenance and offer a cached-only mode for published runs.
+- **Partial credit** (`fail_to_pass` 3/5) recorded but not headline — the board
+  needs one honest number and "solved" is binary. Revisit if partial progress
+  turns out to discriminate between loops that binary solve-rate cannot.
+- **Licensing per fixture** now that the bundle is public: the export must decide
+  per case what it may redistribute (hence `license` on `BenchmarkCase`).
 
 
 ---

@@ -123,18 +123,23 @@ class TestTestRunModel:
     def test_step_run_id_is_nullable(self):
         assert TestRun.__table__.c.step_run_id.nullable is True
 
-    def test_indexes_serve_exactly_the_two_access_paths(self):
+    def test_indexes_serve_exactly_the_declared_access_paths(self):
         """(test_ref_id, created_at) for criterion history and the
         blocks-done freshness walk; step_run_id for the ingestion idempotency
-        lookup. No index on pipeline_run_id or created_at alone: nothing
-        queries by them, and every extra index is write cost on the hot
-        ingestion path."""
+        lookup; and since 12.6.5 (experiment_run_id, test_ref_id) for the
+        leaderboard's per-criterion aggregation. No index on pipeline_run_id
+        or created_at alone: nothing queries by them, and every extra index
+        is write cost on the hot ingestion path."""
         assert _indexes(TestRun) == {
             "ix_test_runs_test_ref_id_created_at": (
                 ("test_ref_id", "created_at"),
                 False,
             ),
             "ix_test_runs_step_run_id": (("step_run_id",), False),
+            "ix_test_runs_experiment_run_id_test_ref_id": (
+                ("experiment_run_id", "test_ref_id"),
+                False,
+            ),
         }
 
     def test_commit_sha_required_branch_nullable(self):
@@ -142,7 +147,8 @@ class TestTestRunModel:
         assert TestRun.__table__.c.branch.nullable is True
 
     def test_duration_and_experiment_context_nullable(self):
-        """model / prompt_template_id are reserved for 12.6.5 — nullable."""
+        """The experiment coordinates are nullable: NULL is the TRUE value on
+        an ordinary CI run, which measured the repo rather than a variant."""
         assert TestRun.__table__.c.duration_ms.nullable is True
         assert TestRun.__table__.c.model.nullable is True
         col = TestRun.__table__.c.prompt_template_id

@@ -32,7 +32,7 @@ from app.database import ALEMBIC_BASELINE_REVISION, Base, _alembic_config, _run_
 
 # Tip of the migration chain. Every startup path (fresh upgrade, legacy
 # adoption stamp-then-upgrade) must end here.
-ALEMBIC_HEAD_REVISION = "0007"
+ALEMBIC_HEAD_REVISION = "0010"
 
 EXPECTED_TABLES = {
     "repos",
@@ -57,6 +57,17 @@ EXPECTED_TABLES = {
     # 0005 (Phase 12.5 usage channel)
     "step_usages",
     # 0006 (Phase 12.6 runner registry) adds columns/indexes only - no tables
+    # 0007 (Phase 12.6 deletion commit) drops columns only - no tables
+    # 0008 was pre-assigned to 12.6.6 and released back to the pool unused
+    # 0009 (Phase 12.7 debug re-run)
+    "debug_sessions",
+    # 0010 (Phase 12.6.5 experiments). Numbered 0010, not the design's 0008:
+    # 0009 landed first parented on 0007, so taking 0008 off 0007 would fork
+    # the chain into two heads and stop init_db dead. See the revision's own
+    # docstring for the four-line path back to the design's ordering.
+    "experiments",
+    "experiment_runs",
+    "prompt_versions",
 }
 
 SPEC_TABLES = {"features", "user_stories", "acceptance_criteria", "prompt_templates"}
@@ -789,8 +800,10 @@ class TestTieBackSchemaShape:
 
     async def test_tieback_indexes_are_exactly_the_access_paths(self, engine_factory):
         """Every index earns its write cost: the repo-scoped identity, the
-        criterion join, the (test_ref_id, created_at) history/freshness walk
-        and the step_run_id idempotency lookup — nothing else."""
+        criterion join, the (test_ref_id, created_at) history/freshness walk,
+        the step_run_id idempotency lookup, and — since 12.6.5 — the
+        (experiment_run_id, test_ref_id) leaderboard aggregation. Nothing
+        else."""
         engine = engine_factory("tieback_indexes.db")
         await _migrate(engine)
 
@@ -808,6 +821,11 @@ class TestTieBackSchemaShape:
                 False,
             ),
             "ix_test_runs_step_run_id": (("step_run_id",), False),
+            # 0010 (Phase 12.6.5): the leaderboard's per-criterion scan.
+            "ix_test_runs_experiment_run_id_test_ref_id": (
+                ("experiment_run_id", "test_ref_id"),
+                False,
+            ),
         }
 
 

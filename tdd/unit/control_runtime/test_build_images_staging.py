@@ -260,6 +260,9 @@ class TestParentHashChain:
             "claude": "agent-base",
             "gemini": "agent-base",
             "test-runner": "base",
+            # 12.7: a child of base like test-runner, so a base change
+            # restamps it. NOT a child of agent-base - it runs no steps.
+            "debug-sidecar": "base",
         }
 
     def test_parents_precede_their_children(self):
@@ -274,7 +277,7 @@ class TestParentHashChain:
     def test_extra_context_is_declared_only_for_agent_base(self):
         extras = {subdir: extra for subdir, _n, _p, extra in IMAGES}
         assert [name for _src, name in extras["agent-base"]] == ["runner-common"]
-        for subdir in ("base", "claude", "gemini", "test-runner"):
+        for subdir in ("base", "claude", "gemini", "test-runner", "debug-sidecar"):
             assert extras[subdir] == []
 
     def test_a_base_change_restamps_the_grandchild(self, staged, tmp_path):

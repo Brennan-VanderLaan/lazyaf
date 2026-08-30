@@ -32,6 +32,7 @@ AGENT_BASE_DOCKERFILE = _dockerfile("agent-base")
 CLAUDE_DOCKERFILE = _dockerfile("claude")
 GEMINI_DOCKERFILE = _dockerfile("gemini")
 TEST_RUNNER_DOCKERFILE = _dockerfile("test-runner")
+DEBUG_SIDECAR_DOCKERFILE = _dockerfile("debug-sidecar")
 
 
 class TestBuildInputHygiene:
@@ -188,17 +189,37 @@ class TestNoPhantomLatest:
                 "lazyaf-claude",
                 "lazyaf-gemini",
                 "lazyaf-test-runner",
+                "lazyaf-debug-sidecar",
             ):
                 assert f"{name}:latest" not in text, (path, name)
 
-    def test_discarded_images_not_ported(self):
-        """debug-sidecar stays parked for 12.7.
+    def test_debug_sidecar_declares_the_inverted_capability_label(self):
+        """12.7 UNPARKS debug-sidecar; the tombstone becomes a contract.
 
-        (gemini WAS on this tombstone list as fiction through 12.4 — 12.5
-        makes it real, because agent steps now run on the control layer and
-        `agent: gemini` needs an image with runner-common and the CLI in it.)
-        """
-        assert not (IMAGES / "debug-sidecar").exists()
+        (gemini was on the same tombstone list as fiction through 12.4 —
+        12.5 made it real. Same story here: the sidecar exists now, so the
+        assertion that has to hold is not "absent" but "absent from the
+        control layer". It is the ONLY image in the tree declaring
+        lazyaf.control-layer=0, and it must derive FROM lazyaf-base:dev so
+        it inherits uid 1000 and joins the content-hash chain — a root
+        Ubuntu sidecar would leave root-owned files in the workspace the
+        resumed step then trips over."""
+        assert (IMAGES / "debug-sidecar" / "Dockerfile").exists()
+        assert "FROM lazyaf-base:dev" in DEBUG_SIDECAR_DOCKERFILE
+        assert "LABEL lazyaf.control-layer=0" in DEBUG_SIDECAR_DOCKERFILE
+        assert "LABEL lazyaf.debug-sidecar=1" in DEBUG_SIDECAR_DOCKERFILE
+        assert "LABEL lazyaf.content-hash=$CONTENT_HASH" in DEBUG_SIDECAR_DOCKERFILE
+        # No other image may claim the sidecar marker or invert the
+        # control-layer label.
+        for other in (
+            BASE_DOCKERFILE,
+            AGENT_BASE_DOCKERFILE,
+            CLAUDE_DOCKERFILE,
+            GEMINI_DOCKERFILE,
+            TEST_RUNNER_DOCKERFILE,
+        ):
+            assert "lazyaf.debug-sidecar" not in other
+            assert "lazyaf.control-layer=0" not in other
 
     def test_agent_wrapper_not_ported(self):
         """12.5 rebuilds it as a runner-common shim; do not copy it now."""

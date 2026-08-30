@@ -8,6 +8,7 @@ This file is automatically loaded by pytest and provides:
 - Common test utilities
 """
 import asyncio
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,23 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+# -----------------------------------------------------------------------------
+# Shared secrets (12.7). MUST run before `from app.main import app` below.
+#
+# The backend has no default for these any more - importing app.main with them
+# unset is a hard MissingSecretError, which is the whole point of the change.
+# The suite is a deployment like any other, so it SETS them rather than opting
+# into the ephemeral dev flag: a fixed value keeps every process in a tiered
+# run (host pytest, T1/T2/T3 step containers) agreeing on one secret, and the
+# fail-closed and ephemeral paths get exercised deliberately in
+# tdd/unit/config/test_auth_secrets.py instead of ambiently here.
+#
+# setdefault, not assignment: a lane that already exports real secrets (the
+# dogfood step containers) keeps them.
+# -----------------------------------------------------------------------------
+os.environ.setdefault("LAZYAF_STEP_AUTH_SECRET", "test-suite-step-auth-secret-not-a-real-deployment")
+os.environ.setdefault("LAZYAF_RUNNER_AUTH_SECRET", "test-suite-runner-auth-secret-not-a-real-deployment")
 
 # Add backend to path for imports - handle both local and Docker environments
 backend_path = Path(__file__).parent.parent / "backend"

@@ -266,6 +266,112 @@ class PromptVersion:
     notes: str | None
 ```
 
+### StepUsage  *(Phase 12.5 — effort telemetry)*
+Per-agent-step resource accounting. Without this, `TestRun` records *what happened*
+and nothing records *what it cost* — and the Benchmark harness (Milestone 13) has no
+effort axis. It rides the control-layer protocol as a fourth channel alongside
+status / logs / test-results, so it must land WITH 12.5's agent-step migration
+rather than after it (12.2.6 became a retrofit precisely because 12.3 froze first).
+
+```python
+class StepUsage:
+    id: UUID
+    step_execution_id: UUID
+    step_run_id: UUID | None
+    provider: str                # "anthropic" | "google" | "openai-compatible" | "self-hosted"
+    model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    cache_read_tokens: int | None
+    cache_write_tokens: int | None
+    cost_usd: Decimal | None     # CLI-reported where available, else derived
+    cost_source: str             # "cli-reported" | "gpu-node" | "estimated" | "unknown"
+    wall_clock_ms: int
+    container_seconds: float | None
+    created_at: datetime
+```
+
+> **Cost sources (owner decision 2026-08-29):** the agent CLIs report their own
+> token counts and dollar cost — the control runtime scrapes that at step end
+> (`cost_source="cli-reported"`). Self-hosted / runpod-style nodes have no
+> per-token bill, so their dollars come from a node-rate x occupancy model
+> (`cost_source="gpu-node"`). Both land on one comparable USD axis; no separate
+> pricing table is needed while the CLIs keep reporting cost.
+
+### BenchmarkSuite / BenchmarkCase  *(Milestone 13)*
+A corpus of repos pinned at known states, each with a task and a definition of
+"solved". Cases are the fixtures a loop is benchmarked against.
+
+```python
+class BenchmarkSuite:
+    id: UUID
+    name: str                    # "core-v1"
+    description: str
+    tags: list[str]              # verticals covered
+
+class BenchmarkCase:
+    id: UUID
+    suite_id: UUID
+    slug: str                    # "flask-api.missing-pagination"
+    repo_id: UUID                # an INGESTED fixture repo (internal git server)
+    base_commit_sha: str         # every trial starts here, byte-identical
+    task_statement: str          # what the agent is told to do
+    vertical: str                # "web-api" | "data-pipeline" | "frontend" | "cli" | ...
+    complexity: str              # "trivial" | "small" | "medium" | "large"
+    fail_to_pass: list[str]      # lazyaf_test_ids that MUST flip red -> green
+    pass_to_pass: list[str]      # lazyaf_test_ids that must STAY green (regression guard)
+    user_story_id: UUID | None   # layered criteria: the human-meaningful "why"
+    loop_defaults: dict          # {max_iterations, budget_usd, per_step_timeout}
+    created_at: datetime
+```
+
+### Trial / TrialIteration  *(Milestone 13)*
+A Trial is one loop run of one case under one (model, prompt, policy) variant.
+TrialIteration is the per-cycle record — the cost *curve*, which is the actual
+science: not just "did it solve it" but "was iteration 4 worth paying for".
+
+```python
+class Trial:
+    id: UUID
+    experiment_id: UUID | None   # set when part of a matrix fan-out
+    benchmark_case_id: UUID
+    model: str
+    prompt_template_id: UUID | None
+    prompt_version: int | None
+    loop_policy: dict            # {max_iterations, budget_usd, stop_on}
+    status: str                  # running | solved | failed | budget_exhausted | error
+    solved_at_iteration: int | None   # headline metric; None = never solved
+    iterations_used: int
+    total_cost_usd: Decimal
+    total_input_tokens: int
+    total_output_tokens: int
+    wall_clock_ms: int
+    base_commit_sha: str
+    final_commit_sha: str | None
+    branch: str
+    created_at: datetime
+    completed_at: datetime | None
+
+class TrialIteration:
+    id: UUID
+    trial_id: UUID
+    iteration_index: int
+    pipeline_run_id: UUID        # each iteration IS a visible pipeline run
+    commit_sha: str | None       # what the agent produced this cycle
+    lines_added: int
+    lines_removed: int
+    files_touched: int
+    fail_to_pass_passed: int
+    fail_to_pass_total: int
+    pass_to_pass_broken: int     # regressions this iteration introduced
+    criteria_verified: int
+    cost_usd: Decimal
+    input_tokens: int
+    output_tokens: int
+    duration_ms: int
+    created_at: datetime
+```
+
 ### Card ↔ Spec Links
 
 The existing `Card` model gains optional links into the spec layer. Cards are still the active unit of work; the spec layer is the meta layer of *why*.
@@ -670,6 +776,18 @@ salvaged agent-step contract test re-targeted at main's protocol; Claude
 image, then Gemini + mock images derived from runner-common executors.
 Playground migrates off job_queue HERE (resolved from OPEN — it is agent
 execution). Polling runners remain only as unused fallback (deletion at 12.6).
+
+**ADDED 2026-08-29 — effort telemetry (do NOT defer past this phase).** Agent
+steps moving into control-mode containers is the moment to add the protocol's
+fourth channel: `POST /api/steps/{id}/usage` -> `StepUsage` (tokens, CLI-reported
+cost, wall-clock, container-seconds; `cost_source` distinguishes CLI-reported
+from gpu-node-derived). The control runtime scrapes the agent CLI's own usage
+report at step end and ships it like it ships test results. Rationale: 12.2.6
+became a retrofit because 12.3 froze the protocol without it — the same mistake
+is available here, and Milestone 13's entire cost axis depends on this channel.
+   EXIT GATE ADDITION: a mock-agent dogfood step produces a StepUsage row with
+   non-null tokens and a cost_source; a step whose CLI reports nothing still
+   succeeds with cost_source="unknown" (telemetry never fails a step).
    EXIT GATE: US-2 e2e (mock agent: card -> agent -> gate -> review -> merge)
    green on ephemeral containers AND added to the dogfood suite; the dogfood
    pipeline DOES include a mock-agent step from now on (zero-cost, every
@@ -703,7 +821,10 @@ same commit, and land test_no_legacy_code assertions in that commit (R2).
 #### Phase 12.6.5 — Experiments & leaderboards  [B, needs 12.6 + 12.2.6 + 12.2.5]
 
 Matrix runs (model x prompt x repeat) fanned out through the executor layer;
-aggregated pass-rate per AcceptanceCriterion; leaderboard + experiment UI
+aggregated pass-rate per AcceptanceCriterion AND cost-to-solve (from StepUsage —
+a cheap model needing six iterations vs an expensive one landing first try is
+THE comparison, and it is meaningless without the effort axis); leaderboard +
+experiment UI
 (with the criterion-history sparklines deferred from 12.2.6); MCP
 launch_experiment tool; guardrails: dry-run cost/run-count estimate + per-
 experiment cap before launch (upgraded from confirm-only per PLAN's open
@@ -782,9 +903,105 @@ Decisions made DURING implementation (all shipped and gate-verified):
   the socket group before gosu; the tree hash sorts POSIX-normalized paths;
   Docker client timeout must exceed the longest container wait budget.
 
+- 2026-08-29 Benchmark harness scoped as Milestone 13 (corpus + trials +
+  effectiveness board), with two mandatory hooks inside 12.x: StepUsage
+  telemetry in 12.5 and the cost-to-solve axis in 12.6.5. (Owner ambition,
+  Claude scoping)
+- 2026-08-29 Benchmark oracle is layered (fail_to_pass/pass_to_pass tests +
+  optional linked UserStory criteria); corpus = ingested repos pinned per case;
+  loop = sequential pipeline runs driven by a Trial orchestrator (the graph is a
+  DAG — no cycles); cost = CLI-reported + GPU-node model. (Owner)
+
 - OPEN: v1 pipeline retirement shape (12.8, owner confirms).
 - OPEN: whether `12.0` counts as done at 12.5 (runner-common adopted by agent
   images) or 12.8 (all runners retired) — resolves itself as those land.
+
+---
+
+## Milestone 13 — Benchmark & Evaluation Harness
+
+> **The question this answers:** take a repo at a known state, set the AI loop
+> loose, and measure what it actually cost to get to a solution — across models,
+> prompts, loop policies, and problem verticals. Not "can an agent do this once"
+> but "which loop is *effective*, and at what price".
+>
+> Scoped 2026-08-29 from the owner's benchmark ambition. Milestone 12 builds the
+> execution platform; Milestone 13 turns it into an instrument. Two hooks
+> (StepUsage in 12.5, the cost axis in 12.6.5) MUST land inside 12.x or this
+> milestone starts with a retrofit.
+
+### What already exists to build on
+
+| Need | Already in place |
+|------|------------------|
+| Deterministic starting state | `populate_workspace(..., commit_sha)` — workspaces already clone at a pinned commit (12.2-INT) |
+| Isolated, reproducible execution | Ephemeral control-mode containers on per-run volumes, byte-reproducible images (12.3) |
+| Outcome capture per test | TestRef / TestRun tie-back keyed to criterion + commit (12.2.6) |
+| Matrix fan-out | `Experiment.matrix = {models, prompts, repeat}` + executor fan-out (12.6.5) |
+| Effort capture | `StepUsage` (12.5 — the new hook) |
+| Human-meaningful intent | Feature / UserStory / AcceptanceCriterion (12.2.5) |
+
+### Design decisions (owner, 2026-08-29)
+
+- **Success oracle: BOTH, layered.** Each case ships `fail_to_pass` /
+  `pass_to_pass` test ids for objective, cheap scoring (SWE-bench-shaped), AND
+  may link a UserStory so criteria give partial credit and human-readable
+  grouping. The oracle decides *solved*; the criteria explain *what was solved*.
+- **Corpus: ingested repos pinned per case.** Fixture repos live in the internal
+  git server; each case pins a `base_commit_sha`. Hermetic, offline-capable,
+  versioned with the platform, and reuses ingest + population unchanged.
+- **Loop driver: the LazyAF pipeline loop.** Each iteration is a real pipeline
+  run — agent step, then the oracle test step, then failures fed forward into the
+  next iteration's agent step. Every iteration is therefore visible, costed, and
+  diffable, and the cost curve falls out of data the platform already writes.
+  *Implementation note:* the v2 graph is a DAG (`entry_points` +
+  all-upstream-satisfied traversal) — cycles would deadlock the traversal. So a
+  **Trial orchestrator drives N sequential pipeline runs**, one per iteration,
+  rather than a cyclic graph. No graph-engine change needed.
+- **Cost sources: CLI-reported + GPU-node model.** See `StepUsage`.
+
+### Phase 13.1 — Corpus & fixtures
+`BenchmarkSuite` / `BenchmarkCase` models + CRUD + a `lazyaf bench` CLI to author
+cases from a real repo state. A case-validation command that proves a case is
+well-formed: at `base_commit_sha` every `fail_to_pass` test FAILS and every
+`pass_to_pass` test PASSES (a case whose oracle is already green is broken).
+Seed a starter suite spanning verticals x complexity.
+   EXIT GATE: `lazyaf bench validate <suite>` green on the starter suite;
+   validation catches a deliberately-miswired case.
+
+### Phase 13.2 — Trial orchestrator & loop policy
+`Trial` / `TrialIteration` + the orchestrator: reset to `base_commit_sha` on a
+fresh branch, run iteration pipelines until solved / max_iterations /
+budget_usd exhausted, recording per-iteration cost, diff churn, and oracle
+progress. Budget enforcement is hard (a trial cannot outspend its cap).
+   EXIT GATE: a mock-model trial on a starter case solves at a known iteration
+   with a complete per-iteration cost curve; a deliberately-unsolvable case
+   terminates at budget_exhausted without overspending.
+
+### Phase 13.3 — Benchmark experiments & the effectiveness board
+Extend `Experiment` to target a suite: (case x model x prompt x policy x repeat)
+fan-out through the executor layer. Aggregate per case, per vertical, per
+complexity: solve-rate, median cost-to-solve, cost curve shape, regression rate
+(`pass_to_pass` broken), and iterations-to-solve distribution. This is the
+leaderboard 12.6.5 starts and 13.3 finishes — ranked by evidence, not vibes.
+   EXIT GATE: a 2-model x 2-policy matrix over a 3-case suite produces a board
+   where the same case is comparable across variants on both axes.
+
+### Phase 13.4 — Reporting & repeatability
+Trial replay (same case, same commit, same policy — how stable is the result?),
+variance across repeats, per-vertical breakdowns, and export. Answers the
+question that makes the whole thing science: *is this difference real or noise?*
+
+### Open questions for Milestone 13
+
+- Repeats needed for signal? (LLM runs are stochastic; N=1 comparisons will lie.)
+- Does a trial get network access? (Dependency installs say yes; reproducibility
+  and cost-control say pin a proxy/cache.)
+- Do we score partial progress (fail_to_pass 3/5) or binary solved? (Model
+  supports both — the board must pick a headline.)
+- Contamination: public fixture repos may be in model training data. Do we need
+  self-authored cases to trust the numbers?
+
 
 ---
 

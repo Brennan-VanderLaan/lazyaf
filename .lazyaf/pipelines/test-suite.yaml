@@ -101,6 +101,37 @@ steps:
     on_failure: stop
     timeout: 1200
 
+  # US-2 continuous coverage (12.5): a REAL agent step through the REAL
+  # control runtime, executed by the mock executor - so the agent path (agent
+  # config file, wrapper dispatch, usage manifest, POST /api/steps/{id}/usage)
+  # is exercised on every push at zero API cost and with no egress to
+  # api.anthropic.com. `agent: mock` resolves to lazyaf-agent-base:dev, which
+  # is the agent runtime image itself (no fourth image to build).
+  #
+  # commit is FALSE: the dogfood run must never push to its own repo. That
+  # also means this step needs no git credentials and leaves no branch behind.
+  - id: "mock-agent"
+    name: "US-2 mock agent step (zero cost)"
+    type: agent
+    config:
+      agent: mock
+      commit: false
+      task: "Write .lazyaf-dogfood/agent-ran into the workspace"
+      mock_config:
+        response_mode: streaming
+        delay_ms: 10
+        file_operations:
+          - action: create
+            path: .lazyaf-dogfood/agent-ran
+            content: "12.5 mock agent step\n"
+        output_events:
+          - {type: content, text: "Analyzing the workspace..."}
+          - {type: complete, text: "Done."}
+        exit_code: 0
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
   # Exit-gate ratchet (R1), 12.3 edition: every script step of THIS run must
   # have executor='local' AND (control-layer probe) show logs that arrived via
   # the POST /api/steps/* path with a StepExecution row per script step.

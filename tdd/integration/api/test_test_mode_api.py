@@ -219,11 +219,25 @@ class TestReset:
     async def test_reset_clears_playground_sessions(self, test_client):
         from app.services.playground_service import playground_service
 
-        session_id = await playground_service.start_test(
-            repo_id="repo-doomed", branch="main", runner_type="any"
+        # The subject here is reset(), not the start path: since 12.5
+        # start_test dispatches a real ad-hoc agent run and needs a db session
+        # plus an ingested repo (that path is covered by
+        # tdd/integration/api/test_playground_control_mode.py). A live session
+        # object is all reset() needs to be exercised.
+        from uuid import uuid4
+
+        from app.services.playground_service import PlaygroundSession
+
+        session = PlaygroundSession(
+            id=str(uuid4()),
+            repo_id="repo-doomed",
+            branch="main",
+            runner_type="any",
+            status="running",
         )
-        session = playground_service.get_session(session_id)
-        assert session is not None
+        session_id = session.id
+        playground_service._sessions[session_id] = session
+        assert playground_service.get_session(session_id) is session
 
         response = await test_client.post("/api/test/reset")
         assert_status_code(response, 200)

@@ -1,5 +1,6 @@
 """
-Contract tests for the REAL image files (images/**) — Phase 12.3.
+Contract tests for the REAL image files (images/**) — Phase 12.3, agent tree
+added in 12.5.
 
 Deliberately minimal (the adversarial review pruned the grep-Dockerfile test
 theater): the built images are exercised for real in
@@ -10,6 +11,10 @@ round trip. What remains here is ONLY what has no real-Docker equivalent:
 - build-input hygiene rules that only text can pin (LF endings, no :latest,
   the .dockerignore/tree_hash pairing, the cache env block, child-image
   build-time install escapes)
+- the 12.5 image TREE (base -> agent-base -> {claude, gemini}), because
+  re-parenting is a one-line edit that no green build would notice: an image
+  still built FROM lazyaf-base:dev works fine right up until an agent step
+  runs `python3 -m runner_common.agent_wrapper` in it
 - tombstones for retired/parked artifacts
 """
 from pathlib import Path
@@ -17,9 +22,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 IMAGES = REPO_ROOT / "images"
 
-BASE_DOCKERFILE = (IMAGES / "base" / "Dockerfile").read_text()
-CLAUDE_DOCKERFILE = (IMAGES / "claude" / "Dockerfile").read_text()
-TEST_RUNNER_DOCKERFILE = (IMAGES / "test-runner" / "Dockerfile").read_text()
+
+def _dockerfile(subdir: str) -> str:
+    return (IMAGES / subdir / "Dockerfile").read_text(encoding="utf-8")
+
+
+BASE_DOCKERFILE = _dockerfile("base")
+AGENT_BASE_DOCKERFILE = _dockerfile("agent-base")
+CLAUDE_DOCKERFILE = _dockerfile("claude")
+GEMINI_DOCKERFILE = _dockerfile("gemini")
+TEST_RUNNER_DOCKERFILE = _dockerfile("test-runner")
 
 
 class TestBuildInputHygiene:
@@ -58,18 +70,81 @@ class TestBuildInputHygiene:
         assert "/workspace/home/.local/bin" in BASE_DOCKERFILE  # PATH
 
 
+class TestAgentRuntimeImage:
+    """lazyaf-agent-base (12.5): the agent runtime, and the mock agent image.
+
+    `agent: mock` resolves HERE rather than to a fourth image whose only
+    content would be "agent-base minus nothing".
+    """
+
+    def test_agent_base_extends_base_dev_tag(self):
+        assert "FROM lazyaf-base:dev" in AGENT_BASE_DOCKERFILE
+
+    def test_agent_base_declares_the_agent_runtime_capability(self):
+        """A POSITIVE declaration, read by exactly one preflight assertion so
+        an agent step pointed at lazyaf-test-runner:dev gets a clear message
+        instead of `ModuleNotFoundError: runner_common` 30s into the step.
+        Never used for mode selection — that stays on the inherited
+        lazyaf.control-layer label."""
+        assert "LABEL lazyaf.agent-runtime=1" in AGENT_BASE_DOCKERFILE
+
+    def test_agent_base_inherits_rather_than_restates_control_layer(self):
+        """lazyaf.control-layer=1 comes from base, so
+        image_supports_control_layer needs no change. Restating it here would
+        make the label two-sourced (R3)."""
+        assert "LABEL lazyaf.control-layer" not in AGENT_BASE_DOCKERFILE
+
+    def test_agent_base_installs_runner_common_into_the_image(self):
+        """PIP_USER=1 is baked and points at the RUNTIME volume, which is
+        shadowed at run time: without the PIP_USER=0 escape the install
+        vanishes and every agent step dies on import."""
+        assert "COPY runner-common/ /opt/runner-common/" in AGENT_BASE_DOCKERFILE
+        assert "PIP_USER=0 pip install" in AGENT_BASE_DOCKERFILE
+        assert "/opt/runner-common" in AGENT_BASE_DOCKERFILE
+
+    def test_agent_base_verifies_the_wrapper_entrypoint(self):
+        """The fixed agent-step command is `python3 -m
+        runner_common.agent_wrapper`; the build fails loudly if packaging
+        regressed rather than a step failing 30 seconds in."""
+        assert "runner_common.agent_wrapper" in AGENT_BASE_DOCKERFILE
+
+    def test_runner_common_is_not_vendored_under_images(self):
+        """R3, the whole reason for the staged build context: ONE copy of the
+        executors in git. scripts/build_images.py stages
+        REPO_ROOT/runner-common into the context at build time."""
+        assert not (IMAGES / "agent-base" / "runner-common").exists()
+        assert not (IMAGES / "agent-base" / "runner_common").exists()
+
+    def test_agent_base_restamps_content_hash(self):
+        assert "LABEL lazyaf.content-hash=$CONTENT_HASH" in AGENT_BASE_DOCKERFILE
+
+
 class TestChildImages:
     """No real-Docker suite covers the child images yet — text rules stay."""
 
-    def test_claude_extends_base_dev_tag(self):
-        assert "FROM lazyaf-base:dev" in CLAUDE_DOCKERFILE
+    def test_claude_extends_agent_base_dev_tag(self):
+        """Re-parented in 12.5: claude needs runner-common in the image or
+        the wrapper command cannot resolve."""
+        assert "FROM lazyaf-agent-base:dev" in CLAUDE_DOCKERFILE
+        assert "FROM lazyaf-base:dev" not in CLAUDE_DOCKERFILE
+
+    def test_gemini_extends_agent_base_dev_tag(self):
+        assert "FROM lazyaf-agent-base:dev" in GEMINI_DOCKERFILE
+        assert "FROM lazyaf-base:dev" not in GEMINI_DOCKERFILE
 
     def test_test_runner_extends_base_dev_tag(self):
+        """test-runner is NOT an agent image: it stays on plain base, and a
+        step that points an agent at it fails the preflight."""
         assert "FROM lazyaf-base:dev" in TEST_RUNNER_DOCKERFILE
+        assert "lazyaf.agent-runtime" not in TEST_RUNNER_DOCKERFILE
 
     def test_claude_installs_node_and_cli(self):
         assert "nodejs" in CLAUDE_DOCKERFILE
         assert "@anthropic-ai/claude-code" in CLAUDE_DOCKERFILE
+
+    def test_gemini_installs_node_and_cli(self):
+        assert "nodejs" in GEMINI_DOCKERFILE
+        assert "@google/gemini-cli" in GEMINI_DOCKERFILE
 
     def test_test_runner_quotes_pytest_version_spec(self):
         """Unquoted pytest>=7.0 is a shell redirect (the failure_01 bug)."""
@@ -84,11 +159,18 @@ class TestChildImages:
         """PIP_USER=1 / NPM_CONFIG_PREFIX point at the runtime volume; child
         build steps must override them or their installs vanish at run time."""
         assert "PIP_USER=0 pip install" in TEST_RUNNER_DOCKERFILE
+        assert "PIP_USER=0 pip install" in AGENT_BASE_DOCKERFILE
         assert "NPM_CONFIG_PREFIX=/usr/local npm install" in TEST_RUNNER_DOCKERFILE
         assert "NPM_CONFIG_PREFIX=/usr/local npm install" in CLAUDE_DOCKERFILE
+        assert "NPM_CONFIG_PREFIX=/usr/local npm install" in GEMINI_DOCKERFILE
 
     def test_children_restamp_content_hash(self):
-        for df in (CLAUDE_DOCKERFILE, TEST_RUNNER_DOCKERFILE):
+        for df in (
+            AGENT_BASE_DOCKERFILE,
+            CLAUDE_DOCKERFILE,
+            GEMINI_DOCKERFILE,
+            TEST_RUNNER_DOCKERFILE,
+        ):
             assert "LABEL lazyaf.content-hash=$CONTENT_HASH" in df
 
 
@@ -100,13 +182,22 @@ class TestNoPhantomLatest:
         files.append(REPO_ROOT / "scripts" / "build_images.py")
         for path in files:
             text = path.read_text(encoding="utf-8", errors="ignore")
-            assert "lazyaf-base:latest" not in text, path
-            assert "lazyaf-claude:latest" not in text, path
-            assert "lazyaf-test-runner:latest" not in text, path
+            for name in (
+                "lazyaf-base",
+                "lazyaf-agent-base",
+                "lazyaf-claude",
+                "lazyaf-gemini",
+                "lazyaf-test-runner",
+            ):
+                assert f"{name}:latest" not in text, (path, name)
 
     def test_discarded_images_not_ported(self):
-        """gemini (fiction) and debug-sidecar (parked for 12.7) stay out."""
-        assert not (IMAGES / "gemini").exists()
+        """debug-sidecar stays parked for 12.7.
+
+        (gemini WAS on this tombstone list as fiction through 12.4 — 12.5
+        makes it real, because agent steps now run on the control layer and
+        `agent: gemini` needs an image with runner-common and the CLI in it.)
+        """
         assert not (IMAGES / "debug-sidecar").exists()
 
     def test_agent_wrapper_not_ported(self):

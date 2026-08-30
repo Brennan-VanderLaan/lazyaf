@@ -64,10 +64,11 @@ class TestDefaultRouting:
         assert decision.mode == "local"
         assert decision.reason
 
-    def test_agent_routes_legacy(self, router):
+    def test_agent_routes_local(self, router):
+        """12.5 flipped this: agent steps run on the control layer."""
         decision = router.decide("agent", {"prompt": "Fix the failing tests"})
-        assert decision.mode == "legacy"
-        assert "12.5" in decision.reason  # states WHY agent steps stay legacy
+        assert decision.mode == "local"
+        assert decision.reason == "agent-default-local"
 
     def test_script_with_image_still_local(self, router):
         decision = router.decide(
@@ -203,13 +204,14 @@ class TestRunnerPins:
         assert "LOCAL" in message
 
     def test_agent_step_keeps_agent_reason_over_pin(self, router):
-        """Agent steps are legacy for their own (12.5) reason; a runner_type
-        on an agent step is normal config, not a warning-worthy pin."""
+        """12.5: agent steps route LOCAL for their own reason; a runner_type
+        on an agent step is normal config (it named the AI runner flavor),
+        not a warning-worthy hardware pin."""
         decision = router.decide(
             "agent", {"prompt": "fix it", "runner_type": "claude-code"}
         )
-        assert decision.mode == "legacy"
-        assert decision.reason == "agent-steps-legacy-until-12.5"
+        assert decision.mode == "local"
+        assert decision.reason == "agent-default-local"
 
     def test_unpinned_script_still_local(self, router):
         decision = router.decide("script", {"command": "pytest"})

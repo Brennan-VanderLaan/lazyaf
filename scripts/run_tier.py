@@ -12,11 +12,14 @@ Stdlib only: runs on the bare python3 of a Linux runner container and on a
 Windows host alike. Paths are derived from this file's location, so the
 current working directory does not matter.
 
-KNOWN EXCLUSION (stated per R4, not a silent cap): the 21 @slow e2e tests
+KNOWN EXCLUSION (stated per R4, not a silent cap): the @slow e2e tests
 (control layer, real card execution, graph pipeline full-stack) run in NO
 tier - they need the compose e2e stack, which the legacy runner cannot host.
 Run them on the host via the scripts/test slow lane; they enter dogfood CI
-at Phase 12.4/12.5 when ephemeral execution can host the stack.
+when ephemeral execution can host the stack. The 12.5 US-2 card loop
+(tdd/e2e/test_us2_card_loop.py) is deliberately NOT slow: it drives the whole
+card -> agent -> gate -> review -> merge chain against the mock agent, so it
+runs in T3 on every push.
 
 Usage:
     python3 scripts/run_tier.py T1 [T2 T3 ...] [-- extra pytest args]
@@ -96,6 +99,15 @@ TIERS: dict[str, dict] = {
             "not slow",
         ],
         "junitxml": "junit-t3.xml",
+        # 12.5: T3 gained the US-2 card loop (tdd/e2e/test_us2_card_loop.py),
+        # which drives a real agent step. It therefore needs the same image
+        # preflight T2 has - a missing or stale lazyaf-agent-base:dev must be
+        # a loud failure naming the rebuild command, never a skip the gate has
+        # to baseline (R4). Same invocation as T2 so the two cannot drift.
+        "preflight": {
+            "argv": ["uv", "run", "python", "../scripts/build_images.py", "--check"],
+            "fix": "python scripts/build_images.py",
+        },
     },
 }
 

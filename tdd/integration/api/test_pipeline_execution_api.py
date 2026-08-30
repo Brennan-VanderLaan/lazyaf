@@ -20,6 +20,9 @@ tdd_path = Path(__file__).parent.parent.parent.parent / "tdd"
 sys.path.insert(0, str(backend_path))
 sys.path.insert(0, str(tdd_path))
 
+from app.services.agent_run import (
+    ADHOC_TRIGGER_TYPES as DISPATCHED_ADHOC_TRIGGER_TYPES,
+)
 from shared.factories import (
     repo_ingest_payload,
     pipeline_create_payload,
@@ -411,3 +414,94 @@ class TestPipelineRunOrdering:
 
         # Most recent run should be first
         assert runs[0]["id"] == run_ids[-1]
+
+
+class TestTriggerTypeIsValidated:
+    """trigger_type is a ROUTING KEY, not a label (12.5).
+
+    `agent_run.on_run_complete` dispatches on the PERSISTED trigger_type: a
+    run stamped `card_work` writes the Card named by trigger_ref - status,
+    Job row, and the card_complete triggers that fire off it. While this
+    endpoint accepted any string, any caller could drive an arbitrary card to
+    in_review or failed by starting a pipeline of their own.
+    """
+
+    async def test_the_refusal_list_is_the_dispatch_list(self):
+        """R3: one vocabulary, not two tuples that happen to agree today.
+
+        `agent_run.ADHOC_TRIGGER_TYPES` is what run completion DISPATCHES on;
+        `schemas.pipeline.ADHOC_TRIGGER_TYPES` is what the public endpoint
+        REFUSES. They are declared in two modules, so a third ad-hoc trigger
+        added to the dispatcher alone would reopen the arbitrary-card-mutation
+        hole silently - the endpoint would happily stamp it and the parametrize
+        below would not grow to notice. Asserted here so the drift is a test
+        failure instead of a vulnerability.
+        """
+        from app.schemas.pipeline import ADHOC_TRIGGER_TYPES as refused
+        from app.services.agent_run import ADHOC_TRIGGER_TYPES as dispatched
+
+        assert tuple(sorted(refused)) == tuple(sorted(dispatched)), (
+            "the trigger types the public endpoint refuses have drifted from "
+            "the ones run completion acts on"
+        )
+
+    @pytest.mark.parametrize(
+        "trigger_type",
+        # Driven off the dispatcher's own list, so a new ad-hoc trigger type
+        # is covered the moment it exists rather than when someone remembers
+        # to extend a literal here.
+        DISPATCHED_ADHOC_TRIGGER_TYPES,
+    )
+    async def test_adhoc_trigger_types_are_refused(
+        self, client, pipeline_with_steps, trigger_type, clean_job_queue
+    ):
+        response = await client.post(
+            f"/api/pipelines/{pipeline_with_steps['id']}/run",
+            json={"trigger_type": trigger_type, "trigger_ref": "some-card-id"},
+        )
+        assert 400 <= response.status_code < 500, response.text
+        assert "internal" in response.text or "reserved" in response.text
+
+    async def test_a_refused_run_mutates_nothing(
+        self, client, pipeline_with_steps, clean_job_queue
+    ):
+        before = await client.get(
+            f"/api/pipelines/{pipeline_with_steps['id']}/runs"
+        )
+        assert_status_code(before, 200)
+
+        response = await client.post(
+            f"/api/pipelines/{pipeline_with_steps['id']}/run",
+            json={"trigger_type": "card_work", "trigger_ref": "victim-card"},
+        )
+        assert 400 <= response.status_code < 500
+
+        after = await client.get(
+            f"/api/pipelines/{pipeline_with_steps['id']}/runs"
+        )
+        assert_status_code(after, 200)
+        assert after.json() == before.json(), (
+            "a refused run must not have created a PipelineRun"
+        )
+
+    async def test_unknown_trigger_type_is_refused_by_the_schema(
+        self, client, pipeline_with_steps, clean_job_queue
+    ):
+        response = await client.post(
+            f"/api/pipelines/{pipeline_with_steps['id']}/run",
+            json={"trigger_type": "cardwork"},
+        )
+        assert response.status_code == 422, response.text
+
+    @pytest.mark.parametrize(
+        "trigger_type", ["manual", "webhook", "push", "schedule", "pipeline"]
+    )
+    async def test_public_trigger_types_still_run(
+        self, client, pipeline_with_steps, trigger_type, clean_job_queue
+    ):
+        response = await client.post(
+            f"/api/pipelines/{pipeline_with_steps['id']}/run",
+            json={"trigger_type": trigger_type},
+        )
+        assert_status_code(response, 200)
+        assert response.json()["trigger_type"] == trigger_type

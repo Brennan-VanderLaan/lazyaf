@@ -31,7 +31,10 @@ sys.path.insert(0, str(backend_path))
 from app.database import Base
 from app.models import Pipeline, PipelineRun, Repo, StepRun, Card, Job
 from app.models.pipeline import ExecutorMode, RunStatus
-from app.services.pipeline_executor import PipelineExecutor
+from app.services.pipeline_executor import (
+    PipelineExecutor,
+    build_verification_step,
+)
 from app.services.websocket import manager
 from app.services.workspace.state_machine import generate_volume_name
 
@@ -49,8 +52,12 @@ class Decision:
 
 
 class ContractRouter:
-    """Implements the contracted routing rules: script/docker -> local,
-    agent -> legacy, explicit executor=legacy override -> legacy.
+    """Implements the contracted routing rules: script/docker/agent -> local,
+    explicit executor=legacy override -> legacy.
+
+    12.5 fallout: agent steps route LOCAL by default ("agent-default-local");
+    `executor: legacy` on an agent step is the LAST legacy escape hatch and
+    stays honored, loudly.
 
     12.4 fallout: `executor: legacy` on a script/docker step RAISES, exactly
     as the real ExecutionRouter does. Phase 12.4 deleted script/docker
@@ -74,7 +81,9 @@ class ContractRouter:
             return Decision("legacy", "explicit-override")
         if step_type in ("script", "docker"):
             return Decision("local", f"{step_type}-runs-local")
-        return Decision("legacy", "agent-legacy-until-12.5")
+        if step_type == "agent":
+            return Decision("local", "agent-default-local")
+        return Decision("legacy", f"unknown-step-type:{step_type}")
 
 
 class ExplodingRouter:
@@ -131,9 +140,15 @@ class FakeLocalExecutor:
 
     async def image_supports_control_layer(self, image: str) -> bool:
         """Contract method (12.3): these fakes model STOCK images - no
-        control-layer capability label, so every step takes stdout mode."""
+        control-layer capability label, so every step takes stdout mode.
+
+        The lazyaf-* agent images are the exception (12.5): they DO declare
+        the label in reality, and an agent step that cannot get control mode
+        fails at dispatch by design - modelling them as unlabeled here would
+        assert the wrong thing.
+        """
         self.label_queries.append(image)
-        return False
+        return image.startswith("lazyaf-")
 
     async def find_missing_images(self, images) -> list[str]:
         """Contract method (12.3 image preflight)."""
@@ -352,7 +367,39 @@ class TestRoutingDispatch:
         assert await fetch_all(env, Job) == []
         assert all(sr.executor == "local" for sr in run.step_runs)
 
-    async def test_agent_step_routes_legacy_and_enqueues(self, env, enqueue_spy):
+    async def test_agent_step_routes_local_and_enqueues_nothing(
+        self, env, enqueue_spy
+    ):
+        """12.5: an agent step runs on the local executor like any other.
+
+        No Card, no Job, no queue entry - a silent fallback to legacy is
+        indistinguishable from success (R1), so the absence is asserted.
+        """
+        repo = await make_repo(env.factory)
+        pipeline = await make_linear_pipeline(
+            env.factory,
+            repo,
+            [{
+                "name": "Agent",
+                "type": "agent",
+                "config": {"agent": "mock", "title": "Do it"},
+            }],
+        )
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert enqueue_spy.calls == []
+        assert run.step_runs[0].executor == "local"
+        cards = await fetch_all(env, Card)
+        jobs = await fetch_all(env, Job)
+        assert cards == [] and jobs == []
+        assert len(env.local.calls) == 1
+
+    async def test_agent_step_without_agent_key_fails_that_step_loudly(
+        self, env, enqueue_spy
+    ):
+        """No default agent: a step that names none fails at dispatch with
+        the valid vocabulary in the message - it never silently picks one."""
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(
             env.factory,
@@ -362,25 +409,20 @@ class TestRoutingDispatch:
 
         run = await start_and_wait(env, pipeline, repo)
 
-        # Legacy path: job enqueued, run still waiting on the runner system
-        assert run.status == RunStatus.RUNNING.value
-        assert len(enqueue_spy.calls) == 1
-        assert enqueue_spy.calls[0].step_type == "agent"
-        assert run.step_runs[0].executor == "legacy"
-        cards = await fetch_all(env, Card)
-        jobs = await fetch_all(env, Job)
-        assert len(cards) == 1 and len(jobs) == 1
-        # Local executor never touched
-        assert env.local.calls == []
+        assert run.status == RunStatus.FAILED.value
+        assert enqueue_spy.calls == []
+        error = run.step_runs[0].error or ""
+        assert "agent" in error and "claude-code" in error
 
     async def test_explicit_legacy_override_on_agent_step_logged_at_warning(
         self, env, enqueue_spy, caplog
     ):
         """`executor: legacy` on an AGENT step is still honored, loudly.
 
-        Agent steps run on the runner queue until Phase 12.5, so the override
-        names a path that exists. It stays a WARNING - an override is never
-        silent (R1).
+        After 12.5 this is the LAST remaining legacy escape hatch (R2
+        requires it to stay callable until the 12.6 deletion commit), so the
+        override still names a path that exists. It stays a WARNING - an
+        override is never silent (R1).
         """
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(
@@ -799,14 +841,14 @@ class TestGraphLocalDispatch:
         assert all(sr.executor == "local" for sr in run.step_runs)
         assert len(env.local.calls) == 2
 
-    async def test_graph_mixed_routing_agent_stays_legacy(self, env, enqueue_spy):
+    async def test_graph_mixed_routing_agent_runs_local(self, env, enqueue_spy):
         graph = {
             "version": 2,
             "steps": {
                 "build": {"id": "build", "name": "Build", "type": "script",
                           "config": {"command": "echo build"}},
                 "agent": {"id": "agent", "name": "Agent", "type": "agent",
-                          "config": {"title": "fix"}},
+                          "config": {"agent": "mock", "title": "fix"}},
             },
             "edges": [
                 {"id": "e1", "from_step": "build", "to_step": "agent",
@@ -819,14 +861,16 @@ class TestGraphLocalDispatch:
 
         run = await start_and_wait(env, pipeline, repo)
 
-        # Build ran locally; agent step enqueued to the legacy runner path
-        assert run.status == RunStatus.RUNNING.value
+        # 12.5: BOTH steps run locally, and nothing reaches the queue.
+        # (The agent step's TERMINAL state is owned by the in-container
+        # control runtime, which this routing fake does not simulate - that
+        # reconciliation is covered by test_control_mode_dispatch.py and the
+        # T2 round trip. What this test pins is the routing decision.)
         by_id = {sr.step_id: sr for sr in run.step_runs}
         assert by_id["build"].executor == "local"
         assert by_id["build"].status == RunStatus.PASSED.value
-        assert by_id["agent"].executor == "legacy"
-        assert len(enqueue_spy.calls) == 1
-        assert enqueue_spy.calls[0].step_type == "agent"
+        assert by_id["agent"].executor == "local"
+        assert enqueue_spy.calls == []
 
 
 # -----------------------------------------------------------------------------
@@ -1270,9 +1314,10 @@ class TestT1DockerGuard:
         assert decision.mode == ExecutorMode.LOCAL.value
         assert decision.reason == "script-default-local"
 
-        # Agent steps still route legacy until 12.5 - unchanged.
+        # 12.5: agent steps route local too.
         agent = pipeline_executor._get_router().decide("agent", {"title": "x"})
-        assert agent.mode == ExecutorMode.LEGACY.value
+        assert agent.mode == ExecutorMode.LOCAL.value
+        assert agent.reason == "agent-default-local"
 
     async def test_global_local_path_is_docker_free_in_t1(self):
         """The stubbed collaborators - not a rerouted decision - are what
@@ -1426,3 +1471,235 @@ class TestImagePreflight:
 
         assert run.status == RunStatus.PASSED.value
         assert env.local.preflight_queries == []
+
+
+# -----------------------------------------------------------------------------
+# The test-result gate (the demotion the legacy path had and local lost)
+# -----------------------------------------------------------------------------
+
+class TestReportingExecutor(FakeLocalExecutor):
+    """Ingests test results for the step it is running, then exits 0.
+
+    Models the real shape: the control runtime POSTs results to
+    /api/steps/{id}/test-results DURING the step, so by the time the step
+    finishes the TestRun rows are already there. `statuses` is what the
+    suite reported.
+    """
+    __test__ = False  # a helper, not a pytest class
+
+    def __init__(self, factory, repo_id, statuses, exit_code=0):
+        super().__init__()
+        self.factory = factory
+        self.repo_id = repo_id
+        self.statuses = list(statuses)
+        self.exit_code = exit_code
+
+    async def execute_step(self, step_config, execution_context):
+        self.calls.append((dict(step_config), dict(execution_context)))
+        await self._write_results(execution_context)
+        yield {"type": "status", "status": "running"}
+        yield {
+            "type": "result",
+            "status": "completed" if self.exit_code == 0 else "failed",
+            "exit_code": self.exit_code,
+        }
+
+    async def _write_results(self, execution_context):
+        from app.models import TestRef, TestRun
+
+        async with self.factory() as db:
+            for i, status in enumerate(self.statuses):
+                ref = TestRef(
+                    id=str(uuid4()),
+                    lazyaf_test_id=f"LZ-{i}",
+                    repo_id=self.repo_id,
+                )
+                db.add(ref)
+                db.add(
+                    TestRun(
+                        id=str(uuid4()),
+                        test_ref_id=ref.id,
+                        pipeline_run_id=execution_context["pipeline_run_id"],
+                        step_run_id=execution_context["step_run_id"],
+                        status=status,
+                    )
+                )
+            await db.commit()
+
+
+class TestTestResultGate:
+    async def test_exit_zero_with_a_failing_suite_fails_the_step(self, env):
+        """THE LOST GATE. A test command that reports failures and still
+        exits 0 (a wrapper script, a `|| true`, a runner that swallows the
+        code) used to read as a PASSING step - which on an ad-hoc card run
+        means the card is offered for merge red."""
+        repo = await make_repo(env.factory)
+        env.executor._local_executor = TestReportingExecutor(
+            env.factory, repo.id, ["passed", "failed", "passed"]
+        )
+        pipeline = await make_linear_pipeline(
+            env.factory, repo, [script_step("Tests", "pytest || true")]
+        )
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.FAILED.value
+        step_run = run.step_runs[0]
+        assert step_run.status == RunStatus.FAILED.value
+        assert "1 test(s) reported FAILED" in (step_run.error or "")
+        assert "reported FAILED" in (step_run.logs or "")
+
+    async def test_a_green_suite_leaves_the_step_green(self, env):
+        repo = await make_repo(env.factory)
+        env.executor._local_executor = TestReportingExecutor(
+            env.factory, repo.id, ["passed", "skipped"]
+        )
+        pipeline = await make_linear_pipeline(
+            env.factory, repo, [script_step("Tests", "pytest")]
+        )
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.PASSED.value
+        assert run.step_runs[0].status == RunStatus.PASSED.value
+
+    async def test_a_step_that_ingests_nothing_is_untouched(self, env):
+        """No results is not a pass and not a failure - the gate only ever
+        DEMOTES, so a step that reports none keeps its exit code's verdict."""
+        repo = await make_repo(env.factory)
+        env.executor._local_executor = TestReportingExecutor(
+            env.factory, repo.id, []
+        )
+        pipeline = await make_linear_pipeline(
+            env.factory, repo, [script_step("No tests", "echo hi")]
+        )
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.PASSED.value
+
+    async def test_an_already_failed_step_keeps_its_own_error(self, env):
+        repo = await make_repo(env.factory)
+        env.executor._local_executor = TestReportingExecutor(
+            env.factory, repo.id, ["failed"], exit_code=1
+        )
+        pipeline = await make_linear_pipeline(
+            env.factory, repo, [script_step("Tests", "pytest")]
+        )
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.step_runs[0].status == RunStatus.FAILED.value
+
+    async def test_results_of_ANOTHER_step_do_not_bleed(self, env):
+        """The gate is scoped to the step's own step_run_id."""
+        repo = await make_repo(env.factory)
+        env.executor._local_executor = TestReportingExecutor(
+            env.factory, repo.id, ["failed"]
+        )
+        pipeline = await make_linear_pipeline(
+            env.factory,
+            repo,
+            [script_step("A", "pytest"), script_step("B", "echo b")],
+        )
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        by_index = {sr.step_index: sr for sr in run.step_runs}
+        assert by_index[0].status == RunStatus.FAILED.value
+        # Step 1 never runs (on_failure defaults to stop), so the only proof
+        # available is that the run stopped at the red step, not that step 1
+        # inherited its results.
+        assert 1 not in by_index
+
+
+class TestVerificationStepSeam:
+    """The seam the ad-hoc card run wires a post-agent test step through."""
+
+    def test_verification_step_stops_the_run_when_red(self):
+        step = build_verification_step("pytest -q")
+        assert step["type"] == "script"
+        assert step["config"]["command"] == "pytest -q"
+        assert step["on_failure"] == "stop", (
+            "a red verification step must fail the RUN - that is what "
+            "demotes the card"
+        )
+        assert step["on_success"] == "next"
+
+    def test_verification_step_accepts_an_image_and_timeout(self):
+        step = build_verification_step(
+            "pytest", image="lazyaf-test-runner:dev", timeout=900,
+            name="Repo suite", step_id="repo-suite",
+        )
+        assert step["config"]["image"] == "lazyaf-test-runner:dev"
+        assert step["timeout"] == 900
+        assert step["name"] == "Repo suite"
+        assert step["id"] == "repo-suite"
+
+    async def test_a_verification_step_after_an_agent_demotes_the_run(self, env):
+        """End to end on the pipeline side: step 0 goes green, step 1 (the
+        verification step) comes back red, and the RUN fails - which is the
+        signal agent_run.on_run_complete routes the card outcome off."""
+        repo = await make_repo(env.factory)
+        env.executor._local_executor = FakeLocalExecutor(
+            events=[
+                {"type": "status", "status": "running"},
+                {"type": "result", "status": "failed", "exit_code": 1},
+            ]
+        )
+        pipeline = await make_linear_pipeline(
+            env.factory,
+            repo,
+            [
+                script_step("Work", "echo worked"),
+                build_verification_step("pytest -q"),
+            ],
+        )
+
+        run = await start_and_wait(env, pipeline, repo)
+
+        assert run.status == RunStatus.FAILED.value
+
+    async def test_the_runs_results_are_readable_off_the_run(self, env):
+        """The other half of the seam: the caller that decides a card's
+        outcome reads TEST RESULTS off the RUN, not an exit code.
+
+        The reader is agent_run.run_test_summary (one owner - the module
+        that puts the numbers on the card). This asserts the pipeline side
+        actually feeds it: results ingested during a step are tied to the
+        run and come back keyed by status.
+        """
+        from app.services.agent_run import run_test_summary
+
+        repo = await make_repo(env.factory)
+        env.executor._local_executor = TestReportingExecutor(
+            env.factory, repo.id, ["passed", "passed", "failed", "skipped"]
+        )
+        pipeline = await make_linear_pipeline(
+            env.factory, repo, [script_step("Tests", "pytest")]
+        )
+        run = await start_and_wait(env, pipeline, repo)
+
+        async with env.factory() as db:
+            summary = await run_test_summary(db, run.id)
+
+        assert summary.tests_run is True
+        assert summary.tests_passed is False
+        assert (summary.pass_count, summary.fail_count, summary.skip_count) == (
+            2, 1, 1,
+        )
+
+    async def test_a_run_with_no_results_claims_nothing(self, env):
+        """"No manifest" is not "green" - the summary must say it has no
+        evidence rather than report a passing suite."""
+        from app.services.agent_run import run_test_summary
+
+        repo = await make_repo(env.factory)
+        pipeline = await make_linear_pipeline(env.factory, repo, [script_step()])
+        run = await start_and_wait(env, pipeline, repo)
+
+        async with env.factory() as db:
+            summary = await run_test_summary(db, run.id)
+
+        assert summary.tests_run is False
+        assert summary.tests_passed is None

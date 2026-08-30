@@ -3,10 +3,13 @@ Execution Router - Phase 12.2-INT / 12.4
 
 Routes pipeline steps to an execution mode:
 - "local":  LocalExecutor - the backend spawns the step container directly.
-            The ONLY path for script and docker steps since Phase 12.4.
-- "legacy": the pre-12.2 job_queue/polling-runner path. Agent steps stay
-            legacy until Phase 12.5; unknown step types fall back here,
-            loudly.
+            The ONLY path for script and docker steps since Phase 12.4, and
+            the DEFAULT path for agent steps since Phase 12.5.
+- "legacy": the pre-12.2 job_queue/polling-runner path. After 12.5 nothing
+            routes there by default; it survives ONLY as the explicit
+            `executor: legacy` escape hatch on an agent step (R2 requires it
+            to stay callable until the 12.6 deletion commit) and as the loud
+            fallback for unknown step types.
 
 Phase 12.4 deleted script/docker execution from the runners: `execute_job`
 in every runner entrypoint now REJECTS a script/docker job instead of
@@ -41,7 +44,17 @@ logger = logging.getLogger(__name__)
 
 # Step types the LocalExecutor handles today. Since 12.4 these are also the
 # step types the runners REFUSE, so local is their only execution path.
+#
+# NOTE: "agent" is deliberately NOT in this tuple even though it routes local
+# since 12.5. This tuple means "the runners cannot execute this at all", and
+# it gates the two hard errors below (executor: legacy raises; the enqueue
+# site refuses). An agent step CAN still be executed by a runner, so its
+# legacy escape hatch stays legal - that is exactly the difference.
 LOCAL_STEP_TYPES = ("script", "docker")
+
+# Step types that route local by DEFAULT. Agent steps joined at 12.5, when
+# the wrapper (runner_common.agent_wrapper) and the agent images landed.
+LOCAL_DEFAULT_STEP_TYPES = LOCAL_STEP_TYPES + ("agent",)
 
 # Valid values for a step-level `executor:` override.
 _VALID_EXECUTOR_OVERRIDES = ("legacy",)
@@ -89,7 +102,8 @@ class ExecutionRouter:
          types since 12.4; the requested path does not exist (fail loudly at
          dispatch rather than enqueue into a guaranteed failure).
        - otherwise -> legacy ("explicit-override", logged at WARNING).
-    2. Agent steps -> legacy (need the AI runner path until 12.5).
+    2. Agent steps -> local ("agent-default-local", 12.5). The wrapper runs
+       in an ephemeral control-mode container exactly like a script step.
     3. script / docker steps -> local. If the step_config carries a runner
        pin (runner_type / requires) it still routes local, with a WARNING
        naming the pin as unhonorable until 12.6 - reason
@@ -142,7 +156,11 @@ class ExecutionRouter:
             )
 
         if step_type == "agent":
-            return RoutingDecision(mode="legacy", reason="agent-steps-legacy-until-12.5")
+            # 12.5: agent steps run on the control layer like everything
+            # else. A runner_type on an agent step is ordinary config (it
+            # named the AI runner flavor), not an unhonorable hardware pin,
+            # so it does NOT take the pin-warning branch below.
+            return RoutingDecision(mode="local", reason="agent-default-local")
 
         if step_type in LOCAL_STEP_TYPES:
             pins = [key for key in _RUNNER_PIN_KEYS if key in step_config]

@@ -1,6 +1,37 @@
 from pydantic import BaseModel
 from functools import lru_cache
+import json
+import logging
 import os
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_gpu_node_rates(raw: str | None) -> dict:
+    """Parse LAZYAF_GPU_NODE_RATES (JSON object) — never fatal.
+
+    A malformed rate table must not stop the backend from booting: it is
+    priced-as-unknown telemetry configuration, not a correctness input. The
+    parse failure is logged loudly and the table falls back to empty.
+    """
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(
+            "LAZYAF_GPU_NODE_RATES is not valid JSON — gpu-node steps will be "
+            "priced as cost_source='unknown'"
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "LAZYAF_GPU_NODE_RATES must be a JSON object keyed by node id, got "
+            "%s — gpu-node steps will be priced as cost_source='unknown'",
+            type(parsed).__name__,
+        )
+        return {}
+    return parsed
 
 
 class Settings(BaseModel):
@@ -36,6 +67,13 @@ class Settings(BaseModel):
     # Secret for step auth tokens (control layer <-> /api/steps/*). Default is
     # the long-standing dev constant; override in real deployments.
     step_auth_secret: str = "lazyaf-step-auth-secret-key-change-in-production"
+    # --- Usage channel (Phase 12.5) ---
+    # Self-hosted node hourly rates, addressed by node id (api-surface 2.5):
+    #   {"runpod-a100-80g": {"rate_usd_hour": "1.89", "note": "..."}}
+    # The SERVER prices gpu-node steps from this table so a corrected rate can
+    # re-price history. Empty by default: nothing sets LAZYAF_GPU_NODE_ID
+    # until 12.6 puts steps on real nodes.
+    gpu_node_rates: dict = {}
 
     class Config:
         env_file = ".env"
@@ -64,4 +102,5 @@ def get_settings() -> Settings:
             "LAZYAF_STEP_AUTH_SECRET",
             "lazyaf-step-auth-secret-key-change-in-production",
         ),
+        gpu_node_rates=_parse_gpu_node_rates(os.getenv("LAZYAF_GPU_NODE_RATES")),
     )

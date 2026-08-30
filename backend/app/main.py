@@ -14,6 +14,7 @@ logging.basicConfig(
 from app.database import init_db
 from app.routers import repos, cards, jobs, runners, agent_files, pipelines, lazyaf_files
 from app.routers import git, playground, models, steps, spec, test_results
+from app.routers import ws_runners
 from app.services.websocket import manager
 
 # Import models to ensure they're registered with Base before init_db
@@ -26,13 +27,18 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     import asyncio
 
+    import os
+
     from app.database import engine, async_session
-    from app.services.runner_pool import runner_pool
     from app.services.playground_service import playground_service
     from app.services.execution import recover_orphaned_executions
+    from app.services.execution.runner_dispatcher import runner_dispatcher
+    from app.services.execution.runner_registry import runner_registry
     from app.services.workspace.population import pre_pull_images
     from app.services.workspace_service import start_orphan_audit
     from app.services.control_layer import auth as step_auth
+
+    log = logging.getLogger(__name__)
 
     # Step auth secret is settings-driven (LAZYAF_STEP_AUTH_SECRET); the
     # default equals the module's dev constant so tests without lifespan
@@ -41,15 +47,48 @@ async def lifespan(app: FastAPI):
 
     await init_db()
 
-    # Recover any orphaned step executions from previous crash/restart
+    # The runner registry is per-PROCESS: a multi-worker uvicorn would route
+    # assignments to a worker holding no socket for the target runner. That
+    # is a stated limit, not a hidden one - say so at startup rather than
+    # letting an operator discover it as intermittent "no runner matched".
+    try:
+        concurrency = int(os.environ.get("WEB_CONCURRENCY", "1"))
+    except ValueError:
+        concurrency = 1
+    if concurrency > 1:
+        log.warning(
+            "WEB_CONCURRENCY=%s: the runner registry and dispatcher are "
+            "per-process, so runner assignments will only work on the worker "
+            "that holds each runner's WebSocket. Run single-worker until the "
+            "registry.send() fan-out seam is implemented.",
+            concurrency,
+        )
+
     async with async_session() as session:
+        # ORDER MATTERS. Bootstrap FIRST: no connection survives a restart,
+        # so every runner row is forced `disconnected` with a NULL
+        # websocket_id before any socket can connect. Only then does the
+        # orphan sweep run - it decides a remote step is stranded by looking
+        # at its runner's status, and a stale "busy" row left over from the
+        # previous process would hide the very steps that need requeueing.
+        disconnected = await runner_registry.bootstrap(session)
+        if disconnected:
+            log.info(
+                f"Marked {disconnected} runner row(s) disconnected on startup"
+            )
+
+        # Local executions are failed (their containers died with us); remote
+        # ones go back to pending for the dispatcher.
         recovered = await recover_orphaned_executions(session)
         if recovered:
-            logging.getLogger(__name__).info(
+            log.info(
                 f"Recovered {len(recovered)} orphaned step executions on startup"
             )
 
-    await runner_pool.start()
+    # The dispatcher installs its wake hook on the registry and its requeue
+    # hook on the job recovery service, then owns the assignment loop.
+    await runner_dispatcher.start(async_session)
+
     await playground_service.start()
     # Periodic workspace orphan audit (Phase 12.2-INT). First sweep runs
     # immediately for startup crash recovery; the loop owns its DB sessions
@@ -67,8 +106,15 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+    # Symmetric shutdown: tell every runner to finish up and go away BEFORE
+    # the dispatcher stops handing out work, so a drain never races a fresh
+    # assignment onto a socket that is about to close.
+    try:
+        await runner_registry.drain("backend shutting down")
+    except Exception:
+        log.exception("runner drain failed during shutdown")
+    await runner_dispatcher.stop()
     await playground_service.stop()
-    await runner_pool.stop()
     await engine.dispose()
 
 
@@ -101,6 +147,9 @@ app.include_router(models.router)
 app.include_router(steps.router)
 app.include_router(spec.router)
 app.include_router(test_results.router)
+# The runner WebSocket (/ws/runner). Registered here rather than under an
+# /api prefix: it is a transport, not a REST surface.
+app.include_router(ws_runners.router)
 
 if settings.test_mode:
     # e2e-only reset/seed surface; module stays unimported when the flag is off

@@ -3,28 +3,31 @@ Pipeline execution service.
 
 Orchestrates multi-step pipeline workflows by:
 1. Creating pipeline runs and step runs
-2. Routing each step through the ExecutionRouter (Phase 12.2-INT):
-   - mode=legacy: enqueue a job via a temporary card (existing runner path)
+2. Routing each step through the ExecutionRouter (Phase 12.2-INT / 12.6):
    - mode=local:  execute in a Docker container via LocalExecutor, in an
      asyncio task with its OWN session scope, streaming status/log events
      incrementally into the StepRun row and over the typed WS publish API
-3. Handling step completion callbacks (legacy) / local task continuations
+   - mode=remote: dispatch the same step to a runner agent over the runner
+     WebSocket via RemoteExecutor, which reproduces LocalExecutor's event
+     contract exactly - so everything downstream of dispatch is shared code
+     and nothing here has to know what "remote" means
+3. Handling local/remote task continuations
 4. Graph-based parallel execution with fan-out/fan-in
 5. Broadcasting status via WebSocket
 
 Async model (R5 / failure_01 landmine 4): request and git-push handlers never
 await container execution. start_pipeline creates the run row and dispatches
-the entry steps; dispatching a legacy step is a fast enqueue and dispatching a
-local step spawns an asyncio task (registered in a task registry with a
-done-callback that logs exceptions, so nothing leaks or dies silently). All
-container execution, log streaming, and continuation logic for local steps
-run inside those tasks using a session factory derived from the caller's
-engine - never the request's session.
+the entry steps; dispatching a step spawns an asyncio task (registered in a
+task registry with a done-callback that logs exceptions, so nothing leaks or
+dies silently). All container execution, log streaming, and continuation
+logic run inside those tasks using a session factory derived from the
+caller's engine - never the request's session.
 
 Observability (R1): every StepRun records which executor ran it in
-StepRun.executor ("local" | "legacy"), set at dispatch time. Routing failures
-fail the step and the run loudly; there is no silent fallback to the legacy
-path. Run lifecycle is driven through main's PipelineStateMachine.
+StepRun.executor ("local" | "remote"), set at dispatch time. Routing
+failures fail the step and the run loudly; since 12.6 there is nothing left
+to silently fall back TO, which is the point of the deletion. Run lifecycle
+is driven through main's PipelineStateMachine.
 """
 
 import asyncio
@@ -51,7 +54,6 @@ from app.models import (
     TestRunStatus,
 )
 from app.models.pipeline import ExecutorMode, StepExecution, StepExecutionStatus
-from app.services.job_queue import job_queue, QueuedJob
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
 from app.services.workspace.pipeline_state_machine import (
@@ -87,6 +89,27 @@ LOG_FLUSH_INTERVAL_SECONDS = 0.5
 # deadline (12.3 hardening: was a full hour - far wider than any legitimate
 # late report needs).
 STEP_TOKEN_TTL_SLACK = 300
+
+# 12.6: control mode is MANDATORY on the remote path, for two independent
+# reasons, so the stdout escape hatches RAISE instead of downgrading (the
+# same shape agent steps have carried since 12.5):
+#
+# 1. The StepExecution row IS the assignment unit. The dispatcher's
+#    compare-and-swap claims it, `StepExecution.runner_id` records who holds
+#    it, and the step gate on the WS endpoint checks it on every inbound
+#    ack/log/step_complete. A stdout-mode remote step has no such row, so
+#    there is nothing to assign and nothing to fence.
+# 2. Its logs could never arrive. On the local path stdout is read off a
+#    container the backend owns; on the remote path that container is on
+#    another host and only the runner's own `[runner]` lines cross the
+#    socket. A stdout-mode remote step would run and report nothing.
+_REMOTE_NEEDS_CONTROL = (
+    "remote step {step!r} cannot run in stdout mode ({why}): the remote "
+    "assignment protocol is keyed on the StepExecution row that only control "
+    "mode creates, and a step container on another host can only report "
+    "through the control layer. Remove the stdout opt-out, or drop the "
+    "`requires:` block to run this step locally."
+)
 
 # StepExecution statuses that count as terminal for reconciliation (mirrors
 # app.routers.steps.TERMINAL_EXECUTION_STATUSES - both derive from the enum).
@@ -488,6 +511,9 @@ class PipelineExecutor:
         self._router = None
         self._workspace_service = None
         self._local_executor = None
+        # RemoteExecutor (12.6). No docker client, no construction race - it
+        # talks to the runner registry - so it needs no init lock.
+        self._remote_executor = None
         # Serializes LocalExecutor construction so exactly one docker client
         # ever exists (fix 5).
         self._local_executor_init_lock = asyncio.Lock()
@@ -544,6 +570,32 @@ class PipelineExecutor:
                     client = await run_in_threadpool(make_docker_client)
                     self._local_executor = LocalExecutor(client)
         return self._local_executor
+
+    async def _get_remote_executor(self):
+        """RemoteExecutor (12.6) over the runner registry.
+
+        Same lazy-import discipline as the router (fix 11): a missing or
+        contract-broken RemoteExecutor raises here and fails the step loudly
+        at dispatch. There is no local fallback - a step whose `requires:`
+        block cannot be honored must NOT silently run on the backend host,
+        which is exactly the 12.4-12.6 interim behavior this phase removes.
+        """
+        if self._remote_executor is None:
+            from app.services.execution.remote_executor import RemoteExecutor
+
+            self._remote_executor = RemoteExecutor()
+        return self._remote_executor
+
+    async def _get_executor(self, mode: ExecutorMode):
+        """The ONE place a mode becomes an executor instance.
+
+        Everything downstream - the event consumer, the deadline discipline,
+        the completion path - is mode-blind by construction because this is
+        the only branch on mode in the execution path.
+        """
+        if mode is ExecutorMode.REMOTE:
+            return await self._get_remote_executor()
+        return await self._get_local_executor()
 
     # -------------------------------------------------------------------------
     # Task registry
@@ -738,18 +790,26 @@ class PipelineExecutor:
 
     def _decide_route(
         self, step_type: str, step_config: dict, step_name: str
-    ) -> tuple[ExecutorMode, str]:
+    ) -> tuple[ExecutorMode, str, dict]:
         """Route a step via the ExecutionRouter contract.
 
-        Returns (ExecutorMode, reason). Raises on any router failure, on an
-        unknown mode, and on modes without an execution path yet (remote,
-        until 12.6) - a routing error must fail the step loudly, never
-        quietly fall back to legacy. Every compare/write site uses the
-        ExecutorMode enum (cross-file contract #3).
+        Returns (ExecutorMode, reason, requirements). Raises on any router
+        failure and on an unknown mode - a routing error must fail the step
+        loudly, never quietly fall back to legacy. Every compare/write site
+        uses the ExecutorMode enum (cross-file contract #3).
+
+        Phase 12.6: ExecutorMode.REMOTE is ACCEPTED and LOCAL and REMOTE
+        are the only modes left. REMOTE used to raise ("...which has no
+        execution path until Phase 12.6"); RemoteExecutor is that path, and
+        `requirements` is the parsed `requires:` block the dispatcher matches
+        against the runner registry. It is empty for a local route and may
+        legitimately be empty for a remote one ("any connected runner will
+        do").
         """
         router = self._get_router()
         decision = router.decide(step_type, step_config)
         reason = decision.reason
+        requirements = dict(getattr(decision, "requirements", {}) or {})
         try:
             mode = ExecutorMode(decision.mode)
         except ValueError:
@@ -757,15 +817,19 @@ class PipelineExecutor:
                 f"ExecutionRouter returned unknown mode {decision.mode!r} "
                 f"(reason={reason!r}) for step '{step_name}'"
             ) from None
-        if mode not in (ExecutorMode.LOCAL, ExecutorMode.LEGACY):
+        if mode not in (ExecutorMode.LOCAL, ExecutorMode.REMOTE):
             raise RuntimeError(
                 f"ExecutionRouter returned mode {mode.value!r} "
                 f"(reason={reason!r}) for step '{step_name}', which has no "
-                "execution path until Phase 12.6"
+                "execution path"
             )
         log = logger.warning if reason == "explicit-override" else logger.info
-        log(f"[ROUTE] step '{step_name}' (type={step_type}) -> {mode.value} ({reason})")
-        return mode, reason
+        detail = f" requirements={requirements}" if mode is ExecutorMode.REMOTE else ""
+        log(
+            f"[ROUTE] step '{step_name}' (type={step_type}) -> "
+            f"{mode.value} ({reason}){detail}"
+        )
+        return mode, reason, requirements
 
     # -------------------------------------------------------------------------
     # Completion / trigger actions
@@ -897,6 +961,40 @@ class PipelineExecutor:
             logger.error(
                 f"Workspace cleanup FAILED for run {run_id[:8]} "
                 f"(audit_orphans will sweep): {e}",
+                exc_info=True,
+            )
+        await self._cleanup_remote_workspaces(run_id)
+
+    async def _cleanup_remote_workspaces(self, run_id: str) -> None:
+        """Tell every connected runner it may reap this run's volume (12.6).
+
+        `retain_key` is the pipeline_run_id, so this is the remote half of
+        the cleanup above: a runner agent provisions its OWN volume from
+        `config.workspace` and cannot see this backend's.
+
+        Broadcast rather than targeted, deliberately: the backend does not
+        track which runners touched a run (steps can be reassigned across
+        several), and a runner that never saw this retain_key no-ops. The
+        agent's WORKSPACE_IDLE_REAP_SECONDS reaper remains the backstop for
+        a frame that never lands, so this is an optimization, never a
+        correctness dependency - which is why it never raises.
+        """
+        try:
+            from app.services.execution.runner_protocol import (
+                CleanupWorkspaceMessage,
+            )
+            from app.services.execution.runner_registry import runner_registry
+
+            message = CleanupWorkspaceMessage(retain_key=run_id)
+            # `machines()` is the registry's public enumeration of LIVE
+            # connections - one machine exists per connected runner and both
+            # are created and dropped together.
+            for runner_id, _machine in runner_registry.machines():
+                await runner_registry.send(runner_id, message)
+        except Exception:
+            logger.warning(
+                f"could not announce workspace cleanup for run {run_id[:8]} to "
+                "the runners; their idle reaper is the backstop",
                 exc_info=True,
             )
 
@@ -1166,8 +1264,8 @@ class PipelineExecutor:
         settings.step_default_image - it needs the runner-common runtime.
         Steps without an explicit image use settings.step_default_image,
         which app startup pre-pulls; resolving it here would force a docker
-        client into runs that route entirely legacy (and into the no-Docker
-        test tier). Preflight infrastructure failures (docker down,
+        client into the no-Docker test tier. Preflight infrastructure
+        failures (docker down,
         guard-blocked client) are logged and non-fatal - per-step dispatch
         surfaces them loudly.
 
@@ -1181,8 +1279,6 @@ class PipelineExecutor:
             if step.get("type") != "agent":
                 continue
             config = step.get("config") or {}
-            if config.get("executor") == "legacy":
-                continue  # R2 escape hatch: no local image is involved
             if config.get("image"):
                 agent_images.add(config["image"])
                 continue
@@ -1369,18 +1465,24 @@ class PipelineExecutor:
         step_id: str | None = None,
     ) -> tuple[StepRun, ExecutorMode | None, str | None]:
         """Route a step, create its StepRun (executor recorded at birth, R1),
-        broadcast, and dispatch the LOCAL path (asyncio task with its own
-        session scope). Legacy enqueueing stays with the caller (payloads
-        differ between graph and linear) via _enqueue_legacy_step.
+        broadcast, and dispatch it (asyncio task with its own session scope).
+        LOCAL and REMOTE are the only routes; a routing failure fails the step.
 
         Returns (step_run, mode, route_error). On a routing failure the
         StepRun is already FAILED and broadcast; the caller drives the run
         continuation.
+
+        12.6: LOCAL and REMOTE take the SAME dispatch line. That is the test
+        of the executor contract - if this method had to learn what "remote"
+        is beyond picking the executor instance, the contract was not met.
         """
         route_error: str | None = None
         mode: ExecutorMode | None = None
+        requirements: dict = {}
         try:
-            mode, _reason = self._decide_route(step_type, step_config, step_name)
+            mode, _reason, requirements = self._decide_route(
+                step_type, step_config, step_name
+            )
         except Exception as e:
             logger.exception(
                 f"Routing failed for step {step_index} ({step_name}) of run "
@@ -1410,140 +1512,20 @@ class PipelineExecutor:
             await self._fail_step_run(db, pipeline_run, step_run, route_error)
             return step_run, None, route_error
 
-        if mode is ExecutorMode.LOCAL:
+        if mode in (ExecutorMode.LOCAL, ExecutorMode.REMOTE):
             factory = self._session_factory_for(pipeline_run.id, db)
             self._spawn_task(
                 f"step:{pipeline_run.id}:{step_run.id}",
-                self._run_local_step(factory, pipeline_run.id, step_run.id, params),
+                self._run_executor_step(
+                    mode,
+                    factory,
+                    pipeline_run.id,
+                    step_run.id,
+                    params,
+                    requirements=requirements,
+                ),
             )
         return step_run, mode, None
-
-    async def _enqueue_legacy_step(
-        self,
-        db: AsyncSession,
-        pipeline_run: PipelineRun,
-        repo: Repo,
-        step_run: StepRun,
-        *,
-        step_type: str,
-        step_config: dict,
-        step_index: int,
-        step_name: str,
-        card_title: str,
-        card_description: str,
-        step_id: str | None = None,
-        agent_file_ids: list | None = None,
-        prompt_template: str | None = None,
-        continue_in_context: bool = False,
-        is_continuation: bool = False,
-        previous_step_logs: str | None = None,
-        required_runner_id: str | None = None,
-    ) -> None:
-        """Legacy path (unchanged semantics): temporary Card + Job + queue.
-
-        Guard (12.4 fallout): script/docker steps must NEVER reach the runner
-        queue. Phase 12.4 deleted their execution from every runner entrypoint
-        (`execute_job` rejects them now), so enqueueing one produces a job that
-        is picked up and immediately failed - the silent in_progress -> failed
-        loop. The router already refuses to route them legacy; this is the
-        belt-and-braces stop at the enqueue site, and it raises so the caller's
-        dispatch error path fails the step with a real message.
-        """
-        from app.services.workspace.execution_router import LOCAL_STEP_TYPES
-
-        if step_type in LOCAL_STEP_TYPES:
-            raise RuntimeError(
-                f"Refusing to enqueue a {step_type!r} step ('{step_name}') to the "
-                "legacy runner queue: runners reject script/docker jobs since "
-                "Phase 12.4. This step belongs on the local executor - a legacy "
-                "route for it is a routing bug, not a fallback."
-            )
-
-        # For agent steps, use title/description from config
-        if step_type == "agent":
-            card_title = step_config.get("title", card_title)
-            card_description = step_config.get("description", card_description)
-
-        card = Card(
-            id=str(uuid4()),
-            repo_id=repo.id,
-            title=card_title,
-            description=card_description,
-            status="in_progress",
-            runner_type=step_config.get("runner_type", "any"),
-            step_type=step_type,
-            step_config=json.dumps(step_config) if step_config else None,
-            # Agent-specific fields (Phase 9.1c)
-            agent_file_ids=json.dumps(agent_file_ids) if agent_file_ids else None,
-            prompt_template=prompt_template,
-            pipeline_run_id=pipeline_run.id,
-            pipeline_step_index=step_index,
-        )
-        db.add(card)
-
-        # Create the job
-        job_id = str(uuid4())
-        job = Job(
-            id=job_id,
-            card_id=card.id,
-            status="queued",
-            step_type=step_type,
-            step_config=json.dumps(step_config) if step_config else None,
-            step_run_id=step_run.id,  # Link job to step run
-        )
-        db.add(job)
-
-        # Update card and step_run with job reference
-        card.job_id = job_id
-        card.branch_name = f"lazyaf/{job_id[:8]}"
-        step_run.job_id = job_id
-
-        await db.commit()
-
-        # Queue the job for a runner
-        queued_job = QueuedJob(
-            id=job_id,
-            card_id=card.id,
-            repo_id=repo.id,
-            repo_url=repo.remote_url or "",
-            base_branch=repo.default_branch,
-            card_title=card_title,
-            card_description=card_description,
-            runner_type=step_config.get("runner_type", "any"),
-            use_internal_git=True,
-            step_type=step_type,
-            step_config=step_config,
-            # Agent-specific fields (Phase 9.1c)
-            agent_file_ids=agent_file_ids or [],
-            prompt_template=prompt_template,
-            # Pipeline context
-            continue_in_context=continue_in_context,
-            is_continuation=is_continuation,
-            previous_step_logs=previous_step_logs,
-            pipeline_run_id=pipeline_run.id,
-            # Step metadata for context directory (Phase 9.1d)
-            step_id=step_id,
-            step_index=step_index,
-            step_name=step_name,
-            # Runner affinity for continuations
-            required_runner_id=required_runner_id,
-        )
-        await job_queue.enqueue(queued_job)
-
-        logger.info(
-            f"Enqueued job {job_id[:8]} for step {step_index} "
-            f"({step_id or step_name}): {step_name}"
-        )
-
-        # Broadcast job queued
-        await manager.send_job_status({
-            "id": job_id,
-            "card_id": card.id,
-            "status": "queued",
-            "error": None,
-            "started_at": None,
-            "completed_at": None,
-        })
 
     # -------------------------------------------------------------------------
     # Step dispatch (graph)
@@ -1608,27 +1590,14 @@ class PipelineExecutor:
             )
             return
 
-        if mode is ExecutorMode.LOCAL:
-            if step.get("continue_in_context"):
-                self._log_local_continue_in_context()
-            logger.info(
-                f"[GRAPH] Dispatched step '{step_id}' ({step_name}) to local executor"
-            )
-            return
-
-        await self._enqueue_legacy_step(
-            db,
-            pipeline_run,
-            repo,
-            step_run,
-            step_type=step_type,
-            step_config=step_config,
-            step_index=step_index,
-            step_name=step_name,
-            card_title=f"[Pipeline] {step_name}",
-            card_description=f"Pipeline: {pipeline.name}\nStep: {step_name}",
-            step_id=step_id,
-            required_runner_id=previous_runner_id,
+        # LOCAL and REMOTE are the only routes _decide_route can return, and
+        # a routing failure already returned above - so reaching here means
+        # the step is dispatched and there is nothing left to fall back to.
+        if step.get("continue_in_context"):
+            self._log_local_continue_in_context()
+        logger.info(
+            f"[GRAPH] Dispatched step '{step_id}' ({step_name}) to the "
+            f"{mode.value} executor"
         )
 
     # -------------------------------------------------------------------------
@@ -1710,37 +1679,16 @@ class PipelineExecutor:
             )
             return
 
-        if mode is ExecutorMode.LOCAL:
-            if continue_in_context or is_continuation:
-                self._log_local_continue_in_context()
-            logger.info(f"Dispatched step {step_index} ({step_name}) to local executor")
-            return
-
-        # If this is a continuation, require the same runner for affinity
-        required_runner_id = previous_runner_id if is_continuation else None
-        logger.info(f"Step {step_index}: is_continuation={is_continuation}, previous_runner_id={previous_runner_id[:8] if previous_runner_id else None}, required_runner_id={required_runner_id[:8] if required_runner_id else None}")
-
-        await self._enqueue_legacy_step(
-            db,
-            pipeline_run,
-            repo,
-            step_run,
-            step_type=step_type,
-            step_config=step_config,
-            step_index=step_index,
-            step_name=step_name,
-            card_title=f"[Pipeline] {step_name}",
-            card_description=(
-                f"Pipeline: {pipeline_run.pipeline_id}\n"
-                f"Step {step_index + 1} of {pipeline_run.steps_total}"
-            ),
-            step_id=step_id,
-            agent_file_ids=agent_file_ids,
-            prompt_template=prompt_template,
-            continue_in_context=continue_in_context,
-            is_continuation=is_continuation,
-            previous_step_logs=previous_step_logs,
-            required_runner_id=required_runner_id,
+        # LOCAL and REMOTE are the only routes; a routing failure already
+        # returned above. There is no third path to fall through to, and no
+        # runner AFFINITY to arrange either: a continuation keeps its state on
+        # the run's workspace volume, which the executor addresses by name,
+        # rather than on whichever machine happened to run the previous step.
+        if continue_in_context or is_continuation:
+            self._log_local_continue_in_context()
+        logger.info(
+            f"Dispatched step {step_index} ({step_name}) to the "
+            f"{mode.value} executor"
         )
 
     async def _fail_step_run(
@@ -1766,7 +1714,7 @@ class PipelineExecutor:
         )
 
     # -------------------------------------------------------------------------
-    # Local execution path (12.2-INT)
+    # Executor-driven execution path (12.2-INT local / 12.6 remote)
     # -------------------------------------------------------------------------
 
     async def _run_local_step(
@@ -1776,12 +1724,52 @@ class PipelineExecutor:
         step_run_id: str,
         params: dict[str, Any] | None = None,
     ) -> None:
-        """Execute one locally-routed step inside its own session scope.
+        """The LOCAL specialization of `_run_executor_step`.
+
+        Kept as its own name because it is the entry point the local-dispatch
+        tests drive directly; it adds nothing but the mode.
+        """
+        await self._run_executor_step(
+            ExecutorMode.LOCAL, session_factory, run_id, step_run_id, params
+        )
+
+    async def _run_executor_step(
+        self,
+        mode: ExecutorMode,
+        session_factory,
+        run_id: str,
+        step_run_id: str,
+        params: dict[str, Any] | None = None,
+        *,
+        requirements: dict | None = None,
+    ) -> None:
+        """Execute one executor-routed step inside its own session scope.
 
         Acquires the run's workspace (creating it on first use), streams the
-        LocalExecutor event stream into the StepRun row and over the typed WS
+        executor's event stream into the StepRun row and over the typed WS
         publish API, releases the workspace, then drives the run continuation
         (next steps / completion) exactly like a legacy job callback would.
+
+        12.6: `mode` selects the executor INSTANCE and nothing else. The
+        event consumer, the deadline discipline, the completion path and the
+        control-mode reconciliation are byte-for-byte identical for LOCAL and
+        REMOTE, because RemoteExecutor reproduces LocalExecutor's event
+        contract (cross-agent contract #3). If any of them had to learn what
+        "remote" is, the contract was not met.
+
+        Two things differ, and both are properties of WHERE the container
+        runs, not of how it is driven:
+
+        1. The workspace. A remote host cannot see the backend's volume, so
+           the AGENT provisions its own from `config.workspace` (section
+           3.4). The backend therefore does NOT create, populate, acquire or
+           release a local workspace for a remote step - cloning a repo into
+           a volume nobody will mount is pure waste, and on a real remote
+           host it is waste the backend pays for every step.
+        2. The wire config. `_build_remote_execution_config` turns the same
+           (exec_config, exec_context) the local path builds into the
+           `execute_step.config` payload, via the single producer
+           `runner_protocol.build_execute_step_config`.
 
         Wedge-proofing (fix 2): every context-load failure routes through
         _fail_wedged_local_step - no path leaves a RUNNING StepRun unowned.
@@ -1792,6 +1780,7 @@ class PipelineExecutor:
         grace, it is abandoned (logged done-callback, session handed to a
         reaper task) and the step is failed from a FRESH session.
         """
+        is_remote = mode is ExecutorMode.REMOTE
         db = session_factory()
         session_abandoned = False
         try:
@@ -1831,14 +1820,15 @@ class PipelineExecutor:
                 branch = context.get("branch") or repo.default_branch
                 commit_sha = context.get("commit_sha")
 
-                workspace = await workspace_service.get_or_create(
-                    db, run_id, repo.id, branch, commit_sha
-                )
-                await workspace_service.acquire(db, workspace.id)
-                acquired = True
-                workspace_id = workspace.id
+                if not is_remote:
+                    workspace = await workspace_service.get_or_create(
+                        db, run_id, repo.id, branch, commit_sha
+                    )
+                    await workspace_service.acquire(db, workspace.id)
+                    acquired = True
+                    workspace_id = workspace.id
 
-                executor = await self._get_local_executor()
+                executor = await self._get_executor(mode)
                 exec_config, exec_context = self._build_local_execution_config(
                     pipeline_run, step_run, step_type, step_config, timeout, params,
                 )
@@ -1849,8 +1839,15 @@ class PipelineExecutor:
                     )
                 await self._prepare_control_mode(
                     db, executor, step_run, step_config, exec_config,
-                    exec_context, timeout,
+                    exec_context, timeout, mode=mode,
                 )
+                if is_remote:
+                    self._build_remote_execution_config(
+                        repo, exec_config, exec_context,
+                        branch=branch,
+                        commit_sha=commit_sha,
+                        requirements=requirements or {},
+                    )
 
                 consumer_task = asyncio.create_task(
                     self._consume_local_events(
@@ -2510,6 +2507,8 @@ class PipelineExecutor:
         exec_config: dict,
         exec_context: dict,
         timeout: int,
+        *,
+        mode: ExecutorMode = ExecutorMode.LOCAL,
     ) -> None:
         """Decide the step's reporting mode AT DISPATCH TIME (12.3), never
         mid-flight, and stamp it EXPLICITLY into exec_context["control_mode"]
@@ -2536,14 +2535,21 @@ class PipelineExecutor:
         Stock/unlabeled images take the stdout path with ZERO behavior
         change.
 
-        AGENT STEPS (12.5) are the one exception: for them control mode is
+        AGENT STEPS (12.5) are one exception: for them control mode is
         MANDATORY, so every escape hatch RAISES instead of downgrading. An
         agent step in stdout mode would run the wrapper with no config file
         (and the API key would have to travel in inspectable container env),
         so it fails loudly at dispatch instead.
+
+        REMOTE STEPS (12.6) are the other, for the two reasons spelled out
+        at `_REMOTE_NEEDS_CONTROL`. They also skip the image-label probe:
+        the label lives in an image on a host the backend does not own, so
+        inspecting a local image of the same tag would answer a question
+        about the wrong machine. Image presence is the agent's preflight.
         """
         exec_context["control_mode"] = False
         is_agent = exec_config.get("type") == "agent"
+        is_remote = mode is ExecutorMode.REMOTE
 
         if step_config.get("control") is False:
             if is_agent:
@@ -2554,6 +2560,10 @@ class PipelineExecutor:
                     "the provider API key must never travel in inspectable "
                     "container environment"
                 )
+            if is_remote:
+                raise ValueError(_REMOTE_NEEDS_CONTROL.format(
+                    step=step_run.step_name, why="`control: false` was set"
+                ))
             logger.info(
                 f"Step {step_run.step_index} ({step_run.step_name}): control "
                 f"mode disabled by step config (control: false) - stdout mode"
@@ -2565,11 +2575,25 @@ class PipelineExecutor:
                     f"agent step {step_run.step_name!r} has a non-string "
                     "command; the wrapper command is platform-owned"
                 )
+            if is_remote:
+                raise ValueError(_REMOTE_NEEDS_CONTROL.format(
+                    step=step_run.step_name,
+                    why="the command is an exec-form list",
+                ))
             return  # exec-form list command: explicit stdout-mode opt-out
 
         settings = get_settings()
         image = exec_config.get("image") or settings.step_default_image
-        if not await executor.image_supports_control_layer(image):
+        # REMOTE steps skip the image-label probe entirely (12.6). The label
+        # lives in an image on a host the BACKEND does not own and may not
+        # even have pulled; inspecting a local image of the same tag would
+        # answer a question about the wrong machine. Image presence and its
+        # capability label are the AGENT's preflight (section 7.1) - a step
+        # whose image is missing there fails with the identical
+        # "Image not found: <tag>" message the local path produces.
+        if mode is not ExecutorMode.REMOTE and not await (
+            executor.image_supports_control_layer(image)
+        ):
             if is_agent:
                 raise ValueError(
                     f"agent step {step_run.step_name!r} is pinned to image "
@@ -2608,6 +2632,144 @@ class PipelineExecutor:
             f"Step {step_run.step_index} ({step_run.step_name}): control mode "
             f"(image {image}, step_execution {execution.id[:8]})"
         )
+
+    # -------------------------------------------------------------------------
+    # Remote dispatch (12.6)
+    # -------------------------------------------------------------------------
+
+    def _build_remote_execution_config(
+        self,
+        repo: Repo,
+        exec_config: dict,
+        exec_context: dict,
+        *,
+        branch: str,
+        commit_sha: str | None,
+        requirements: dict,
+    ) -> dict:
+        """Stamp the remote half of `exec_context` and build the wire config.
+
+        Adds to `exec_context`, in place:
+            runner_requirements
+                          - the parsed `requires:` block the dispatcher
+                            matches against the registry. RemoteExecutor
+                            persists it onto the StepExecution column of the
+                            same name, which is what makes a step requeued
+                            after a backend restart still matchable (the
+                            dispatch closure does not survive a restart; the
+                            row does).
+            repo_id / clone_url / branch / commit_sha / retain_key
+                          - the workspace provisioning inputs the AGENT
+                            needs, because it clones into its OWN volume.
+            remote_config - the `execute_step.config` payload.
+
+        The payload itself is produced ONLY by
+        `runner_protocol.build_execute_step_config` (cross-agent contract
+        #2). This method's job is to hand that single producer the two
+        control FILES the local path builds inside the executor - so the
+        producers (`generate_step_config` / `generate_agent_config`) stay
+        single-sourced and only the DELIVERY changes (R3).
+
+        Secret boundary (cross-agent contract #9): the step JWT and
+        `secret_environment` go into `control_files` and NOWHERE else.
+        `container.environment` is what `docker inspect` shows on the remote
+        host, so it carries the non-secret table and CONFIG_PATH only.
+        """
+        from app.services.execution.runner_protocol import build_execute_step_config
+
+        settings = get_settings()
+        exec_context["runner_requirements"] = dict(requirements or {})
+        exec_context["repo_id"] = repo.id
+        exec_context["clone_url"] = settings.container_git_url_template.format(
+            repo_id=repo.id
+        )
+        exec_context["branch"] = branch
+        exec_context["commit_sha"] = commit_sha
+        # One volume per RUN, exactly as locally: HOME=/workspace/home
+        # persistence between steps has to work the same on both hosts.
+        exec_context["retain_key"] = exec_context["pipeline_run_id"]
+
+        step_config_file, agent_config_file = self._build_control_files(
+            exec_config, exec_context
+        )
+        config = build_execute_step_config(
+            exec_config, exec_context, step_config_file, agent_config_file
+        )
+        exec_context["remote_config"] = config
+        logger.info(
+            "Remote step %s of run %s: config keys=%s image=%s volume=%s "
+            "requirements=%s",
+            exec_context["step_index"],
+            str(exec_context["pipeline_run_id"])[:8],
+            sorted(config.keys()),
+            config["container"]["image"],
+            config["workspace"]["volume"],
+            exec_context["runner_requirements"],
+        )
+        return config
+
+    def _build_control_files(
+        self, exec_config: dict, exec_context: dict
+    ) -> tuple[dict | None, dict | None]:
+        """The control files for a remote step, from the SAME producers the
+        local executor uses (R3).
+
+        Returns (step_config_file, agent_config_file); both None when the
+        step is not in control mode, which is how a stdout-mode remote step
+        travels with no config file at all - the same shape the local path
+        produces for an unlabeled image.
+        """
+        if not exec_context.get("control_mode"):
+            return None, None
+
+        from app.services.control_layer.workspace import (
+            generate_agent_config,
+            generate_step_config,
+        )
+        from app.services.execution.local_executor import (
+            AGENT_CONFIG_PATH_ENV,
+            AGENT_CONFIG_PREFIX,
+            CONTROL_CONFIG_DIR,
+        )
+
+        settings = get_settings()
+        step_execution_id = exec_context["step_execution_id"]
+        user_env = exec_config.get("environment", {}) or {}
+        secret_env = exec_config.get("secret_environment") or {}
+        agent_payload = exec_config.get("agent")
+
+        # The FILE environment is the secret channel (12.5), verbatim from
+        # the local path: the in-container executor does
+        # env.update(config.environment) before Popen, so these reach the
+        # step process without ever entering inspectable container env.
+        file_environment = {**user_env, **secret_env}
+        agent_filename = f"{AGENT_CONFIG_PREFIX}{step_execution_id}.json"
+        if agent_payload is not None:
+            file_environment[AGENT_CONFIG_PATH_ENV] = (
+                f"/workspace/{CONTROL_CONFIG_DIR}/{agent_filename}"
+            )
+
+        step_config_file = generate_step_config(
+            step_id=step_execution_id,
+            step_run_id=exec_context["step_run_id"],
+            execution_key=exec_context["execution_key"],
+            command=exec_config.get("command", ""),
+            backend_url=getattr(
+                settings, "container_backend_url", "http://backend:8000"
+            ),
+            auth_token=exec_context["step_auth_token"],
+            environment=file_environment,
+            timeout_seconds=exec_config.get("timeout", 300),
+            working_directory=exec_config.get(
+                "working_dir", settings.step_working_dir
+            ),
+            shell=exec_config.get("shell", "bash"),
+        )
+        agent_config_file = (
+            generate_agent_config(**agent_payload) if agent_payload is not None
+            else None
+        )
+        return step_config_file, agent_config_file
 
     async def _consume_local_events(
         self,
@@ -3394,21 +3556,21 @@ class PipelineExecutor:
         """Clone a card as template and run it, on the control layer, to fix
         issues.
 
-        12.5: this used to be the last caller of ``job_queue.enqueue`` on the
-        card path. Card START and card RETRY moved to the ad-hoc agent run
-        (``agent_run.start_card_work``); the ``trigger:{card_id}`` action did
-        not, so "nothing enqueues any more" was true of the paths people look
-        at and false of this one - and a queue with one live caller is a
-        queue nobody notices has stopped being polled. It now takes exactly
-        the same path card start does.
+        12.5: this was the last caller of the polling queue on the card
+        path. Card START and card RETRY had already moved to the ad-hoc agent
+        run (``agent_run.start_card_work``); the ``trigger:{card_id}`` action
+        had not, so "nothing enqueues any more" was true of the paths people
+        look at and false of this one - and a queue with one live caller is a
+        queue nobody notices has stopped being polled. It takes exactly the
+        same path card start does, and 12.6 deleted the queue itself.
 
-        CONTINUATION. The legacy shape blocked the parent run: the fix job's
+        CONTINUATION. The old shape blocked the parent run: the fix job's
         runner callback re-entered ``on_step_complete`` for a StepRun parked
         at the SAME index, which then re-applied that index's action - so a
         fix that failed re-fired ``trigger:{card_id}`` and looped. An ad-hoc
         run has no such callback into this run, so the parent continues
         immediately, exactly like the sibling ``trigger:pipeline:`` action
-        (fire-and-forget). That is the legacy SUCCESS path's destination
+        (fire-and-forget). That is the old SUCCESS path's destination
         (``on_success: next`` -> ``current_step + 1``) minus the wait, and it
         has no re-trigger lap.
 

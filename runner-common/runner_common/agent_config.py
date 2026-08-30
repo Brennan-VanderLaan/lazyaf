@@ -45,6 +45,12 @@ AGENT_CONFIG_PATH_ENV = "LAZYAF_AGENT_CONFIG_PATH"
 #: Keys that must be present and truthy.
 REQUIRED_KEYS = ("agent", "prompt", "repo")
 
+#: Filename the wrapper materialises the curated spec bundle under, inside the
+#: directory the backend announced through AGENT_CONFIG_PATH_ENV (12.6.6).
+#: Pinned equal to ``control_layer.workspace.SPEC_CONTEXT_FILENAME`` by the
+#: contract test - the two sides name the same file or neither does.
+SPEC_CONTEXT_FILENAME = "spec_context.md"
+
 
 @dataclass
 class AgentConfig:
@@ -90,6 +96,32 @@ class AgentConfig:
     role: Optional[str] = None
     """M13 fan-out attribution. Always null in 12.5 — on the wire NOW so the
     usage channel is not a retrofit (api-surface 2.6)."""
+
+    spec_context: Optional[Dict[str, Any]] = None
+    """The curated spec bundle (12.6.6), or None when the card has no spec
+    links / curation was switched off for this step.
+
+    {markdown, source, criteria_count, test_ref_count, estimated_tokens,
+     truncated, dropped}
+
+    ``markdown`` is ALREADY inside ``prompt`` — the backend is the single
+    renderer (R3). It travels here as well so the wrapper can materialise it
+    at ``<control dir>/spec_context.md`` for an agent that wants to re-read
+    its brief 40 turns in, and so the size/truncation facts can be LOGGED: a
+    silently-shrunk brief is exactly the dark behaviour R1 forbids."""
+
+    @property
+    def spec_markdown(self) -> Optional[str]:
+        """The bundle text, or None. Empty string is None: a bundle with no
+        markdown is not a bundle."""
+        if not isinstance(self.spec_context, dict):
+            return None
+        markdown = self.spec_context.get("markdown")
+        return markdown if isinstance(markdown, str) and markdown else None
+
+    @property
+    def has_spec_context(self) -> bool:
+        return self.spec_markdown is not None
 
     @property
     def workdir(self) -> Path:
@@ -168,6 +200,28 @@ def load_agent_config(config_path: Path) -> Optional[AgentConfig]:
         _fail(f"repo must be an object; got {type(data['repo']).__name__}")
         return None
 
+    # 12.6.6. ABSENT is fine and means "pre-12.6.6 backend" — an additive,
+    # optional key that an old consumer ignores and a new one defaults is
+    # exactly what does NOT justify a version bump (bumping would strand every
+    # runner agent in the field mid-phase). PRESENT-BUT-WRONG is a refusal:
+    # a wrapper that half-understands its instructions is worse than one that
+    # refuses, and the curated brief is not a field to guess at.
+    spec_context = data.get("spec_context")
+    if spec_context is not None:
+        if not isinstance(spec_context, dict):
+            _fail(
+                "spec_context must be an object or null; got "
+                f"{type(spec_context).__name__}"
+            )
+            return None
+        markdown = spec_context.get("markdown")
+        if markdown is not None and not isinstance(markdown, str):
+            _fail(
+                "spec_context.markdown must be a string or null; got "
+                f"{type(markdown).__name__}"
+            )
+            return None
+
     return AgentConfig(
         version=AGENT_CONFIG_VERSION,
         agent=data["agent"],
@@ -181,6 +235,7 @@ def load_agent_config(config_path: Path) -> Optional[AgentConfig]:
         commit=data.get("commit") or {},
         mock_config=data.get("mock_config"),
         role=data.get("role"),
+        spec_context=spec_context,
     )
 
 

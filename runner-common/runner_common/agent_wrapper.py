@@ -21,11 +21,14 @@ WHAT IT DOES
 1. Reads the agent config from the sibling file announced by
    LAZYAF_AGENT_CONFIG_PATH (contract #1) and CONSUMES it.
 2. Refuses to run as root (see the getuid check below).
-3. Dispatches to one of runner_common.executors by ``agent`` — there is no
+3. Materialises the curated spec context (12.6.6) next to that config as
+   ``spec_context.md`` so the agent can re-read its brief, logs one line
+   about it either way, and deletes it in the same ``finally``.
+4. Dispatches to one of runner_common.executors by ``agent`` — there is no
    default agent; an unknown one is a loud exit 1.
-4. Renders the CLI's events to human-readable log lines as they arrive.
-5. Commits/pushes the work when the config says to.
-6. Writes the usage manifest (contract #2) in a ``finally`` and from a
+5. Renders the CLI's events to human-readable log lines as they arrive.
+6. Commits/pushes the work when the config says to.
+7. Writes the usage manifest (contract #2) in a ``finally`` and from a
    SIGTERM handler, so telemetry survives every outcome including a
    watchdog kill.
 
@@ -43,7 +46,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .agent_config import AgentConfig, config_path_from_env, load_and_consume
+from .agent_config import (
+    SPEC_CONTEXT_FILENAME,
+    AgentConfig,
+    config_path_from_env,
+    load_and_consume,
+    unlink_quietly,
+)
 from .executors import (
     ClaudeExecutor,
     ExecutorConfig,
@@ -227,6 +236,71 @@ def _write_usage(result: Optional[ExecutorResult]) -> None:
         role=_STATE.get("role"),
         model=_STATE.get("model"),
     )
+
+
+# --------------------------------------------------------------------------
+# curated spec context (12.6.6)
+# --------------------------------------------------------------------------
+
+def _write_spec_context(cfg: AgentConfig, control_dir: Path) -> Optional[Path]:
+    """Materialise the curated spec bundle next to the agent config.
+
+    WHY AT ALL, when the same markdown is already inside ``cfg.prompt``: an
+    agent 40 turns into a session should be able to ``cat`` its brief rather
+    than trust its own context window. The prompt is the channel; the file is
+    the reference copy.
+
+    WHY THE PATH IS DERIVED, NOT TAKEN FROM THE PAYLOAD: ``control_dir`` is
+    ``config_path.parent`` — the directory the backend already announced
+    through LAZYAF_AGENT_CONFIG_PATH. The wrapper never writes to a path a
+    payload told it to.
+
+    NEVER FATAL. The bundle is already in the prompt, so failing the step over
+    a convenience file would be a worse outcome than the file's absence. The
+    failure is a WARNING naming the path and the errno — loud, per R1; the
+    silent version is the violation.
+
+    ALWAYS SAYS SOMETHING. No bundle logs one line too: a silent absence is
+    indistinguishable from a bug that dropped the brief.
+    """
+    if not cfg.has_spec_context:
+        _log("[agent] spec context: none (no spec links for this card)")
+        return None
+
+    meta = cfg.spec_context or {}
+    markdown = cfg.spec_markdown or ""
+    path = control_dir / SPEC_CONTEXT_FILENAME
+    try:
+        # 0600, matching the tar's file mode. The .control DIRECTORY is
+        # already chowned to the agent uid by images/base/control/entrypoint.sh
+        # before gosu, so this needs no image change.
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(markdown)
+    except OSError as exc:
+        print(
+            f"[agent] WARNING: could not write the spec context to {path}: "
+            f"{exc} — the same text is already in the prompt, so the step "
+            "continues",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+    _log(
+        "[agent] spec context: "
+        f"{meta.get('criteria_count', 0)} criteria, "
+        f"{meta.get('test_ref_count', 0)} related tests, "
+        f"~{meta.get('estimated_tokens', 0)} tokens, "
+        f"truncated={bool(meta.get('truncated'))} -> {path}"
+    )
+    if meta.get("truncated"):
+        dropped = meta.get("dropped") or []
+        _log(
+            "[agent] note: spec context was truncated (dropped: "
+            f"{', '.join(str(d) for d in dropped) or 'unspecified'})"
+        )
+    return path
 
 
 def _running_as_root() -> bool:
@@ -419,6 +493,8 @@ def main() -> int:
     if cfg.context.get("previous_step_logs_truncated"):
         _log("[agent] note: previous step logs were truncated to fit the config")
 
+    spec_context_path = _write_spec_context(cfg, config_path.parent)
+
     result: Optional[ExecutorResult] = None
     try:
         # INSIDE the try whose finally writes the manifest (F3.3): the agent
@@ -455,6 +531,11 @@ def main() -> int:
         return 1
     finally:
         _write_usage(result)
+        # Consume-once, same rule as the agent config: the workspace volume
+        # is shared by every step of the run, and step N+1's agent must never
+        # read step N's brief.
+        if spec_context_path is not None:
+            unlink_quietly(spec_context_path)
 
 
 if __name__ == "__main__":

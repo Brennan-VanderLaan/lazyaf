@@ -33,6 +33,7 @@ The producer<->consumer round trip is pinned by
 `tdd/unit/control_runtime/test_agent_config_contract.py` (cross-agent
 contract #1).
 """
+import math
 from typing import Any, Dict, List, Optional
 
 
@@ -133,6 +134,96 @@ def truncate_previous_step_logs(
     return marker + kept, True
 
 
+# --- Curated spec context (12.6.6) -----------------------------------------
+#
+# The budget is stated in TOKENS (the unit the operator and PLAN think in) and
+# enforced in BYTES (the unit the wire and the kernel think in) - the same
+# split `truncate_previous_step_logs` already uses one section above.
+#
+# WHY 4000 TOKENS AND NOT MORE. `runner_common.executors.claude` builds
+# `["claude", "-p", config.prompt, ...]`: the whole prompt is ONE argv element,
+# and Linux caps a single argv element at MAX_ARG_STRLEN = 131072 bytes (32
+# pages, not tunable). The prompt already carries up to
+# PREVIOUS_STEP_LOGS_MAX_BYTES (32 KiB) of previous-step logs plus an unbounded
+# card description. 16 KiB of spec leaves ~80 KiB of headroom for the
+# description before an agent step starts dying with E2BIG. This cap is not a
+# nicety - it is what keeps the step dispatchable.
+
+SPEC_CONTEXT_MAX_TOKENS = 4000
+
+#: Bytes-per-token used by the estimator. There is no offline tokenizer for
+#: the target models here and the model varies per step, so this is a
+#: deliberately CONSERVATIVE constant for English prose plus source paths.
+#: Every number derived from it is documented as an estimate.
+SPEC_CONTEXT_BYTES_PER_TOKEN = 4
+
+SPEC_CONTEXT_MAX_BYTES = SPEC_CONTEXT_MAX_TOKENS * SPEC_CONTEXT_BYTES_PER_TOKEN
+
+#: Most related tests listed in one bundle. Paths are cheap (~80 bytes each);
+#: this exists so a story with 400 refs cannot spend the whole budget on them.
+SPEC_CONTEXT_MAX_TEST_REFS = 25
+
+#: Most sibling story titles listed on the feature-only path.
+SPEC_CONTEXT_MAX_STORY_TITLES = 20
+
+#: Every truncation rule that fires leaves one of these IN the markdown, so an
+#: agent reading a shrunk brief can SEE that it is shrunk (R1).
+SPEC_CONTEXT_TRUNCATION_MARKER = (
+    "> [spec context truncated to fit the {tokens}-token budget: {what}]\n"
+)
+
+#: Where the wrapper materialises the bundle inside the container. Mirrors
+#: `execution.local_executor.CONTROL_CONFIG_DIR` deliberately rather than
+#: importing it: this module must stay importable with no docker/config
+#: dependency (the contract suite imports it standalone). The contract test
+#: pins the two against each other, exactly as AGENT_CONFIG_VERSION is pinned.
+SPEC_CONTEXT_DIR = "/workspace/.control"
+SPEC_CONTEXT_FILENAME = "spec_context.md"
+SPEC_CONTEXT_PATH = f"{SPEC_CONTEXT_DIR}/{SPEC_CONTEXT_FILENAME}"
+
+
+def estimate_spec_context_tokens(markdown: str) -> int:
+    """Estimated token count of a bundle. An ESTIMATE, never a measurement."""
+    if not markdown:
+        return 0
+    return math.ceil(
+        len(markdown.encode("utf-8")) / SPEC_CONTEXT_BYTES_PER_TOKEN
+    )
+
+
+def validate_spec_context(spec_context: Optional[Dict[str, Any]]) -> None:
+    """Last gate before the wire for the 12.6.6 curated spec bundle.
+
+    `None` is the clean no-op and passes. Anything else must be a dict
+    carrying non-empty `markdown` inside the byte budget.
+
+    This is a LOUD refusal at dispatch on purpose: a bundle that slipped the
+    assembler's truncation would otherwise arrive oversized and kill the CLI
+    with E2BIG twenty minutes into a paid run, with nothing in the log naming
+    the reason.
+    """
+    if spec_context is None:
+        return
+    if not isinstance(spec_context, dict):
+        raise ValueError(
+            "spec_context must be an object or None; got "
+            f"{type(spec_context).__name__}"
+        )
+    markdown = spec_context.get("markdown")
+    if not isinstance(markdown, str) or not markdown:
+        raise ValueError(
+            "spec_context must carry a non-empty 'markdown' string, or be "
+            "None - an empty bundle is spelled None, never {}"
+        )
+    size = len(markdown.encode("utf-8"))
+    if size > SPEC_CONTEXT_MAX_BYTES:
+        raise ValueError(
+            f"spec_context is {size} bytes, over the {SPEC_CONTEXT_MAX_BYTES}-"
+            f"byte ({SPEC_CONTEXT_MAX_TOKENS}-token) budget; the assembler "
+            "must truncate before dispatch"
+        )
+
+
 def generate_agent_config(
     *,
     agent: str,
@@ -160,6 +251,7 @@ def generate_agent_config(
     allow_empty: bool = False,
     mock_config: Optional[Dict[str, Any]] = None,
     role: Optional[str] = None,
+    spec_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Generate the agent payload file for an agent step (12.5).
 
@@ -188,17 +280,26 @@ def generate_agent_config(
         mock_config: deterministic MockExecutor behavior (the dogfood ratchet).
         role: M13 fan-out attribution. `None` in 12.5, on the wire NOW so
             M13 is not a retrofit.
+        spec_context: The curated spec bundle (12.6.6) from
+            `app.services.spec_context.build_spec_context`, or `None` when the
+            card has no spec links / curation is switched off for the step.
+            Its `markdown` is ALREADY inside `prompt`; it travels here as well
+            so the wrapper can materialise it at SPEC_CONTEXT_PATH and log
+            what it received. Refused at dispatch when it is over budget.
 
     Returns:
         The agent configuration dictionary.
 
     Raises:
-        ValueError: on an unknown agent (there is NO default agent).
+        ValueError: on an unknown agent (there is NO default agent), or on a
+            spec_context that is malformed or over the token budget.
     """
     if agent not in AGENT_TYPES:
         raise ValueError(
             f"unknown agent {agent!r}: valid agents are {', '.join(AGENT_TYPES)}"
         )
+
+    validate_spec_context(spec_context)
 
     logs, truncated = truncate_previous_step_logs(previous_step_logs)
 
@@ -239,6 +340,7 @@ def generate_agent_config(
         },
         "mock_config": mock_config,
         "role": role,
+        "spec_context": spec_context,
     }
 
 
@@ -263,4 +365,5 @@ def agent_config_keys() -> List[str]:
         "commit",
         "mock_config",
         "role",
+        "spec_context",
     ]

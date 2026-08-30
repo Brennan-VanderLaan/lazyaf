@@ -1076,7 +1076,27 @@ Decisions made DURING implementation (all shipped and gate-verified):
   agent-addressable step - a strategy variant a single-sandbox harness cannot
   express. (Owner: "lazyaf is the bridge")
 
-- OPEN: v1 pipeline retirement shape (12.8, owner confirms).
+- 2026-08-30 RESOLVED: retire the v1 array pipeline format. (Owner: "retire the
+  old pipeline format") The shape is the one 12.8 recommended and the owner
+  confirmed: **execution is graph-only**. Concretely:
+  - `pipeline_executor` loses its array branch entirely - `is_graph` and every
+    two-way fork behind it disappear, leaving ONE path through the executor.
+    This is the whole point: the array path is a second execution semantics
+    nobody reads, and every graph fix since 12.4 had to be written twice.
+  - The array survives ONLY as an authoring convenience at two edges - repo
+    YAML (`.lazyaf/pipelines/*.yaml`) and the pipeline API - both converting
+    via `array_to_graph` at the boundary. A human writing a five-step pipeline
+    should not have to hand-author nodes, edges and positions; a human is not
+    the executor.
+  - Everything that currently persists `steps=json.dumps([...])` writes a graph
+    instead: `trigger_service.upsert_materialized_pipeline`,
+    `agent_run` (both card-work sites), `experiment_service`, the test-mode
+    seed.
+  - `Pipeline.steps` is backfilled into `steps_graph` by a migration and then
+    DROPPED (R3: one source of truth per wire contract; R2: deleted after the
+    backfill is accepted). `0007_drop_polling_runner_columns.py` is the
+    precedent for the SQLite table rebuild.
+  - The dogfood pipeline converts to a v2 graph, which is what proves it.
 - OPEN: whether `12.0` counts as done at 12.5 (runner-common adopted by agent
   images) or 12.8 (all runners retired) — resolves itself as those land.
 

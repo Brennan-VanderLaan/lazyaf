@@ -1,0 +1,134 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# "The diff changed behaviour. Do the docs still match?"
+#
+# This is the recipe that shows `trigger:{card_id}`: when the reviewer finds
+# drift, the pipeline SPAWNS A CARD to fix it. The card is cloned from a
+# template card you already created, put straight into in_progress, and run as
+# an ad-hoc agent run. Fire and forget - this run does not wait for it.
+#
+# BEFORE YOU ARM THIS: replace TEMPLATE_CARD_ID below with the id of a real
+# card. A `trigger:` naming a card that does not exist logs
+# "Template card ... not found for trigger action" and the run CONTINUES -
+# v1 behaviour, preserved deliberately - so a typo here is a silently missing
+# fix card, not a failure.
+#
+# COST: one agent step per push, plus a SECOND agent run every time drift is
+# found (the fix card runs whatever agent the template card names). Budget for
+# the second one: it is a full implement-and-commit run, not a read-only pass.
+name: "Doc Drift"
+description: "An agent checks the pushed diff against the docs it should have updated, and spawns a fix card when they disagree."
+
+triggers:
+  - type: push
+    config:
+      branches: ["main"]
+
+steps:
+  - id: "collect-diff"
+    name: "Collect the pushed diff"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        mkdir -p .lazyaf-run
+        grep -qxF '/.lazyaf-run/' .git/info/exclude 2>/dev/null \
+          || echo '/.lazyaf-run/' >> .git/info/exclude
+        python3 - <<'PY'
+        import json, os, subprocess, urllib.request
+        run = json.load(urllib.request.urlopen(
+            f"{os.environ['LAZYAF_BACKEND_URL']}/api/pipeline-runs"
+            f"/{os.environ['LAZYAF_PIPELINE_RUN_ID']}", timeout=30))
+        ctx = run.get("trigger_context") or {}
+        new = ctx.get("commit_sha") or "HEAD"
+        old = ctx.get("old_sha") or ""
+        have = lambda r: subprocess.run(
+            ["git", "cat-file", "-e", r + "^{commit}"]).returncode == 0
+        if not old or set(old) == {"0"} or not have(old):
+            old = new + "~1" if have(new + "~1") else new
+        diff = subprocess.run(["git", "diff", old, new],
+                              capture_output=True, text=True).stdout
+        open(".lazyaf-run/diff.patch", "w", encoding="utf-8").write(diff[:200000])
+        print(f"[diff] {old[:12]}..{new[:12]} -> .lazyaf-run/diff.patch "
+              f"({len(diff)} bytes)")
+        PY
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  - id: "doc-check"
+    name: "Check the docs against the diff"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      commit: false
+      task: "Decide whether this diff made the documentation wrong"
+      description: |
+        Read .lazyaf-run/diff.patch. Then read the docs in the checkout that
+        describe the things it touched: README files, docs/, and the module
+        docstrings of the files in the diff.
+
+        You are looking for one thing only: a sentence that is now FALSE.
+        Not a missing sentence, not an out-of-date example you would have
+        written differently - a claim the code no longer honours.
+
+        Write .lazyaf-run/doc-drift.md, first line exactly one of:
+
+          DRIFT
+          OK
+
+        Then, under `## Stale claims`, one entry per false statement:
+          - <doc file>:<line> says "<the claim>", but <file>:<symbol> now <what
+            it actually does>.
+
+        A doc that was already wrong before this diff is not drift from this
+        push. Say so and answer OK.
+      harness:
+        max_iterations: 16
+        temperature: 0
+    on_success: next
+    on_failure: stop
+    timeout: 1200
+
+  # Exits non-zero on drift, which fires on_failure -> the fix card. v1's
+  # trigger action SPAWNS AND CONTINUES: this step goes to `verdict` either
+  # way, which is what keeps the run's own status honest (see below).
+  - id: "drift-gate"
+    name: "Spawn a fix card on drift"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        cat .lazyaf-run/doc-drift.md
+        if head -n 1 .lazyaf-run/doc-drift.md | grep -q '^DRIFT'; then
+          echo "docs no longer match the code" >&2
+          exit 1
+        fi
+    on_success: next
+    on_failure: "trigger:TEMPLATE_CARD_ID"
+    timeout: 120
+
+  # WHY THIS STEP EXISTS. On the array format a `trigger:` action continues to
+  # the next step, and reaching the end of the array completes the run PASSED
+  # regardless of what failed earlier. That is a stated limitation of the v1
+  # caller (pipeline_executor._spawn_fix_card), and it means a pipeline whose
+  # LAST step fired a fix card reports green. A final step whose on_failure is
+  # `stop` is how you get an honest red: `stop` completes the run with THIS
+  # step's verdict.
+  - id: "verdict"
+    name: "Fail the run if the docs drifted"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        head -n 1 .lazyaf-run/doc-drift.md | grep -q '^OK'
+    on_success: next
+    on_failure: stop
+    timeout: 120

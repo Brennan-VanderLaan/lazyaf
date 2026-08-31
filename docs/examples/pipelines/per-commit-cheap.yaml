@@ -1,0 +1,61 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# THE CHEAP LANE. Everything here is deterministic, fast and free: no model
+# call, no GPU, no API key. This is what should run on every push, on every
+# branch, and it is the half of the split most people get wrong by putting an
+# agent in it.
+#
+# The rule this lane follows: a step belongs here if a machine can answer it
+# the same way twice. Secrets, syntax, types, the fast unit tier. Anything
+# that needs judgement goes in nightly-expensive.yaml.
+#
+# COST: zero model calls. Wall clock is the whole budget.
+name: "Per-Commit (cheap)"
+description: "The free, deterministic lane: leak gate, then the fast unit tier. Runs on every push to every branch because it costs nothing to."
+
+triggers:
+  - type: push
+    config:
+      branches: ["*"]
+
+steps:
+  # Cheapest first, and the one that must never be skipped. A credential that
+  # reaches the repo is already public; the sooner this runs, the smaller the
+  # window.
+  - id: "secret-scan"
+    name: "Secret scan"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        python3 .github/scripts/scan_repo_secrets.py
+    on_success: next
+    on_failure: stop
+    timeout: 120
+
+  - id: "deps"
+    name: "Sync dependencies"
+    type: script
+    config:
+      image: "lazyaf-test-runner:dev"
+      command: |
+        cd backend
+        uv sync --all-extras
+    on_success: next
+    on_failure: stop
+    # Cold-cache dependency resolution on a fresh workspace volume needs
+    # headroom. HOME is /workspace/home, which persists across the steps of
+    # this run, so the later steps get a warm cache.
+    timeout: 720
+
+  - id: "unit"
+    name: "Fast unit tier"
+    type: script
+    config:
+      image: "lazyaf-test-runner:dev"
+      command: |
+        cd backend
+        uv run pytest ../tdd/unit -q
+    on_success: next
+    on_failure: stop
+    timeout: 1800

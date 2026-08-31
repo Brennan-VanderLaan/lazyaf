@@ -1,0 +1,118 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# "Explain this failure": when the test step goes red, an agent reads the
+# failure and says what probably caused it - before a human opens the run.
+#
+# THE MECHANISM THAT MAKES THIS WORK, and it needs no config:
+# an agent step is handed the PREVIOUS step's logs automatically. The backend
+# reads the StepRun at step_index - 1 and renders them into the prompt under a
+# `## Previous Step Output` heading (pipeline_executor._load_previous_step_output
+# + services/agent_prompt.py). It is strictly the step BEFORE this one - not
+# "the last failing step" - so the explainer must sit immediately after the
+# step it explains. Insert anything between them and it explains that instead.
+#
+# The logs are capped before rendering, so a 40 MB pytest log does not blow the
+# prompt; the agent sees the tail, which is where the failure is.
+#
+# COST: one agent step per push, including the pushes where everything passed.
+# The task tells the agent to stop immediately when there is no failure, so a
+# green push costs one short turn. See migration-review.yaml for why it cannot
+# cost zero.
+name: "Test + Explain"
+description: "Run the suite; when it fails, an agent reads the failure output and writes the likely cause before anyone opens the run."
+
+triggers:
+  - type: push
+    config:
+      branches: ["main", "feature/*"]
+
+steps:
+  # on_failure: next is the whole trick - the run CONTINUES past a red suite so
+  # the explainer gets to see it. The failure is recorded in a marker the last
+  # step re-reads, because a step that continues cannot make the run red by
+  # itself (see the `verdict` step).
+  - id: "tests"
+    name: "Run the suite"
+    type: script
+    config:
+      image: "lazyaf-test-runner:dev"
+      command: |
+        cd /workspace/repo
+        mkdir -p .lazyaf-run
+        grep -qxF '/.lazyaf-run/' .git/info/exclude 2>/dev/null \
+          || echo '/.lazyaf-run/' >> .git/info/exclude
+        rm -f .lazyaf-run/tests-failed
+        cd backend
+        uv sync --extra test
+        if ! uv run pytest ../tdd/unit -q; then
+          touch /workspace/repo/.lazyaf-run/tests-failed
+          exit 1
+        fi
+    on_success: next
+    on_failure: next
+    timeout: 1800
+
+  - id: "explain"
+    name: "Explain the failure"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      commit: false
+      task: "Explain why the previous step failed"
+      description: |
+        The previous step's output is in this prompt, under
+        `## Previous Step Output`. It is the tail of the test run.
+
+        If .lazyaf-run/tests-failed does not exist, the suite passed: write
+        the single line "PASSED" to .lazyaf-run/failure.md and finish. Do not
+        read anything else.
+
+        Otherwise: find the FIRST genuine failure in that output - not the
+        summary line, the first real assertion or error - and write
+        .lazyaf-run/failure.md:
+
+          ## Failing test
+          <the test id, verbatim>
+
+          ## What the output says
+          <the assertion or exception, quoted, two or three lines>
+
+          ## Likely cause
+          <one paragraph. Open the file the traceback names and say what
+           about it is wrong. If the output does not let you tell, say
+           "cannot tell from this output" and name what you would need.>
+
+          ## First thing to check
+          <one concrete command or one file:line>
+
+        Do not fix anything. Do not run the suite again - it takes as long as
+        it just took, and a second red run tells nobody anything new.
+      harness:
+        max_iterations: 14
+        temperature: 0
+    on_success: next
+    on_failure: stop
+    timeout: 900
+
+  # On the array format the run's verdict is whatever the last `stop` says, and
+  # reaching the end of the array completes it PASSED. A step that continued
+  # with `next` therefore cannot fail the run on its own. This step re-states
+  # the test result so a red suite is a red run.
+  - id: "verdict"
+    name: "Re-state the test result"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        cat .lazyaf-run/failure.md 2>/dev/null || echo "(no explanation written)"
+        if [ -f .lazyaf-run/tests-failed ]; then
+          echo "the suite failed; see the explanation above" >&2
+          exit 1
+        fi
+        echo "[verdict] suite passed"
+    on_success: next
+    on_failure: stop
+    timeout: 120

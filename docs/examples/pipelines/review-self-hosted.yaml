@@ -1,0 +1,121 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# AI code review on every push, running against a model YOU host.
+#
+# COST: no API bill. `agent: openai-harness` + `endpoint:` drives an
+# OpenAI-compatible server you registered (ollama, vLLM, anything that speaks
+# the same wire format). The step is still billed in LazyAF's own ledger:
+# usage_ingestion prices it from the endpoint's node rate as
+# cost_source="gpu-node", which is 0.00 on owned hardware and a real number on
+# rented hardware. Wall clock is the thing you actually spend.
+#
+# PREREQUISITE: an endpoint named `local-4090` must exist and be PROBED.
+#   POST /api/model-endpoints            {name, base_url, model, server_kind}
+#   POST /api/model-endpoints/{id}/probe
+# resolve_step_endpoint refuses to dispatch against an unprobed endpoint on
+# purpose - a 15-minute agent step is not the place to discover the model
+# cannot tool-call.
+name: "Review (self-hosted)"
+description: "Read the pushed diff, write .lazyaf-run/review.md, and fail the run on a BLOCKER. Runs on a self-hosted OpenAI-compatible endpoint, so a per-commit agent step costs GPU seconds instead of API dollars."
+
+triggers:
+  - type: push
+    config:
+      branches: ["main", "feature/*"]
+
+steps:
+  # The push's before/after shas are on the RUN, not in the step's env. Every
+  # step container gets LAZYAF_PIPELINE_RUN_ID and LAZYAF_BACKEND_URL, and the
+  # run read endpoint needs no token from inside the network.
+  - id: "collect-diff"
+    name: "Collect the pushed diff"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        mkdir -p .lazyaf-run
+        grep -qxF '/.lazyaf-run/' .git/info/exclude 2>/dev/null \
+          || echo '/.lazyaf-run/' >> .git/info/exclude
+        python3 - <<'PY'
+        import json, os, subprocess, urllib.request
+        run = json.load(urllib.request.urlopen(
+            f"{os.environ['LAZYAF_BACKEND_URL']}/api/pipeline-runs"
+            f"/{os.environ['LAZYAF_PIPELINE_RUN_ID']}", timeout=30))
+        ctx = run.get("trigger_context") or {}
+        new = ctx.get("commit_sha") or "HEAD"
+        old = ctx.get("old_sha") or ""
+        have = lambda r: subprocess.run(
+            ["git", "cat-file", "-e", r + "^{commit}"]).returncode == 0
+        if not old or set(old) == {"0"} or not have(old):
+            old = new + "~1" if have(new + "~1") else new
+        diff = subprocess.run(["git", "diff", old, new],
+                              capture_output=True, text=True).stdout
+        open(".lazyaf-run/diff.patch", "w", encoding="utf-8").write(diff[:200000])
+        print(f"[diff] {old[:12]}..{new[:12]} -> .lazyaf-run/diff.patch "
+              f"({len(diff)} bytes)")
+        PY
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  # commit: false makes this analysis-only. It also flips the harness's
+  # `require_changes` default to false, so "the reviewer changed nothing" is
+  # not treated as a failed step.
+  - id: "review"
+    name: "AI review"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      commit: false
+      task: "Review the pushed diff and write .lazyaf-run/review.md"
+      description: |
+        Read .lazyaf-run/diff.patch. It is the whole change this push made.
+
+        Write .lazyaf-run/review.md. Use exactly this shape:
+
+          ## Verdict
+          BLOCKER   (only if the diff is unsafe to ship as written)
+          or
+          OK
+
+          ## Findings
+          - <file>:<line> - <one sentence, what is wrong and why it matters>
+
+        Rules:
+        - Only report things you can point at a line for. No style opinions.
+        - BLOCKER means: data loss, a credential, a broken migration, an
+          unhandled failure path, or a test that cannot fail.
+        - When the diff is fine, write the OK verdict with an empty findings
+          list and stop. "Nothing to report" is a real answer.
+      harness:
+        max_iterations: 12
+        temperature: 0
+    on_success: next
+    on_failure: stop
+    timeout: 900
+
+  # The reviewer's own exit code says "the loop finished", not "the code is
+  # good". This step is what turns a finding into a red run.
+  - id: "review-gate"
+    name: "Fail on BLOCKER"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        if [ ! -f .lazyaf-run/review.md ]; then
+          echo "the reviewer wrote no review.md" >&2
+          exit 1
+        fi
+        cat .lazyaf-run/review.md
+        if grep -qi '^BLOCKER' .lazyaf-run/review.md; then
+          echo "review reported a BLOCKER" >&2
+          exit 1
+        fi
+    on_success: next
+    on_failure: stop
+    timeout: 120

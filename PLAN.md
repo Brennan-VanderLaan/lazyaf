@@ -2,694 +2,343 @@
 
 > Visual orchestrator for AI agents to handle feature development via Trello-style cards
 
-## What is LazyAF?
-
-LazyAF is a local-first CI/CD platform that integrates AI agents as first-class citizens. Instead of writing GitHub Actions YAML, you define pipelines with a mix of:
-
-- **Agent steps**: Claude or Gemini implements features, fixes tests, reviews code
-- **Script steps**: Traditional shell commands (lint, test, build)
-- **Docker steps**: Commands in isolated container images
-
-The core workflow:
-1. **Ingest** a repo via CLI (`lazyaf ingest /path/to/repo`)
-2. **Create cards** describing features or tasks
-3. **Start work** -> Runner clones, executes, pushes to internal git server
-4. **Pipeline triggers** -> Tests run, AI fixes failures, auto-merge on success
-5. **Land changes** to real remote when ready (`lazyaf land`)
+> **Reconciled against the tree 2026-08-30.** Status claims in this file name
+> their evidence. History lives in `historical-documents/`; this file is about
+> what is next.
 
 ---
 
-## Long-Term Vision: Specification-Driven Development
+## What to do next
 
-> Sprint reviews, PRs, and code review evolved to mentor humans. With LLMs in the loop, the leverage shifts from *implementation review* to *specification fidelity* — does the result match the product intent, and can we prove it repeatedly?
-
-LazyAF is moving toward a model where humans **over-specify what the software must do** (features, user stories, acceptance criteria) and LLMs handle implementation. The platform's job is to:
-
-1. **Capture intent** — features, user stories, and acceptance criteria live in a queryable database, not scattered across Jira/Notion/heads.
-2. **Tie tests back to intent** — every test in every repo declares which acceptance criterion it covers, and every run reports back. Test history is keyed to `(criterion, commit, model, prompt)`.
-3. **Run experiments, not just builds** — re-run the same card across multiple model/prompt combinations and compare pass-rates per criterion. Make model + prompt selection an evidence-driven decision.
-4. **Curate context for parallel agents** — the spec DB lets the platform hand each agent the relevant slice of intent (instead of stuffing the whole codebase into a context window).
-5. **Enable cross-repo features** — a "feature" can span multiple repos (frontend + backend + infra), and the platform tracks delivery across all of them.
-
-This direction reframes LazyAF as a *platform for software science*: experiments, leaderboards, regression dashboards, and reusable prompt structures — alongside the day-to-day "active project management" view (cards, kanban, pipelines).
-
-The spec layer is being added to Phase 12.x in parallel with the runner architecture refactor (see Phases 12.2.5, 12.2.6, 12.6.5, 12.6.6).
-
----
-
-## Project Structure
-
-```
-lazyaf/
-|-- backend/
-|   |-- app/
-|   |   |-- main.py              # FastAPI app entry point
-|   |   |-- config.py            # Settings
-|   |   |-- database.py          # SQLAlchemy async setup
-|   |   |-- models/              # SQLAlchemy models
-|   |   |-- routers/             # API endpoints
-|   |   |-- services/            # Business logic
-|   |   |-- schemas/             # Pydantic models
-|   |   +-- mcp/                 # MCP server for Claude Desktop
-|   |-- git_repos/               # Internal bare git repos
-|   |-- runner/
-|   |   |-- Dockerfile
-|   |   +-- entrypoint.py        # Runner execution logic
-|   |-- pyproject.toml
-|   +-- alembic/                 # DB migrations
-|-- cli/                         # LazyAF CLI tool (ingest, land)
-|   |-- pyproject.toml
-|   +-- lazyaf/cli.py
-|-- frontend/
-|   |-- src/
-|   |   |-- lib/
-|   |   |   |-- components/      # Svelte components
-|   |   |   |-- stores/          # State management
-|   |   |   +-- api/             # API client
-|   |   +-- routes/              # Pages
-|   |-- package.json
-|   +-- vite.config.ts
-|-- historical-documents/        # Archived phase documentation
-|-- docker-compose.yml
-|-- PLAN.md                      # This file
-+-- README.md
-```
-
----
-
-## Tech Stack
-
-| Layer | Technology | Purpose |
-|-------|------------|---------|
-| Frontend | Svelte + Vite | Reactive UI, fast builds |
-| Backend | FastAPI | Async Python API |
-| Database | SQLite + SQLAlchemy | Simple persistence (PostgreSQL ready) |
-| Queue | In-memory | Job management |
-| Containers | Docker SDK for Python | Runner isolation |
-| Real-time | WebSockets | Status updates |
-| Git | Dulwich | Pure Python git server |
-| MCP | FastMCP | Claude Desktop integration |
-
----
-
-## Core Data Models
-
-### Repo
-```python
-class Repo:
-    id: UUID
-    name: str
-    remote_url: str | None       # Real remote (GitHub/GitLab)
-    default_branch: str          # e.g., "dev" or "main"
-    is_ingested: bool
-```
-
-### Card
-```python
-class CardStatus(Enum):
-    TODO = "todo"
-    IN_PROGRESS = "in_progress"
-    IN_REVIEW = "in_review"
-    DONE = "done"
-    FAILED = "failed"
-
-class Card:
-    id: UUID
-    repo_id: UUID
-    title: str
-    description: str
-    status: CardStatus
-    branch_name: str | None
-    step_type: StepType          # agent | script | docker
-    step_config: dict            # Type-specific config
-```
-
-### Pipeline
-```python
-class Pipeline:
-    id: UUID
-    repo_id: UUID
-    name: str
-    steps: list[PipelineStep]    # Ordered execution
-    triggers: list[TriggerConfig]
-
-class PipelineStep:
-    name: str
-    type: StepType               # agent | script | docker
-    config: dict
-    on_success: str              # "next" | "stop" | "merge:{branch}"
-    on_failure: str              # "next" | "stop" | "trigger:{card_id}"
-    continue_in_context: bool    # Preserve workspace
-```
-
----
-
-## Specification Layer Models
-
-> Introduced in Phase 12.2.5. These models capture *what the software must do* and let the platform measure whether AI-generated changes still satisfy intent. Hierarchy is intentionally shallow: `Feature -> UserStory -> AcceptanceCriterion`. Tests and runs are orthogonal entities that join back to criteria.
-
-### Feature
-A product capability. Cross-repo by design — a single feature can span frontend, backend, infra, etc.
-
-```python
-class Feature:
-    id: UUID
-    name: str
-    description: str             # Markdown, free-form product narrative
-    repo_ids: list[UUID]         # Repos this feature touches (one or many)
-    status: FeatureStatus        # proposed | active | shipped | deprecated
-    owner: str | None            # Free-form (email, handle, team name)
-    created_at: datetime
-    updated_at: datetime
-```
-
-### UserStory
-A natural-language behavior expectation in the gherkin spirit (less rigid). Belongs to one feature.
-
-```python
-class UserStory:
-    id: UUID
-    feature_id: UUID
-    title: str                   # "User can revoke an API key"
-    persona: str | None          # "As a security-conscious admin"
-    narrative: str               # Free-form: "When X, then Y, so that Z"
-    repo_ids: list[UUID]         # Subset of parent feature's repos
-    priority: int                # Simple integer, not story points
-    status: StoryStatus          # draft | accepted | in_progress | done | blocked
-    created_at: datetime
-    updated_at: datetime
-```
-
-### AcceptanceCriterion
-A single, testable expectation. Natural language; one or more `TestRef`s prove it.
-
-```python
-class AcceptanceCriterion:
-    id: UUID
-    user_story_id: UUID
-    description: str             # "Revoked keys return 401 within 60s globally"
-    is_required: bool            # Story-blocking vs nice-to-have
-    created_at: datetime
-```
-
-### TestRef
-A pointer from a test in the application repo back to one or more acceptance criteria. The application's test suite emits a manifest declaring its `lazyaf_test_id`s; the platform reconciles that manifest against TestRefs to detect drift (orphaned tests, uncovered criteria).
-
-```python
-class TestRef:
-    id: UUID                     # Stable platform-side ID
-    lazyaf_test_id: str          # Stable repo-side identifier (decorator/sidecar)
-    repo_id: UUID
-    file_path: str               # e.g., "tests/api/test_keys.py"
-    test_name: str               # e.g., "test_revoked_key_returns_401"
-    framework: str               # "pytest" | "vitest" | "go-test" | "custom"
-    criterion_ids: list[UUID]    # Many-to-many with AcceptanceCriterion
-    last_seen_commit: str | None # SHA of latest commit where test was observed
-    is_orphaned: bool            # True if test_id no longer found in repo
-```
-
-### TestRun
-The result of executing one TestRef. Joined to commit, and (when run inside an experiment) to model + prompt.
-
-```python
-class TestRun:
-    id: UUID
-    test_ref_id: UUID
-    pipeline_run_id: UUID | None # Pipeline that produced this run
-    step_execution_id: UUID | None
-    commit_sha: str
-    repo_id: UUID
-    status: TestStatus           # passed | failed | skipped | error
-    duration_ms: int
-    output: str | None           # Truncated stdout/stderr or pointer to artifact
-    model: str | None            # e.g., "claude-opus-4-7" - set inside experiments
-    prompt_template_id: UUID | None
-    prompt_version: int | None
-    experiment_id: UUID | None
-    created_at: datetime
-```
-
-### Experiment
-A user-defined run that evaluates one or more (model, prompt) tuples against a card / story / feature. Produces TestRuns tagged with the matrix coordinates so leaderboards can aggregate.
-
-```python
-class Experiment:
-    id: UUID
-    name: str
-    description: str
-    target_type: str             # "card" | "user_story" | "feature"
-    target_id: UUID
-    matrix: dict                 # {"models": [...], "prompts": [...], "repeat": N}
-    status: ExperimentStatus     # draft | running | complete | aborted
-    created_by: str
-    created_at: datetime
-    completed_at: datetime | None
-```
-
-### PromptTemplate
-A versioned, reusable prompt. Leaderboards rank `(template_id, version, model)` by pass-rate per criterion.
-
-```python
-class PromptTemplate:
-    id: UUID
-    name: str
-    purpose: str                 # "implement-from-story" | "fix-failing-test" | etc.
-    versions: list[PromptVersion]
-
-class PromptVersion:
-    id: UUID
-    template_id: UUID
-    version: int
-    body: str                    # The prompt itself, with placeholders
-    placeholders: list[str]      # e.g., ["{story_narrative}", "{failing_test_output}"]
-    created_at: datetime
-    notes: str | None
-```
-
-### StepUsage  *(Phase 12.5 — effort telemetry)*
-Per-agent-step resource accounting. Without this, `TestRun` records *what happened*
-and nothing records *what it cost* — and the Benchmark harness (Milestone 13) has no
-effort axis. It rides the control-layer protocol as a fourth channel alongside
-status / logs / test-results, so it must land WITH 12.5's agent-step migration
-rather than after it (12.2.6 became a retrofit precisely because 12.3 froze first).
-
-```python
-class StepUsage:
-    id: UUID
-    step_execution_id: UUID
-    step_run_id: UUID | None
-    provider: str                # "anthropic" | "google" | "openai-compatible" | "self-hosted"
-    model: str | None
-    input_tokens: int | None
-    output_tokens: int | None
-    cache_read_tokens: int | None
-    cache_write_tokens: int | None
-    cost_usd: Decimal | None     # CLI-reported where available, else derived
-    cost_source: str             # "cli-reported" | "gpu-node" | "estimated" | "unknown"
-    wall_clock_ms: int
-    container_seconds: float | None
-    created_at: datetime
-```
-
-> **Cost sources (owner decision 2026-08-29):** the agent CLIs report their own
-> token counts and dollar cost — the control runtime scrapes that at step end
-> (`cost_source="cli-reported"`). Self-hosted / runpod-style nodes have no
-> per-token bill, so their dollars come from a node-rate x occupancy model
-> (`cost_source="gpu-node"`). Both land on one comparable USD axis; no separate
-> pricing table is needed while the CLIs keep reporting cost.
-
-### BenchmarkSuite / BenchmarkCase  *(Milestone 13)*
-A corpus of repos pinned at known states, each with a task and a definition of
-"solved". Cases are the fixtures a loop is benchmarked against.
-
-```python
-class BenchmarkSuite:
-    id: UUID
-    name: str                    # "core-v1"
-    description: str
-    tags: list[str]              # verticals covered
-
-class BenchmarkCase:
-    id: UUID
-    suite_id: UUID
-    slug: str                    # "flask-api.missing-pagination"
-    repo_id: UUID                # an INGESTED fixture repo (internal git server)
-    base_commit_sha: str         # every trial starts here, byte-identical
-    task_statement: str          # what the agent is told to do
-    vertical: str                # "web-api" | "data-pipeline" | "frontend" | "cli" | ...
-    complexity: str              # "trivial" | "small" | "medium" | "large"
-    fail_to_pass: list[str]      # lazyaf_test_ids that MUST flip red -> green
-    pass_to_pass: list[str]      # lazyaf_test_ids that must STAY green (regression guard)
-    user_story_id: UUID | None   # layered criteria: the human-meaningful "why"
-    loop_defaults: dict          # {max_iterations, budget_usd, per_step_timeout}
-    contamination_risk: str      # "high" (public repo, likely in training data)
-                                 # | "medium" | "low" (self-authored / post-cutoff)
-    source_url: str | None       # upstream provenance for public fixtures
-    license: str | None          # SPDX id - decides what the public bundle may ship
-    test_command: str            # the PINNED oracle invocation, e.g. "pytest -q"
-    oracle_file_hashes: dict     # {path: sha256} for every file carrying an oracle
-                                 # id - an agent that edits the oracle to pass is
-                                 # cheating, and this is how the trial detects it
-    quarantined_tests: list[str] # ids ejected by the flake screen, kept on the record
-    reference_patch: str | None  # gold patch where upstream has one -> enables the
-                                 # "is this case solvable at all" control
-    solvable_verified: bool      # the gold-patch control passed
-    created_at: datetime
-```
-
-### StrategyTemplate  *(Milestone 13 — the independent variable)*
-A strategy is a graph of activity plus how models are assigned to its roles. It
-is DATA: authoring a new strategy means writing a template, not changing code.
-
-```python
-class StrategyTemplate:
-    id: UUID
-    slug: str                    # "planner-fanout-8" | "adversarial-3" | "one-shot"
-    description: str
-    graph: dict                  # a v2 pipeline graph: steps + edges + fan-out/join.
-                                 # Step configs carry ROLE placeholders, not models:
-                                 #   {"role": "planner"} / {"role": "worker", "fanout": 8}
-    roles: list[str]             # ["planner", "worker", "integrator", "reviewer"]
-    loop_policy: dict            # {max_iterations, budget_usd, stop_on}
-    parallelism: dict            # {max_concurrent_workers, branch_per_worker: bool}
-    variables: dict              # {"K": {"type":"int","default":4,"min":1,"max":32}} -
-                                 # what makes planner-fanout-4 and -16 the SAME
-                                 # template, so a K-sweep is one template not sixteen
-    integration: dict            # HOW parallel work rejoins - itself under test:
-                                 # {"policy": "sequential-merge" | "rebase-onto-trunk"
-                                 #            | "cherry-pick" | "agent-composed",
-                                 #  "on_conflict": "fail" | "resolver-agent" | "human"}
-    created_at: datetime
-```
-
-> **Why roles, not models:** the owner's leading hypothesis is that a high-end
-> model writing instructions for a fan-out of small models beats one big model
-> doing everything. That strategy is only expressible if a template says "planner"
-> and "worker" and the *trial* binds those roles to concrete models — otherwise
-> every model mix is a different template and nothing is comparable.
-
-> **Parallelism is git-native — LazyAF is the bridge.** K workers do not fight
-> over one checkout: each gets its own workspace cloned at the case's base commit
-> on **its own branch**, works freely, and commits. Integration is then a *git
-> merge*, not a file-level reconciliation — which is precisely the substrate this
-> platform already is:
+> Reconciled against the tree on **2026-08-30**. Every status below names its
+> evidence — a file, a test, a commit, or a measured number. Where a claim could
+> not be checked in the tree, it says so rather than assuming.
 >
-> | Needed for fan-out | Already shipped |
-> |---|---|
-> | Per-worker isolation | Internal git server (bare repo per project) + workspace-per-clone at a pinned commit |
-> | Independent work | Branch-per-unit-of-work, the model cards have used since Phase 2 |
-> | Integration | `git_server.merge_branch` / `rebase_branch` |
-> | Conflict handling | `POST /api/cards/{id}/resolve-conflicts` returns STRUCTURED conflicts and accepts resolved contents; `ConflictResolver.svelte` is the human path |
-> | Review before merge | The existing approve/reject diff flow |
->
-> Two consequences. First, fan-out needs far less new machinery than a
-> from-scratch harness would: the orchestrator allocates branches and calls
-> merges the platform already performs. Second — and more interesting —
-> **conflict resolution is itself an agent-addressable task**, because conflicts
-> come back as structured data rather than as a wall of `<<<<<<<` markers. A
-> strategy can legitimately say "on conflict, spawn a resolver agent", which is a
-> strategy variant nobody can benchmark on a single-sandbox harness.
->
-> So **integration policy becomes a measured variable, not a fixed detail**:
-> sequential merge, rebase-onto-trunk, cherry-pick, agent-composed integration,
-> resolver-on-conflict. Integration conflict rate and resolution cost are
-> outcomes of the strategy under test — plausibly the dominant cost of aggressive
-> parallelism, and exactly the number that decides whether the pattern is worth
-> it.
+> Status vocabulary, used consistently in this document:
+> **COMPLETE** (landed and evidenced) · **IN PROGRESS** (some parts landed,
+> named individually) · **DESIGNED** (a written plan, zero implementation) ·
+> **NOT STARTED**.
 
-### Trial / TrialIteration  *(Milestone 13)*
-A Trial is one loop run of one case under one (model, prompt, policy) variant.
-TrialIteration is the per-cycle record — the cost *curve*, which is the actual
-science: not just "did it solve it" but "was iteration 4 worth paying for".
+### 1. Now — finish Phase 12.8: retire the v1 array pipeline format
 
-```python
-class Trial:
-    id: UUID
-    experiment_id: UUID | None   # set when part of a matrix fan-out
-    benchmark_case_id: UUID
-    strategy_template_id: UUID   # THE independent variable
-    model_assignment: dict       # {"planner": "claude-opus-5", "worker": "haiku-4.5",
-                                 #  "integrator": "claude-sonnet-5"} - a strategy may
-                                 # use several models in different roles, so cost is
-                                 # attributed PER ROLE from StepUsage, never per trial
-    prompt_template_id: UUID | None
-    prompt_version: int | None
-    loop_policy: dict            # {max_iterations, budget_usd, stop_on}
-    status: str                  # running | solved | failed | budget_exhausted | error
-    template_variables: dict     # {"K": 16} - a trial that does not record the K it
-                                 # ran at cannot be reproduced
-    target_met: bool             # all fail_to_pass green at the final commit
-    clean: bool                  # zero pass_to_pass broken at the final commit
-                                 # solved == target_met AND clean. Storing the halves
-                                 # separately is the only way to compute a regression
-                                 # rate that is not definitionally zero.
-    solved_at_iteration: int | None   # None = never solved (a CENSORED observation,
-                                 # not a missing one - see the metrics spec)
-    budget_overrun_usd: Decimal  # spend already in flight when the cap hit; recorded
-                                 # rather than hidden
-    queued_ms: int               # excluded from wall_clock, never silently folded in
-    machine_profile: str         # "local-16c-64g" | "runpod-a100" | ... - a speedup
-                                 # number is meaningless without the host it ran on
-    host_concurrency_limit: int  # what the fan-out was actually ALLOWED to run, which
-                                 # is not always the K it asked for
-    error_class: str | None      # "infra" | "provider" | "oracle_tampered" |
-                                 # "base_state_invalid" - trials that failed for
-                                 # reasons that are not the strategy's fault must be
-                                 # excludable from denominators, and visibly so
-    iterations_used: int
-    total_cost_usd: Decimal
-    cost_by_role: dict           # {"planner": 0.42, "worker": 1.10, ...}
-    total_input_tokens: int
-    total_output_tokens: int
-    wall_clock_ms: int           # co-headline: parallelism buys latency with money,
-                                 # so a cost-only board would rank fan-out as worse
-                                 # while hiding the entire point of it
-    serial_equivalent_ms: int | None  # summed step time; wall_clock/serial = speedup
-    integration_conflicts: int   # merges that did not apply cleanly
-    conflicts_resolved: int      # of those, how many a resolver agent/human fixed
-    integration_cost_usd: Decimal  # what rejoining the work cost - the tax on
-                                 # parallelism, and the number that decides whether
-                                 # fan-out actually pays
-    base_commit_sha: str
-    final_commit_sha: str | None
-    branch: str
-    # --- provenance: what makes this number falsifiable by someone else ---
-    harness_version: str         # git describe of LazyAF at trial time
-    image_hashes: dict           # {"lazyaf-base": "1f9bff1a6d1e", ...} - already
-                                 # stamped as content-hash labels by build_images.py
-    model_version: str | None    # the provider's exact version, not just the family
-    determinism: dict            # {temperature, seed, top_p} where exposed
-    suite_version: str           # corpus revision the case came from
-    created_at: datetime
-    completed_at: datetime | None
+P1 and P2 landed in commit `b79bb7f`. **P3 through P6 have not started.** The
+plan of record, with the strict file-ownership split and the acceptance gate, is
+`upcoming/wave10-v1-retirement.md`.
 
-class TrialIteration:
-    id: UUID
-    trial_id: UUID
-    iteration_index: int
-    pipeline_run_id: UUID        # each iteration IS a visible pipeline run
-    commit_sha: str | None       # what the agent produced this cycle
-    lines_added: int
-    lines_removed: int
-    files_touched: int
-    fail_to_pass_passed: int
-    fail_to_pass_total: int
-    pass_to_pass_broken: int     # regressions this iteration introduced
-    criteria_verified: int
-    cost_usd: Decimal
-    input_tokens: int
-    output_tokens: int
-    duration_ms: int
-    created_at: datetime
-```
+| Step | What it is | State |
+|---|---|---|
+| P1 | The graph gains terminal actions: `StepActions`, `describe_terminal_action`, `_run_terminal_action` | **COMPLETE** — `b79bb7f`; `STEP_ACTION_PREFIXES` and `_run_terminal_action` both live in `backend/app/services/pipeline_executor.py` |
+| P2 | `array_to_graph` becomes the faithful, *refusing* boundary converter | **COMPLETE** — `b79bb7f`; `backend/app/schemas/pipeline.py:597` |
+| **P3** | **Every writer emits graphs; every reader stops reading the array; `steps` leaves the wire** | **NOT STARTED — this is the next action.** `PipelineRead.steps`, `PipelineCreate.steps` and `PipelineUpdate.steps` are all still on the wire (`backend/app/schemas/pipeline.py:236,255,268`) |
+| P4 | Migration (next free revision id): backfill `steps` -> `steps_graph`, add the `definition_error` column | NOT STARTED. The `definition_error` *schema field* already exists (`schemas/pipeline.py:283`) but there is no column and no backfill revision. (The uncommitted `0012_workspaces_per_worker.py` in the tree is a **different** concurrent wave's migration — 12.8's backfill will need the next free revision id.) |
+| P5 | Delete the executor's array fork | NOT STARTED — `is_graph`, `_handle_action` and `parse_steps` all still branch in `pipeline_executor.py` |
+| — | **ACCEPTANCE GATE** (`wave10-v1-retirement.md` §5). Nothing below runs until it passes. | — |
+| P6 | Migration (the revision after P4's): drop the `steps` column; the tombstone lands | NOT STARTED |
 
-### Card ↔ Spec Links
+Two things to carry into P3 that the wave doc flags and the tree confirms:
 
-The existing `Card` model gains optional links into the spec layer. Cards are still the active unit of work; the spec layer is the meta layer of *why*.
+- `PipelineRead.definition_error` must land **with** P4's column, not before it —
+  until the column exists the API would read an attribute the ORM does not have.
+- YAML export is a P3-adjacent hazard, not a cosmetic one. `export_pipeline_yaml`
+  (`backend/app/routers/pipelines.py:576`) writes a graph as a `steps` **dict**
+  keyed by step id, while `PipelineYaml.steps` is a **list** — so a graph export
+  cannot be re-imported — and it drops `timeout`, `continue_in_context` and, since
+  P1, `actions` entirely. Once actions are the only way a graph can express
+  `merge:`/`trigger:`, a lossy export silently discards auto-merge. See T18 in the
+  ledger.
 
-```python
-class Card:
-    # ... existing fields ...
-    feature_id: UUID | None          # If this card delivers part of a feature
-    user_story_id: UUID | None       # If this card delivers a story
-    promotes_to_feature: bool        # Marks card for "promote to feature" workflow
-```
+### 2. Then — Milestone 13: the benchmark & evaluation harness
 
-A card with neither link is fine — it's a pure work item (e.g., a bug fix, a chore). When work outgrows a card, the user can promote it to a `Feature` and the card becomes the first child story.
+**NOT STARTED. Zero implementation.** A repo-wide grep for `BenchmarkCase`,
+`StrategyTemplate`, `TrialIteration`, `fail_to_pass` and `cost_to_solve` returns
+exactly one hit, and it is a comment
+(`backend/app/services/agent_run.py:15`). The design is complete and lives in
+this document plus `docs/milestone-13/`. Start at **13.1 (corpus & fixtures)**.
+
+**One blocker the design does not mention.** `backend/app/models/workspace.py` at
+HEAD declares `pipeline_run_id` with `unique=True`, so a pipeline run owns
+exactly one workspace — meaning K parallel agents would share a single checkout.
+That directly contradicts 13.2's "a branch and a workspace per worker", which is
+the substrate the whole parallel-strategy thesis rests on. A concurrent wave is
+fixing it (an uncommitted `backend/alembic/versions/0012_workspaces_per_worker.py`
+is in the working tree). **Confirm that has landed and is migrated before
+starting 13.2.**
+
+Both of Milestone 13's mandatory in-12.x hooks are in place: `StepUsage` (12.5,
+migration `0005_step_usage.py`) and the cost axis in 12.6.5.
+
+### 3. Waiting — Phase 14.5: runner images with inference baked in
+
+**DESIGNED, zero implementation.** No `vllm` or `ollama` appears anywhere under
+`images/` or `scripts/`, and no GPU-yield / drain mechanism exists. Wiring doc:
+`upcoming/wave9-145-runner-images.md`. It blocks nothing today, but it is what
+makes Milestone 13's headline experiment — an expensive planner directing K
+cheap local workers — runnable on hardware the owner already owns.
+
+### 4. Standing — the open-item ledger
+
+The [verified open items](#open-items-verified-2026-08-30) below are the
+non-phase work: two security-posture problems, four correctness defects, and a
+handful of validation gaps. They are carried here so they are not lost between
+milestones. Each was re-checked against the tree on 2026-08-30; the ones fixed
+that day were removed.
 
 ---
 
-## API Summary
+## Status at a glance
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET/POST /api/repos` | Repo management |
-| `POST /api/repos/ingest` | Ingest local repo |
-| `GET/POST /api/repos/{id}/cards` | Card CRUD |
-| `POST /api/cards/{id}/start` | Trigger agent work |
-| `GET/POST /api/pipelines` | Pipeline CRUD |
-| `POST /api/pipelines/{id}/run` | Run pipeline |
-| `GET /api/pipeline-runs/{id}` | Run status |
-| `/git/{id}.git/*` | Internal git server |
-| `/ws` | WebSocket for real-time updates |
+### Milestones
 
-**Specification Layer (Phase 12.2.5+, planned):**
+| Milestone | Status | Evidence |
+|---|---|---|
+| 1-11 (foundation through playground) | COMPLETE | `historical-documents/phase-01…phase-11` |
+| **12 — Runner architecture + spec/eval layer** | **IN PROGRESS** — every phase through 12.7 COMPLETE; **12.8 open** | Detail retired to [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md); 12.8 tracked below |
+| **13 — Benchmark & evaluation harness** | **NOT STARTED** | Zero implementation. Grep for `BenchmarkCase` / `StrategyTemplate` / `TrialIteration` / `fail_to_pass` / `cost_to_solve` across `backend/`, `frontend/`, `cli/`, `tdd/` returns one hit, a comment at `backend/app/services/agent_run.py:15`. Design: this document + `docs/milestone-13/` |
+| **14 — Self-hosted OpenAI-compatible endpoints** | **COMPLETE** (2026-08-30) | Commit `4b429c6`: 56 files, ~21.5k lines. `ModelEndpoint` + migration `0011_model_endpoints.py`, capability probe, agent harness in `runner-common/runner_common/harness/`, stdlib mock OpenAI server, Endpoints UI. Out of the 12.x sequence |
+| **14.5 — Runner images with inference baked in** | **DESIGNED** | Zero implementation: no `vllm`/`ollama` anywhere under `images/` or `scripts/`; no GPU-yield mechanism exists. Doc: `upcoming/wave9-145-runner-images.md` |
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET/POST /api/features` | Feature CRUD (cross-repo) |
-| `GET/POST /api/features/{id}/stories` | User story CRUD |
-| `GET/POST /api/stories/{id}/criteria` | Acceptance criterion CRUD |
-| `GET/POST /api/test-refs` | Test reference registry |
-| `POST /api/test-refs/reconcile` | Compare repo manifest vs registry |
-| `POST /api/test-results/ingest` | Bulk ingest TestRuns from a step |
-| `GET /api/criteria/{id}/history` | Pass/fail history per (model, prompt) |
-| `GET/POST /api/experiments` | Experiment CRUD + launch |
-| `GET /api/experiments/{id}/results` | Matrix results, ready for leaderboard |
-| `GET/POST /api/prompts` | Prompt template + version CRUD |
-| `GET /api/leaderboards/feature/{id}` | Aggregated pass-rate per (prompt, model) |
+### Milestone 12 phases
 
-Full API: 31 MCP tools for Claude Desktop orchestration (will grow with spec-layer tools).
-
----
-
-## Agent Guidelines for This Repo
-
-When working on LazyAF, agents should:
-
-1. **Understand the architecture**: Backend (FastAPI) + Frontend (Svelte) + Runners (Docker)
-2. **Check existing patterns**: Look at similar routers/services before creating new ones
-3. **Run tests after changes**: `pytest` for backend, `npm test` for frontend
-4. **Use the internal git server**: Changes go to internal server, not GitHub
-5. **Follow the step type model**: All work is agent/script/docker steps
-6. **Reference historical docs**: See `historical-documents/` for completed phase details
-
----
-
-## Completed Phases Summary
-
-Detailed documentation for completed phases is in `historical-documents/`.
-
-| Phase | Name | Status | Key Deliverable |
-|-------|------|--------|-----------------|
-| 1 | Project Foundation | COMPLETE | `docker-compose up` runs both services |
-| 2 | Repo & Card Management | COMPLETE | Create cards on kanban board |
-| 3-3.75 | Runner Pool & Git Server | COMPLETE | Internal git server, runner isolation |
-| 4 | Agent Integration | COMPLETE | Cards trigger Claude Code |
-| 5 | Review Flow | COMPLETE | Approve/reject workflow |
-| 6 | Polish | ONGOING | Quality of life improvements |
-| 7 | MCP Interface | COMPLETE | 31 tools for Claude Desktop |
-| 8 | Test Result Capture | COMPLETE | Test results displayed in UI |
-| 8.5 | CI/CD Foundation | COMPLETE | Script/docker step types |
-| 9-9.1 | Pipelines | COMPLETE | Multi-step workflows with context |
-| 12.0 | Unify Entrypoints | COMPLETE | runner-common installed system-wide in images/agent-base (import asserted at build time) and the three monolithic entrypoints are deleted from HEAD (2026-08-30) |
-| 12.1 | LocalExecutor + State Machine | COMPLETE | Step state machine, idempotency, LocalExecutor, crash recovery |
-| 0 | Self-Hosting Bootstrap | COMPLETE | LazyAF runs LazyAF's CI: tiered dogfood pipeline + ci_gate floors/skip baseline, alembic, test-mode API |
-| 12.2-INT | Workspace Persistence + Executor Wiring | COMPLETE | Workspace model/service, repo population, router -> LocalExecutor by default, per-step `executor` recorded |
-| 12.2.5 | Specification Data Model | COMPLETE | Feature/UserStory/AcceptanceCriterion/PromptTemplate + API + MCP + Specs UI |
-| 12.3 | Control Layer & Step Images | COMPLETE | Built lazyaf-* images, in-container control runtime -> live steps API, terminal reconciliation |
-
----
-
-## Current Status
-
-> Last updated 2026-08-30. Plan of record: "Milestone 12 —
-> Attempt #3 Roadmap" below. Salvage map + post-mortem of the abandoned first
-> attempt: `upcoming/failure_01-salvage-audit.md`.
-
-**Milestone 12 progress: every phase through 12.7 is COMPLETE**, each signed off
-by its own dogfood exit gate (LazyAF's CI, running on LazyAF). 12.8 is the only
-one open, and it is now unblocked: the owner retired the v1 array format on
-2026-08-30. T1 stands at 4523 passed / 0 failed (floor 4432), T2 at 77, T3 at 22.
-
-Milestone 14 (self-hosted OpenAI-compatible model endpoints) landed the same
-day and is OUT of the 12.x sequence - it is listed separately below.
+Every phase below is COMPLETE and committed. Full narrative, deliverables and
+exit gates: [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md).
 
 | Phase | Status | Evidence |
-|-------|--------|----------|
-| 0 — Self-hosting bootstrap | COMPLETE | Push -> tiered dogfood pipeline, ci_gate floors + skip baseline enforced |
-| 12.2-INT — Workspace persistence + executor wiring | COMPLETE | Steps run in ephemeral containers on persistent volumes; `executor='local'` verified per run |
-| 12.2.5 — Specification data model | COMPLETE | Feature/UserStory/AcceptanceCriterion/PromptTemplate + API + MCP + Specs UI, seeded with the three north-star stories |
-| 12.3 — Control layer & step images | COMPLETE | Real `lazyaf-{base,claude,test-runner}:dev` images, in-container runtime reporting to `/api/steps/*`, run #11 passed the gate |
-| 12.2.6 — Test result tie-back | COMPLETE | A push-triggered run wrote a TestRun joined to criterion fb95f11d: `passed / commit 2a513dd4 / main / us1.pipeline-outcome-gates-branch` |
-| 12.4 — Script/docker steps fully ephemeral | COMPLETE | Runners agent-only; script/docker deleted from the three images AND runner-common; DooD anchor retired |
-| 12.5 — Agent steps via the control layer | COMPLETE | Runners idle on every default path (asserted); StepUsage live at 1163/7 tokens on the gate |
-| 12.6 — RemoteExecutor + runner agents | COMPLETE | 74 dormant contract tests now execute (0 skipped), polling stack DELETED, all 7 polling endpoints 404 on a live probe |
-| 12.6.5 / 12.6.6 / 12.7 | COMPLETE | Experiment finalize is one atomic CAS; spec context reaches the agent; debug re-run ships its gated T2/T3 coverage and the CLI client. Landed 2026-08-30, T1 green at 4523 |
-| 12.8 — Cleanup & polish | IN PROGRESS | Owner retired the v1 array format (2026-08-30). Plan: upcoming/wave10-v1-retirement.md. P1 (graph gains terminal actions) and P2 (faithful refusing converter) are landing; P3-P6 not started |
+|---|---|---|
+| 0 — Self-hosting bootstrap | COMPLETE | Push to the internal remote runs the tiered dogfood pipeline; `scripts/ci_gate.py` enforces `tdd/skip_baseline.json` and the per-tier floors in `tdd/tier_floors.json` |
+| 12.0 — Unify runner entrypoints | COMPLETE | `images/agent-base/Dockerfile` installs `runner-common` system-wide (line 29) and **asserts the import at build time** (line 34: `python3 -c "import runner_common.agent_wrapper as w; assert callable(w.main)"`). `images/claude` and `images/gemini` inherit from it. The three monolithic entrypoints were deleted in `67a4e1c` |
+| 12.1 — LocalExecutor + step state machine | COMPLETE | `StepExecution` with unique `execution_key`, `StepStateMachine`, `recover_orphaned_executions()` at startup |
+| 12.2-INT — Workspace persistence + executor wiring | COMPLETE | Run `71d56980` (push-triggered) executed all 6 steps in ephemeral containers on a persistent volume; `verify_executor` confirmed `executor='local'` for every one |
+| 12.2.5 — Specification data model | COMPLETE | `backend/app/models/spec.py`, migration `0003_spec_layer.py`, live routes `/api/features`, `/api/user-stories`, `/api/criteria`, `/api/prompt-templates`; three north-star stories seeded |
+| 12.3 — Control layer & step images | COMPLETE | `lazyaf-{base,claude,test-runner}:dev` built by `scripts/build_images.py` with content-hash labels; in-container runtime reports to `/api/steps/*`; run #11 passed the gate |
+| 12.2.6 — Test result tie-back | COMPLETE | A push-triggered run wrote a TestRun joined to criterion `fb95f11d` (`passed` / commit `2a513dd4` / branch `main` / `us1.pipeline-outcome-gates-branch`); 9 TestRefs linked, 0 orphans. `GET /api/criteria/{id}/history` live (`routers/test_results.py:99`) |
+| 12.4 — Script/docker steps fully ephemeral | COMPLETE | Script/docker execution removed from the images **and** from `runner-common`; the interim DooD anchor retired |
+| 12.5 — Agent steps via the control layer | COMPLETE | Migration `0005_step_usage.py`; `StepUsage` live on the gate at 1163/7 tokens; `POST /api/steps/{id}/usage` |
+| 12.6 — RemoteExecutor + runner agents | COMPLETE | Ported contract suite executes at zero skips; polling stack deleted and policed by `tdd/unit/services/test_no_legacy_code.py` (6 assertions, two mechanisms that cannot silently skip); all seven polling endpoints 404 on a live probe. Migrations `0006`, `0007` |
+| 12.6.5 — Experiments & leaderboards | COMPLETE | Migration `0010_experiments.py`; `GET /api/experiments/{id}/leaderboard` and `GET /api/leaderboards/feature/{id}` (`routers/experiments.py:521,549`); finalize is one atomic CAS |
+| 12.6.6 — Spec-curated agent context | COMPLETE | `backend/app/routers/spec_context.py`; `GET /api/cards/{id}/spec-context`; `card_id` resolves from step config as well as run context |
+| 12.7 — Debug re-run mode | COMPLETE | `backend/app/routers/debug.py`, migration `0009_debug_sessions.py`, `images/debug-sidecar/`, `WS /api/debug/{id}/terminal`, `lazyaf debug` shipped in the wheel |
+| **12.8 — Retire the v1 array format** | **IN PROGRESS** | P1+P2 landed (`b79bb7f`); **P3-P6 not started.** Plan: `upcoming/wave10-v1-retirement.md`. See [Phase 12.8](#phase-128--retire-the-v1-array-pipeline-format-in-progress) |
+| 12.9 — Kubernetes orchestrator | NOT STARTED (deliberately future) | Scope decision 2026-08-29: K8s stays out of Milestone 12 |
 
-**Phase 12.6: COMPLETE (2026-08-30).** The 74 contract tests ported dormant in
-Phase 0 all execute now, zero skipped, and git diff proves neither file was
-edited to fit the implementation - the spec came first by two months and won.
-The polling stack is DELETED: no job_queue, no runner_pool (importing them
-raises ModuleNotFoundError, policed by test_no_legacy_code with two mechanisms
-that cannot silently skip), all seven polling endpoints 404 on a live probe,
-and the three monolithic runner images are gone. Steps now run local OR remote
-over a WebSocket runner protocol, with the step container still POSTing to
-/api/steps/* either way because the step JWT is location-independent.
+> **Correction, 2026-08-30.** Earlier revisions of this file carried a note
+> saying 12.0's COMPLETE mark "remains aspirational — the three runner images
+> still ship monolithic entrypoints and do not import `runner-common`". That
+> note was stale and is **wrong**: the images import `runner-common` and assert
+> it at build time (see the 12.0 row above), and the monolithic entrypoints were
+> deleted in `67a4e1c`. The same revisions also described 12.6.5, 12.6.6 and
+> 12.7 as in progress after they had landed, and said 12.8 was blocked on a
+> decision the owner had already made. All four are corrected here.
 
-**Execution today**: script/docker steps flow pipeline_executor -> ExecutionRouter ->
-LocalExecutor -> ephemeral control-mode container on a persistent workspace volume,
-reporting status/logs to the live steps API, and shipping a test-result
-manifest that joins back to acceptance criteria. Agent steps still take the
-legacy card -> job -> queue -> polling runner path until 12.5.
+### Numbers
 
-**Phases 12.2.6 + 12.4: COMPLETE (2026-08-30).** The tie-back is proven on real
-data, not just in tests: a push-triggered dogfood run wrote a TestRun joined to
-criterion fb95f11d - `passed | commit 2a513dd4 | branch main |
-us1.pipeline-outcome-gates-branch`. 9 TestRefs seeded and linked, 0 orphans.
-Suite 1731 passed; gates T1 1657 / T2 60 / T3 17. Two second-order lessons, both
-now pinned by tests: 12.3 moved alembic into the image so production boots
-self-sufficiently, which meant DEV silently ran a pre-0004 versions directory
-and believed itself at head (dev now mounts ./backend/alembic like app code);
-and because manifest delivery is deliberately non-fatal to a step, the first
-live run shipped three manifests into 404s and still gated clean - the gate now
-fails on any manifest delivery problem, closing the R7 gap where 12.2.6 landed
-without extending the ratchet to cover itself.
-
-**Still true from the January-era assessment**: Phase 12.0's COMPLETE mark in the
-table above remains aspirational — the three runner images still ship monolithic
-entrypoints and do not import `runner-common` (adoption lands in 12.5/12.8).
-
-**Abandoned attempt**: branch `failure_01` (12.0 -> 12.7 in two days, 2026-01-03/04).
-Reference only — never merge it.
-
-**Phase 0: COMPLETE (2026-08-29).** LazyAF gates LazyAF: a push to the internal
-remote triggers the tiered dogfood pipeline (T1 1159 / T2 19 / T3 17 executed,
-all three ci_gate floors enforced, run `cda4ddce` PASSED via push trigger).
-Definition sync-on-push, trigger dedup, alembic migrations, test-mode API,
-12.6 contract suite (dormant), frontend testids + vitest layer, Playwright
-dogfood-live spec all landed; 10 confirmed review findings fixed pre-commit.
-
-**Phase 12.2-INT + 12.2.5: COMPLETE (2026-08-29).** Dogfood CI runs end-to-end
-on the new architecture: run 71d56980 (push-triggered) executed every step in
-ephemeral containers on a persistent workspace volume, verify_executor
-confirmed executor='local' for all 6 steps, all tier gates green (T1 1379 /
-T2 41 / T3 17), workspace created+cleaned (0 leaked). Spec layer live with
-the three north-star stories seeded; live WS step streaming in the UI with a
-contract-pinning test. Ten more confirmed review findings fixed pre-commit;
-dogfood run cccae257 caught a DooD landmine-2 seam the review missed (fixed).
-
-**Phase 12.3: COMPLETE (2026-08-29).** Real images (lazyaf-{base,claude,
-test-runner}:dev, reproducible content-hash builds), in-container control
-runtime reporting to the live steps API, one reporting path with terminal
-reconciliation, dogfood CI fully on the new stack. Exit gate: run #11 passed
-with all tier gates green in control-mode containers and verify_executor
-confirming executor='local' + delivered logs. Six dogfood iterations (#5-#11)
-each caught a real environment seam host testing could not: repo uid
-ownership, async completion timing, socket group across gosu, platform-
-dependent tree-hash collation, cross-uid git trust, docker client timeout
-under DooD load, sibling-network reachability — all regression-tested now.
-
-**Wave 3 (12.2.6 + 12.4): PAUSED mid-implementation (2026-08-29, quota).**
-Partial, unverified agent edits sit uncommitted in the working tree; nothing
-pushed. Resume = reconcile the partial tree against the wave's pinned contracts,
-finish, review, then dogfood-gate it.
-
-Phase 12.1 deliverables (COMPLETE):
-  - `StepExecution` model with unique `execution_key` for idempotency
-  - `StepExecutionStatus` enum: pending → assigned → preparing → running → completing → completed/failed/timeout
-  - `StepStateMachine` class with valid transition enforcement
-  - `ExecutionService` for idempotent get_or_create semantics
-  - `LocalExecutor` for Docker-based step execution (spawns containers, streams logs, handles timeouts)
-  - Crash recovery: `recover_orphaned_executions()` on backend startup marks orphaned executions as failed
-  - Docker socket mounted in docker-compose for local execution mode
-  - 92 unit tests, 19 integration tests, 1 skipped (async timeout handling TODO)
-  - Chaos tests: OOM handling, Docker unavailable, connection timeouts
-
-The target workflow is now fully functional:
-1. Ingest repos via CLI
-2. Create cards describing features (or CI steps: script/docker)
-3. Start work -> runner clones repo, executes step
-4. Card completes -> reaches "in_review" status
-5. **Pipeline triggers automatically** (if configured with card_complete trigger)
-6. Pipeline runs tests/validation steps
-7. **On pass**: Card auto-merged and marked done
-8. **On fail**: Card marked failed (user can retry)
+| Thing | Value | Source |
+|---|---|---|
+| T1 (unit + non-Docker integration) | **4724 executed, 0 failed** | Measured on the 12.8 P1-P2 landing (`b79bb7f`), which added ~2,240 lines of test. `tdd/tier_floors.json` still records the previous green measurement — floor 4432, measured 4523 on 2026-08-30 — because the floor is only raised on a deliberate ratchet. **The floor is stale-low by design, not by neglect; raise it on the next green T1.** |
+| T2 (Docker integration) | 77 executed, floor 75 | `tdd/tier_floors.json` |
+| T3 (e2e quick) | 22 executed, floor 21 | `tdd/tier_floors.json` |
+| Alembic head (committed) | **`0011_model_endpoints`** | `git ls-files backend/alembic/versions/` — 0001-0007, 0009, 0010, 0011. There is no `0008`. `0012_workspaces_per_worker.py` exists in the working tree but is **not committed** (a concurrent wave) |
+| MCP tools | 45 | `grep -c '@mcp.tool' backend/app/mcp/server.py` |
+| Release CI | Publishes **9 images** to GHCR: 3 service (`backend`, `frontend`, `runner-agent`) + 6 step (`base`, `agent-base`, `claude`, `gemini`, `test-runner`, `debug-sidecar`) | `.github/workflows/images.yml`; the step list is read from `scripts/build_images.py`'s `IMAGES` table, not duplicated |
+| Release tags | **None. `git tag` is empty.** `release.yml` triggers only on `push: tags: ['v*']` (plus manual dispatch), so the tag path has never fired. `images.yml` also runs on push to `main`. | `.github/workflows/release.yml:51-54`, `images.yml:60-64` |
 
 ---
 
-## Milestone 12 — Attempt #3 Roadmap (2026-08-29)
+## Open items (verified 2026-08-30)
+
+Findings from the adversarial QA pass (`upcoming/qa-triage.md`, which keeps the
+reproductions) plus the security review, carried here so they survive between
+milestones. **Every item below was re-checked against the tree on 2026-08-30**
+and the file:line evidence is the check. Items fixed that day were removed —
+they are listed at the bottom so the shrinkage is visible rather than silent.
+
+These are not a phase. Fold them into whatever phase touches the same file, or
+schedule the security block on its own.
+
+### Security posture
+
+**S1 — No authentication on any human-facing router, while compose binds
+`0.0.0.0` and mounts the Docker socket.** CONFIRMED.
+Not one of `cards.py`, `pipelines.py`, `repos.py`, `spec.py`, `experiments.py`,
+`model_endpoints.py` or `jobs.py` declares any dependency other than `get_db` —
+there is no auth dependency anywhere on the human-facing surface. Machine
+surfaces are the exception and *are* authenticated: `steps.py` and
+`ws_runners.py` verify the step / runner JWT.
+
+Meanwhile `docker-compose.yml:5` publishes `"8000:8000"` — no `127.0.0.1`
+prefix, so the API listens on every interface — and `docker-compose.yml:14`
+mounts `/var/run/docker.sock` into the backend, which is root-equivalent on the
+host. The internal git server rides the same unauthenticated port.
+
+The README is honest about the posture ("No authentication, and it holds your
+Docker socket… Run it somewhere you trust, bound to localhost") but **no compose
+file in the repo actually binds to localhost** — the only `127.0.0.1` in
+`docker-compose.yml` is inside a healthcheck (line 144). So the instruction and
+the shipped default disagree, and the default is the permissive one. Minimum
+fix: make `127.0.0.1:8000:8000` the default binding and require an explicit
+opt-out to widen it.
+
+Related and still open: **T21** — the playground `internal/*` endpoints were
+reported unauthenticated. *Not re-verified this pass:*
+`backend/app/routers/playground.py` and `services/playground_service.py` were
+under concurrent edit and deliberately not opened. Re-check before closing.
+
+**S2 — Step containers have no CPU or PID limit, and there is no fan-out cap.**
+CONFIRMED. `backend/app/services/execution/local_executor.py:773-774` sets
+`mem_limit` when a step asks for one and sets nothing else — no `nano_cpus`, no
+`cpu_quota`, no `pids_limit`. And `pipeline_executor.py` has no semaphore or
+`max_parallel` of any kind, so a wide graph fans out as far as its edges allow.
+One pipeline can starve the host the backend is running on.
+
+### Correctness
+
+**T5 — The run-list serializer ships every step's full logs.** CONFIRMED.
+`GET /api/pipeline-runs` and `GET /api/pipelines/{id}/runs`
+(`backend/app/routers/pipelines.py:399,420`) both return
+`list[PipelineRunRead]`; `PipelineRunRead.step_runs` is `list[StepRunRead]`
+and `StepRunRead.logs` is a plain `str` (`schemas/pipeline.py:349`). With
+`limit` up to 100 runs, a dashboard poll drags every log line of every step of
+every listed run across the wire. The fix is a list-shaped read model without
+`logs`; the per-step log endpoint already exists
+(`GET /api/pipeline-runs/{run_id}/steps/{step_index}/logs`).
+
+**T9 — Duplicate graph edges dispatch a step twice — and now fire its effects
+twice.** CONFIRMED.
+`graph_definition_errors` says so in its own docstring: duplicate entry points
+and duplicate parallel edges are "NOT checked here (deliberately)"
+(`pipeline_executor.py:891-894`). In `_handle_graph_step_complete`, the fan-out
+loop appends one entry to `steps_to_execute` per matching edge
+(`pipeline_executor.py:4645-4665`), and the already-completed/already-active
+guard is evaluated *before* `_reserve_active_steps` runs — so two identical
+`A -> B` edges both pass the guard and `_execute_graph_step` is called twice
+for B.
+
+Since 12.8 P1 this got sharper. Terminal actions are keyed to node *completion*,
+not to the edge (`pipeline_executor.py:4613-4634`), and there is no
+already-handled guard at the entry of `_handle_graph_step_complete` — so a node
+that completes twice fires its `merge:` / `trigger:` twice. A duplicated edge is
+now a double merge or a duplicate spawned card, not just a wasted container.
+Cheapest fix: reject duplicate edges in `graph_definition_errors` (422 at the
+boundary), and de-duplicate `steps_to_execute` as defence in depth.
+
+**T10 — `POST /api/pipelines/{id}/run` walks the whole graph inside the request
+handler.** CONFIRMED. `run_pipeline` still does
+`await pipeline_executor.start_pipeline(...)` inline
+(`backend/app/routers/pipelines.py:309,378`), and there is no bound anywhere on
+graph size — no `MAX_STEPS`, no step-count check in `pipeline_executor.py` or
+`schemas/pipeline.py`. This is the one place the codebase departs from standing
+rule **R5** (async-first: "HTTP/git-push handlers return a run id immediately").
+Measured at 299 s on a 400-step chain in the QA pass.
+
+**T18 — YAML export is lossy, and for graphs not re-importable.** CONFIRMED, and
+worse since 12.8 P1. `export_pipeline_yaml`
+(`backend/app/routers/pipelines.py:576-620`) emits a graph's `steps` as a **dict
+keyed by step id** with `on_success` holding a list on fan-out, while the import
+schema `PipelineYaml.steps` is a `list[PipelineStepYaml]` whose `on_success` is a
+single `str` (`schemas/lazyaf_yaml.py:35-60,101`). The export also drops
+`timeout`, `continue_in_context`, and — the new one — `actions`, which since P1
+is the *only* way a graph expresses `merge:` and `trigger:`. Exporting a pipeline
+that auto-merges and re-importing it produces a pipeline that does not.
+
+### Validation and robustness
+
+**T13 — `.lazyaf/pipelines/*.yaml` is a second, unvalidated definition door.**
+CONFIRMED. `PipelineStepYaml.type` is `str = Field("script", …)`
+(`schemas/lazyaf_yaml.py:54`) — a bare string, so `type: banana` is accepted —
+and `timeout: int = Field(300, …)` (line 58) has no bounds, so `timeout: -5`
+passes. Both should be a `Literal` and a bounded `int` respectively; the platform
+API and the YAML door should validate identically.
+
+**T14 — A malformed pipeline YAML vanishes from the listing and 500s on fetch
+with the raw Python exception.** CONFIRMED. The list endpoints swallow it with
+`except Exception … continue` and a bare `print`
+(`routers/lazyaf_files.py:83-86` and `179-182`), so a broken file is invisible;
+fetching it directly raises
+`HTTPException(500, detail=f"Error parsing pipeline file: {e}")`
+(lines 128, 225, 279). Silent for the case that matters, loud and leaky for the
+case that does not.
+
+**T20 — The usage manifest accepts impossible accounting.** CONFIRMED.
+`UsageManifest` (`backend/app/schemas/usage.py:57-75`) declares
+`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
+`wall_clock_ms`, `container_seconds` and `gpu_fraction` with no `Field`
+constraints at all — negative tokens, negative wall-clock and
+`gpu_fraction: 99999` are all valid. This one matters more than it looks:
+Milestone 13's headline metric is cost-to-solve, computed from exactly these
+numbers.
+
+**T22 — Internal exception text leaks into user-facing `detail` strings.**
+CONFIRMED. `routers/git.py:71,73,100,104,154,156`,
+`routers/lazyaf_files.py:128,225,279,307` and `routers/pipelines.py:367` all
+interpolate a caught exception straight into the response body.
+
+**T24 — Assorted polish.** Partly fixed on 2026-08-30 ("1 steps" and the
+long-name overflow landed in `a39cb24`). The remainder — 400-vs-409
+inconsistency, unbounded `commits?limit`, silent PATCH drops — was not
+re-verified this pass.
+
+### Closed on 2026-08-30 — verified fixed, not just claimed
+
+Kept as a short list so a reader can tell the ledger shrank on evidence.
+
+| Was | Fixed by | Verified how |
+|---|---|---|
+| T1 — every timestamp naive UTC, durations render negative | `db5f9f5` | `UTCDateTime` is the serialization type throughout `schemas/pipeline.py` |
+| T2 — card lifecycle had no state guards; `PATCH` could fabricate `done` | `db5f9f5` | `_require_status` + one transition table in `routers/cards.py` |
+| T3 — unhandled DB exceptions returned plain-text 500s and killed the connection | `db5f9f5` | Structured JSON handler; connection preserved |
+| T4 — structurally broken graphs reported PASSED | `db5f9f5` | `_verify_graph_coverage` now gates every success verdict (`pipeline_executor.py:2055`) |
+| T6 — `start`/`retry` were read-check-write races | `db5f9f5` | `_claim_card` is a conditional UPDATE whose rowcount is the decision (`routers/cards.py:266,1019`) |
+| T8 — no length bound on any name field | `db5f9f5` | Constrained `Name` / `Body` string types (`schemas/_strings.py:76,89`) applied across the schemas |
+| T12 — deleting a pipeline/repo mid-run cascaded the live run away | `db5f9f5` | Named in the commit; guard added in the pipeline/repo delete paths |
+| T16 — the seeded review card pointed at a branch nothing created | `db5f9f5`, `5334b09` | Seed is idempotent and creates the branch |
+| T17 — pipeline name went raw into `Content-Disposition` | `db5f9f5` | `_content_disposition()` now owns the header (`routers/pipelines.py:642`) |
+| T19 — ingested repo said `main`, git HEAD said `master` | `db5f9f5` | `dulwich init_bare` HEAD now matches the row |
+| T23 — step/runner JWT secrets defaulted to published constants | `acb7408` | `backend/app/config.py` refuses `RETIRED_PUBLIC_SECRETS` and `_PLACEHOLDER_SECRETS`, raising `MissingSecretError`; the only escape is `LAZYAF_DEV_EPHEMERAL_SECRETS=1` |
+| T7 — UI never resynced after a dropped socket | `a39cb24` | Per the commit: `ConnectionStatus` names staleness and reconnects without a reload. *Frontend files were under concurrent edit and not opened; this rests on the commit message, not a direct read.* |
+| T15 — `resolve-conflicts` had no state guard | `db5f9f5` | `_require_status(RESOLVE_CONFLICTS_FROM)` plus an atomic claim (`routers/cards.py:900`). The separate "force-merges invented content with no conflict present" half was **not** re-verified — treat that half as open until someone checks |
+
+---
+
+### Completed phases — where the detail went
+
+Every phase from 1 through 12.7 is COMPLETE. The narrative, deliverables, exit
+gates and test-first tables live in `historical-documents/`; this file keeps only
+the status line and the evidence.
+
+| Phase | Detail |
+|---|---|
+| 1 — Project Foundation | [`phase-01-project-foundation.md`](historical-documents/phase-01-project-foundation.md) |
+| 2 — Repo & Card Management | [`phase-02-repo-and-cards.md`](historical-documents/phase-02-repo-and-cards.md) |
+| 3-3.75 — Runner Pool & Git Server | [`phase-03-runner-pool.md`](historical-documents/phase-03-runner-pool.md) |
+| 4 — Agent Integration | [`phase-04-agent-integration.md`](historical-documents/phase-04-agent-integration.md) |
+| 5 — Review Flow | [`phase-05-review-flow.md`](historical-documents/phase-05-review-flow.md) |
+| 6 — Polish (ongoing QoL) | [`phase-06-polish.md`](historical-documents/phase-06-polish.md) |
+| 7 — MCP Interface | [`phase-07-mcp-interface.md`](historical-documents/phase-07-mcp-interface.md) |
+| 8 — Test Result Capture | [`phase-08-test-capture.md`](historical-documents/phase-08-test-capture.md) |
+| 8.5 — CI/CD Foundation | [`phase-08.5-cicd-foundation.md`](historical-documents/phase-08.5-cicd-foundation.md) |
+| 9-9.1 — Pipelines | [`phase-09-pipelines.md`](historical-documents/phase-09-pipelines.md) |
+| 10 — Events & Triggers | [`phase-10-events-and-triggers.md`](historical-documents/phase-10-events-and-triggers.md) |
+| 11 — Agent Playground | [`phase-11-agent-playground.md`](historical-documents/phase-11-agent-playground.md) |
+| — Pipeline node graph UI ("graph creep") | [`graph-creep.txt`](historical-documents/graph-creep.txt) |
+| **0, 12.0-12.7 — Runner architecture + spec/eval layer** | [**`phase-12-runner-architecture.md`**](historical-documents/phase-12-runner-architecture.md) — architecture reference, attempt-#3 phase plans with exit gates, the January-era per-phase specs, and the superseded January plan for 12.8 |
+
+Implementation-level wave documents (contracts, review findings, verification
+transcripts) stay in `upcoming/`: `wave2-123-wiring.md`, `wave4-125-wiring.md`,
+`wave5-126-wiring.md`, `wave6-1265-wiring.md`, `wave6-1266-wiring.md`,
+`wave6-127-wiring.md`, `wave8-m14-wiring.md`, `wave9-145-runner-images.md`,
+`wave10-v1-retirement.md`. QA evidence: `qa-triage.md` and the
+`qa-findings-*.md` set. Post-mortem of the abandoned first attempt:
+`failure_01-salvage-audit.md`.
+
+---
+
+## Milestone 12 — Attempt #3 Roadmap
+
+> **Where it stands (2026-08-30): every phase through 12.7 is COMPLETE and
+> committed; 12.8 is the only one open.** The per-phase plans, deliverables
+> and exit gates for the completed phases were retired on 2026-08-30 to
+> [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md).
+> What stays here is what still governs: the history, the north-star user
+> stories, the standing rules, the open phase, and the decision log.
 
 > Scope decision (owner, 2026-08-29): finish EVERYTHING numbered 12.x — the runner
 > architecture arc AND the spec/eval layer (12.2.5, 12.2.6, 12.6.5, 12.6.6).
@@ -778,234 +427,131 @@ R8 UI SHIPS WITH ITS SPEC. Every phase that ships or rebuilds a UI surface
    "UI shows it live" in an exit gate always means a named spec, never vibes.
    Pure store logic gets vitest coverage (first frontend unit layer).
 
-### Sequencing
+### Standing operational policy
 
-Track A = execution arc (risky, strictly ordered).
-Track B = spec/eval layer (additive; interleaves, sync points labeled).
-Migration policy: alembic migrations land serialized on main only; Track B
-rebases before generating. Startup runs `alembic upgrade head`; existing
-unversioned dev DBs are stamped at baseline first.
+Still governing, carried over from the attempt-#3 sequencing note. (The Track A
+/ Track B split it accompanied is now history — see
+[`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md)
+Part 1.)
 
-#### Phase 0 — Self-hosting bootstrap + salvage quick wins  [prologue]  ✅ COMPLETE
+- **Alembic migrations land serialized on `main` only**; a parallel wave rebases
+  before generating one. Startup runs `alembic upgrade head`; an existing
+  unversioned dev DB is stamped at baseline first.
+- Committed head is **`0011_model_endpoints`** (there is no `0008`). Two waves
+  currently want the next id — 12.8 P4's backfill and the uncommitted
+  `0012_workspaces_per_worker.py` — so **check `git ls-files
+  backend/alembic/versions/` before you generate**, not just the directory
+  listing.
 
-0a DOGFOOD CI LIVE (US-1 minimal form, on the legacy path):
-   - Pipeline-definition sync on push: the receive-pack handler re-reads
-     `.lazyaf/pipelines/` from the pushed commit and creates/refreshes the
-     materialized platform pipeline (including a new `triggers:` binding in the
-     yaml schema) BEFORE trigger matching. Without this, repo-defined pipelines
-     are invisible to push triggers and CI changes take effect one push late —
-     unacceptable for self-hosted CI.
-   - Tiered dogfood suite (one step per tier, not one pytest invocation):
-     T1 unit + non-Docker integration (runs in any runner);
-     T2 Docker-dependent integration (runs on a dedicated CI runner service
-        with the Docker socket mounted — deliberate interim DooD, retired when
-        step containers get a socket option in 12.4);
-     T3 e2e quick tier with compose-network URLs (not localhost).
-   - Gate step: parse junitxml/-rs output; fail on out-of-baseline skips or
-     executed-count below committed per-tier floors (R4 mechanism).
-   - Wire trigger_dedup into trigger_service (two rapid pushes = one run).
-0b SALVAGE QUICK WINS (audit order): sprawl.md (done); data-testid sweep +
-   vite proxy env var (hand-apply equivalents in the graph editor); 12.6
-   contract suite + RunnerStateMachine ported dormant (baseline'd per R4) with
-   IDLE->DEAD and DEAD->DISCONNECTED added; alembic scaffold + clean
-   regenerated baseline + upgrade-at-startup + stamp-if-existing, replacing
-   database.py's PRAGMA/except-pass hacks. (Before 12.2-INT adds tables.)
-0c TEST-HARNESS HARDENING: env-gated test-mode API rebuilt (reset/seed + an
-   in-memory singleton reset hook); Playwright harness fixed (workers=1 real
-   tier or per-worker namespacing); skip-baseline gate implemented (R4);
-   minimal vitest harness for stores; dogfood-live Playwright spec (push ->
-   run appears -> status transitions + log lines stream over WS) per R8.
-0d HYGIENE: delete stale .pyc ghosts (images/, backend/alembic/versions/);
-   retire graph-creep.txt to historical-documents/; delete dead
-   PipelinesPanel.svelte; PLAN.md status corrected (done — this document).
+---
 
-   EXIT GATE: a push to the internal remote runs all three tiers through
-   LazyAF itself, green, with per-tier executed counts >= committed floors;
-   two rapid pushes produce one run; dogfood-live spec passes.
+### Phase 12.8 — Retire the v1 array pipeline format [IN PROGRESS]
 
-#### Phase 12.2-INT — Workspace persistence + wiring the dark libraries [A]  ✅ COMPLETE
+The last open phase of Milestone 12, and the only one with work left in it.
+Plan of record — ordered phases, strict file ownership, pinned cross-agent
+contracts, and the acceptance gate: **`upcoming/wave10-v1-retirement.md`**.
 
-The step both prior attempts died before/at. Deliverables:
-   - Alembic-born Workspace model (ADAPT failure_01 schema onto main's
-     WorkspaceStatus vocabulary; full run id in volume names).
-   - WorkspaceService rebuilt on main's tested locking + state machines
-     (failure_01's service is the shape, not the code). Lifecycle includes
-     cleanup on completion AND failure, plus a periodic orphan audit task.
-   - NETWORK PLUMBING (pulled forward from 12.3 — the clone needs it): named
-     network declared in compose; settings-driven network name + backend/git
-     URL; LocalExecutor gains a network kwarg.
-   - WORKSPACE POPULATION (net-new; no attempt ever built it): helper/init
-     container on the named network clones from the internal git server into
-     the named volume at /workspace/repo (matching LocalExecutor's
-     working_dir, which becomes config-driven).
-   - LocalExecutor hardening: shell-wrap script commands (['bash','-c',...] —
-     docker-py shlex-splits raw strings); run the ported migration-compat
-     matrix (old YAML, missing image, multiline commands, all step types)
-     against it; addressing enum per R6.
-   - pipeline_executor rewiring per R5: asyncio task per run driving main's
-     pipeline_state_machine; ExecutionRouter -> LocalExecutor for script/
-     docker steps, default-ON (R1); legacy retained for agent steps (R2).
-   - OBSERVABILITY (R1): StepRun.executor field; LocalExecutor status/log
-     events persisted incrementally to StepRun + typed WS broadcast; the
-     container-logs->StepRun-row round-trip test lands HERE (12.3 re-runs it
-     over the control-layer POST path); spy test: locally-routed steps never
-     touch job_queue.
-   - Until 12.3's base image exists, test-suite.yaml pins a stock image with
-     bash/curl/git (python:3.12 full, not slim).
+**The decision** (owner, 2026-08-30): execution goes **graph-only**. The array
+survives only as an authoring convenience at two edges — repo YAML and the
+pipeline API — both converting through `array_to_graph` at the boundary. See the
+decision log entry for the full shape.
 
-   EXIT GATE: dogfood script steps run through LocalExecutor by default and a
-   dogfood step asserts executor='local' for them via the API; named-volume
-   clone test passes through the network path; volume create/cleanup balanced
-   across success, failure, and backend-restart orphan-sweep scenarios; tier
-   floors hold.
+**Why it could not be done by subtraction.** `on_success` / `on_failure` in v1
+is two vocabularies wearing one coat: `next` / `stop` are *flow* and already
+exist as graph edges, but `merge:{branch}` and `trigger:{card}` are *effects*
+that lived nowhere except `_handle_action`, which only the array branch reached.
+`array_to_graph` silently dropped both, so deleting the array path would have
+quietly removed card auto-merge and pipeline chaining. P1 landed the replacement
+before anything was removed.
 
-#### Phase 12.2.5 — Specification data model  [B]  ✅ COMPLETE
+#### State
 
-Feature / UserStory / AcceptanceCriterion / PromptTemplate + card links +
-promote-to-feature; CRUD routers + minimal UI + MCP spec tools; serialized
-alembic migration. The required-criterion-blocks-done rule ships stubbed
-(criterion with no TestRuns = not blocking; xfail(strict) marks the real
-check) and activates in 12.2.6. Seed with THIS ROADMAP's three user stories.
-   EXIT GATE: spec CRUD API tests + spec-UI Playwright spec (R8); the three
-   north-star stories queryable via API and MCP.
+| Step | Deliverable | Status |
+|---|---|---|
+| P1 | `StepActions` on `PipelineStepV2`, `describe_terminal_action`, `_run_terminal_action` and its dispatch site; `_trigger_card` / `_merge_branch` / `_resolve_merge_source_branch` gain `step_id`-keyed forms. Plus executed tests for graph `failure` and `always` edges, which had **never** been dispatched by any test in any tier. | **COMPLETE** — `b79bb7f` |
+| P2 | `array_to_graph` becomes faithful and *refuses loudly* what it cannot represent — naming the step, the value and the vocabulary. Refuses `trigger:pipeline:`, unknown actions, duplicate ids, empty input, and any conversion producing an unreachable node. Two deliberate carve-outs: a mid-array `stop` is a refusal (v1 could hold a contradiction the graph cannot), and flow on the *terminal* step is neither an edge nor a refusal (the dogfood pipeline's last step is `on_success: next` with nothing after it). | **COMPLETE** — `b79bb7f` |
+| **P3** | Every writer emits `steps_graph=`; `PipelineRead.steps` and its `parse_steps` validator are deleted; `pipeline_to_ws_dict` loses the key; `PipelineUpdate._reject_nulls` drops `"steps"`; `serialize_steps` goes; `verify_executor` re-keys on `step_id`; the frontend loses `convertLegacyToGraph`. | **NOT STARTED — next action** |
+| P4 | Migration: backfill `Pipeline.steps` -> `steps_graph` for every row without a graph using an **inlined, frozen** converter, and add the `definition_error` column. Pure `UPDATE` + additive `ALTER` — no column dropped, no table rebuilt, fully reversible. | NOT STARTED |
+| P5 | Delete the executor fork: `_execute_step`, `_handle_action`, `_trigger_pipeline`, `parse_steps`, `describe_step_action` / `STEP_ACTIONS` / `STEP_ACTION_PREFIXES`, `Pipeline.has_graph_definition()`, the `else:` branch of `start_pipeline`, and the `is_graph` / `steps` parameters threaded through the local-step helpers. **The fork that gets missed**: `_on_step_complete_locked` (the job-callback path) recomputes `graph` itself rather than receiving `is_graph`. | NOT STARTED |
+| — | **ACCEPTANCE GATE** — `wave10-v1-retirement.md` §5: named tests exist and pass, all three tiers green, and the dogfood ratchet holds on **real backfilled data**. Nothing below runs until it passes. | — |
+| P6 | Migration: `batch_alter_table('pipelines')` + `drop_column('steps')`; `Pipeline.steps` removed from the model; `_adopt_unversioned` taught about retired columns; the no-legacy guards added. | NOT STARTED |
 
-#### Phase 12.3 — Real step images + control layer  [A]  ✅ COMPLETE
+#### The invariant that makes this safe
 
-Port failure_01's images/ tree (base + control runtime + backend client +
-claude + test-runner) with the audit's contract fixes: LogLine payload
-wrapping; token->auth_token / working_dir->working_directory renames; enforce
-timeout_seconds; quote the pytest pin; chown-at-entrypoint for volume
-ownership; settings-driven backend URL. Build story: compose build targets +
-script — no phantom :latest. HOME=/workspace/home persistence contract + the
-cross-step tool-persistence test (agent installs tool, script step uses it).
-Retire BOTH half-baked variants on main (control_layer/image.py generators,
-backend/docker/ copies). Gemini image deferred to 12.5 (failure_01's is
-fiction). Dogfood ratchet: test-suite.yaml moves to lazyaf-base (the
-install-uv step dissolves into the image).
-   EXIT GATE: dogfood steps run in lazyaf-base with control-layer status/
-   logs/heartbeat feeding the UI (round-trip test over the POST path); tier
-   floors hold.
+`Pipeline.steps` stays on the ORM model, with its python-side `default="[]"`,
+until the very last phase. The column is `nullable=False` with **no
+server_default** (`0001_baseline.py` declares a bare
+`sa.Column('steps', sa.Text(), nullable=False)`), so any state where the model
+has stopped declaring the field while the column still exists is a backend that
+cannot INSERT a pipeline. Keeping model and column together removes that hazard
+— and that is what lets the migration split into two revisions, which is what
+buys **R2**: acceptance is a green dogfood run on real backfilled data, and it
+happens *between* the two revisions.
 
-#### Phase 12.2.6 — Test result tie-back  [B]  ✅ COMPLETE
+#### Also in 12.8
 
-Manifest channel `/workspace/.control/test_results.json` picked up at step
-end -> POST /api/test-results/ingest -> TestRef/TestRun joined to criterion +
-commit + model + prompt. Full PLAN 12.2.6 scope: reconcile endpoint + `lazyaf
-tests reconcile` CLI + background reconciliation on successful pipelines +
-orphan-TestRef lifecycle + GET /api/criteria/{id}/history. pytest plugin in
-runner-common (`lazyaf_test_id` marker). Sparkline/history UI deferred to
-12.6.5 (stated, not dropped). Activates 12.2.5's blocks-done rule.
-   EXIT GATE: LazyAF's own suite annotates a starter set of tests against the
-   US-1/2/3 criteria; a dogfood run produces TestRuns joined to criteria; the
-   history endpoint returns the series.
+- The dogfood pipeline converts to a v2 graph. That conversion is what proves
+  the retirement, not a unit test.
+- Retire completed phase sections to `historical-documents/`. **Done
+  2026-08-30**: the 12.0-12.7 narrative moved to
+  [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md),
+  taking this file from 3,858 lines to roughly a third of that.
+- `runner-common` adopted everywhere. **Already true** — see the 12.0 row in the
+  status tables; the open question in the decision log about whether 12.0
+  "counts as done" is resolved.
+- Audit the January-era 12.8 regression matrix against the dogfood suite and
+  backfill the gaps. The matrix itself is in
+  [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md)
+  Part 4; the legacy-removal half is already covered by
+  `tdd/unit/services/test_no_legacy_code.py`.
+- Dead-code sweep and docs.
 
-#### Phase 12.4 — Script/docker steps fully ephemeral  [A]  ✅ COMPLETE
+---
 
-All script/docker steps through LocalExecutor + step images by default; step
-config gains a socket/volume option so the T2 Docker tier runs in ephemeral
-containers (retiring the 0a interim DooD runner); THEN remove script/docker
-execution from runner entrypoints (own commit, R2).
-   EXIT GATE: migration-compat matrix green against the ephemeral path;
-   dogfood asserts executor='local' for every script/docker step; removal
-   commit contains the entrypoint deletions and nothing else; tier floors.
+### Phase 12.9 — Kubernetes Orchestrator [NOT STARTED, deliberately future]
 
-#### Phase 12.5 — Agent steps via control layer  [A]  ✅ COMPLETE
+> Out of scope for Milestone 12 by owner decision (2026-08-29). Nothing below
+> exists in the tree: there is no `KubernetesOrchestrator` and no
+> `test_k8s_orchestrator_contract.py`. Kept here rather than retired because it
+> is future work, not history.
 
-agent_wrapper rebuilt as a thin shim over runner-common baked into agent
-images (failure_01's monolith is reference); config-file contract from the
-salvaged agent-step contract test re-targeted at main's protocol; Claude
-image, then Gemini + mock images derived from runner-common executors.
-Playground migrates off job_queue HERE (resolved from OPEN — it is agent
-execution). Polling runners remain only as unused fallback (deletion at 12.6).
+**Goal**: Same code works on Kubernetes
 
-**ADDED 2026-08-29 — effort telemetry (do NOT defer past this phase).** Agent
-steps moving into control-mode containers is the moment to add the protocol's
-fourth channel: `POST /api/steps/{id}/usage` -> `StepUsage` (tokens, CLI-reported
-cost, wall-clock, container-seconds; `cost_source` distinguishes CLI-reported
-from gpu-node-derived). The control runtime scrapes the agent CLI's own usage
-report at step end and ships it like it ships test results. Rationale: 12.2.6
-became a retrofit because 12.3 froze the protocol without it — the same mistake
-is available here, and Milestone 13's entire cost axis depends on this channel.
-   EXIT GATE ADDITION: a mock-agent dogfood step produces a StepUsage row with
-   non-null tokens and a cost_source; a step whose CLI reports nothing still
-   succeeds with cost_source="unknown" (telemetry never fails a step).
-   EXIT GATE: US-2 e2e (mock agent: card -> agent -> gate -> review -> merge)
-   green on ephemeral containers AND added to the dogfood suite; the dogfood
-   pipeline DOES include a mock-agent step from now on (zero-cost, every
-   push); playground works with job_queue idle.
+#### Tests First (Define Contracts)
 
-#### Phase 12.6 — RemoteExecutor + runner agents (loopback first)  [A]  ✅ COMPLETE
+**test_k8s_orchestrator_contract.py** - Write BEFORE implementing K8s
+| Test | Defines Contract |
+|------|------------------|
+| `test_creates_k8s_job_for_step` | Job resource created |
+| `test_uses_pvc_for_workspace` | PVC mounted |
+| `test_node_selector_from_labels` | Labels -> node selector |
+| `test_job_completion_detected` | Job status watched |
 
-The ported 137-test contract suite is the spec. RunnerStateMachine (ported in
-0b) wired to a DB-backed runner registry with labels + matches_requirements
-(re-authored migration); runner_protocol ADAPTed (+auth via step-token
-pattern, protocol version, cancel, real execute_step.config schema);
-RemoteExecutor rebuilt on the salvaged skeleton (connection registry,
-ACK-future, death monitor) with persistence, heartbeat-death reassignment,
-double-assign guard, and a real dispatcher for requeued steps; /ws/runner
-endpoint with per-message session scope + auth; runner-agent package rebuilt
-embedding runner-common/LocalExecutor behind a pluggable executor seam.
-NativeOrchestrator explicitly DEFERRED to the manual remote-hardware lane —
-the seam and protocol stay Docker-agnostic so runpod-style socketless pods
-and OpenAI-compatible agents slot in without protocol changes. Runner panel
-rebuilt (snapshot fetch + WS deltas) with a Playwright spec asserting
-snapshot-then-delta after reload (R8). Loopback lane: a runner-agent process
-on the same host over WS is the tested path; real remote is manual.
-THEN, in its own commit, after the contract suite passes end-to-end against
-the push path: delete the polling stack (runner_pool, polling entrypoints,
-job pull endpoints, job_queue) with frontend + all consumers migrated in the
-same commit, and land test_no_legacy_code assertions in that commit (R2).
-   EXIT GATE: dogfood suite (incl. the US-2 mock-agent step) runs through a
-   loopback runner agent; 137-test contract suite at zero skips (R4 ratchet
-   complete); polling stack deleted; runner-panel spec green; tier floors.
+- [ ] Write `test_k8s_orchestrator_contract.py` (defines K8s behavior)
 
-#### Phase 12.6.5 — Experiments & leaderboards  [B, needs 12.6 + 12.2.6 + 12.2.5]
+#### Implementation (Make Tests Pass)
 
-Matrix runs (model x prompt x repeat) fanned out through the executor layer;
-aggregated pass-rate per AcceptanceCriterion AND cost-to-solve (from StepUsage —
-a cheap model needing six iterations vs an expensive one landing first try is
-THE comparison, and it is meaningless without the effort axis); leaderboard +
-experiment UI
-(with the criterion-history sparklines deferred from 12.2.6); MCP
-launch_experiment tool; guardrails: dry-run cost/run-count estimate + per-
-experiment cap before launch (upgraded from confirm-only per PLAN's open
-question — owner veto welcome). Completes US-3.
-   EXIT GATE: tdd/e2e/test_experiment_matrix.py green (2 models x 2 prompts
-   on mock-model runners, asserts per-variant aggregation); leaderboard +
-   experiment-launch Playwright spec (R8).
+- [ ] Implement `KubernetesOrchestrator` (make tests pass)
+- [ ] PersistentVolumeClaims for workspaces
+- [ ] K8s Jobs for step execution
+- [ ] Node selectors based on runner labels
+- [ ] Integration tests in K8s environment
 
-#### Phase 12.6.6 — Spec-curated agent context  [B, needs 12.2.5 + 12.2.6 + 12.5; measured via 12.6.5]
+#### Done Criteria
 
-Per-card context bundle from linked feature/story/criteria INCLUDING related
-TestRef file paths ("these tests already cover related criteria — read, don't
-duplicate"), token-budget truncation, {spec_context} PromptTemplate
-placeholder -> /workspace/.control/spec_context.md via the control layer;
-agent wrapper injects it. Measure the effect with a 12.6.5 experiment.
-   EXIT GATE: bundle-content tests (incl. TestRef paths + truncation);
-   wrapper-injection test; one experiment comparing with/without curation.
+- [ ] K8s orchestrator tests pass (mocked)
+- [ ] Integration tests pass (real K8s)
 
-#### Phase 12.7 — Debug re-run mode  [A, after 12.5]
+**Effort**: 2-3 weeks when needed
+**Outcome**: Production-ready K8s deployment
 
-Rebuild from spec against the 12.2-INT executor. failure_01 contributes
-shelf-ready leaves (debug state machine + tests, schemas, sidecar image) and
-UX reference (DebugRerunModal, breakpoint checkboxes, join command). New
-work: session-service lifecycle (create actually starts the run; resume
-does not end multi-breakpoint sessions), terminal I/O bridge, breakpoint =
-pre-step gate in the executor. Sidecar-vs-shell split per the audit.
-   EXIT GATE: e2e — failed dogfood-style run re-run with a breakpoint,
-   terminal attach, resume to completion; debug UI Playwright spec (R8).
+---
 
-#### Phase 12.8 — Cleanup & polish  [epilogue]
+### Decision log
 
-v1 array pipeline format decision (recommend: execution goes graph-only, v1
-auto-converts at the API/YAML boundary via array_to_graph; OWNER CONFIRMS
-before removal); dogfood pipeline converted to v2 graph; runner-common
-adopted everywhere (12.0 finally true); audit PLAN 12.8's regression matrix
-against the dogfood suite and backfill gaps (the suite absorbs its intent —
-stated, not silent); dead-code sweep; docs; retire completed phase sections
-to historical-documents/.
+> The record of what was decided, by whom, and why. Newest blocks last.
 
-### Decision log (attempt #3)
+#### Milestone 12, attempt #3 (2026-08-29)
 
 - 2026-08-29 Scope: all of 12.x; K8s stays future. (Owner)
 - 2026-08-29 No external CI ever; self-host ASAP. (Owner)
@@ -1079,187 +625,127 @@ Decisions made DURING implementation (all shipped and gate-verified):
   agent-addressable step - a strategy variant a single-sandbox harness cannot
   express. (Owner: "lazyaf is the bridge")
 
-- 2026-08-30 RESOLVED: retire the v1 array pipeline format. (Owner: "retire the
-  old pipeline format") The shape is the one 12.8 recommended and the owner
+#### Milestone 14 and 14.5 (2026-08-30)
+
+- **2026-08-30 We own the agent loop.** A minimal tool-calling harness in
+  `runner-common`, running inside the existing control-mode container as a new
+  entry in the `EXECUTORS` registry beside claude/gemini/mock. Wrapping an
+  existing OSS agent CLI was rejected for one specific reason: Milestone 13
+  makes *loop shape* the independent variable, and a loop we do not own is one
+  we cannot vary. (Owner) — **shipped**, `runner-common/runner_common/harness/`.
+- **2026-08-30 Capability is probed and recorded, never assumed.** Tool-calling
+  support is inconsistent across self-hosted models, so probe at registration
+  and store the result on the endpoint. This turns "does tool support matter?"
+  from an assumption into something Milestone 13 can measure. (Owner) —
+  **shipped**; verified against this host's ollama, where `llama3.1:8b` reported
+  `probe_status: ok`, tools/streaming/usage all true, and a context window of
+  `131072` discovered through ollama's `POST /api/show` extension.
+- **2026-08-30 Three reachability modes**, because the deployments genuinely
+  differ: `runner-local` (home bare metal behind NAT), `direct` (default;
+  runpod and any routable endpoint), `proxy` (central auth/logging — opt in per
+  endpoint, never the default, because it makes the backend an inference
+  bottleneck). (Owner)
+- **2026-08-30 Combined runner+inference images, not a local compose profile.**
+  One image = one deployable node: `FROM` the upstream inference server with the
+  12.6 runner agent layered on. The pod dials OUT over WebSocket, so **zero
+  inbound connectivity** — which is what makes the same image work on runpod and
+  behind home NAT. We do **not** rebuild the inference servers; forking
+  `ollama/ollama` and `vllm/vllm-openai` would mean multi-GB pushes on every
+  release plus tracking CUDA/torch compatibility forever. (Owner)
+- **2026-08-30 14.5 targets Windows desktops with idle RTX cards.** Docker
+  Desktop on the WSL2 backend, running the *same* image as runpod with
+  `--gpus all` (NVIDIA's CUDA-on-WSL driver makes this work), so there is
+  nothing Windows-specific to maintain. The box takes a dual role — serve models
+  **and** execute steps — advertised as labels rather than as two deployment
+  shapes. (Owner)
+- **2026-08-30 Yield on GPU busy by DRAINING, not disconnecting.** LazyAF must
+  not fight the owner for his own GPU: the node samples GPU utilization and
+  stops accepting new assignments while letting an in-flight step finish, then
+  resumes, with hysteresis so a transient spike cannot flap it. The naive
+  version — disconnect when busy — is wrong *precisely because* 14.5 establishes
+  that the connection IS the advertisement, so dropping it would orphan running
+  work. Expect a small backend availability flag. The UI must show WHY a node is
+  not taking work, and a manual force-drain / force-available override is
+  required. (Owner)
+- **2026-08-30 LazyAF builds its own heavy runner images, not GitHub.** A
+  repo-defined pipeline with docker steps builds and pushes
+  `lazyaf-runner-ollama` and `lazyaf-runner-vllm` on a LazyAF runner agent. Two
+  reasons, and the second is the hard one: a ~45GB vLLM build does not fit a
+  standard GitHub runner, and **a self-hosted Actions runner on a PUBLIC repo
+  would execute fork PRs on the owner's hardware**. GitHub keeps the wheel, the
+  small service images, the existing step images, secret-scan and
+  release-please; `pr-build.yml` stays GitHub-hosted for exactly that reason.
+  GHCR credentials reach the build step through 12.5 `secret_environment`, so
+  they never appear in `docker inspect`. (Owner) — **dogfooding at the top of
+  the stack: the platform ships its own artifacts.**
+
+#### Phase 12.8 (2026-08-30)
+
+- **2026-08-30 RESOLVED: retire the v1 array pipeline format.** (Owner: "retire
+  the old pipeline format".) The shape is the one 12.8 recommended and the owner
   confirmed: **execution is graph-only**. Concretely:
-  - `pipeline_executor` loses its array branch entirely - `is_graph` and every
+  - `pipeline_executor` loses its array branch entirely — `is_graph` and every
     two-way fork behind it disappear, leaving ONE path through the executor.
     This is the whole point: the array path is a second execution semantics
     nobody reads, and every graph fix since 12.4 had to be written twice.
-  - The array survives ONLY as an authoring convenience at two edges - repo
-    YAML (`.lazyaf/pipelines/*.yaml`) and the pipeline API - both converting
-    via `array_to_graph` at the boundary. A human writing a five-step pipeline
+  - The array survives ONLY as an authoring convenience at two edges — repo YAML
+    (`.lazyaf/pipelines/*.yaml`) and the pipeline API — both converting via
+    `array_to_graph` at the boundary. A human writing a five-step pipeline
     should not have to hand-author nodes, edges and positions; a human is not
     the executor.
   - Everything that currently persists `steps=json.dumps([...])` writes a graph
-    instead: `trigger_service.upsert_materialized_pipeline`,
-    `agent_run` (both card-work sites), `experiment_service`, the test-mode
-    seed.
+    instead: `trigger_service.upsert_materialized_pipeline`, `agent_run` (both
+    card-work sites), `experiment_service`, the test-mode seed.
   - `Pipeline.steps` is backfilled into `steps_graph` by a migration and then
     DROPPED (R3: one source of truth per wire contract; R2: deleted after the
     backfill is accepted). `0007_drop_polling_runner_columns.py` is the
     precedent for the SQLite table rebuild.
   - The dogfood pipeline converts to a v2 graph, which is what proves it.
-- OPEN: whether `12.0` counts as done at 12.5 (runner-common adopted by agent
-  images) or 12.8 (all runners retired) — resolves itself as those land.
-
----
-
-## Milestone 14 — Self-Hosted & OpenAI-Compatible Model Endpoints
-
-> **The ask (owner, 2026-08-30):** run agents against models we host ourselves —
-> ollama and vLLM on bare metal at home, or on runpod.io — so "all sorts of AI
-> models" can be in the mix. Push-style: LazyAF reaches out when it wants work
-> done, never a long-poll loop.
->
-> **Sequencing:** independently valuable for the product (cheap local models
-> doing routine work), AND a hard prerequisite for Milestone 13's central
-> hypothesis — "a high-end model writes instructions, K cheap models execute in
-> parallel" is unmeasurable without cheap models. It can be built in parallel
-> with 13.1/13.2; 13.3's headline experiment depends on it.
-
-### The thing that is actually hard
-
-The transport is easy and already push: LazyAF is the HTTP client, so calling
-`/v1/chat/completions` involves no polling by anyone. **The hard part is that
-ollama and vLLM are inference servers, not agents.** Claude Code and the Gemini
-CLI ship their own agent loop — read files, edit, run commands, iterate until
-done. A raw OpenAI-compatible endpoint gives you completions and nothing else.
-So LazyAF has to supply the loop.
-
-### Decisions (owner, 2026-08-30)
-
-- **We own the loop.** A minimal tool-calling harness in `runner-common`
-  (read/write/list files, run shell, apply patches, stop conditions) running
-  inside the existing control-mode container, as a new entry in the `EXECUTORS`
-  registry beside claude/gemini/mock. Wrapping an existing OSS agent CLI was
-  rejected for a specific reason: Milestone 13 makes *loop shape* the
-  independent variable, and a loop we do not own is one we cannot vary.
-- **All three reachability modes**, because the deployments genuinely differ:
-  | Mode | For | How |
-  |---|---|---|
-  | `runner-local` | Home bare metal behind NAT | A 12.6 runner agent runs on the box hosting ollama; the backend pushes the step there over WS and the step container calls `localhost`. Zero inbound connectivity, no tunnel. |
-  | `direct` (default) | runpod, any routable endpoint | The step container calls the endpoint URL itself. |
-  | `proxy` | Central auth/logging | The backend brokers the call. Convenient, but it puts inference traffic through the backend and makes it a bottleneck — opt in per endpoint, never the default. |
-- **Capability is probed and recorded, not assumed.** Tool-calling support is
-  inconsistent across self-hosted models (ollama supports it for some; vLLM
-  depends on model plus chat template). Probe at registration, store the result
-  on the endpoint, and let the strategy decide — which turns "does tool support
-  matter?" from an assumption into something Milestone 13 can measure.
-- **Cost: tokens always, dollars when known.** Token counts come from the
-  OpenAI-compatible `usage` field. An endpoint may carry a $/hour rate (a
-  runpod pod rate, or an estimate for home hardware); when set, cost is
-  rate x wall-clock occupancy recorded as `cost_source="gpu-node"`. When unset,
-  tokens are recorded and cost stays null, and the board must show WHICH trials
-  have real cost data rather than silently mixing them.
-
-### What already anticipates this
-
-`StepUsage.provider` already includes `openai-compatible` and `self-hosted`;
-`cost_source` already includes `gpu-node`; and 12.6 deliberately kept the
-runner-agent's executor seam Docker-agnostic and pluggable for exactly this.
-The work is a new executor plus an endpoint registry, not a re-architecture.
-
-### Phases
-
-- **14.1 — Endpoint registry.** A `ModelEndpoint` entity (name, base_url, model,
-  auth style + secret reference, reach mode, optional $/hour, probed
-  capabilities), CRUD, a health/capability probe, and secret handling that
-  reuses the 12.5 `secret_environment` path so a key never reaches
-  `docker inspect`. Endpoints with no auth (typical LAN ollama) are first-class.
-- **14.2 — The agent harness.** The tool-calling loop in `runner-common`, with a
-  no-tools fallback for models that cannot tool-call, bounded iterations and
-  budget, and usage reporting through the existing sidecar so self-hosted runs
-  land in `StepUsage` like every other step.
-- **14.3 — UI category.** A Model Endpoints surface (register, probe, health,
-  capabilities, rate) and endpoint selection wherever an agent is chosen: agent
-  step config, card creation, playground, and the 12.6.5 experiment matrix — the
-  last one is what lets a matrix mix API and self-hosted models in one run.
-- **14.4 — Prove it.** A dogfood step running against a real self-hosted
-  endpoint, and the Milestone 13 fan-out hypothesis finally runnable:
-  expensive planner, K cheap local workers, measured.
-
-### Phase 14.5 — Runner images with inference baked in
-
-> **The ask (owner, 2026-08-30):** "images available as runners with vllm and
-> llama baked in so that you mount your data / cache of models and just go."
-> Chosen shape: the COMBINED runner+inference image (not a local compose
-> profile). Servers: **vLLM** and **ollama**.
-
-One image = one deployable node. `FROM` the upstream inference server, with the
-12.6 runner agent layered on top. You give a pod the model cache, a LazyAF
-server URL and a runner token; it starts the inference server, dials OUT over
-WebSocket, and its steps call the model on `localhost`. **Zero inbound
-connectivity** - which is what makes it work on runpod and behind home NAT
-alike, and why this is a runner image rather than a model image.
-
-- `lazyaf-runner-ollama` FROM `ollama/ollama` - mount `~/.ollama`; ollama pulls
-  models itself, so "mount your data and go" is literally true.
-- `lazyaf-runner-vllm` FROM `vllm/vllm-openai` - mount the HF cache; the
-  throughput option and the right one on a rented GPU.
-
-**We do NOT rebuild the inference servers.** Both upstreams publish official
-images; forking them means multi-GB pushes on every release plus tracking
-CUDA/torch/vLLM compatibility forever. We add a thin layer - the runner agent,
-an entrypoint that supervises two processes, and the endpoint declaration - and
-inherit their release engineering.
-
-**Windows desktops with idle RTX cards (owner, 2026-08-30).** The target is a
-Windows box running Docker Desktop on the WSL2 backend, using the SAME image as
-runpod with `--gpus all` (NVIDIA's CUDA-on-WSL driver makes this work), so there
-is nothing Windows-specific to maintain. Two decisions attach to it:
-
-- **Dual role, selected per endpoint.** The box can serve models AND execute
-  steps; the difference is advertised as labels, not as two deployment shapes.
-- **Yield on GPU busy.** LazyAF must not fight the owner for his own GPU. This
-  is genuinely new mechanism: the node samples GPU utilization and DRAINS -
-  stops accepting new assignments while letting an in-flight step finish - then
-  resumes, with hysteresis so a transient spike cannot flap it. The naive
-  version (disconnect when busy) is wrong precisely because 14.5 establishes
-  that the connection IS the advertisement, so disconnecting would orphan
-  running work. Expect a small backend availability flag; silently dropping the
-  connection is not acceptable. The UI must show WHY a node is not taking work,
-  and a manual force-drain / force-available override is required.
-
-Design points the wiring doc must settle:
-- **Two processes, one container.** The entrypoint starts the inference server,
-  waits for it to be healthy, then starts the runner agent, and propagates
-  signals and exit codes so a dead server does not leave a live runner
-  advertising a model that is gone.
-- **How the pod's endpoint gets registered.** 14.1 already has `runner-local`
-  reach mode plus `requires: {has: ["endpoint:<name>"]}` label matching, so the
-  minimum is: the operator registers the endpoint once and the pod advertises
-  the matching label from env. Whether the pod may ALSO self-register through
-  the API is a real decision - it is the difference between "just go" and a
-  node being able to write rows in your control plane.
-- **LazyAF builds the heavy images itself** (owner, 2026-08-30). A repo-defined
-  pipeline with docker steps builds and pushes the two runner images on a LazyAF
-  runner agent, not on GitHub compute. This is dogfooding at the top of the
-  stack - the platform ships its own artifacts - and it also sidesteps a real
-  problem: a ~45GB vLLM build does not fit a standard GitHub runner, and a
-  self-hosted Actions runner on a PUBLIC repo would expose the owner's hardware
-  to fork PRs. GitHub keeps the wheel, the small service images, the existing
-  step images, secret-scan and release-please; `pr-build.yml` stays
-  GitHub-hosted for exactly that reason. GHCR credentials reach the build step
-  through 12.5 `secret_environment`, so they never appear in `docker inspect`.
-- **Image size is a release problem, not a detail.** A CUDA vLLM image is ~10GB.
-  These must not ride the normal per-tag image matrix; they need their own
-  trigger, their own cadence, and a documented "build it yourself" path.
-- **GPU passthrough** differs between runpod (automatic) and local
-  `docker run --gpus`; the docs must not assume either.
-
-### Open questions
-
-- Which model families are worth pinning as known-good in the docs, and do we
-  ship a capability matrix or let the probe speak for itself?
-- Context-window limits vary wildly on local models; does the harness truncate,
-  summarize, or refuse when a repo context exceeds them?
-- Concurrency: one local GPU serving K parallel fan-out workers will queue.
-  Does the endpoint carry a max-concurrency the scheduler respects?
+- **2026-08-30 The retirement is additive-first, in six ordered phases.**
+  (Claude, from the wave-10 recon; owner veto welcome.) The capability lands
+  before anything is removed, and the column drop is a *separate revision* from
+  the backfill so acceptance — a green dogfood run on real backfilled data — can
+  happen between the two. A departure from the earlier recommendation of one
+  combined revision: that NOT-NULL hazard only bites if the model field is
+  removed before the column, and here it is not.
+- **2026-08-30 `StepActions` is named `actions.`, deliberately not
+  `on_success`.** (Claude.) `export_pipeline_yaml` already writes `on_success` on
+  a graph step meaning "the ids of the nodes this edge points at" — and on a
+  fan-out that is a LIST, the same shape an action list would be. The two would
+  have been indistinguishable by shape.
+- **2026-08-30 RESOLVED: 12.0 counts as done.** The earlier open question — does
+  12.0 close at 12.5 (runner-common adopted by agent images) or at 12.8 (all
+  runners retired)? — is answered by the tree: `images/agent-base` installs
+  `runner-common` system-wide and asserts the import at build time, `claude` and
+  `gemini` inherit it, and the monolithic entrypoints were deleted in `67a4e1c`.
 
 ---
 
 ## Milestone 13 — Benchmark & Evaluation Harness
+
+> **STATUS: NOT STARTED — zero implementation, as of 2026-08-30.** A repo-wide
+> grep for `BenchmarkCase`, `StrategyTemplate`, `TrialIteration`, `fail_to_pass`
+> and `cost_to_solve` across `backend/`, `frontend/`, `cli/` and `tdd/` returns
+> exactly one hit, and it is a comment
+> (`backend/app/services/agent_run.py:15`). Everything below is **design**. The
+> data models described under "Specification Layer Models" for
+> `BenchmarkSuite` / `BenchmarkCase` / `StrategyTemplate` / `Trial` /
+> `TrialIteration` are likewise designed and unbuilt — no table, no migration,
+> no router.
+>
+> Both mandatory in-12.x hooks did land, so this does not start with a retrofit:
+> `StepUsage` (12.5, migration `0005_step_usage.py`) and the cost axis in
+> 12.6.5.
+>
+> **Known blocker, not mentioned in the design below.**
+> `backend/app/models/workspace.py` declares `pipeline_run_id` with
+> `unique=True`, so a pipeline run owns exactly one workspace and K parallel
+> agents would share a single checkout — which contradicts 13.2's "a branch and
+> a workspace per worker", the substrate the whole parallel-strategy thesis
+> rests on. A concurrent wave is fixing it (an uncommitted
+> `backend/alembic/versions/0012_workspaces_per_worker.py` sits in the working
+> tree). Confirm it has landed and migrated before starting 13.2.
+
 
 > **The question this answers:** take a repo at a known state, set the AI loop
 > loose, and measure what it actually cost to get to a solution — across models,
@@ -1483,2377 +969,776 @@ the case set exactly (results within variance, which is the honest claim).
   hurting via conflicts)? A sweep over K on one case is a cheap early experiment
   and probably the first genuinely publishable result this harness can produce.
 
-
 ---
 
-## Phase 12: Runner Architecture Refactor
-
-> **Vision**: Runners become execution targets (machines with capabilities), not execution environments. Steps run in ephemeral containers with a shared workspace. Enables multi-image pipelines, hardware-specific runners, and future Kubernetes support.
-
-### Current Problems
-
-1. **Entrypoint divergence**: Claude and Gemini runners are ~1800 lines each, 95% duplicated, features diverging
-2. **Docker-in-Docker required**: For `type: docker` steps, runners need Docker socket mounted (gross)
-3. **Workspace conflicts**: Multiple pipelines on same runner can destroy each other's workspace
-4. **No image flexibility**: Steps inherit the runner's environment, can't use custom images
-5. **No hardware affinity**: Can't route steps to specific hardware (embedded devices, GPUs)
-
-### Target Architecture
-
-**Two execution modes:**
-
-```
-MODE 1: LOCAL (Backend has Docker access) - Zero latency
-
-    BACKEND
-    +----------------+     +----------------+     +----------------+
-    | Pipeline       | --> | Execution      | --> | Local          | --> Docker API
-    | Executor       |     | Router         |     | Executor       |         |
-    +----------------+     +----------------+     +----------------+         |
-                                                                             v
-                                                                    +----------------+
-                                                                    | Step Container |
-                                                                    +----------------+
-
-MODE 2: REMOTE (Hardware/distributed runners) - WebSocket push, millisecond latency
-
-    BACKEND
-    +----------------+     +----------------+     +----------------+
-    | Pipeline       | --> | Execution      | --> | Remote         | <-- WebSocket
-    | Executor       |     | Router         |     | Executor       |         |
-    +----------------+     +----------------+     +----------------+         |
-                                                                             |
-            +----------------------------------------------------------------+
-            | (push job immediately)
-            v
-    +----------------+     +----------------+     +----------------+
-    | Runner Agent   |     | Runner Agent   |     | Runner Agent   |
-    | (Docker host)  |     | (Raspberry Pi) |     | (GPU server)   |
-    |                |     |                |     |                |
-    | labels:        |     | labels:        |     | labels:        |
-    |   arch=amd64   |     |   arch=arm64   |     |   arch=amd64   |
-    |   type=docker  |     |   has=gpio     |     |   has=cuda     |
-    |                |     |   has=camera   |     |                |
-    | [Docker Orch.] |     | [Native Orch.] |     | [Docker Orch.] |
-    +----------------+     +----------------+     +----------------+
-```
-
-### Key Design Decisions
-
-**Event-driven, not polling**: Old runners polled every 5 seconds. New architecture:
-- Local: Backend spawns containers directly (instant)
-- Remote: Backend pushes jobs via WebSocket (milliseconds)
-
-**OCI containers for everything** (except embedded hardware):
-- System dependencies are container-level concerns
-- Even "local" development uses Docker containers
-- Native execution only for hardware that can't run Docker (GPIO, sensors)
-
-### Core Concepts
-
-**LocalExecutor**: Backend service that spawns containers directly via Docker SDK. No runner process, no polling - instant execution. This is the default for local development.
-
-**RemoteExecutor**: Backend service that pushes jobs to connected runner agents via WebSocket. For remote Docker hosts, specialized hardware, distributed execution.
-
-**Runner Agent**: Process that runs on remote machines, connects to backend via WebSocket, receives job assignments immediately. Has a local orchestrator (Docker or Native).
-
-**Orchestrator**: How steps actually execute on a runner:
-- `DockerOrchestrator`: Runs steps in containers (most common)
-- `NativeOrchestrator`: Runs steps directly on host (embedded devices only)
-- `KubernetesOrchestrator`: Runs steps as K8s Jobs (future)
-
-**Workspace**: Per-pipeline-run working directory containing:
-```
-/workspace/
-|-- repo/           # Git checkout
-|-- home/           # Persistent $HOME (caches, .local/bin survive across steps)
-+-- .control/       # Step config, logs, metadata
-```
-
-**Control Layer**: Thin wrapper in every step container handling heartbeat, log streaming, status reporting.
-
-### Step Requirements (New Pipeline YAML)
-
-```yaml
-steps:
-  - name: "Build firmware"
-    type: docker
-    config:
-      image: "arm-toolchain:latest"
-      command: "make firmware"
-    requires:
-      arch: arm64
-
-  - name: "Run tests"
-    type: docker
-    config:
-      image: "lazyaf-test-runner:latest"  # Pre-built with deps
-      command: "pytest -v"
-
-  - name: "Flash and test hardware"
-    type: script
-    config:
-      command: "flash-firmware && run-hardware-tests"
-    requires:
-      has: gpio,camera
-      runner_id: pi-workshop-1  # Pin to specific device
-```
-
-### Workspace Portability
-
-| Scenario | Strategy |
-|----------|----------|
-| Same Docker host | Shared named volume (fast) |
-| Different machines | Workspace tarball transfer |
-| Kubernetes | PersistentVolumeClaim |
-
----
-
-### Workspace Transfer Protocol
-
-How workspaces move between steps, especially when steps run on different machines.
-
-#### LocalExecutor (backend has Docker access)
-
-Simplest case - all steps run on the same Docker host:
-
-```
-Step 1 container --> /workspace volume --> Step 2 container
-                          |
-                     Named volume persists
-                     on Docker host
-```
-
-- Volume name: `lazyaf-ws-{pipeline_run_id}`
-- All steps mount the same volume
-- No transfer needed - it's already there
-- Cleanup: Volume deleted when pipeline completes or after timeout
-
-#### RemoteExecutor with DockerOrchestrator (remote Docker host)
-
-Steps run on a remote machine with Docker. Same as LocalExecutor but on the remote host:
-
-- Runner creates named volume on its local Docker
-- All steps assigned to that runner share the volume
-- **Affinity required**: Steps with `continue_in_context=true` MUST run on same runner
-
-#### RemoteExecutor with NativeOrchestrator (embedded devices)
-
-For devices that can't run Docker (Raspberry Pi GPIO work, bare metal, etc.):
-
-- Workspace is a directory on the filesystem: `/var/lazyaf/workspaces/{pipeline_run_id}/`
-- Runner manages the directory directly
-- **Affinity required**: Steps with `continue_in_context=true` MUST run on same runner
-
-#### Cross-Machine Workspace Transfer (Tarball Protocol)
-
-When a step MUST run on a different machine than the previous step (different hardware requirements), the workspace is transferred as a tarball:
-
-```
-Runner A                      Backend                         Runner B
-   |                             |                               |
-   |-- step complete             |                               |
-   |                             |                               |
-   |-- POST /workspace-snapshot -->                              |
-   |   (uploads tarball)         |                               |
-   |                             |-- stores tarball              |
-   |<-- 200 OK ------------------|                               |
-   |                             |                               |
-   |                             |   (step 2 assigned to B)      |
-   |                             |                               |
-   |                             |<-- GET /workspace-snapshot ---|
-   |                             |   (B requests tarball)        |
-   |                             |                               |
-   |                             |--- tarball response --------->|
-   |                             |                               |
-   |                             |   (B extracts, runs step 2)   |
-```
-
-The runner's control layer handles upload/download - backend just stores the blob.
-
-**API Endpoints:**
-```
-POST /api/pipeline-runs/{id}/workspace-snapshot
-  Body: multipart/form-data with tarball
-  Response: {snapshot_id, size_bytes}
-
-GET /api/pipeline-runs/{id}/workspace-snapshot
-  Response: application/gzip tarball
-
-DELETE /api/pipeline-runs/{id}/workspace-snapshot
-  (Called on pipeline completion)
-```
-
-**Tarball contents:**
-```
-workspace.tar.gz
-|-- repo/              # Git checkout + uncommitted changes
-|-- home/              # Persisted HOME (~/.local/bin, caches)
-+-- .control/          # Step metadata, logs
-```
-
-**When transfer happens:**
-- Only when next step has different `requires:` that forces a different runner
-- NOT for normal `continue_in_context` on same runner (volume is faster)
-- Backend detects machine boundary and triggers upload/download
-
-**Size limits:**
-- Default max: 500MB compressed
-- Configurable per pipeline: `workspace_transfer_max_mb: 1000`
-- Steps producing large artifacts should use dedicated artifact storage (future)
-
-**Failure handling:**
-- Upload fails: Step marked failed, pipeline can retry
-- Download fails: Step marked failed, pipeline can retry
-- Tarball corrupted: Checksum validation, retry from last good snapshot
-
----
-
-### continue_in_context Semantics
-
-The `continue_in_context` flag controls what persists between pipeline steps.
-
-#### What IS Preserved
-
-| Item | Location | Notes |
-|------|----------|-------|
-| Workspace files | `/workspace/repo/` | All files, tracked and untracked |
-| Build artifacts | `/workspace/repo/` | node_modules, __pycache__, binaries |
-| HOME directory | `/workspace/home/` | pip cache, npm cache, installed CLIs |
-| Step logs | `/workspace/.lazyaf-context/` | Previous step outputs |
-| Git state | `/workspace/repo/.git/` | Uncommitted changes preserved |
-
-#### What is NOT Preserved
-
-| Item | Why | Workaround |
-|------|-----|------------|
-| Container | Fresh container per step | Use same image if env matters |
-| Environment variables | New process, new env | Set in step config or script |
-| Running processes | Container dies between steps | Re-start in next step |
-| Memory state | Fresh process | Serialize to file if needed |
-| Network connections | Fresh container | Re-establish in next step |
-
-#### Example: What Users Should Expect
-
-```yaml
-steps:
-  - name: "Install deps"
-    type: script
-    config:
-      command: |
-        pip install pytest
-        export MY_VAR=foo
-        echo "done" > /tmp/marker
-    continue_in_context: true
-
-  - name: "Run tests"
-    type: script
-    config:
-      command: |
-        pytest -v           # Works - pytest in /workspace/home/.local/bin
-        echo $MY_VAR        # Empty - env var not preserved
-        cat /tmp/marker     # Fails - /tmp is container-local, not in workspace
-```
-
-#### Different Images Across Steps
-
-Each step runs in its specified image. The workspace volume is mounted regardless:
-
-```yaml
-steps:
-  - name: "Build Go binary"
-    type: docker
-    config:
-      image: golang:1.21
-      command: go build -o /workspace/repo/myapp
-    continue_in_context: true
-
-  - name: "Test with Python"
-    type: docker
-    config:
-      image: python:3.12
-      command: python /workspace/repo/integration_test.py
-    # /workspace/repo/myapp binary is available!
-```
-
-This is intentional - allows heterogeneous pipelines. Caveat: architecture must match (can't build ARM binary on amd64 and run it).
-
-#### Runner Affinity
-
-> **Implementation Status** (as of Phase 11):
-> - ✅ Basic affinity: `required_runner_id` enforced in job_queue.dequeue()
-> - ✅ `continue_in_context` / `is_continuation` flags working in both runners
-> - ✅ `previous_runner_id` passed between pipeline steps
-> - ❌ `affinity_timeout` NOT implemented (jobs wait indefinitely for required runner)
-> - ❌ No tests for affinity scenarios
-
-When `continue_in_context: true`, the next step REQUIRES the same runner:
-
-```
-Step 1 (runner A, continue_in_context=true)
-    |
-    v
-Step 2 (MUST be runner A - has the workspace volume)
-```
-
-**Affinity failure handling:**
-
-| Scenario | Behavior |
-|----------|----------|
-| Runner A still connected | Step 2 assigned to A immediately |
-| Runner A temporarily disconnected | Wait up to `affinity_timeout` (default 5 min) |
-| Runner A dead (heartbeat timeout) | Pipeline FAILS with clear error |
-| Runner A reconnects after timeout | Too late - pipeline already failed |
-
-**Why not fall back to another runner?**
-- Workspace state would be inconsistent
-- Silent fallback causes confusing failures
-- Explicit failure is better than subtle bugs
-
-**Configurable timeout:**
-```yaml
-pipeline:
-  affinity_timeout: 300  # seconds, default 5 minutes
-```
-
-#### Forcing Fresh Workspace
-
-To explicitly NOT continue from previous step:
-
-```yaml
-steps:
-  - name: "Build"
-    continue_in_context: true  # Keep workspace
-
-  - name: "Test in clean env"
-    continue_in_context: false  # This step gets fresh clone
-    # Previous workspace is discarded, fresh git clone
-```
-
----
-
-### Lifecycle State Machines
-
-All state transitions are guarded by locks and idempotency keys to prevent race conditions and duplicate executions.
-
-#### Centralized Locking (Backend is Source of Truth)
-
-**Critical design decision**: All locking and state management happens in the backend database. Runners are stateless clients - they never hold locks or make decisions about state transitions.
-
-**Two execution paths, same locking model:**
-
-| Mode | How Steps Execute | Locking |
-|------|-------------------|---------|
-| **LocalExecutor** | Backend spawns containers directly via Docker SDK | DB row locks; container death detected via Docker API/exit codes |
-| **RemoteExecutor** | Backend pushes jobs to runners via WebSocket | DB row locks + heartbeat timeout for runner death detection |
-
-Both modes use the database as the single source of truth. The difference is how failure is detected:
-- LocalExecutor: Docker SDK tells us immediately when a container dies
-- RemoteExecutor: Heartbeat timeout (30s) tells us when a runner is unreachable
-
-**RemoteExecutor flow (push-based, not polling):**
-
-```
-+-------------------+          +-------------------+          +-------------------+
-|  Runner Agent A   |          |      BACKEND      |          |  Runner Agent B   |
-|   (stateless)     |          | (source of truth) |          |   (stateless)     |
-+-------------------+          +-------------------+          +-------------------+
-        |                              |                              |
-        |--- WebSocket connect ------->|                              |
-        |--- register {labels} ------->|                              |
-        |                              |-- DB: find pending step ---->|
-        |                              |-- DB: SELECT FOR UPDATE ---->|
-        |                              |<- lock acquired, assign -----|
-        |<-- push: "execute step X" ---|                              |
-        |--- ACK -------------------->|                              |
-        |                              |                              |
-        |--- heartbeat --------------->|                              |
-        |--- heartbeat --------------->|                              |
-        |                              |                              |
-        |     (network dies)           |                              |
-        |       X    X    X            |                              |
-        |                              |-- 30s timeout: no heartbeat -|
-        |                              |-- DB: mark step pending ---->|
-        |                              |                              |
-        |                              |<--- WebSocket connect -------|
-        |                              |<--- register {labels} -------|
-        |                              |-- DB: find pending step ---->|
-        |                              |-- push: "execute step X" --->|
-```
-
-**Why this works:**
-- Backend holds all state in PostgreSQL/SQLite with ACID guarantees
-- `SELECT FOR UPDATE` prevents double-assignment race conditions
-- Heartbeat timeout (30s) detects dead runners, releases their work
-- Runners reconnecting check if their work was reassigned before resuming
-- Idempotency keys prevent duplicate execution even with retries
-
-**What runners do:**
-- Connect via WebSocket, receive job assignments (pushed, not pulled)
-- Send heartbeats every 10s to prove liveness
-- Report status transitions (preparing -> running -> completed)
-- Stream logs back to backend
-- **Never** decide on their own whether to take or release work
-
-**What backend does:**
-- All assignment decisions (who gets what step)
-- All state transitions (step status, workspace status)
-- All lock management (row-level DB locks, not Redis)
-- Heartbeat monitoring and dead runner detection
-- Work re-queuing when runners die
-
-**Locking implementation:**
-- **Step assignment**: `SELECT ... FOR UPDATE` on step row
-- **Idempotency**: Unique constraint on `execution_key` column
-- **Workspace access**: PostgreSQL advisory locks (SQLite: file locking in dev)
-- **No Redis required**: All coordination through the primary database
-
-**Network partition handling:**
-| Scenario | Backend Action |
-|----------|----------------|
-| Runner disconnects mid-job | Wait for heartbeat timeout (30s), return step to `pending` |
-| Runner reconnects after timeout | Check if step was reassigned; if yes, abort local work |
-| Runner reconnects before timeout | Continue normally, step still assigned to this runner |
-| Backend restarts | Runners reconnect, re-register; backend resumes from DB state |
-| Double-completion (race) | Idempotency key rejects second completion |
-| LocalExecutor container dies | Docker SDK notifies backend immediately; step marked `failed` |
-
-> **Note**: Current implementation uses 90s heartbeat timeout (generous for polling).
-> WebSocket push model reduces this to 30s for faster failure detection.
-
-**Debug mode integration**: Debug sessions (Phase 12.7) have extended timeouts (1-4 hours)
-and their own state machine. When a step is at a debug breakpoint, the normal heartbeat
-timeout is suspended - the debug session timeout applies instead.
-
-#### Step Lifecycle
-
-```
-[pending] --> [assigned] --> [preparing] --> [running] --> [completing]
-                                                 |              |
-                                                 | exit_0       | finalized
-                                                 v              v
-                                            [timeout]      [completed]
-                                                 |
-                                                 v
-[cancelled] <-- cancel (any state) ------- [failed]
-```
-
-| State | Description |
-|-------|-------------|
-| `pending` | Created, waiting for executor |
-| `assigned` | Assigned to runner, awaiting ACK (remote only) |
-| `preparing` | Pulling image, setting up workspace |
-| `running` | Container executing |
-| `completing` | Processing results |
-| `completed` | Exit code 0, success |
-| `failed` | Non-zero exit or exception |
-| `cancelled` | User cancelled |
-| `timeout` | Exceeded time limit |
-
-**Idempotency**: Each step execution has an `execution_key = "{pipeline_run_id}:{step_index}:{attempt}"`. Duplicate requests return existing execution.
-
-#### Workspace Lifecycle
-
-```
-[creating] --> [ready] <--> [in_use] --> [cleaning] --> [destroyed]
-     |                          |
-     | create_failed            | audit_detects_orphan
-     v                          v
- [failed]                  [orphaned] --> manual cleanup --> destroyed
-```
-
-| State | Description |
-|-------|-------------|
-| `creating` | Volume being created, repo cloning |
-| `ready` | Available, no active steps |
-| `in_use` | Step(s) currently executing |
-| `cleaning` | Pipeline done, destroying volume |
-| `destroyed` | Cleaned up (terminal) |
-| `orphaned` | Lost track, needs manual cleanup |
-| `failed` | Creation failed |
-
-**Locking**:
-- Exclusive lock for creation/cleanup
-- Shared lock for step execution (allows parallel steps)
-- Use count tracks concurrent usage
-
-#### Pipeline Run Lifecycle
-
-```
-[pending] --> [preparing] --> [running] --> [completing] --> [completed]
-                   |              |
-                   | prep_failed  | step_failed
-                   v              v
-              [failed] <----- [failed]
-                   ^
-                   | timeout
-             [cancelled] <-- cancel (any non-terminal)
-```
-
-**Exactly-once step execution**: Pipeline executor skips steps with completed `execution_key`.
-
-**Trigger deduplication**: Triggers have a `trigger_key` (e.g., `push:{repo}:{sha}`). Duplicates within 1 hour are ignored.
-
-#### Runner Lifecycle (Remote Only)
-
-```
-[disconnected] --> [connecting] --> [idle] --> [assigned] --> [busy]
-       ^                                            |            |
-       |                                            | ack_timeout|
-       |                                            v            |
-       |                                        [dead] <---------+
-       |                                            |
-       +------- heartbeat_timeout -----------------+
-       |                                            |
-       +------------- reconnect -------------------+
-```
-
-| State | Description |
-|-------|-------------|
-| `disconnected` | No WebSocket connection |
-| `connecting` | WebSocket open, registration pending |
-| `idle` | Ready to accept jobs |
-| `assigned` | Job sent, awaiting ACK |
-| `busy` | Executing step |
-| `dead` | Heartbeat timeout, presumed crashed |
-
-**Job recovery**: When runner dies mid-job, step is re-queued if still in `running` state (prevents duplicate if completion was lost).
-
-#### Synchronization Requirements
-
-| Resource | Lock Type | Implementation |
-|----------|-----------|----------------|
-| Step assignment | Row lock | `SELECT FOR UPDATE` on step row |
-| Step execution | Idempotency key | Unique constraint on `execution_key` |
-| Workspace access | Shared/Exclusive | PostgreSQL advisory locks (SQLite file lock in dev) |
-| Pipeline execution | Exclusive | Row lock on pipeline_run + single executor process |
-| Trigger dedup | Time-windowed key | Unique constraint on `trigger_key` + created_at window |
-
-> **No Redis required**: All synchronization uses the primary database. This simplifies
-> deployment and eliminates a distributed systems failure mode.
-
-#### Crash Recovery
-
-On backend restart:
-1. **Steps**: Find non-terminal steps, reattach to running containers or re-queue
-2. **Pipelines**: Resume execution (idempotent - skips completed steps)
-3. **Workspaces**: Audit for orphans, cleanup stale volumes
-4. **Runners**: Mark as dead, wait for reconnection
-
----
-
-### Phase 12 Prerequisites: Test Infrastructure
-
-> **Goal**: Establish platform-level test hooks and fixtures BEFORE any Phase 12 implementation begins. Tests define interfaces and expected behavior - they are written FIRST, not as an afterthought.
-
-**This must exist BEFORE any Phase 12 work begins.**
-
-#### Test Fixtures (Create First)
-
-- [ ] `tdd/conftest.py` with shared pytest fixtures:
-  - `docker_client` - Connected Docker SDK client (skip tests if unavailable)
-  - `test_database` - Fresh SQLite in-memory or temp file per test
-  - `async_session` - Async SQLAlchemy session factory
-  - `mock_websocket` - Fake WebSocket for protocol testing
-  - `temp_workspace` - Creates and cleans up temp directories
-
-#### Platform-Level Test Hooks
-
-- [ ] Docker manipulation helpers (`tdd/shared/docker_helpers.py`):
-  - `spawn_test_container(image, command)` - Create container, return handle
-  - `kill_container(container_id)` - Force kill
-  - `pause_container(container_id)` - Simulate hang
-  - `disconnect_network(container_id)` - Network partition
-- [ ] Process control helpers (`tdd/shared/process_helpers.py`):
-  - `kill_process(pid)` - Simulate crash
-  - `send_signal(pid, signal)` - SIGTERM, SIGKILL, SIGSTOP
-- [ ] Time manipulation (`tdd/shared/time_helpers.py`):
-  - `freeze_time(timestamp)` - For timeout testing
-  - `advance_time(seconds)` - Fast-forward for heartbeat tests
-
-#### Mock Infrastructure
-
-- [ ] `MockDockerClient` - Fake Docker SDK for unit tests (no real Docker needed)
-- [ ] `MockWebSocket` - Fake WebSocket for protocol tests
-- [ ] `TestDatabase` - Fresh database per test with rollback
-- [ ] `MockRunner` - Simulates runner behavior for RemoteExecutor tests
-
-#### Chaos Test Infrastructure
-
-- [ ] `ChaosController` class (`tdd/shared/chaos.py`):
-  - `inject_failure(type, target, duration)` - Programmatic failure injection
-  - Failure types: network_partition, process_kill, disk_full, slow_io
-- [ ] Recovery verification helpers:
-  - `wait_for_state(entity, expected_state, timeout)`
-  - `assert_eventually(condition, timeout, interval)`
-
-**Outcome**: All Phase 12 sub-phases can write tests immediately without infrastructure blockers.
-
----
-
-### Phase 12 Prerequisites: E2E Test Infrastructure
-
-> **Goal**: Establish end-to-end tests covering full user workflows (frontend + backend + runner) BEFORE Phase 12 refactoring begins. These tests validate the system works correctly and serve as regression protection during architectural changes.
-
-**Why E2E tests before Phase 12?**
-- Phase 12 fundamentally changes how steps execute (polling -> push, runners -> containers)
-- Unit tests verify components work; E2E tests verify the *system* works
-- Catch integration bugs that unit tests miss (WebSocket message ordering, SSE timing, etc.)
-- Confidence to refactor: if E2E tests pass after Phase 12, the system still works
-
-#### Key Decision: Mock Executor Type
-
-E2E tests use a **mock executor** that's a first-class executor type alongside `claude` and `gemini`:
-
-```
-job_queue → runner → container → mock executor → scripted response through normal flow
-```
-
-**NOT** special test-only logic or CLI overrides. The mock executor is a real executor that:
-- Gets dispatched through the same runner pathways as claude/gemini
-- Runs in the same container infrastructure
-- Returns scripted responses based on configuration
-- Exercises all the same WebSocket/SSE/status update code paths
-
-```
-+-------------+     +---------+     +-----------+     +----------------+
-| Test Driver | --> | Backend | --> | Container | --> | Mock Executor  |
-|             |     |  (real) |     |   (real)  |     | (type: "mock") |
-+-------------+     +---------+     +-----------+     +----------------+
-                         |                                    |
-                         v                                    v
-                    [WebSocket]                       [Scripted Response]
-                    [Events]                          [File Changes]
-```
-
-**Mock Executor behavior**:
-- Reads mock config from `/workspace/.control/mock_config.json`
-- Creates file changes as specified in config
-- Returns scripted output (reasoning, tool calls, completion)
-- Supports streaming mode for playground tests
-- Same log streaming, status updates, and completion flow as real executors
-
----
-
-#### User Story 1: Create and Execute a Card
-
-**As a** developer
-**I want to** create a card and start agent work
-**So that** I can have AI implement a feature
-
-**Happy Path**:
-1. User opens board, selects repo
-2. User creates card with title and description
-3. User clicks "Start Work"
-4. Runner picks up job, clones repo, executes agent
-5. Agent makes file changes
-6. Card status progresses: `todo` → `in_progress` → `in_review`
-7. Diff is visible in card detail
-
-**Acceptance Criteria**:
-| Criterion | Verification |
-|-----------|--------------|
-| Card created in database | GET `/api/cards/{id}` returns 200 |
-| Job queued | Job appears in job_queue |
-| Runner executes | Container started, logs streaming |
-| Status updates via WebSocket | Frontend receives `card_updated` events |
-| Diff captured | GET `/api/cards/{id}/diff` returns changes |
-| Card reaches `in_review` | Final status = `in_review` |
-
-**Failure Modes to Test**:
-| Failure | Expected Behavior |
-|---------|-------------------|
-| Agent returns non-zero exit | Card status → `failed`, error captured |
-| Container timeout | Card status → `failed`, timeout error |
-| Agent makes no changes | Card status → `in_review` with empty diff |
-| WebSocket disconnect mid-job | Reconnect sees correct final state |
-
----
-
-#### User Story 2: Review and Approve/Reject Changes
-
-**As a** reviewer
-**I want to** see the diff and approve or reject changes
-**So that** quality code gets merged
-
-**Happy Path (Approve)**:
-1. User opens card in `in_review` status
-2. User sees diff with file changes
-3. User clicks "Approve"
-4. Card status → `done`
-5. Changes merged to target branch
-
-**Happy Path (Reject)**:
-1. User opens card in `in_review` status
-2. User sees diff with file changes
-3. User clicks "Reject"
-4. Card status → `todo` (or `failed` depending on config)
-5. Branch preserved for retry
-
-**Acceptance Criteria**:
-| Criterion | Verification |
-|-----------|--------------|
-| Diff displays correctly | UI shows correct file changes |
-| Approve updates status | Card status → `done` |
-| Approve triggers merge | Branch merged to default branch |
-| Reject updates status | Card status → `todo` |
-| WebSocket broadcasts update | Other tabs see status change |
-
-**Failure Modes to Test**:
-| Failure | Expected Behavior |
-|---------|-------------------|
-| Merge conflict on approve | Card status → `failed`, conflict error shown |
-| Approve card not in_review | 400 error, status unchanged |
-| Concurrent approve attempts | One succeeds, other gets 409 conflict |
-
----
-
-#### User Story 3: Pipeline Triggers on Card Completion
-
-**As a** developer
-**I want** pipelines to auto-trigger when cards complete
-**So that** tests run automatically after AI work
-
-**Happy Path**:
-1. Pipeline configured with `card_complete` trigger
-2. Card reaches `in_review` (or `done` depending on trigger config)
-3. Pipeline automatically starts
-4. Pipeline steps execute sequentially
-5. On pipeline success: trigger action executes (e.g., merge)
-6. On pipeline failure: card marked failed
-
-**Acceptance Criteria**:
-| Criterion | Verification |
-|-----------|--------------|
-| Trigger fires on card status | Pipeline run created automatically |
-| Trigger context includes card info | `trigger_context` has card_id, branch, commit |
-| Pipeline runs correct steps | Steps execute in order |
-| on_pass action executes | Merge happens if configured |
-| on_fail action executes | Card marked failed if configured |
-| WebSocket broadcasts pipeline status | `pipeline_run_status` events sent |
-
-**Failure Modes to Test**:
-| Failure | Expected Behavior |
-|---------|-------------------|
-| Pipeline step fails | Pipeline fails, on_fail action runs |
-| Trigger disabled | No pipeline run created |
-| No matching pipeline | Card status unchanged |
-| Pipeline already running for card | Duplicate trigger ignored (dedup) |
-
----
-
-#### User Story 4: Agent Playground - Quick Iteration
-
-**As a** developer
-**I want to** test agent prompts without full card workflow
-**So that** I can iterate quickly on agent behavior
-
-**Happy Path**:
-1. User opens Playground tab
-2. User selects repo, branch, agent
-3. User optionally overrides task description
-4. User clicks "Test Once"
-5. SSE stream shows agent reasoning in real-time
-6. On completion, diff preview shows changes
-7. User optionally saves to branch
-
-**Acceptance Criteria**:
-| Criterion | Verification |
-|-----------|--------------|
-| SSE stream connects | `/playground/{session_id}/stream` returns events |
-| Tokens stream in real-time | Events arrive before completion |
-| Tool calls visible | Tool use events displayed |
-| Diff captured on completion | `get_result()` returns diff |
-| Save to branch works | Changes pushed to `agent-test/*` branch |
-| Cancel stops execution | Container killed, session cleaned up |
-
-**Failure Modes to Test**:
-| Failure | Expected Behavior |
-|---------|-------------------|
-| Agent error mid-stream | Error event sent, session ends gracefully |
-| SSE disconnect | Reconnect shows final state |
-| Save to non-existent branch | Branch created |
-| Cancel during git push | Partial changes not pushed |
-
----
-
-#### User Story 5: Real-Time Updates Across Tabs
-
-**As a** user with multiple browser tabs open
-**I want** all tabs to stay in sync
-**So that** I see consistent state
-
-**Happy Path**:
-1. User opens board in two tabs
-2. Tab 1: Creates card
-3. Tab 2: Sees card appear (WebSocket)
-4. Tab 1: Starts work on card
-5. Tab 2: Sees status change to `in_progress`
-6. Tab 1: Card completes
-7. Tab 2: Sees status change to `in_review`
-
-**Acceptance Criteria**:
-| Criterion | Verification |
-|-----------|--------------|
-| Card create broadcast | `card_created` event received |
-| Card update broadcast | `card_updated` events for status changes |
-| Pipeline run broadcast | `pipeline_run_status` events |
-| Step run broadcast | `step_run_status` events |
-| Repo update broadcast | `repo_updated` events |
-
-**Failure Modes to Test**:
-| Failure | Expected Behavior |
-|---------|-------------------|
-| WebSocket disconnect | Reconnect, state refreshed via REST |
-| Missed event during disconnect | REST call catches up |
-| High-frequency updates | No events dropped, order preserved |
-
----
-
-#### E2E Test Structure
-
-```
-tdd/e2e/
-├── conftest.py                    # E2E-specific fixtures
-├── helpers/
-│   ├── __init__.py
-│   ├── mock_executor.py           # Mock executor configuration helpers
-│   ├── browser.py                 # Playwright browser helpers
-│   ├── websocket.py               # WebSocket test client
-│   └── assertions.py              # E2E-specific assertions
-├── test_card_execute.py           # User Story 1: Create and Execute
-├── test_review_flow.py            # User Story 2: Review and Approve/Reject
-├── test_pipeline_triggers.py      # User Story 3: Pipeline Triggers
-├── test_playground.py             # User Story 4: Agent Playground
-├── test_realtime_updates.py       # User Story 5: WebSocket Consistency
-└── fixtures/
-    ├── mock_responses/            # Canned mock executor responses
-    │   ├── simple_file_change.json
-    │   ├── multi_file_change.json
-    │   └── error_response.json
-    └── test_repos/                # Minimal git repos for testing
-        └── minimal-repo/
-```
-
----
-
-#### Mock Executor Implementation
-
-**Add `mock` as a first-class executor type** alongside `claude` and `gemini`:
-
-The mock executor is added to the runner codebase as a real executor that:
-
-1. Reads mock configuration from `/workspace/.control/mock_config.json`
-2. Performs scripted file operations (create, modify, delete)
-3. Outputs scripted response with configurable streaming
-4. Exits with configured exit code
-5. Uses the same log streaming and status reporting as real executors
-
-**Mock Config Format**:
-```json
-{
-  "response_mode": "streaming",
-  "file_operations": [
-    {
-      "action": "create",
-      "path": "src/new_file.py",
-      "content": "# New file content"
-    },
-    {
-      "action": "modify",
-      "path": "src/existing.py",
-      "search": "old_code",
-      "replace": "new_code"
-    }
-  ],
-  "output_events": [
-    {"type": "content", "text": "I'll analyze the code..."},
-    {"type": "tool_use", "tool": "Read", "path": "src/main.py"},
-    {"type": "content", "text": "Making the requested changes..."},
-    {"type": "tool_use", "tool": "Edit", "path": "src/main.py"},
-    {"type": "complete", "text": "Done!"}
-  ],
-  "exit_code": 0,
-  "delay_ms": 100
-}
-```
-
-**Runner Integration**:
-
-```python
-# In runner entrypoint - mock executor dispatched same as claude/gemini
-if runner_type == "mock":
-    from executors.mock_executor import execute_mock
-    execute_mock(config_path="/workspace/.control/mock_config.json")
-elif runner_type == "claude":
-    # existing claude logic
-elif runner_type == "gemini":
-    # existing gemini logic
-```
-
-**Why this approach?**
-- No special test-only code paths in production executors
-- Mock executor exercises the full runner machinery
-- Tests can target `runner_type: "mock"` just like `runner_type: "claude"`
-- Same WebSocket events, same status updates, same log streaming
-
----
-
-#### E2E Test Fixtures
-
-**conftest.py for E2E**:
-```python
-@pytest.fixture(scope="session")
-def e2e_backend():
-    """Start backend server for E2E tests."""
-    # Start real backend (not ASGI test client)
-    # Returns base URL
-
-@pytest.fixture(scope="session")
-def e2e_browser():
-    """Playwright browser instance."""
-    # Returns browser context
-
-@pytest.fixture
-def mock_executor_config():
-    """Factory for creating mock executor configurations."""
-    def _create(file_ops=None, output=None, exit_code=0):
-        return MockExecutorConfig(...)
-    return _create
-
-@pytest.fixture
-def test_repo(e2e_backend):
-    """Create and ingest a minimal test repo."""
-    # Returns repo data with cleanup
-
-@pytest.fixture
-def websocket_client(e2e_backend):
-    """WebSocket client for real-time event testing."""
-    # Returns connected client
-```
-
----
-
-#### Phase 12 E2E Prerequisites Checklist
-
-- [ ] **Mock Executor**
-  - [ ] Add `mock` executor type to runner entrypoint
-  - [ ] Implement mock executor logic (read config, apply file ops, stream output)
-  - [ ] Define mock config JSON schema
-  - [ ] Unit test mock executor standalone
-
-- [ ] **E2E test harness**
-  - [ ] Create `tdd/e2e/conftest.py` with fixtures
-  - [ ] Backend startup fixture (real server, not ASGI)
-  - [ ] Playwright browser fixture
-  - [ ] WebSocket client fixture
-  - [ ] Test repo fixture with cleanup
-
-- [ ] **User Story 1: Card Execute**
-  - [ ] `test_card_create_and_execute_happy_path`
-  - [ ] `test_card_execute_agent_error`
-  - [ ] `test_card_execute_timeout`
-  - [ ] `test_card_execute_no_changes`
-
-- [ ] **User Story 2: Review Flow**
-  - [ ] `test_review_approve_happy_path`
-  - [ ] `test_review_reject_happy_path`
-  - [ ] `test_review_merge_conflict`
-  - [ ] `test_review_concurrent_approve`
-
-- [ ] **User Story 3: Pipeline Triggers**
-  - [ ] `test_pipeline_auto_trigger_on_card_complete`
-  - [ ] `test_pipeline_on_pass_merge`
-  - [ ] `test_pipeline_on_fail_marks_card_failed`
-  - [ ] `test_pipeline_trigger_deduplication`
-
-- [ ] **User Story 4: Playground**
-  - [ ] `test_playground_streaming_output`
-  - [ ] `test_playground_diff_capture`
-  - [ ] `test_playground_save_to_branch`
-  - [ ] `test_playground_cancel`
-
-- [ ] **User Story 5: Real-Time Updates**
-  - [ ] `test_websocket_card_created_broadcast`
-  - [ ] `test_websocket_card_status_updates`
-  - [ ] `test_websocket_reconnect_catches_up`
-
----
-
-#### Done Criteria for E2E Prerequisites
-
-1. **Mock Executor works**: Can run mock executor with config, produces expected file changes and output
-2. **E2E harness runs**: `pytest tdd/e2e/ --collect-only` shows all tests
-3. **At least one happy path per user story passes**: Core workflows verified
-4. **At least one failure mode per user story passes**: Error handling verified
-5. **Tests run in CI**: GitHub Actions workflow for E2E tests
-6. **No flaky tests**: Tests pass consistently 10 runs in a row
-
-**Effort Estimate**: 1-2 weeks
-**Risk**: Medium (Playwright setup, WebSocket testing can be tricky)
-**Outcome**: Confidence to proceed with Phase 12 refactoring
-
----
-
-### Phase 12.0: Unify Runner Entrypoints
-**Goal**: Fix immediate pain, unblock future phases
-
-The current entrypoints are ~1800 lines each with 95% duplication. This phase extracts common code into a shared package.
-
-#### Tests First (Define Contracts)
-
-Write these tests BEFORE implementing the shared modules:
-
-**test_git_helpers.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_clone_creates_repo_at_path` | `clone(url, path) -> None` raises on failure |
-| `test_checkout_branch_switches` | `checkout(path, branch) -> None` |
-| `test_get_current_sha_returns_string` | `get_sha(path) -> str` |
-| `test_clone_handles_auth_failure` | Returns specific exception type |
-
-**test_context_helpers.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_create_context_dir_structure` | `.lazyaf-context/` has expected subdirs |
-| `test_write_context_file_creates_json` | Files are valid JSON |
-| `test_read_context_returns_parsed` | Read matches written |
-
-**test_job_helpers.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_heartbeat_sends_to_backend` | `send_heartbeat(job_id)` hits correct endpoint |
-| `test_heartbeat_timeout_raises` | Raises after N seconds |
-| `test_status_report_formats_correctly` | Status payload structure |
-
-- [x] Write `test_git_helpers.py` (defines interface) - 17 tests
-- [x] Write `test_context_helpers.py` (defines interface) - 20 tests
-- [x] Write `test_job_helpers.py` (defines interface) - 23 tests
-
-#### Implementation (Make Tests Pass)
-
-- [x] Create `runner-common/` package structure with stub modules
-  - `git_helpers.py` - clone, branch, push, commit operations
-  - `context_helpers.py` - `.lazyaf-context/` management
-  - `job_helpers.py` - heartbeat, logging, status reporting
-  - `executors/` - Agent-specific CLI invocation (ClaudeExecutor, GeminiExecutor, MockExecutor)
-  - `entrypoint.py` - Unified runner entrypoint
-- [x] Implement `git_helpers.py` to pass tests (17 tests)
-- [x] Implement `context_helpers.py` to pass tests (20 tests)
-- [x] Implement `job_helpers.py` to pass tests (23 tests)
-- [x] Create `executors/` package with Claude/Gemini/Mock executors (23 tests)
-- [x] Create unified entrypoint that dispatches by agent type (17 tests)
-- [x] Reduce Claude/Gemini-specific code to ~50 lines each (just CLI invocation)
-
-#### Integration Validation
-
-- [x] `test_entrypoint.py`:
-  - Claude agent type routes correctly
-  - Gemini agent type routes correctly
-  - Mock agent type routes correctly
-  - Unknown agent type fails with clear error
-- [ ] `test_existing_pipelines_still_work.py`:
-  - Run actual pipeline with unified entrypoint
-  - Compare output to baseline
-
-#### Done Criteria
-
-- [x] All `test_*_helpers.py` tests pass (100 tests total, 1 skipped)
-- [x] E2E tests pass with mock runner (9 tests, validates full pipeline flow)
-- [x] No regression in existing pipeline behavior (e2e tests confirm)
-
-**Effort**: 2-3 days
-**Risk**: Low
-**Outcome**: Maintainable entrypoints, foundation for new architecture
-
----
-
-### Phase 12.1: LocalExecutor + Step State Machine
-**Goal**: Instant step execution with proper state management
-
-The fast path - backend spawns containers directly, with full lifecycle tracking.
-
-#### Tests First (Define Contracts)
-
-**test_step_state_machine.py** - Write BEFORE implementing state machine
-| Test | Defines Contract |
-|------|------------------|
-| `test_pending_to_assigned_valid` | Transition allowed |
-| `test_pending_to_running_invalid` | Must go through assigned first |
-| `test_running_to_completed_on_exit_0` | Exit code 0 = success |
-| `test_running_to_failed_on_nonzero` | Exit code != 0 = failure |
-| `test_running_to_timeout_on_deadline` | Timeout = specific state |
-| `test_cancel_from_any_state` | Cancel always works |
-| `test_completed_is_terminal` | No transitions from completed |
-| `test_transition_records_timestamp` | State changes have timestamps |
-
-**test_idempotency_keys.py** - Write BEFORE implementing idempotency
-| Test | Defines Contract |
-|------|------------------|
-| `test_execution_key_format` | Format: `{run_id}:{step}:{attempt}` |
-| `test_same_key_returns_existing` | Duplicate request = same execution |
-| `test_different_attempt_new_execution` | Retry = new execution |
-
-**test_local_executor_contract.py** - Write BEFORE implementing LocalExecutor
-| Test | Defines Contract |
-|------|------------------|
-| `test_execute_step_returns_generator` | `execute_step() -> AsyncGenerator` |
-| `test_execute_step_idempotent` | Same key = same result |
-| `test_execute_step_spawns_container` | Container created with correct image |
-| `test_execute_step_mounts_workspace` | Volume mounted at /workspace |
-| `test_execute_step_streams_logs` | Generator yields log lines |
-| `test_timeout_kills_container` | Container killed after timeout |
-| `test_crash_detection_fails_step` | Container crash = step failed |
-
-- [x] Write `test_step_state_machine.py` (defines state transitions) - 32 tests
-- [x] Write `test_idempotency_keys.py` (defines idempotency contract) - 18 tests
-- [x] Write `test_local_executor_contract.py` (defines executor interface) - 31 tests
-
-#### Database Migration
-
-- [x] Create `StepExecution` model in `backend/app/models/pipeline.py`
-  ```python
-  class StepExecution(Base):
-      __tablename__ = "step_executions"
-      id: str  # UUID
-      execution_key: str  # "{pipeline_run_id}:{step_index}:{attempt}" - UNIQUE constraint
-      step_run_id: str  # FK to step_runs
-      status: str  # pending, assigned, preparing, running, completing, completed, failed, cancelled, timeout
-      runner_id: str | None  # Which runner is executing (remote only)
-      container_id: str | None  # Docker container ID (local only)
-      exit_code: int | None
-      error: str | None
-      started_at: datetime | None
-      completed_at: datetime | None
-      created_at: datetime
-  ```
-- [x] Add unique index on `execution_key` for idempotency
-
-#### Implementation (Make Tests Pass)
-
-- [x] Implement Step state machine in `backend/app/services/execution/state_machine.py`
-- [x] Implement idempotency service in `backend/app/services/execution/idempotency.py`
-- [x] Create `LocalExecutor` service in `backend/app/services/execution/local_executor.py`
-- [x] Docker SDK (`docker` package) already in backend dependencies
-- [x] Timeout handling with automatic container kill
-- [x] Container crash detection and proper state transition to `failed`
-- [x] Real-time log streaming from container
-- [x] Mount Docker socket to backend container in docker-compose
-- [x] Crash recovery: on startup, find orphaned steps and mark them failed
-
-#### Integration Validation
-
-- [x] `test_local_executor_real_docker.py` (requires Docker):
-  - Actually spawns container
-  - Actually streams logs
-  - Actually detects exit codes
-- [x] `test_recovery.py`:
-  - Orphaned executions (pending, running, preparing) marked as failed on startup
-  - Terminal executions (completed, failed) not affected
-  - Recovery sets completed_at timestamp
-
-#### Chaos Tests
-
-- [x] `test_chaos_oom.py` - OOM exit codes (137) detected as failed
-- [x] `test_chaos_docker_unavailable.py` - Docker down = graceful error handling
-  - Connection refused handled
-  - API timeouts handled
-  - Image not found handled
-  - Resource exhaustion handled
-
-#### Done Criteria
-
-- [x] All state machine unit tests pass (32 tests)
-- [x] All idempotency tests pass (18 tests)
-- [x] LocalExecutor contract tests pass (31 tests)
-- [x] Recovery tests pass (11 tests)
-- [x] Integration tests pass with real Docker (8 tests)
-- [x] Chaos tests pass (12 tests)
-- [x] Total: 111 tests passed, 1 skipped (async timeout needs implementation)
-
-**Effort**: 1.5 weeks
-**Risk**: Medium
-**Outcome**: Local dev is instant with proper state tracking and crash recovery
-
----
-
-### Phase 12.2: Workspace State Machine & Pipeline Integration
-**Goal**: Proper workspace lifecycle with locking and cleanup
-
-#### Tests First (Define Contracts)
-
-**test_workspace_state_machine.py** - Write BEFORE implementing workspace lifecycle
-| Test | Defines Contract |
-|------|------------------|
-| `test_creating_to_ready_on_success` | Volume created = ready |
-| `test_creating_to_failed_on_error` | Volume creation fails = failed |
-| `test_ready_to_in_use_increments_count` | use_count tracks concurrent access |
-| `test_in_use_to_ready_decrements_count` | Step completes = decrement |
-| `test_cleaning_requires_zero_use_count` | Can't clean while in use |
-| `test_orphaned_detection` | Workspace with no pipeline = orphaned |
-
-**test_workspace_locking.py** - Write BEFORE implementing locking
-| Test | Defines Contract |
-|------|------------------|
-| `test_exclusive_lock_for_create` | Only one creator |
-| `test_exclusive_lock_for_cleanup` | Only one cleaner |
-| `test_shared_lock_for_execution` | Multiple steps can run |
-| `test_lock_timeout_returns_false` | Don't block forever |
-
-**test_execution_router.py** - Write BEFORE implementing router
-| Test | Defines Contract |
-|------|------------------|
-| `test_routes_to_local_when_no_requirements` | Default = LocalExecutor |
-| `test_routes_to_remote_when_hardware_required` | `requires: {has: gpio}` = remote |
-| `test_returns_executor_handle` | Caller gets async generator |
-
-**test_pipeline_state_machine.py** - Write BEFORE implementing pipeline lifecycle
-| Test | Defines Contract |
-|------|------------------|
-| `test_pending_to_preparing` | Pipeline starts |
-| `test_preparing_to_running` | Workspace ready |
-| `test_running_to_completing` | All steps done |
-| `test_completing_to_completed` | Cleanup done |
-| `test_step_failure_fails_pipeline` | One step fails = pipeline fails |
-
-**test_trigger_deduplication.py** - Write BEFORE implementing dedup
-| Test | Defines Contract |
-|------|------------------|
-| `test_same_trigger_key_within_window_ignored` | Duplicate = no new run |
-| `test_same_trigger_key_after_window_allowed` | Window expired = new run |
-| `test_trigger_key_format` | Format: `{type}:{repo}:{ref}` |
-
-- [ ] Write `test_workspace_state_machine.py` (defines workspace lifecycle)
-- [ ] Write `test_workspace_locking.py` (defines locking semantics)
-- [ ] Write `test_execution_router.py` (defines routing contract)
-- [ ] Write `test_pipeline_state_machine.py` (defines pipeline lifecycle)
-- [ ] Write `test_trigger_deduplication.py` (defines dedup contract)
-
-#### Implementation (Make Tests Pass)
-
-- [ ] Implement Workspace state machine (make workspace tests pass)
-- [ ] Create `Workspace` model with state and use_count
-  ```python
-  class Workspace:
-      id: str  # "lazyaf-ws-{pipeline_run_id}"
-      status: WorkspaceStatus
-      use_count: int  # For concurrent step access
-      pipeline_run_id: str
-  ```
-- [ ] Implement workspace locking (make lock tests pass)
-- [ ] Idempotent workspace creation (`get_or_create_workspace`)
-- [ ] Create `ExecutionRouter` (make routing tests pass)
-- [ ] Update `pipeline_executor.py` to use ExecutionRouter instead of job queue
-- [ ] Implement pipeline state machine (make pipeline tests pass)
-- [ ] Implement trigger deduplication (make dedup tests pass)
-- [ ] Workspace cleanup on pipeline completion
-- [ ] Orphan detection: periodic audit finds abandoned workspaces
-
-#### Integration Validation
-
-- [ ] `test_multi_step_pipeline.py`:
-  - Step 1 completes, workspace persists
-  - Step 2 sees Step 1 artifacts
-  - Pipeline completes, workspace cleaned
-- [ ] `test_different_images_share_workspace.py`:
-  - Step 1 in `golang:1.21`
-  - Step 2 in `python:3.12`
-  - Workspace contains both outputs
-- [ ] `test_workspace_cleanup_on_failure.py`:
-  - Pipeline fails mid-execution
-  - Workspace still cleaned up (eventually)
-
-#### Chaos Tests
-
-- [ ] `test_concurrent_workspace_access.py` - Multiple steps, same workspace
-- [ ] `test_orphan_workspace_recovery.py` - Backend dies, workspace orphaned, recovered on restart
-
-#### Done Criteria
-
-- [ ] Workspace state machine tests pass
-- [ ] Locking tests pass (no race conditions)
-- [ ] ExecutionRouter tests pass
-- [ ] Pipeline state machine tests pass
-- [ ] Multi-step integration test passes
-- [ ] Orphan recovery test passes
-
-**Effort**: 1.5 weeks
-**Risk**: Medium
-**Outcome**: Robust workspace lifecycle, exactly-once execution, no orphaned resources
-
----
-
-### Phase 12.2.5: Specification Data Model
-**Goal**: Stand up the spec layer (Feature / UserStory / AcceptanceCriterion / PromptTemplate) with CRUD APIs and a minimal UI. No execution changes yet — just the foundation for Phase 12.2.6 and beyond.
-
-> **[Superseded 2026-08-29 — 12.2.5 shipped alongside 12.2-INT and 12.3 landed first; 12.2.6 is a deliberate retrofit. Kept for design context.]**
+## Milestone 14 — Self-Hosted & OpenAI-Compatible Model Endpoints
+
+> **STATUS: 14.1-14.3 COMPLETE, landed 2026-08-30** in commit `4b429c6` (56
+> files, ~21,500 lines). `ModelEndpoint` + migration `0011_model_endpoints.py`;
+> the capability probe (`backend/app/services/model_endpoints/probe.py`); the
+> agent harness with a tool-calling loop and a text-fence fallback
+> (`runner-common/runner_common/harness/`); a stdlib mock OpenAI server so CI
+> needs no GPU (`tdd/shared/mock_openai/`); the Endpoints UI, store and
+> Playwright spec. Verified against this host's real ollama: `llama3.1:8b`
+> probed `ok` with tools, streaming and usage all true and a context window of
+> `131072` discovered via ollama's `/api/show`.
 >
-> **Why now (before 12.3):** Phase 12.3 freezes the Control Layer protocol — what steps report back to the backend. Once the spec models exist, 12.3 can extend that protocol with a test-result manifest channel (see Phase 12.2.6) instead of bolting it on later.
+> **14.4 ("prove it" — a dogfood step against a real self-hosted endpoint, and
+> the fan-out hypothesis measured) is NOT COMPLETE**, because its second half
+> depends on Milestone 13, which has not started. Test notes and the manual
+> verification transcript: `upcoming/m14-testing.md`.
+>
+> **14.5 is DESIGNED ONLY — zero implementation.** No `vllm` or `ollama`
+> appears anywhere under `images/` or `scripts/`, and no GPU-yield or drain
+> mechanism exists in the tree. Wiring doc:
+> `upcoming/wave9-145-runner-images.md`.
+>
+> Milestone 14 sits OUTSIDE the 12.x sequence.
 
-#### Tests First (Define Contracts)
 
-**test_feature_crud.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_create_feature_returns_id` | POST `/api/features` returns 201 with UUID |
-| `test_feature_spans_multiple_repos` | `repo_ids` accepts list, validated against existing repos |
-| `test_feature_status_transitions` | proposed -> active -> shipped -> deprecated only |
-| `test_delete_feature_cascades_stories` | Removing feature removes orphaned stories |
+> **The ask (owner, 2026-08-30):** run agents against models we host ourselves —
+> ollama and vLLM on bare metal at home, or on runpod.io — so "all sorts of AI
+> models" can be in the mix. Push-style: LazyAF reaches out when it wants work
+> done, never a long-poll loop.
+>
+> **Sequencing:** independently valuable for the product (cheap local models
+> doing routine work), AND a hard prerequisite for Milestone 13's central
+> hypothesis — "a high-end model writes instructions, K cheap models execute in
+> parallel" is unmeasurable without cheap models. It can be built in parallel
+> with 13.1/13.2; 13.3's headline experiment depends on it.
 
-**test_user_story_crud.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_story_requires_feature` | Cannot create story without feature_id |
-| `test_story_repos_subset_of_feature` | Story repo_ids must be subset of feature.repo_ids |
-| `test_story_priority_int` | Priority is plain int, not story points enum |
-| `test_story_narrative_freeform` | No gherkin enforcement — markdown OK |
+### The thing that is actually hard
 
-**test_criterion_crud.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_criterion_requires_story` | Cannot create without story |
-| `test_required_blocks_story_done` | Story can't be `done` if any required criterion has no passing TestRun |
-| `test_criterion_can_have_no_tests` | Criterion exists without TestRefs (yet) |
+The transport is easy and already push: LazyAF is the HTTP client, so calling
+`/v1/chat/completions` involves no polling by anyone. **The hard part is that
+ollama and vLLM are inference servers, not agents.** Claude Code and the Gemini
+CLI ship their own agent loop — read files, edit, run commands, iterate until
+done. A raw OpenAI-compatible endpoint gives you completions and nothing else.
+So LazyAF has to supply the loop.
 
-**test_prompt_template_versioning.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_first_version_starts_at_1` | New template gets version 1 |
-| `test_new_version_immutable_predecessor` | Old versions cannot be edited |
-| `test_placeholders_extracted_from_body` | `{story_narrative}` placeholders auto-detected |
+### Decisions (owner, 2026-08-30)
 
-**test_card_spec_links.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_card_can_link_to_feature` | `feature_id` settable on existing Card |
-| `test_card_can_link_to_story` | `user_story_id` settable on existing Card |
-| `test_promote_card_creates_feature` | Promotion creates Feature + Story; original Card relinked |
+- **We own the loop.** A minimal tool-calling harness in `runner-common`
+  (read/write/list files, run shell, apply patches, stop conditions) running
+  inside the existing control-mode container, as a new entry in the `EXECUTORS`
+  registry beside claude/gemini/mock. Wrapping an existing OSS agent CLI was
+  rejected for a specific reason: Milestone 13 makes *loop shape* the
+  independent variable, and a loop we do not own is one we cannot vary.
+- **All three reachability modes**, because the deployments genuinely differ:
+  | Mode | For | How |
+  |---|---|---|
+  | `runner-local` | Home bare metal behind NAT | A 12.6 runner agent runs on the box hosting ollama; the backend pushes the step there over WS and the step container calls `localhost`. Zero inbound connectivity, no tunnel. |
+  | `direct` (default) | runpod, any routable endpoint | The step container calls the endpoint URL itself. |
+  | `proxy` | Central auth/logging | The backend brokers the call. Convenient, but it puts inference traffic through the backend and makes it a bottleneck — opt in per endpoint, never the default. |
+- **Capability is probed and recorded, not assumed.** Tool-calling support is
+  inconsistent across self-hosted models (ollama supports it for some; vLLM
+  depends on model plus chat template). Probe at registration, store the result
+  on the endpoint, and let the strategy decide — which turns "does tool support
+  matter?" from an assumption into something Milestone 13 can measure.
+- **Cost: tokens always, dollars when known.** Token counts come from the
+  OpenAI-compatible `usage` field. An endpoint may carry a $/hour rate (a
+  runpod pod rate, or an estimate for home hardware); when set, cost is
+  rate x wall-clock occupancy recorded as `cost_source="gpu-node"`. When unset,
+  tokens are recorded and cost stays null, and the board must show WHICH trials
+  have real cost data rather than silently mixing them.
 
-- [ ] Write `test_feature_crud.py`
-- [ ] Write `test_user_story_crud.py`
-- [ ] Write `test_criterion_crud.py`
-- [ ] Write `test_prompt_template_versioning.py`
-- [ ] Write `test_card_spec_links.py`
+### What already anticipates this
 
-#### Database Migration
+`StepUsage.provider` already includes `openai-compatible` and `self-hosted`;
+`cost_source` already includes `gpu-node`; and 12.6 deliberately kept the
+runner-agent's executor seam Docker-agnostic and pluggable for exactly this.
+The work is a new executor plus an endpoint registry, not a re-architecture.
 
-- [ ] Alembic migration creating: `features`, `user_stories`, `acceptance_criteria`, `prompt_templates`, `prompt_versions`
-- [ ] `feature_repos` join table for cross-repo scope
-- [ ] `story_repos` join table
-- [ ] Add nullable `feature_id`, `user_story_id`, `promotes_to_feature` columns to `cards`
+### Phases
 
-#### Implementation (Make Tests Pass)
+- **14.1 — Endpoint registry.** A `ModelEndpoint` entity (name, base_url, model,
+  auth style + secret reference, reach mode, optional $/hour, probed
+  capabilities), CRUD, a health/capability probe, and secret handling that
+  reuses the 12.5 `secret_environment` path so a key never reaches
+  `docker inspect`. Endpoints with no auth (typical LAN ollama) are first-class.
+- **14.2 — The agent harness.** The tool-calling loop in `runner-common`, with a
+  no-tools fallback for models that cannot tool-call, bounded iterations and
+  budget, and usage reporting through the existing sidecar so self-hosted runs
+  land in `StepUsage` like every other step.
+- **14.3 — UI category.** A Model Endpoints surface (register, probe, health,
+  capabilities, rate) and endpoint selection wherever an agent is chosen: agent
+  step config, card creation, playground, and the 12.6.5 experiment matrix — the
+  last one is what lets a matrix mix API and self-hosted models in one run.
+- **14.4 — Prove it.** A dogfood step running against a real self-hosted
+  endpoint, and the Milestone 13 fan-out hypothesis finally runnable:
+  expensive planner, K cheap local workers, measured.
 
-- [ ] Pydantic schemas in `backend/app/schemas/spec.py`
-- [ ] SQLAlchemy models in `backend/app/models/spec.py`
-- [ ] Service layer in `backend/app/services/spec/` (one module per entity)
-- [ ] Routers in `backend/app/routers/spec.py`
-- [ ] WebSocket events: `feature_updated`, `story_updated`, `criterion_updated`
-- [ ] MCP tools: add spec CRUD to MCP server (so Claude Desktop can author specs)
+### Phase 14.5 — Runner images with inference baked in
 
-#### Minimal UI (Frontend)
+> **The ask (owner, 2026-08-30):** "images available as runners with vllm and
+> llama baked in so that you mount your data / cache of models and just go."
+> Chosen shape: the COMBINED runner+inference image (not a local compose
+> profile). Servers: **vLLM** and **ollama**.
 
-- [ ] `/specs` route — feature list with status badges
-- [ ] Feature detail page — stories + criteria tree (collapsible)
-- [ ] Story editor — markdown narrative, criterion checklist
-- [ ] Card detail panel: "Linked feature/story" selector + "Promote to feature" button
+One image = one deployable node. `FROM` the upstream inference server, with the
+12.6 runner agent layered on top. You give a pod the model cache, a LazyAF
+server URL and a runner token; it starts the inference server, dials OUT over
+WebSocket, and its steps call the model on `localhost`. **Zero inbound
+connectivity** - which is what makes it work on runpod and behind home NAT
+alike, and why this is a runner image rather than a model image.
 
-#### Integration Validation
+- `lazyaf-runner-ollama` FROM `ollama/ollama` - mount `~/.ollama`; ollama pulls
+  models itself, so "mount your data and go" is literally true.
+- `lazyaf-runner-vllm` FROM `vllm/vllm-openai` - mount the HF cache; the
+  throughput option and the right one on a rented GPU.
 
-- [ ] `test_promote_card_to_feature_e2e.py` — full UI flow
-- [ ] `test_cross_repo_feature_appears_on_both_repos` — feature shows in repo views for all linked repos
-- [ ] `test_mcp_can_create_feature_from_claude_desktop`
+**We do NOT rebuild the inference servers.** Both upstreams publish official
+images; forking them means multi-GB pushes on every release plus tracking
+CUDA/torch/vLLM compatibility forever. We add a thin layer - the runner agent,
+an entrypoint that supervises two processes, and the endpoint declaration - and
+inherit their release engineering.
 
-#### Done Criteria
+**Windows desktops with idle RTX cards (owner, 2026-08-30).** The target is a
+Windows box running Docker Desktop on the WSL2 backend, using the SAME image as
+runpod with `--gpus all` (NVIDIA's CUDA-on-WSL driver makes this work), so there
+is nothing Windows-specific to maintain. Two decisions attach to it:
 
-- [ ] All CRUD test suites pass
-- [ ] UI lets a user define a feature with at least one story and one criterion in under 60s
-- [ ] Existing card workflows unchanged (no regressions)
+- **Dual role, selected per endpoint.** The box can serve models AND execute
+  steps; the difference is advertised as labels, not as two deployment shapes.
+- **Yield on GPU busy.** LazyAF must not fight the owner for his own GPU. This
+  is genuinely new mechanism: the node samples GPU utilization and DRAINS -
+  stops accepting new assignments while letting an in-flight step finish - then
+  resumes, with hysteresis so a transient spike cannot flap it. The naive
+  version (disconnect when busy) is wrong precisely because 14.5 establishes
+  that the connection IS the advertisement, so disconnecting would orphan
+  running work. Expect a small backend availability flag; silently dropping the
+  connection is not acceptable. The UI must show WHY a node is not taking work,
+  and a manual force-drain / force-available override is required.
 
-**Effort**: 1.5-2 weeks
-**Risk**: Low (data + UI, no execution-path changes)
-**Outcome**: Specs exist as first-class entities. Foundation for tying tests + experiments to intent.
+Design points the wiring doc must settle:
+- **Two processes, one container.** The entrypoint starts the inference server,
+  waits for it to be healthy, then starts the runner agent, and propagates
+  signals and exit codes so a dead server does not leave a live runner
+  advertising a model that is gone.
+- **How the pod's endpoint gets registered.** 14.1 already has `runner-local`
+  reach mode plus `requires: {has: ["endpoint:<name>"]}` label matching, so the
+  minimum is: the operator registers the endpoint once and the pod advertises
+  the matching label from env. Whether the pod may ALSO self-register through
+  the API is a real decision - it is the difference between "just go" and a
+  node being able to write rows in your control plane.
+- **LazyAF builds the heavy images itself** (owner, 2026-08-30). A repo-defined
+  pipeline with docker steps builds and pushes the two runner images on a LazyAF
+  runner agent, not on GitHub compute. This is dogfooding at the top of the
+  stack - the platform ships its own artifacts - and it also sidesteps a real
+  problem: a ~45GB vLLM build does not fit a standard GitHub runner, and a
+  self-hosted Actions runner on a PUBLIC repo would expose the owner's hardware
+  to fork PRs. GitHub keeps the wheel, the small service images, the existing
+  step images, secret-scan and release-please; `pr-build.yml` stays
+  GitHub-hosted for exactly that reason. GHCR credentials reach the build step
+  through 12.5 `secret_environment`, so they never appear in `docker inspect`.
+- **Image size is a release problem, not a detail.** A CUDA vLLM image is ~10GB.
+  These must not ride the normal per-tag image matrix; they need their own
+  trigger, their own cadence, and a documented "build it yourself" path.
+- **GPU passthrough** differs between runpod (automatic) and local
+  `docker run --gpus`; the docs must not assume either.
 
-> **OPEN QUESTION:** Should `Feature` belong to a higher-level "Project" or "Workspace" entity (multi-tenant org), or live flat at the install level? Defaulting to flat for now; add Workspace if multi-org need emerges.
+### Open questions
+
+- Which model families are worth pinning as known-good in the docs, and do we
+  ship a capability matrix or let the probe speak for itself?
+- Context-window limits vary wildly on local models; does the harness truncate,
+  summarize, or refuse when a repo context exceeds them?
+- Concurrency: one local GPU serving K parallel fan-out workers will queue.
+  Does the endpoint carry a max-concurrency the scheduler respects?
 
 ---
 
-### Phase 12.2.6: Test Result Tie-Back
-**Goal**: Tests in application repos declare a stable identifier; runs flow back into LazyAF and join to acceptance criteria, commits, and (later) experiments.
+# Reference
 
-> **Why now (before 12.3):** This phase defines the test-result manifest format. Phase 12.3's Control Layer needs to know about it so the step→backend protocol can carry test results natively.
+> Background for a reader who has not seen LazyAF before. None of this is a
+> plan; it is what the system is.
 
-#### Test Identifier Convention
+## What is LazyAF?
 
-The platform supports multiple frameworks via a *manifest convention*. The test runner (pytest, vitest, go test, etc.) emits a JSON file at a known path; the control layer ships it back.
+LazyAF is a local-first CI/CD platform that integrates AI agents as first-class citizens. Instead of writing GitHub Actions YAML, you define pipelines with a mix of:
 
-**Manifest path:** `/workspace/.control/test_results.json`
+- **Agent steps**: Claude or Gemini implements features, fixes tests, reviews code
+- **Script steps**: Traditional shell commands (lint, test, build)
+- **Docker steps**: Commands in isolated container images
 
-**Manifest schema:**
-```json
-{
-  "schema_version": 1,
-  "framework": "pytest",
-  "commit_sha": "abc123...",
-  "results": [
-    {
-      "lazyaf_test_id": "auth.revoke_key.returns_401",
-      "file_path": "tests/api/test_keys.py",
-      "test_name": "test_revoked_key_returns_401",
-      "status": "passed",
-      "duration_ms": 142,
-      "output": null
-    }
-  ]
-}
+The core workflow:
+1. **Ingest** a repo via CLI (`lazyaf ingest /path/to/repo`)
+2. **Create cards** describing features or tasks
+3. **Start work** -> Runner clones, executes, pushes to internal git server
+4. **Pipeline triggers** -> Tests run, AI fixes failures, auto-merge on success
+5. **Land changes** to real remote when ready (`lazyaf land`)
+
+---
+
+## Long-Term Vision: Specification-Driven Development
+
+> Sprint reviews, PRs, and code review evolved to mentor humans. With LLMs in the loop, the leverage shifts from *implementation review* to *specification fidelity* — does the result match the product intent, and can we prove it repeatedly?
+
+LazyAF is moving toward a model where humans **over-specify what the software must do** (features, user stories, acceptance criteria) and LLMs handle implementation. The platform's job is to:
+
+1. **Capture intent** — features, user stories, and acceptance criteria live in a queryable database, not scattered across Jira/Notion/heads.
+2. **Tie tests back to intent** — every test in every repo declares which acceptance criterion it covers, and every run reports back. Test history is keyed to `(criterion, commit, model, prompt)`.
+3. **Run experiments, not just builds** — re-run the same card across multiple model/prompt combinations and compare pass-rates per criterion. Make model + prompt selection an evidence-driven decision.
+4. **Curate context for parallel agents** — the spec DB lets the platform hand each agent the relevant slice of intent (instead of stuffing the whole codebase into a context window).
+5. **Enable cross-repo features** — a "feature" can span multiple repos (frontend + backend + infra), and the platform tracks delivery across all of them.
+
+This direction reframes LazyAF as a *platform for software science*: experiments, leaderboards, regression dashboards, and reusable prompt structures — alongside the day-to-day "active project management" view (cards, kanban, pipelines).
+
+The spec layer is being added to Phase 12.x in parallel with the runner architecture refactor (see Phases 12.2.5, 12.2.6, 12.6.5, 12.6.6).
+
+---
+
+## Project Structure
+
 ```
-
-**How tests declare their `lazyaf_test_id`:**
-
-| Framework | Mechanism |
-|-----------|-----------|
-| pytest | `@lazyaf_test("auth.revoke_key.returns_401")` decorator (ships in a tiny `pytest-lazyaf` plugin) |
-| vitest / jest | `lazyaf("auth.revoke_key.returns_401", () => { ... })` wrapper |
-| go test | `// lazyaf:auth.revoke_key.returns_401` magic comment above the test func |
-| Anything else | `lazyaf.tests.json` sidecar mapping `{file::test_name -> lazyaf_test_id}` |
-
-The platform doesn't care which mechanism is used — it only cares that the manifest is correctly emitted.
-
-#### Tests First (Define Contracts)
-
-**test_manifest_schema.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_valid_manifest_accepted` | Schema-conformant JSON parses |
-| `test_invalid_status_rejected` | Status must be passed/failed/skipped/error |
-| `test_unknown_test_id_marked_orphan` | `lazyaf_test_id` not in registry → orphan TestRun + warning |
-| `test_missing_commit_sha_rejected` | Commit required for traceability |
-
-**test_result_ingestion.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_ingest_creates_test_runs` | One TestRun per result entry |
-| `test_ingest_idempotent_per_step` | Re-ingesting same step's manifest doesn't duplicate |
-| `test_ingest_links_to_step_execution` | TestRun.step_execution_id populated |
-| `test_ingest_propagates_experiment_context` | If step is part of experiment, model/prompt fields filled |
-
-**test_reconcile_command.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_reconcile_creates_missing_test_refs` | New tests in repo auto-registered |
-| `test_reconcile_marks_disappeared_orphan` | Test removed from repo → TestRef.is_orphaned = true |
-| `test_reconcile_per_repo_scoped` | Reconciliation only affects one repo at a time |
-
-**test_criterion_history_query.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_history_groups_by_commit` | Query returns chronological pass/fail per criterion |
-| `test_history_groups_by_model` | Optional `?model=...` filter |
-| `test_history_groups_by_prompt_version` | Optional `?prompt_version=...` filter |
-
-- [ ] Write `test_manifest_schema.py`
-- [ ] Write `test_result_ingestion.py`
-- [ ] Write `test_reconcile_command.py`
-- [ ] Write `test_criterion_history_query.py`
-
-#### Implementation (Make Tests Pass)
-
-- [ ] Add `test_refs` and `test_runs` tables (Alembic migration)
-- [ ] `POST /api/test-results/ingest` endpoint
-- [ ] `POST /api/test-refs/reconcile` endpoint
-- [ ] `GET /api/criteria/{id}/history` endpoint
-- [ ] Background reconciliation job (run on every successful pipeline)
-- [ ] Reference `pytest-lazyaf` plugin in `runner-common/test_plugins/pytest_lazyaf/`
-- [ ] CLI: `lazyaf tests reconcile <repo>` for manual sync
-- [ ] UI: criterion view shows "last 20 runs" sparkline (pass-rate over time)
-
-#### Integration Validation
-
-- [ ] `test_full_loop.py`:
-  - Create criterion in spec UI
-  - Add `@lazyaf_test("...")` decorated test in repo
-  - Run pipeline that executes pytest
-  - Confirm TestRun appears, criterion history updates
-
-- [ ] `test_orphan_detection.py`:
-  - Test exists in two commits
-  - Removed in third
-  - Reconcile against latest commit marks TestRef orphaned
-
-#### Done Criteria
-
-- [ ] Manifest schema documented + JSON Schema published
-- [ ] At least the pytest plugin works end-to-end
-- [ ] Criterion history endpoint returns data joinable to commits
-
-**Effort**: 1.5-2 weeks
-**Risk**: Medium (cross-language test framework support is a long tail — start with pytest only)
-**Outcome**: Test results flow back to LazyAF with full provenance. Criteria gain a measurable definition of done.
-
-> **OPEN QUESTIONS:**
-> 1. Should `lazyaf_test_id` be a structured dotted path (`feature.story.criterion.assertion`) or an arbitrary string? Defaulting to arbitrary; users can adopt a convention.
-> 2. Are skipped tests informational or do they count against criteria? Defaulting to informational (skipped ≠ failed).
-
----
-
-### Phase 12.3: Control Layer & Step Images
-**Goal**: Proper container communication and base images
-
-#### Tests First (Define Contracts)
-
-**test_control_layer_protocol.py** - Write BEFORE implementing control layer
-| Test | Defines Contract |
-|------|------------------|
-| `test_reads_config_from_control_dir` | Config at `/workspace/.control/step_config.json` |
-| `test_reports_status_on_start` | POST to `/api/steps/{id}/status` with `running` |
-| `test_reports_status_on_complete` | POST with `completed` and exit code |
-| `test_streams_logs_to_backend` | POST to `/api/steps/{id}/logs` |
-| `test_heartbeat_during_execution` | POST to `/api/steps/{id}/heartbeat` periodically |
-| `test_handles_backend_unavailable` | Retries, eventually fails gracefully |
-| `test_uploads_test_results_manifest` | If `/workspace/.control/test_results.json` exists at completion, ship to `/api/test-results/ingest` (see 12.2.6) |
-| `test_propagates_experiment_context` | step_config carries experiment_id, model, prompt_template_id, prompt_version → forwarded to result ingest |
-
-**test_step_api_endpoints.py** - Write BEFORE implementing API (backend side)
-| Test | Defines Contract |
-|------|------------------|
-| `test_post_status_updates_step` | Status endpoint updates DB |
-| `test_post_logs_appends` | Logs endpoint appends to step logs |
-| `test_post_heartbeat_updates_timestamp` | Heartbeat extends timeout |
-| `test_auth_required` | Endpoints require step token |
-
-**test_base_image_contract.py** - Write BEFORE building base image
-| Test | Defines Contract |
-|------|------------------|
-| `test_python_available` | `python3 --version` works |
-| `test_git_available` | `git --version` works |
-| `test_control_layer_at_expected_path` | `/control/run.py` exists |
-| `test_entrypoint_is_control_layer` | Default entrypoint runs control layer |
-
-**test_home_persistence.py** - Write BEFORE implementing HOME behavior
-| Test | Defines Contract |
-|------|------------------|
-| `test_home_is_workspace_home` | `$HOME` = `/workspace/home` |
-| `test_pip_cache_persists` | pip cache survives step boundary |
-| `test_local_bin_persists` | `~/.local/bin` survives step boundary |
-
-- [ ] Write `test_control_layer_protocol.py` (defines control layer contract)
-- [ ] Write `test_step_api_endpoints.py` (defines API contract)
-- [ ] Write `test_base_image_contract.py` (defines image requirements)
-- [ ] Write `test_home_persistence.py` (defines HOME behavior)
-
-#### Implementation (Make Tests Pass)
-
-- [ ] Create control layer script (`/control/run.py`) - make protocol tests pass
-  - Reads step config from `/workspace/.control/step_config.json`
-  - Reports status to backend (running, completed, failed)
-  - Streams logs to backend
-  - Heartbeat during long operations
-  - On step completion, checks for `/workspace/.control/test_results.json` and ships it to `/api/test-results/ingest` with experiment context (Phase 12.2.6 dependency)
-- [ ] Create API endpoints - make endpoint tests pass
-  - `POST /api/steps/{step_id}/status`
-  - `POST /api/steps/{step_id}/logs`
-  - `POST /api/steps/{step_id}/heartbeat`
-- [ ] Create base image (`lazyaf-base`) - make image contract tests pass
-  - Python 3.12-slim + git + curl + control layer
-  - `ENTRYPOINT ["python", "/control/run.py"]`
-- [ ] Configure HOME persistence - make persistence tests pass
-  - `HOME=/workspace/home`
-  - pip/npm/uv caches persist across steps
-  - `~/.local/bin` for user-installed tools
-- [ ] Create agent images inheriting from base
-  - `lazyaf-claude`: base + Claude CLI + agent wrapper
-  - `lazyaf-gemini`: base + Gemini CLI + agent wrapper
-
-#### Integration Validation
-
-- [ ] `test_agent_script_agent_pipeline.py`:
-  - Agent step installs tool via pip
-  - Script step uses that tool
-  - Agent step sees script output
-- [ ] `test_control_layer_reports_failure.py`:
-  - Command exits non-zero
-  - Control layer reports failed status
-  - Backend marks step failed
-
-#### Done Criteria
-
-- [ ] Control layer protocol tests pass
-- [ ] API endpoint tests pass
-- [ ] Base image passes contract tests
-- [ ] HOME persistence tests pass
-- [ ] Cross-step integration test passes
-
-**Effort**: 1-1.5 weeks
-**Risk**: Medium
-**Outcome**: Steps run in proper containers with backend communication
-
----
-
-### Phase 12.4: Migrate Script/Docker Steps
-**Goal**: All non-agent steps use new architecture
-
-#### Tests First (Define Contracts)
-
-**test_step_routing_contract.py** - Write BEFORE implementing routing
-| Test | Defines Contract |
-|------|------------------|
-| `test_script_step_routes_through_orchestrator` | type=script uses new path |
-| `test_docker_step_routes_through_orchestrator` | type=docker uses new path |
-| `test_custom_image_respected` | `image: foo:bar` uses that image |
-
-**test_migration_compatibility.py** - Write BEFORE migrating
-| Test | Defines Contract |
-|------|------------------|
-| `test_existing_pipeline_yaml_works` | Old format still executes |
-| `test_new_pipeline_yaml_works` | New format with images executes |
-
-- [ ] Write `test_step_routing_contract.py` (defines routing behavior)
-- [ ] Write `test_migration_compatibility.py` (defines backward compat)
-
-#### Implementation (Make Tests Pass)
-
-- [ ] Pipeline executor routes script/docker steps through orchestrator
-- [ ] Remove `execute_script_step` and `execute_docker_step` from runner entrypoints
-- [ ] Steps can specify custom images in pipeline YAML
-- [ ] Migrate test-suite.yaml to use pre-built image
-- [ ] Create example `lazyaf-test-runner` Dockerfile with uv + deps
-
-#### Integration Validation
-
-- [ ] `test_existing_pipelines_work.py` - Run actual existing pipelines
-- [ ] `test_multi_image_pipeline.py` - Different images in same pipeline
-
-#### Done Criteria
-
-- [ ] Routing tests pass
-- [ ] Backward compatibility tests pass
-- [ ] All existing pipelines pass (regression suite)
-
-**Effort**: 1 week
-**Risk**: Medium (migration path)
-**Outcome**: Script/docker steps don't need runners
-
----
-
-### Phase 12.5: Migrate Agent Steps
-**Goal**: Agent steps also use new architecture
-
-#### Tests First (Define Contracts)
-
-**test_agent_step_contract.py** - Write BEFORE implementing agent migration
-| Test | Defines Contract |
-|------|------------------|
-| `test_agent_step_spawns_container` | Agent runs in container, not runner |
-| `test_agent_wrapper_invokes_cli` | Claude CLI called correctly |
-| `test_agent_uses_correct_image` | `lazyaf-claude` image used |
-
-**test_polling_removal.py** - Write BEFORE removing polling
-| Test | Defines Contract |
-|------|------------------|
-| `test_no_runner_polling_calls` | Backend doesn't poll runners |
-| `test_runners_not_long_lived` | No persistent runner processes |
-
-- [ ] Write `test_agent_step_contract.py` (defines agent execution)
-- [ ] Write `test_polling_removal.py` (defines what's removed)
-
-#### Implementation (Make Tests Pass)
-
-- [ ] Agent steps spawn ephemeral containers via orchestrator
-- [ ] Agent wrapper script handles Claude/Gemini CLI invocation
-- [ ] Remove old runner polling infrastructure
-- [ ] Runners no longer long-lived - spawned per step
-
-#### Integration Validation
-
-- [ ] `test_claude_script_gemini_pipeline.py`:
-  - Claude step (container)
-  - Script step (container)
-  - Gemini step (container)
-  - All share workspace
-
-#### Done Criteria
-
-- [ ] Agent step contract tests pass
-- [ ] Polling removal verified
-- [ ] Cross-agent pipeline works
-
-**Effort**: 1-1.5 weeks
-**Risk**: Higher (changes agent execution model)
-**Outcome**: All step types use unified architecture
-
----
-
-### Phase 12.6: RemoteExecutor & Runner State Machine
-**Goal**: Millisecond-latency job assignment with proper connection lifecycle
-
-Event-driven architecture - no polling, backend pushes jobs immediately.
-
-#### Tests First (Define Contracts)
-
-**test_runner_state_machine.py** - Write BEFORE implementing runner lifecycle
-| Test | Defines Contract |
-|------|------------------|
-| `test_disconnected_to_connecting` | WebSocket opens |
-| `test_connecting_to_idle_on_register` | Registration succeeds |
-| `test_idle_to_assigned_on_job` | Job pushed to runner |
-| `test_assigned_to_busy_on_ack` | Runner acknowledges |
-| `test_busy_to_dead_on_timeout` | Heartbeat missed |
-| `test_dead_to_connecting_on_reconnect` | Runner reconnects |
-
-**test_websocket_protocol.py** - Write BEFORE implementing WebSocket
-| Test | Defines Contract |
-|------|------------------|
-| `test_register_message_format` | `{"type": "register", "runner_id": ..., "labels": ...}` |
-| `test_execute_step_message_format` | `{"type": "execute_step", ...}` |
-| `test_ack_required_within_timeout` | 5s ACK timeout |
-| `test_heartbeat_interval` | Heartbeat every 10s |
-| `test_death_timeout` | 30s without heartbeat = dead |
-
-**test_remote_executor_contract.py** - Write BEFORE implementing RemoteExecutor
-| Test | Defines Contract |
-|------|------------------|
-| `test_register_runner_stores_in_db` | Runner record created |
-| `test_execute_step_pushes_via_websocket` | Job pushed immediately |
-| `test_ack_timeout_reassigns` | No ACK = try another runner |
-| `test_heartbeat_extends_deadline` | Heartbeat resets death timer |
-| `test_death_requeues_step` | Dead runner = step back to pending |
-
-**test_job_recovery.py** - Write BEFORE implementing recovery
-| Test | Defines Contract |
-|------|------------------|
-| `test_runner_dies_mid_job_requeues` | Step re-queued |
-| `test_runner_reconnects_resumes` | Same runner picks up |
-| `test_reconnect_after_reassign_aborts` | Too late = abort local work |
-
-- [ ] Write `test_runner_state_machine.py` (defines runner lifecycle)
-- [ ] Write `test_websocket_protocol.py` (defines protocol contract)
-- [ ] Write `test_remote_executor_contract.py` (defines executor interface)
-- [ ] Write `test_job_recovery.py` (defines recovery contract)
-
-#### Database Migration
-
-- [ ] Write migration test first:
-  ```python
-  def test_runners_table_created():
-      """Migration creates runners table."""
-      # Assert columns: id, name, status, labels, current_step_execution_id, ...
-  ```
-- [ ] Create `runners` table with Alembic migration
-  ```python
-  class Runner(Base):
-      __tablename__ = "runners"
-      id: str  # Client-provided or generated UUID
-      name: str
-      status: str  # disconnected, connecting, idle, assigned, busy, dead
-      runner_type: str  # claude-code, gemini, generic
-      labels: JSON  # {"arch": "arm64", "has": ["gpio", "camera"]}
-      current_step_execution_id: str | None  # FK to step_executions
-      last_heartbeat: datetime
-      connected_at: datetime | None
-      created_at: datetime
-  ```
-
-#### Implementation (Make Tests Pass)
-
-- [ ] Implement Runner state machine (make state tests pass)
-- [ ] Remove in-memory `runner_pool.py` dict, query database instead
-- [ ] Implement WebSocket protocol (make protocol tests pass)
-- [ ] Create `RemoteExecutor` service (make executor tests pass)
-- [ ] WebSocket endpoint for runner connections (`/ws/runner`)
-  - Registration with auth timeout (10s)
-  - ACK required for job assignment (5s timeout)
-  - Heartbeat monitoring (30s death timeout)
-  - Graceful drain for shutdown
-- [ ] Implement job recovery (make recovery tests pass)
-- [ ] Reconnection handling
-  - Same runner_id can reconnect after death
-  - Rejects duplicate connections from same runner_id
-- [ ] Create `runner-agent` package (runs on target machines)
-  - Connects to backend via WebSocket (NAT-friendly)
-  - Sends ACK on job receipt
-  - Heartbeat thread during execution
-  - Auto-reconnect on disconnect
-- [ ] `NativeOrchestrator` for embedded devices
-  - Runs steps directly on host (no Docker)
-  - Git-based workspace sync
-
-#### Integration Validation
-
-- [ ] `test_remote_runner_full_flow.py`:
-  - Start runner agent
-  - Push job via backend
-  - Runner executes
-  - Runner reports completion
-- [ ] `test_runner_failover.py`:
-  - Two runners connected
-  - Kill one mid-job
-  - Other picks up
-
-#### Chaos Tests (Critical for this phase)
-
-- [ ] `test_runner_disconnect_mid_job.py` - Network partition
-- [ ] `test_all_runners_disconnect.py` - Total failure
-- [ ] `test_runner_reconnect_race.py` - Reconnect vs reassign race
-
-#### Done Criteria
-
-- [ ] Runner state machine tests pass
-- [ ] WebSocket protocol tests pass
-- [ ] RemoteExecutor contract tests pass
-- [ ] Job recovery tests pass
-- [ ] Chaos tests pass
-
-**Effort**: 2 weeks
-**Risk**: Medium-High
-**Outcome**: Robust remote execution with proper failure handling
-
-**Example runner deployment:**
-```bash
-# On Raspberry Pi
-export LAZYAF_BACKEND_URL="http://192.168.1.100:8000"
-export LAZYAF_RUNNER_ID="pi-workshop-1"
-export LAZYAF_LABELS="arch=arm64,has=gpio,has=camera"
-export LAZYAF_ORCHESTRATOR="native"
-
-python -m lazyaf_runner  # Connects via WebSocket, receives jobs immediately
-```
-
-**WebSocket Protocol:**
-```
-Runner -> Backend: {"type": "register", "runner_id": "...", "labels": {...}}
-Backend -> Runner: {"type": "execute_step", "step_id": "...", "image": "...", ...}
-Runner -> Backend: {"type": "log", "step_id": "...", "line": "..."}
-Runner -> Backend: {"type": "step_complete", "step_id": "...", "exit_code": 0}
+lazyaf/
+|-- backend/
+|   |-- app/
+|   |   |-- main.py              # FastAPI app entry point
+|   |   |-- config.py            # Settings
+|   |   |-- database.py          # SQLAlchemy async setup
+|   |   |-- models/              # SQLAlchemy models
+|   |   |-- routers/             # API endpoints
+|   |   |-- services/            # Business logic
+|   |   |-- schemas/             # Pydantic models
+|   |   +-- mcp/                 # MCP server for Claude Desktop
+|   |-- git_repos/               # Internal bare git repos
+|   |-- runner/
+|   |   |-- Dockerfile
+|   |   +-- entrypoint.py        # Runner execution logic
+|   |-- pyproject.toml
+|   +-- alembic/                 # DB migrations
+|-- cli/                         # LazyAF CLI tool (ingest, land)
+|   |-- pyproject.toml
+|   +-- lazyaf/cli.py
+|-- frontend/
+|   |-- src/
+|   |   |-- lib/
+|   |   |   |-- components/      # Svelte components
+|   |   |   |-- stores/          # State management
+|   |   |   +-- api/             # API client
+|   |   +-- routes/              # Pages
+|   |-- package.json
+|   +-- vite.config.ts
+|-- images/                      # Step images: base, agent-base, claude,
+|                                #   gemini, test-runner, debug-sidecar
+|-- runner-common/               # Shared runner library + the M14 agent harness
+|-- runner-agent/                # Remote runner agent (12.6)
+|-- tdd/                         # Test tiers T1/T2/T3 + floors + skip baseline
+|-- .lazyaf/pipelines/           # LazyAF's own dogfood CI, synced on push
+|-- historical-documents/        # Archived phase documentation
+|-- upcoming/                    # Per-wave wiring docs, QA findings, post-mortems
+|-- docs/milestone-13/           # Milestone 13 design (not yet implemented)
+|-- docker-compose.yml
+|-- PLAN.md                      # This file
++-- README.md
 ```
 
 ---
 
-### Phase 12.6.5: Experiments & Model/Prompt Leaderboards
-**Goal**: Run the same target (card / story / feature) across a matrix of (model, prompt_template, prompt_version), aggregate TestRuns, surface a leaderboard. Turn LazyAF into a platform for *software science*.
+## Tech Stack
 
-> **Why now (after 12.6):** Once remote execution is stable, fan-out to many parallel runs becomes cheap. Experiments are the high-value workload that demand fan-out.
-
-#### Tests First (Define Contracts)
-
-**test_experiment_lifecycle.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_create_experiment_validates_matrix` | Matrix must specify at least one model and one prompt |
-| `test_launch_creates_pipeline_run_per_cell` | NxM matrix + repeat=R → N*M*R pipeline runs |
-| `test_experiment_completes_when_all_runs_terminal` | Status flips to `complete` after last run lands |
-| `test_abort_cancels_pending_runs` | Abort cancels queued runs, leaves running ones to finish |
-
-**test_experiment_run_tagging.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_pipeline_run_carries_experiment_id` | `pipeline_runs.experiment_id` populated |
-| `test_test_runs_inherit_matrix_coords` | Each TestRun tagged with model + prompt info |
-| `test_step_config_includes_matrix_cell` | Runner sees model+prompt env vars for agent invocation |
-
-**test_leaderboard_aggregation.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_leaderboard_groups_by_prompt_and_model` | One row per (prompt_template, version, model) |
-| `test_leaderboard_per_criterion_pass_rate` | Pass-rate = passed / (passed + failed) |
-| `test_leaderboard_filters_skipped` | Skipped tests excluded from rate denominator |
-| `test_leaderboard_handles_zero_runs` | Cell with no runs shown as N/A, not 0% |
-
-- [ ] Write `test_experiment_lifecycle.py`
-- [ ] Write `test_experiment_run_tagging.py`
-- [ ] Write `test_leaderboard_aggregation.py`
-
-#### Implementation (Make Tests Pass)
-
-- [ ] `experiments` and `experiment_runs` tables (Alembic migration)
-- [ ] `ExperimentService.launch()` fans out to ExecutionRouter, one pipeline run per matrix cell
-- [ ] Extend `step_config` schema with `experiment_context: {experiment_id, model, prompt_template_id, prompt_version}`
-- [ ] Agent executors (Claude/Gemini) read `model` from step_config to override default
-- [ ] Prompt rendering: `PromptVersion.body` is rendered with `{story_narrative}` etc. resolved from spec layer at experiment-launch time
-- [ ] Aggregation queries (criterion pass-rate per matrix cell)
-- [ ] UI: `/experiments` route — create + monitor experiments, launch from a card/story/feature
-- [ ] UI: leaderboard view per Feature — sortable matrix
-- [ ] MCP tool: `launch_experiment` so Claude Desktop can drive evaluations
-
-#### Integration Validation
-
-- [ ] `test_2x2_experiment_e2e.py`:
-  - 2 models × 2 prompts × 1 repeat = 4 pipeline runs
-  - All complete
-  - Leaderboard renders with 4 rows
-  - At least one row has pass-rate > 0%
-
-- [ ] `test_experiment_with_failing_prompt.py`:
-  - One prompt is intentionally bad
-  - Leaderboard correctly ranks it last
-
-#### Done Criteria
-
-- [ ] Experiment lifecycle tests pass
-- [ ] Pass-rates correctly computed per cell
-- [ ] User can launch a 2x2 experiment from the UI in under 30s
-
-**Effort**: 2-3 weeks
-**Risk**: Medium (fan-out cost — need quotas / cost guardrails)
-**Outcome**: Evidence-driven model + prompt selection. Regression dashboard per feature.
-
-> **OPEN QUESTIONS:**
-> 1. Cost guardrails — a 5x5x3 experiment is 75 agent runs. Do we need per-experiment budget caps + dry-run estimates before launch?
-> 2. Should leaderboards be public (anyone in the org sees them) or private to the experiment creator? Defaulting to org-visible.
+| Layer | Technology | Purpose |
+|-------|------------|---------|
+| Frontend | Svelte + Vite | Reactive UI, fast builds |
+| Backend | FastAPI | Async Python API |
+| Database | SQLite + SQLAlchemy | Simple persistence (PostgreSQL ready) |
+| Queue | In-memory | Job management |
+| Containers | Docker SDK for Python | Runner isolation |
+| Real-time | WebSockets | Status updates |
+| Git | Dulwich | Pure Python git server |
+| MCP | FastMCP | Claude Desktop integration |
 
 ---
 
-### Phase 12.6.6: Spec-Curated Agent Context
-**Goal**: When an agent runs against a card, the platform automatically curates the relevant slice of the spec layer (linked feature, story, criteria, related TestRefs) and injects it into the agent's prompt — instead of relying on the agent to discover intent from the codebase.
+## Core Data Models
 
-> **Why now (after 12.6.5):** Experiments will reveal that prompt content matters more than model choice for many tasks. Spec-curated context is the single biggest lever on prompt quality.
+> Verified against `backend/app/models/` on 2026-08-30. Models marked
+> **DESIGNED** have no table, no migration and no router — they are
+> Milestone 13's shape, not the tree's.
 
-#### The Context Curation Problem
+### Repo
+```python
+class Repo:
+    id: UUID
+    name: str
+    remote_url: str | None       # Real remote (GitHub/GitLab)
+    default_branch: str          # e.g., "dev" or "main"
+    is_ingested: bool
+```
 
-A card linked to a UserStory has natural context: the story narrative, all acceptance criteria, related TestRefs (with file paths!), and the parent Feature's description. Without curation, agents either:
-- Get the whole repo dumped in (wastes context, distracts the model), or
-- Get only the card title + description (misses critical intent)
+### Card
+```python
+class CardStatus(Enum):
+    TODO = "todo"
+    IN_PROGRESS = "in_progress"
+    IN_REVIEW = "in_review"
+    DONE = "done"
+    FAILED = "failed"
 
-Curation gives the agent: *"Here's the story you're delivering. Here are the criteria you must satisfy. Here are the existing tests that already cover related criteria — read them, don't duplicate them."*
+class Card:
+    id: UUID
+    repo_id: UUID
+    title: str
+    description: str
+    status: CardStatus
+    branch_name: str | None
+    step_type: StepType          # agent | script | docker
+    step_config: dict            # Type-specific config
+```
 
-#### Tests First (Define Contracts)
+### Pipeline
+```python
+class Pipeline:
+    id: UUID
+    repo_id: UUID
+    name: str
+    steps: list[PipelineStep]    # Ordered execution
+    triggers: list[TriggerConfig]
 
-**test_context_bundle_assembly.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_card_with_story_link_pulls_narrative` | Bundle includes full story narrative |
-| `test_bundle_includes_all_criteria` | All criteria for the linked story present |
-| `test_bundle_includes_related_test_paths` | TestRef file paths surfaced (so agent can read them) |
-| `test_bundle_includes_parent_feature_description` | Feature context included |
-| `test_bundle_omits_unrelated_features` | No leakage from sibling features |
-| `test_bundle_handles_card_without_links` | Falls back to card-only context, no error |
-| `test_bundle_size_capped` | Truncates with summary if total > N tokens |
-
-**test_context_injection.py**
-| Test | Defines Contract |
-|------|------------------|
-| `test_bundle_written_to_workspace` | Available at `/workspace/.control/spec_context.md` |
-| `test_executor_includes_in_prompt` | Claude/Gemini wrappers prepend spec_context.md to system prompt |
-| `test_prompt_template_can_reference` | `{spec_context}` placeholder resolves |
-
-- [ ] Write `test_context_bundle_assembly.py`
-- [ ] Write `test_context_injection.py`
-
-#### Implementation (Make Tests Pass)
-
-- [ ] `SpecContextService.build_bundle(card_id) -> str` — assembles markdown
-- [ ] Pipeline executor writes bundle to workspace before agent step
-- [ ] Update Claude/Gemini executor wrappers to read and prepend
-- [ ] Token-budget aware truncation (summarize if oversized)
-- [ ] Add `{spec_context}` placeholder support to PromptTemplate rendering
-
-#### Integration Validation
-
-- [ ] `test_agent_uses_curated_context.py`:
-  - Card linked to story with 3 criteria + 2 existing TestRefs
-  - Agent run completes
-  - Logs show agent referenced criteria by name (heuristic check)
-  - Diff includes new test that satisfies a criterion
-
-#### Done Criteria
-
-- [ ] Context bundle tests pass
-- [ ] Bundle injection works for both Claude and Gemini executors
-- [ ] At least one before/after experiment shows improvement on linked-card pass-rate
-
-**Effort**: 1.5-2 weeks
-**Risk**: Medium (token-budget tuning is iterative)
-**Outcome**: Parallel agents stay coherent because each one gets a precisely-scoped slice of intent. Reduces context-window pressure as the system scales.
-
-> **OPEN QUESTION:** Should the bundle include actual *source code* from related TestRefs (full file content) or just file paths? Defaulting to paths — agent can choose to read what it needs.
+class PipelineStep:
+    name: str
+    type: StepType               # agent | script | docker
+    config: dict
+    on_success: str              # "next" | "stop" | "merge:{branch}"
+    on_failure: str              # "next" | "stop" | "trigger:{card_id}"
+    continue_in_context: bool    # Preserve workspace
+```
 
 ---
 
-### Phase 12.7: Debug Re-Run Mode
-**Goal**: Re-run failed pipelines with breakpoints for interactive debugging
+## Specification Layer Models
 
-The primary use case: someone points you at a failed pipeline and you need to figure out what went wrong. Debug mode lets you re-run with breakpoints, inspect state, and iterate.
+> Introduced in Phase 12.2.5 and **live since 2026-08-29** — `Feature`, `UserStory`, `AcceptanceCriterion` and `PromptTemplate` are in
+> `backend/app/models/spec.py`, `TestRef`/`TestRun` in `models/testref.py`,
+> `Experiment` in `models/experiment.py`, `StepUsage` in `models/usage.py`. These models capture *what the software must do* and let the platform measure whether AI-generated changes still satisfy intent. Hierarchy is intentionally shallow: `Feature -> UserStory -> AcceptanceCriterion`. Tests and runs are orthogonal entities that join back to criteria.
 
-#### Tests First (Define Contracts)
+### Feature
+A product capability. Cross-repo by design — a single feature can span frontend, backend, infra, etc.
 
-**test_debug_session_state_machine.py** - Write BEFORE implementing debug lifecycle
-| Test | Defines Contract |
-|------|------------------|
-| `test_pending_to_waiting_on_breakpoint` | Breakpoint hit = waiting |
-| `test_waiting_to_connected_on_join` | CLI connects = connected |
-| `test_connected_to_ended_on_resume` | Resume = continue |
-| `test_timeout_from_waiting` | No connect = timeout |
-| `test_timeout_from_connected` | Idle too long = timeout |
-
-**test_debug_api_contract.py** - Write BEFORE implementing API endpoints
-| Test | Defines Contract |
-|------|------------------|
-| `test_create_debug_rerun_returns_session` | POST returns session ID |
-| `test_get_debug_session_returns_info` | GET returns commit, runtime, logs |
-| `test_resume_continues_pipeline` | POST resume = pipeline continues |
-| `test_abort_cancels_pipeline` | POST abort = pipeline cancelled |
-
-**test_breakpoint_execution.py** - Write BEFORE implementing breakpoint behavior
-| Test | Defines Contract |
-|------|------------------|
-| `test_pipeline_pauses_at_breakpoint` | Execution stops |
-| `test_workspace_preserved_at_breakpoint` | Files accessible |
-| `test_multiple_breakpoints_work` | Can set many breakpoints |
-
-**test_terminal_connection.py** - Write BEFORE implementing terminal
-| Test | Defines Contract |
-|------|------------------|
-| `test_sidecar_mode_spawns_container` | Sidecar container created |
-| `test_shell_mode_execs_into_running` | Exec into step container |
-| `test_special_commands_work` | @resume, @abort, @status |
-| `test_token_required` | Auth enforced |
-
-- [ ] Write `test_debug_session_state_machine.py` (defines debug lifecycle)
-- [ ] Write `test_debug_api_contract.py` (defines API contract)
-- [ ] Write `test_breakpoint_execution.py` (defines breakpoint behavior)
-- [ ] Write `test_terminal_connection.py` (defines terminal protocol)
-
-#### Debug Re-Run Workflow
-
-```
-1. User sees failed pipeline → clicks "Debug Re-run"
-2. Modal shows:
-   - Step list with checkboxes for breakpoints (dynamic, not YAML)
-   - Commit selection: "Same as failure (abc123)" OR "Different branch/commit"
-3. User starts debug run
-4. Pipeline executes until breakpoint
-5. UI shows rich context + CLI join command
-6. User connects via CLI, inspects, continues or aborts
-7. Repeat until done or pipeline completes
+```python
+class Feature:
+    id: UUID
+    name: str
+    description: str             # Markdown, free-form product narrative
+    repo_ids: list[UUID]         # Repos this feature touches (one or many)
+    status: FeatureStatus        # proposed | active | shipped | deprecated
+    owner: str | None            # Free-form (email, handle, team name)
+    created_at: datetime
+    updated_at: datetime
 ```
 
-#### UI at Breakpoint
+### UserStory
+A natural-language behavior expectation in the gherkin spirit (less rigid). Belongs to one feature.
 
-When a breakpoint is hit, the UI displays:
-
-| Field | Description |
-|-------|-------------|
-| **Current Commit** | SHA + message of commit being tested |
-| **Runtime Info** | Host, orchestrator type, container image, image SHA |
-| **Step Info** | Current step name, index, type |
-| **Logs** | Full job/pipeline logs up to this point |
-| **Join Command** | Pre-populated CLI command to copy/paste |
-| **Controls** | Resume, Abort buttons |
-
-#### Two Connection Modes
-
-The CLI supports two ways to connect, depending on what you need:
-
-**1. Sidecar Mode** (inspect filesystem only)
-```bash
-lazyaf debug <session-id> --sidecar
-```
-- Spawns a debug sidecar container with workspace volume mounted
-- Read-only inspection of checkout, build artifacts, logs
-- Useful when step container has exited or you just need to look at files
-- Full shell with common tools (vim, git, htop, etc.)
-
-**2. Live Shell Mode** (process in running container)
-```bash
-lazyaf debug <session-id> --shell
-```
-- Creates a new process inside the current step container
-- Access to full runtime environment (same image, env vars, installed packages)
-- Can run the same commands the step would run
-- Only available when step container is still running (at breakpoint)
-
-Both modes use WebSocket transport (not SSH) for simplicity.
-
-#### CLI Commands
-
-```bash
-# Connect to debug session (default: sidecar if container stopped, shell if running)
-lazyaf debug <session-id> --token <token>
-
-# Explicit mode selection
-lazyaf debug <session-id> --sidecar --token <token>
-lazyaf debug <session-id> --shell --token <token>
-
-# Control commands (from within debug shell or separately)
-lazyaf debug <session-id> --resume      # Continue to next breakpoint
-lazyaf debug <session-id> --abort       # Cancel the debug run
-lazyaf debug <session-id> --status      # Show current state
+```python
+class UserStory:
+    id: UUID
+    feature_id: UUID
+    title: str                   # "User can revoke an API key"
+    persona: str | None          # "As a security-conscious admin"
+    narrative: str               # Free-form: "When X, then Y, so that Z"
+    repo_ids: list[UUID]         # Subset of parent feature's repos
+    priority: int                # Simple integer, not story points
+    status: StoryStatus          # draft | accepted | in_progress | done | blocked
+    created_at: datetime
+    updated_at: datetime
 ```
 
-Inside a debug shell, special commands:
-```
-@resume    # Continue pipeline (alias for --resume)
-@abort     # Cancel debug run (alias for --abort)
-@status    # Show breakpoint info
-@help      # List available commands
-```
+### AcceptanceCriterion
+A single, testable expectation. Natural language; one or more `TestRef`s prove it.
 
-#### API Endpoints
-
-```
-# Start debug re-run from failed pipeline
-POST /api/pipeline-runs/{id}/debug-rerun
-  Body: {
-    breakpoints: ["step-id-1", "step-id-2"],  # Steps to break before
-    use_original_commit: bool,                 # true = same commit as failure
-    commit_sha: string | null,                 # if use_original_commit=false
-    branch: string | null                      # if use_original_commit=false
-  }
-  Returns: { run_id, debug_session_id }
-
-# Get debug session info (for UI display)
-GET /api/debug/{session_id}
-  Returns: {
-    status: "waiting" | "connected" | "timeout" | "ended",
-    current_step: { name, index, type },
-    commit: { sha, message },
-    runtime: { host, orchestrator, image, image_sha },
-    logs: string,
-    join_command: string,
-    token: string
-  }
-
-# Control debug session
-POST /api/debug/{session_id}/resume     # Continue to next breakpoint
-POST /api/debug/{session_id}/abort      # Cancel debug run
-POST /api/debug/{session_id}/extend     # Extend timeout
-
-# WebSocket endpoint for terminal
-WS /api/debug/{session_id}/terminal?mode=sidecar|shell&token=<token>
+```python
+class AcceptanceCriterion:
+    id: UUID
+    user_story_id: UUID
+    description: str             # "Revoked keys return 401 within 60s globally"
+    is_required: bool            # Story-blocking vs nice-to-have
+    created_at: datetime
 ```
 
-#### Debug Session States
+### TestRef
+A pointer from a test in the application repo back to one or more acceptance criteria. The application's test suite emits a manifest declaring its `lazyaf_test_id`s; the platform reconciles that manifest against TestRefs to detect drift (orphaned tests, uncovered criteria).
 
-```
-[pending] --> [waiting_at_bp] --> [connected] --> [ended]
-                    |                   |
-                    | timeout           | timeout/disconnect
-                    v                   v
-               [timeout]           [timeout]
-```
-
-| State | Description |
-|-------|-------------|
-| `pending` | Debug run started, executing before first breakpoint |
-| `waiting_at_bp` | At breakpoint, waiting for user to connect |
-| `connected` | User connected via CLI |
-| `timeout` | Session timed out (default 1hr, max 4hr) |
-| `ended` | User resumed/aborted, or pipeline completed |
-
-#### Pipeline Run States (Extended)
-
-| State | Description |
-|-------|-------------|
-| `debug_pending` | Debug re-run created, not yet started |
-| `debug_running` | Executing between breakpoints |
-| `debug_waiting` | At breakpoint, waiting for user |
-| `debug_connected` | User connected, inspecting |
-
-#### Sidecar Container
-
-```dockerfile
-FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y \
-    vim nano less \
-    git curl wget \
-    htop tree jq \
-    python3 python3-pip \
-    && rm -rf /var/lib/apt/lists/*
-
-# WebSocket terminal server
-COPY debug-terminal-server /usr/local/bin/
-ENTRYPOINT ["debug-terminal-server"]
+```python
+class TestRef:
+    id: UUID                     # Stable platform-side ID
+    lazyaf_test_id: str          # Stable repo-side identifier (decorator/sidecar)
+    repo_id: UUID
+    file_path: str               # e.g., "tests/api/test_keys.py"
+    test_name: str               # e.g., "test_revoked_key_returns_401"
+    framework: str               # "pytest" | "vitest" | "go-test" | "custom"
+    criterion_ids: list[UUID]    # Many-to-many with AcceptanceCriterion
+    last_seen_commit: str | None # SHA of latest commit where test was observed
+    is_orphaned: bool            # True if test_id no longer found in repo
 ```
 
-Mounts workspace volume at `/workspace`. Lightweight, starts fast.
+### TestRun
+The result of executing one TestRef. Joined to commit, and (when run inside an experiment) to model + prompt.
 
-#### Security
+```python
+class TestRun:
+    id: UUID
+    test_ref_id: UUID
+    pipeline_run_id: UUID | None # Pipeline that produced this run
+    step_execution_id: UUID | None
+    commit_sha: str
+    repo_id: UUID
+    status: TestStatus           # passed | failed | skipped | error
+    duration_ms: int
+    output: str | None           # Truncated stdout/stderr or pointer to artifact
+    model: str | None            # e.g., "claude-opus-4-7" - set inside experiments
+    prompt_template_id: UUID | None
+    prompt_version: int | None
+    experiment_id: UUID | None
+    created_at: datetime
+```
 
-- **One-time tokens**: Generated per debug session, single use
-- **Session timeout**: Default 1 hour, max 4 hours, extendable
-- **Token expiry**: Tokens expire with session
-- **Resource limits**: Debug containers have CPU/memory limits
-- **No SSH**: WebSocket only, simpler attack surface
-- **Future**: Integrate with auth system when available
+### Experiment
+A user-defined run that evaluates one or more (model, prompt) tuples against a card / story / feature. Produces TestRuns tagged with the matrix coordinates so leaderboards can aggregate.
 
-#### Implementation Phases
+```python
+class Experiment:
+    id: UUID
+    name: str
+    description: str
+    target_type: str             # "card" | "user_story" | "feature"
+    target_id: UUID
+    matrix: dict                 # {"models": [...], "prompts": [...], "repeat": N}
+    status: ExperimentStatus     # draft | running | complete | aborted
+    created_by: str
+    created_at: datetime
+    completed_at: datetime | None
+```
 
-**Phase 12.7a: Core Debug Re-Run (MVP)**
-- [ ] `POST /api/pipeline-runs/{id}/debug-rerun` endpoint
-- [ ] `DebugSession` model and service
-- [ ] Pipeline executor honors breakpoints, pauses execution
-- [ ] `GET /api/debug/{session_id}` for session info
-- [ ] Resume/abort endpoints
-- [ ] UI: "Debug Re-run" button on failed pipelines
-- [ ] UI: Breakpoint selector modal
-- [ ] UI: Commit selector (original vs custom)
-- [ ] UI: Debug panel showing context when at breakpoint
+### PromptTemplate
+A versioned, reusable prompt. Leaderboards rank `(template_id, version, model)` by pass-rate per criterion.
 
-**Phase 12.7b: CLI Connection**
-- [ ] `lazyaf debug` command structure
-- [ ] WebSocket terminal client in CLI
-- [ ] Sidecar mode: spawn debug container, connect
-- [ ] Shell mode: exec into running container
-- [ ] Special commands (@resume, @abort, @status)
-- [ ] Token-based authentication
+```python
+class PromptTemplate:
+    id: UUID
+    name: str
+    purpose: str                 # "implement-from-story" | "fix-failing-test" | etc.
+    versions: list[PromptVersion]
 
-**Phase 12.7c: Polish**
-- [ ] Session timeout management
-- [ ] Reconnection handling (resume interrupted session)
-- [ ] UI improvements (better log display, status indicators)
-- [ ] `--extend` to add time to session
-- [ ] Cleanup: remove debug containers on session end
+class PromptVersion:
+    id: UUID
+    template_id: UUID
+    version: int
+    body: str                    # The prompt itself, with placeholders
+    placeholders: list[str]      # e.g., ["{story_narrative}", "{failing_test_output}"]
+    created_at: datetime
+    notes: str | None
+```
 
-#### Integration Validation
+### StepUsage  *(Phase 12.5 — effort telemetry)*
+Per-agent-step resource accounting. Without this, `TestRun` records *what happened*
+and nothing records *what it cost* — and the Benchmark harness (Milestone 13) has no
+effort axis. It rides the control-layer protocol as a fourth channel alongside
+status / logs / test-results, so it must land WITH 12.5's agent-step migration
+rather than after it (12.2.6 became a retrofit precisely because 12.3 froze first).
 
-- [ ] `test_e2e_debug_workflow.py`:
-  - Pipeline fails
-  - Create debug re-run with breakpoint
-  - Connect via CLI
-  - Inspect workspace
-  - Resume
-  - Pipeline completes
+```python
+class StepUsage:
+    id: UUID
+    step_execution_id: UUID
+    step_run_id: UUID | None
+    provider: str                # "anthropic" | "google" | "openai-compatible" | "self-hosted"
+    model: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    cache_read_tokens: int | None
+    cache_write_tokens: int | None
+    cost_usd: Decimal | None     # CLI-reported where available, else derived
+    cost_source: str             # "cli-reported" | "gpu-node" | "estimated" | "unknown"
+    wall_clock_ms: int
+    container_seconds: float | None
+    created_at: datetime
+```
 
-#### Done Criteria
+> **Cost sources (owner decision 2026-08-29):** the agent CLIs report their own
+> token counts and dollar cost — the control runtime scrapes that at step end
+> (`cost_source="cli-reported"`). Self-hosted / runpod-style nodes have no
+> per-token bill, so their dollars come from a node-rate x occupancy model
+> (`cost_source="gpu-node"`). Both land on one comparable USD axis; no separate
+> pricing table is needed while the CLIs keep reporting cost.
 
-- [ ] Debug session state machine tests pass
-- [ ] API contract tests pass
-- [ ] Breakpoint execution tests pass
-- [ ] Terminal connection tests pass
-- [ ] E2E workflow test passes
+### BenchmarkSuite / BenchmarkCase  *(Milestone 13 — DESIGNED, not built)*
+A corpus of repos pinned at known states, each with a task and a definition of
+"solved". Cases are the fixtures a loop is benchmarked against.
 
-**Effort**: 2-3 weeks
-**Risk**: Medium
-**Outcome**: Operators can re-run failed pipelines with breakpoints and connect via CLI to debug
+```python
+class BenchmarkSuite:
+    id: UUID
+    name: str                    # "core-v1"
+    description: str
+    tags: list[str]              # verticals covered
+
+class BenchmarkCase:
+    id: UUID
+    suite_id: UUID
+    slug: str                    # "flask-api.missing-pagination"
+    repo_id: UUID                # an INGESTED fixture repo (internal git server)
+    base_commit_sha: str         # every trial starts here, byte-identical
+    task_statement: str          # what the agent is told to do
+    vertical: str                # "web-api" | "data-pipeline" | "frontend" | "cli" | ...
+    complexity: str              # "trivial" | "small" | "medium" | "large"
+    fail_to_pass: list[str]      # lazyaf_test_ids that MUST flip red -> green
+    pass_to_pass: list[str]      # lazyaf_test_ids that must STAY green (regression guard)
+    user_story_id: UUID | None   # layered criteria: the human-meaningful "why"
+    loop_defaults: dict          # {max_iterations, budget_usd, per_step_timeout}
+    contamination_risk: str      # "high" (public repo, likely in training data)
+                                 # | "medium" | "low" (self-authored / post-cutoff)
+    source_url: str | None       # upstream provenance for public fixtures
+    license: str | None          # SPDX id - decides what the public bundle may ship
+    test_command: str            # the PINNED oracle invocation, e.g. "pytest -q"
+    oracle_file_hashes: dict     # {path: sha256} for every file carrying an oracle
+                                 # id - an agent that edits the oracle to pass is
+                                 # cheating, and this is how the trial detects it
+    quarantined_tests: list[str] # ids ejected by the flake screen, kept on the record
+    reference_patch: str | None  # gold patch where upstream has one -> enables the
+                                 # "is this case solvable at all" control
+    solvable_verified: bool      # the gold-patch control passed
+    created_at: datetime
+```
+
+### StrategyTemplate  *(Milestone 13 — the independent variable; DESIGNED, not built)*
+A strategy is a graph of activity plus how models are assigned to its roles. It
+is DATA: authoring a new strategy means writing a template, not changing code.
+
+```python
+class StrategyTemplate:
+    id: UUID
+    slug: str                    # "planner-fanout-8" | "adversarial-3" | "one-shot"
+    description: str
+    graph: dict                  # a v2 pipeline graph: steps + edges + fan-out/join.
+                                 # Step configs carry ROLE placeholders, not models:
+                                 #   {"role": "planner"} / {"role": "worker", "fanout": 8}
+    roles: list[str]             # ["planner", "worker", "integrator", "reviewer"]
+    loop_policy: dict            # {max_iterations, budget_usd, stop_on}
+    parallelism: dict            # {max_concurrent_workers, branch_per_worker: bool}
+    variables: dict              # {"K": {"type":"int","default":4,"min":1,"max":32}} -
+                                 # what makes planner-fanout-4 and -16 the SAME
+                                 # template, so a K-sweep is one template not sixteen
+    integration: dict            # HOW parallel work rejoins - itself under test:
+                                 # {"policy": "sequential-merge" | "rebase-onto-trunk"
+                                 #            | "cherry-pick" | "agent-composed",
+                                 #  "on_conflict": "fail" | "resolver-agent" | "human"}
+    created_at: datetime
+```
+
+> **Why roles, not models:** the owner's leading hypothesis is that a high-end
+> model writing instructions for a fan-out of small models beats one big model
+> doing everything. That strategy is only expressible if a template says "planner"
+> and "worker" and the *trial* binds those roles to concrete models — otherwise
+> every model mix is a different template and nothing is comparable.
+
+> **Parallelism is git-native — LazyAF is the bridge.** K workers do not fight
+> over one checkout: each gets its own workspace cloned at the case's base commit
+> on **its own branch**, works freely, and commits. Integration is then a *git
+> merge*, not a file-level reconciliation — which is precisely the substrate this
+> platform already is:
+>
+> | Needed for fan-out | Already shipped |
+> |---|---|
+> | Per-worker isolation | Internal git server (bare repo per project) + workspace-per-clone at a pinned commit |
+> | Independent work | Branch-per-unit-of-work, the model cards have used since Phase 2 |
+> | Integration | `git_server.merge_branch` / `rebase_branch` |
+> | Conflict handling | `POST /api/cards/{id}/resolve-conflicts` returns STRUCTURED conflicts and accepts resolved contents; `ConflictResolver.svelte` is the human path |
+> | Review before merge | The existing approve/reject diff flow |
+>
+> Two consequences. First, fan-out needs far less new machinery than a
+> from-scratch harness would: the orchestrator allocates branches and calls
+> merges the platform already performs. Second — and more interesting —
+> **conflict resolution is itself an agent-addressable task**, because conflicts
+> come back as structured data rather than as a wall of `<<<<<<<` markers. A
+> strategy can legitimately say "on conflict, spawn a resolver agent", which is a
+> strategy variant nobody can benchmark on a single-sandbox harness.
+>
+> So **integration policy becomes a measured variable, not a fixed detail**:
+> sequential merge, rebase-onto-trunk, cherry-pick, agent-composed integration,
+> resolver-on-conflict. Integration conflict rate and resolution cost are
+> outcomes of the strategy under test — plausibly the dominant cost of aggressive
+> parallelism, and exactly the number that decides whether the pattern is worth
+> it.
+
+### Trial / TrialIteration  *(Milestone 13 — DESIGNED, not built)*
+A Trial is one loop run of one case under one (model, prompt, policy) variant.
+TrialIteration is the per-cycle record — the cost *curve*, which is the actual
+science: not just "did it solve it" but "was iteration 4 worth paying for".
+
+```python
+class Trial:
+    id: UUID
+    experiment_id: UUID | None   # set when part of a matrix fan-out
+    benchmark_case_id: UUID
+    strategy_template_id: UUID   # THE independent variable
+    model_assignment: dict       # {"planner": "claude-opus-5", "worker": "haiku-4.5",
+                                 #  "integrator": "claude-sonnet-5"} - a strategy may
+                                 # use several models in different roles, so cost is
+                                 # attributed PER ROLE from StepUsage, never per trial
+    prompt_template_id: UUID | None
+    prompt_version: int | None
+    loop_policy: dict            # {max_iterations, budget_usd, stop_on}
+    status: str                  # running | solved | failed | budget_exhausted | error
+    template_variables: dict     # {"K": 16} - a trial that does not record the K it
+                                 # ran at cannot be reproduced
+    target_met: bool             # all fail_to_pass green at the final commit
+    clean: bool                  # zero pass_to_pass broken at the final commit
+                                 # solved == target_met AND clean. Storing the halves
+                                 # separately is the only way to compute a regression
+                                 # rate that is not definitionally zero.
+    solved_at_iteration: int | None   # None = never solved (a CENSORED observation,
+                                 # not a missing one - see the metrics spec)
+    budget_overrun_usd: Decimal  # spend already in flight when the cap hit; recorded
+                                 # rather than hidden
+    queued_ms: int               # excluded from wall_clock, never silently folded in
+    machine_profile: str         # "local-16c-64g" | "runpod-a100" | ... - a speedup
+                                 # number is meaningless without the host it ran on
+    host_concurrency_limit: int  # what the fan-out was actually ALLOWED to run, which
+                                 # is not always the K it asked for
+    error_class: str | None      # "infra" | "provider" | "oracle_tampered" |
+                                 # "base_state_invalid" - trials that failed for
+                                 # reasons that are not the strategy's fault must be
+                                 # excludable from denominators, and visibly so
+    iterations_used: int
+    total_cost_usd: Decimal
+    cost_by_role: dict           # {"planner": 0.42, "worker": 1.10, ...}
+    total_input_tokens: int
+    total_output_tokens: int
+    wall_clock_ms: int           # co-headline: parallelism buys latency with money,
+                                 # so a cost-only board would rank fan-out as worse
+                                 # while hiding the entire point of it
+    serial_equivalent_ms: int | None  # summed step time; wall_clock/serial = speedup
+    integration_conflicts: int   # merges that did not apply cleanly
+    conflicts_resolved: int      # of those, how many a resolver agent/human fixed
+    integration_cost_usd: Decimal  # what rejoining the work cost - the tax on
+                                 # parallelism, and the number that decides whether
+                                 # fan-out actually pays
+    base_commit_sha: str
+    final_commit_sha: str | None
+    branch: str
+    # --- provenance: what makes this number falsifiable by someone else ---
+    harness_version: str         # git describe of LazyAF at trial time
+    image_hashes: dict           # {"lazyaf-base": "1f9bff1a6d1e", ...} - already
+                                 # stamped as content-hash labels by build_images.py
+    model_version: str | None    # the provider's exact version, not just the family
+    determinism: dict            # {temperature, seed, top_p} where exposed
+    suite_version: str           # corpus revision the case came from
+    created_at: datetime
+    completed_at: datetime | None
+
+class TrialIteration:
+    id: UUID
+    trial_id: UUID
+    iteration_index: int
+    pipeline_run_id: UUID        # each iteration IS a visible pipeline run
+    commit_sha: str | None       # what the agent produced this cycle
+    lines_added: int
+    lines_removed: int
+    files_touched: int
+    fail_to_pass_passed: int
+    fail_to_pass_total: int
+    pass_to_pass_broken: int     # regressions this iteration introduced
+    criteria_verified: int
+    cost_usd: Decimal
+    input_tokens: int
+    output_tokens: int
+    duration_ms: int
+    created_at: datetime
+```
+
+### Card ↔ Spec Links  *(partly built)*
+
+The existing `Card` model gains optional links into the spec layer. Cards are still the active unit of work; the spec layer is the meta layer of *why*.
+
+```python
+class Card:
+    # ... existing fields ...
+    feature_id: UUID | None          # If this card delivers part of a feature
+    user_story_id: UUID | None       # If this card delivers a story
+```
+
+`feature_id` and `user_story_id` are live on `backend/app/models/card.py:54-55`.
+The promote-to-feature *workflow* is referenced in `routers/spec.py:164` but the
+`promotes_to_feature` flag described in earlier drafts of this plan does not exist
+on the model — it was never built, and has been dropped from the sketch above.
+
+A card with neither link is fine — it's a pure work item (e.g., a bug fix, a chore). When work outgrows a card, the user can promote it to a `Feature` and the card becomes the first child story.
 
 ---
 
-### Phase 12.8: Cleanup & Polish
-**Goal**: Remove legacy code, document new model
+## API Summary
 
-#### Tests First (Regression Focus)
+Route names below were read off `backend/app/routers/` on 2026-08-30. This is a
+map, not the contract — FastAPI's own `/docs` is authoritative.
 
-**test_no_legacy_code.py** - Verify removal is complete
-| Test | Validates |
-|------|-----------|
-| `test_old_entrypoints_removed` | Files don't exist |
-| `test_runner_pool_removed` | No polling infrastructure |
-| `test_no_docker_in_docker` | No socket mounting in runners |
+**Core**
 
-**test_full_regression_suite.py** - Everything still works
+| Endpoint | Purpose |
+|----------|---------|
+| `GET/POST /api/repos`, `POST /api/repos/ingest` | Repo management and ingest |
+| `GET/POST /api/repos/{id}/cards` | Card CRUD |
+| `POST /api/cards/{id}/start` · `/retry` · `/approve` · `/reject` | Card lifecycle (state-guarded, atomic claim) |
+| `POST /api/cards/{id}/rebase` · `/resolve-conflicts` · `/resolve-rebase-conflicts` | Merge and rebase machinery |
+| `GET /api/cards/{id}/diff` | Review diff |
+| `GET/POST /api/pipelines`, `POST /api/pipelines/{id}/run` | Pipeline CRUD and ad-hoc run |
+| `GET /api/pipeline-runs`, `GET /api/pipeline-runs/{id}` | Run status |
+| `GET /api/pipeline-runs/{id}/steps/{index}/logs` | Per-step logs (use this, not the run list — see ledger T5) |
+| `GET /api/pipeline-runs/{id}/usage` | Usage rollup for a run (12.5) |
+| `GET /api/pipelines/{id}/export/yaml` | YAML export (lossy for graphs — see ledger T18) |
+| `GET/POST /api/repos/{id}/lazyaf/pipelines` · `/agents` | The repo-YAML definition door |
+| `/git/{id}.git/*` | Internal git server (`git-receive-pack` is the push trigger) |
+| `/ws` | WebSocket for real-time UI updates |
 
-*Pipeline Execution Paths*
-| Test | Validates |
-|------|-----------|
-| `test_pipeline_with_single_step_completes` | Minimal pipeline executes end-to-end |
-| `test_pipeline_with_multiple_steps_sequential` | Steps execute in order |
-| `test_pipeline_on_success_next_continues` | `on_success: next` advances to next step |
-| `test_pipeline_on_success_stop_completes` | `on_success: stop` ends pipeline with passed status |
-| `test_pipeline_on_failure_stop_halts` | `on_failure: stop` ends pipeline with failed status |
-| `test_pipeline_on_failure_next_continues` | `on_failure: next` continues despite step failure |
-| `test_pipeline_cancel_stops_execution` | Cancel marks run cancelled, stops steps |
+**Machine surfaces (authenticated — the only ones that are)**
 
-*Step Type Variations*
-| Test | Validates |
-|------|-----------|
-| `test_script_step_executes_command` | `type: script` runs shell command |
-| `test_docker_step_uses_specified_image` | `type: docker` pulls and runs in specified image |
-| `test_agent_step_invokes_ai_runner` | `type: agent` dispatches to Claude/Gemini runner |
-| `test_step_timeout_enforced` | Step exceeding timeout is killed |
-| `test_step_config_passed_to_executor` | step_config JSON reaches executor |
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /api/steps/{id}/status` · `/logs` · `/heartbeat` | Control-layer reporting from inside a step container (12.3), authenticated by a per-step JWT |
+| `POST /api/steps/{id}/test-results` | Test-manifest delivery (12.2.6) — this is the ingest path; there is **no** `/api/test-results/ingest` |
+| `POST /api/steps/{id}/usage` | Effort telemetry -> `StepUsage` (12.5) |
+| `WS /ws/runner` | Runner-agent protocol (12.6), authenticated by a runner JWT |
 
-*Executor Modes*
-| Test | Validates |
-|------|-----------|
-| `test_local_executor_spawns_container` | LocalExecutor creates Docker container |
-| `test_remote_executor_pushes_via_websocket` | RemoteExecutor sends job over WebSocket |
-| `test_execution_router_selects_correct_executor` | Router picks Local vs Remote based on requirements |
+**Specification and evaluation layer — LIVE (12.2.5, 12.2.6, 12.6.5, 12.6.6)**
 
-*Workspace Continuity*
-| Test | Validates |
-|------|-----------|
-| `test_continue_in_context_preserves_workspace` | `continue_in_context: true` keeps files |
-| `test_is_continuation_skips_cleanup` | Continuation step does not reset workspace |
-| `test_previous_step_logs_passed_to_next` | Agent sees previous step output |
-| `test_different_images_share_workspace` | Step 1 in golang, Step 2 in python, both see files |
+| Endpoint | Purpose |
+|----------|---------|
+| `GET/POST /api/features` (+ `PATCH`/`DELETE`) | Feature CRUD (cross-repo) |
+| `GET/POST /api/features/{id}/stories`, `/api/user-stories` | User story CRUD |
+| `GET/POST /api/criteria` | Acceptance criterion CRUD |
+| `GET /api/test-refs`, `POST /api/test-refs/reconcile` | Test reference registry and reconciliation |
+| `GET /api/criteria/{id}/history` | Pass/fail history per (model, prompt) |
+| `GET/POST /api/experiments`, `POST /api/experiments/{id}/abort` · `/resume` | Experiment CRUD and launch |
+| `GET /api/experiments/{id}/estimate` | Dry-run cost / run-count estimate before launch |
+| `GET /api/experiments/{id}/leaderboard`, `GET /api/leaderboards/feature/{id}` | Aggregated pass-rate per (prompt, model) |
+| `GET/POST /api/prompt-templates` | Prompt template + version CRUD |
+| `GET /api/cards/{id}/spec-context` | The curated per-card context bundle (12.6.6) |
 
-*Trigger Mechanisms*
-| Test | Validates |
-|------|-----------|
-| `test_card_complete_trigger_fires` | Card -> done triggers pipeline |
-| `test_push_trigger_on_branch_match` | Push to matching branch triggers |
-| `test_trigger_disabled_does_not_fire` | enabled: false suppresses trigger |
+**Model endpoints (Milestone 14) and debug (12.7)**
 
-*WebSocket Broadcasts*
-| Test | Validates |
-|------|-----------|
-| `test_pipeline_run_status_broadcast` | pipeline_run_status event sent |
-| `test_step_run_status_broadcast` | step_run_status event sent |
-| `test_card_updated_broadcast` | card_updated on status change |
+| Endpoint | Purpose |
+|----------|---------|
+| `GET/POST /api/model-endpoints`, `POST /api/model-endpoints/{ref}/probe` | Self-hosted OpenAI-compatible endpoint registry and capability probe |
+| `GET /api/model-endpoints/{ref}/usage` | Per-endpoint usage rollup |
+| `GET/POST /api/debug`, `POST /api/debug/{id}/resume` · `/abort` · `/extend` | Debug re-run sessions |
+| `WS /api/debug/{id}/terminal` | Terminal attach to a paused step |
 
-*Error Handling*
-| Test | Validates |
-|------|-----------|
-| `test_step_failure_captured_in_error_field` | Failed step has error message |
-| `test_job_failure_updates_card_status` | Failed job -> card status = failed |
-| `test_tests_failed_marks_card_failed` | tests_passed=false -> card failed |
-| `test_runner_death_requeues_step` | Runner dies -> step returns to pending |
+**Not yet built:** everything under `/api/bench/*` (Milestone 13). Specified in
+`docs/milestone-13/api-surface.md`; no router exists.
 
-*Recovery Scenarios*
-| Test | Validates |
-|------|-----------|
-| `test_backend_restart_resumes_pipelines` | Running pipelines resume after restart |
-| `test_orphan_containers_cleaned_on_startup` | Stale containers killed |
-| `test_orphan_steps_marked_failed` | Abandoned steps get failed status |
-
-- [ ] Write `test_no_legacy_code.py` (verifies cleanup)
-- [ ] Write `test_full_regression_suite.py` (validates everything works - 30+ tests above)
-
-#### Implementation
-
-- [ ] Remove old runner entrypoints (archive for reference)
-- [ ] Update docker-compose for new architecture
-- [ ] Remove `runner_pool.py` polling infrastructure
-- [ ] Documentation: runner deployment, custom images, step requirements
-- [ ] Example Dockerfiles for common step images
-
-#### Done Criteria
-
-- [ ] Legacy removal tests pass
-- [ ] Full regression suite passes
-- [ ] Documentation reviewed
-
-**Effort**: 1 week
-**Outcome**: Clean, documented system
+**MCP:** 45 tools for Claude Desktop orchestration
+(`grep -c '@mcp.tool' backend/app/mcp/server.py`).
 
 ---
 
-### Phase 12.9: Kubernetes Orchestrator (Future)
-**Goal**: Same code works on Kubernetes
+## Agent Guidelines for This Repo
 
-#### Tests First (Define Contracts)
+When working on LazyAF, agents should:
 
-**test_k8s_orchestrator_contract.py** - Write BEFORE implementing K8s
-| Test | Defines Contract |
-|------|------------------|
-| `test_creates_k8s_job_for_step` | Job resource created |
-| `test_uses_pvc_for_workspace` | PVC mounted |
-| `test_node_selector_from_labels` | Labels -> node selector |
-| `test_job_completion_detected` | Job status watched |
-
-- [ ] Write `test_k8s_orchestrator_contract.py` (defines K8s behavior)
-
-#### Implementation (Make Tests Pass)
-
-- [ ] Implement `KubernetesOrchestrator` (make tests pass)
-- [ ] PersistentVolumeClaims for workspaces
-- [ ] K8s Jobs for step execution
-- [ ] Node selectors based on runner labels
-- [ ] Integration tests in K8s environment
-
-#### Done Criteria
-
-- [ ] K8s orchestrator tests pass (mocked)
-- [ ] Integration tests pass (real K8s)
-
-**Effort**: 2-3 weeks when needed
-**Outcome**: Production-ready K8s deployment
+1. **Understand the architecture**: Backend (FastAPI) + Frontend (Svelte) + Runners (Docker)
+2. **Check existing patterns**: Look at similar routers/services before creating new ones
+3. **Run tests after changes**: `pytest` for backend, `npm test` for frontend
+4. **Use the internal git server**: Changes go to internal server, not GitHub
+5. **Follow the step type model**: All work is agent/script/docker steps
+6. **Reference historical docs**: See `historical-documents/` for completed phase details

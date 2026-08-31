@@ -1,0 +1,119 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# The same review as review-self-hosted.yaml, on a paid API instead.
+#
+# COST: A REAL BILLED MODEL CALL ON EVERY PUSH TO A MATCHED BRANCH.
+# `agent: claude-code` runs the Anthropic CLI in the step container; the
+# backend injects ANTHROPIC_API_KEY through the step config file, and the
+# wrapper scrapes the CLI's own reported cost into a StepUsage row with
+# cost_source="cli-reported". That row is what GET /api/pipeline-runs/{id}/usage
+# adds up, so the number on the run is the provider's number, not an estimate.
+#
+# The bill scales with how much of the diff the agent reads, and the diff is
+# bounded here at 200 kB. A busy trunk pushing 30 times a day pays 30 times.
+# If that is the wrong trade, this is the recipe to move to a card_complete
+# trigger (see cheap-and-nightly.yaml) or onto your own GPU
+# (review-self-hosted.yaml).
+#
+# Note the branch list: no glob that could match `lazyaf/*`. This pipeline
+# does not push, but keeping agent work branches out of a trigger is the habit
+# that stops the push loop described in docs/examples/README.md.
+name: "Review (hosted API)"
+description: "AI code review on every push to main, running on the Anthropic CLI. One real billed model call per push."
+
+triggers:
+  - type: push
+    config:
+      branches: ["main"]
+
+steps:
+  - id: "collect-diff"
+    name: "Collect the pushed diff"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        mkdir -p .lazyaf-run
+        grep -qxF '/.lazyaf-run/' .git/info/exclude 2>/dev/null \
+          || echo '/.lazyaf-run/' >> .git/info/exclude
+        python3 - <<'PY'
+        import json, os, subprocess, urllib.request
+        run = json.load(urllib.request.urlopen(
+            f"{os.environ['LAZYAF_BACKEND_URL']}/api/pipeline-runs"
+            f"/{os.environ['LAZYAF_PIPELINE_RUN_ID']}", timeout=30))
+        ctx = run.get("trigger_context") or {}
+        new = ctx.get("commit_sha") or "HEAD"
+        old = ctx.get("old_sha") or ""
+        have = lambda r: subprocess.run(
+            ["git", "cat-file", "-e", r + "^{commit}"]).returncode == 0
+        if not old or set(old) == {"0"} or not have(old):
+            old = new + "~1" if have(new + "~1") else new
+        diff = subprocess.run(["git", "diff", old, new],
+                              capture_output=True, text=True).stdout
+        open(".lazyaf-run/diff.patch", "w", encoding="utf-8").write(diff[:200000])
+        print(f"[diff] {old[:12]}..{new[:12]} -> .lazyaf-run/diff.patch "
+              f"({len(diff)} bytes)")
+        PY
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  # prompt_template REPLACES the default prompt body. Only {{title}},
+  # {{description}} and {{spec_context}} are substituted, in one pass - a
+  # value that comes out of a substitution is never re-scanned, so nothing in
+  # a diff can smuggle in another placeholder.
+  - id: "review"
+    name: "AI review"
+    type: agent
+    config:
+      agent: claude-code
+      commit: false
+      title: "Review this push"
+      description: "Read .lazyaf-run/diff.patch and write .lazyaf-run/review.md."
+      prompt_template: |
+        You are reviewing one commit range in this repository. You are sitting
+        in the checkout; the diff is at .lazyaf-run/diff.patch.
+
+        ## Task
+        {{title}}
+
+        {{description}}
+
+        ## Output
+        Write .lazyaf-run/review.md with a `## Verdict` line that is either
+        BLOCKER or OK, then a `## Findings` list of `file:line - one sentence`
+        entries. Only report what you can point at a line for.
+
+        BLOCKER means the change is unsafe to ship as written: data loss, a
+        credential, a broken migration, an unhandled failure path, or a test
+        that cannot fail.
+
+        ## Do not
+        Do not change any source file. Do not run the test suite - a later
+        step does that, and your budget is better spent reading.
+    on_success: next
+    on_failure: stop
+    timeout: 1200
+
+  - id: "review-gate"
+    name: "Fail on BLOCKER"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        if [ ! -f .lazyaf-run/review.md ]; then
+          echo "the reviewer wrote no review.md" >&2
+          exit 1
+        fi
+        cat .lazyaf-run/review.md
+        if grep -qi '^BLOCKER' .lazyaf-run/review.md; then
+          echo "review reported a BLOCKER" >&2
+          exit 1
+        fi
+    on_success: next
+    on_failure: stop
+    timeout: 120

@@ -129,12 +129,16 @@
 </div>
 
 <style>
+  /* See the note in PipelinesPage: `overflow: hidden` made content that did
+     not fit permanently unreachable at narrow widths instead of merely
+     off-screen. No scrollbar appears at any width where the content fits. */
   .specs-page {
     flex: 1;
     display: flex;
     flex-direction: column;
     padding: 1.5rem 2rem;
-    overflow: hidden;
+    overflow-x: auto;
+    overflow-y: hidden;
   }
 
   .page-header {

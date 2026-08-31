@@ -17,10 +17,29 @@
     close: void;
   }>();
 
+  // The STEP INDEX of the selected step - the same number the API keys logs
+  // by - never its position in `step_runs`. Those two agree only while every
+  // step has reported: a parallel or conditional pipeline where step 2
+  // reported before step 1 made row #2 fetch step 1's logs, and made a later
+  // frame for the missing step re-point the heading at a step the user was
+  // not reading. R3: one meaning per number.
   let selectedStepIndex: number | null = null;
   let stepLogs: StepLogsResponse | null = null;
   let loadingLogs = false;
+  let logsFetchError: string | null = null;
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
+
+  /**
+   * The log body, ONE ENTRY PER LINE.
+   *
+   * Kept as a growing list rather than recomputed from whichever source is
+   * currently fresher: the WS tail and the REST snapshot are two views of the
+   * same stream, and swapping between them (the old "longer string wins")
+   * rewrote every line in the pane. Adopting only a candidate at least as long
+   * as what is on screen means the pane only ever gains lines, so the nodes a
+   * user has selected are never touched.
+   */
+  let displayedLines: string[] = [];
 
   // The launcher needs the PIPELINE, not just the run: breakpoints are step
   // keys read off the step list. Fetched on demand, so an ordinary viewer
@@ -39,20 +58,28 @@
   // frames and also feeds the store.
   $: liveRun = $activeRunsStore.get(run.id) ?? run;
 
+  // Rendered in step_index order, and KEYED by it below. `step_runs` is
+  // rebuilt by every REST poll and re-sorted whenever a late step reports, so
+  // without a stable order and a stable key the rows shuffle under the cursor
+  // and the click lands on a step the user did not aim at.
+  $: orderedSteps = [...(liveRun.step_runs ?? [])].sort((a, b) => a.step_index - b.step_index);
+
+  $: selectedStep =
+    selectedStepIndex === null
+      ? null
+      : orderedSteps.find(s => s.step_index === selectedStepIndex) ?? null;
+
   // Live log tail streamed over the WS (step_log / step_log_batch) for the
   // selected step.
   $: liveLines =
     selectedStepIndex !== null
       ? $liveStepLogsStore.get(stepLogKey(run.id, selectedStepIndex)) ?? []
       : [];
-  $: liveLogText = liveLines.join('\n');
 
-  // What the log pane shows: the persisted snapshot (REST) is authoritative,
-  // but while the WS tail is ahead of the last poll — or before the first
-  // fetch returns — show the live tail so lines appear as they happen. Both
-  // are views of the same stream, so "longer wins" picks the fresher one.
-  $: displayedLogs =
-    liveLogText.length > (stepLogs?.logs?.length ?? 0) ? liveLogText : stepLogs?.logs ?? '';
+  // The persisted snapshot (REST), split once at the component boundary.
+  $: snapshotLines = splitLogLines(stepLogs?.logs ?? '');
+
+  $: adoptLogLines(liveLines, snapshotLines);
 
   // Auto-refresh while running
   $: if (liveRun.status === 'running' || liveRun.status === 'pending') {
@@ -84,22 +111,52 @@
     }
   });
 
+  function splitLogLines(text: string): string[] {
+    if (!text) return [];
+    const lines = text.split('\n');
+    // A trailing newline terminates the last line, it is not an empty one.
+    if (lines[lines.length - 1] === '') lines.pop();
+    return lines;
+  }
+
+  /**
+   * Take whichever source has more lines, but never go backwards. Called from
+   * a reactive statement; `displayedLines` is deliberately not referenced in
+   * that statement so writing it here cannot re-trigger the block.
+   */
+  function adoptLogLines(live: string[], snapshot: string[]) {
+    const candidate = snapshot.length >= live.length ? snapshot : live;
+    if (candidate.length >= displayedLines.length) {
+      displayedLines = candidate;
+    }
+  }
+
   async function loadStepLogs(stepIndex: number) {
     if (loadingLogs) return;
     loadingLogs = true;
     try {
       stepLogs = await runsApi.stepLogs(run.id, stepIndex);
+      logsFetchError = null;
     } catch (e) {
-      stepLogs = null;
+      // R1: say so, and do NOT blank out logs already on screen - a failed
+      // 2s refresh used to replace a transcript the user was reading with
+      // nothing at all. The last snapshot stands and the WS tail keeps
+      // feeding the pane; the banner says the refresh is behind.
+      logsFetchError = e instanceof Error ? e.message : 'Failed to refresh logs';
+      if (displayedLines.length === 0) stepLogs = null;
     } finally {
       loadingLogs = false;
     }
   }
 
-  function selectStep(index: number) {
-    selectedStepIndex = index;
+  /** @param stepIndex the StepRun's `step_index`, not its row position. */
+  function selectStep(stepIndex: number) {
+    if (selectedStepIndex === stepIndex) return;
+    selectedStepIndex = stepIndex;
     stepLogs = null;
-    loadStepLogs(index);
+    displayedLines = [];
+    logsFetchError = null;
+    loadStepLogs(stepIndex);
   }
 
   async function handleCancel() {
@@ -133,6 +190,8 @@
     // different pipeline run than the steps underneath it.
     selectedStepIndex = null;
     stepLogs = null;
+    displayedLines = [];
+    logsFetchError = null;
     try {
       const started = await runsApi.get(event.detail.runId);
       activeRunsStore.updateRun(started);
@@ -147,8 +206,22 @@
     if (e.key === 'Escape') dispatch('close');
   }
 
-  function handleBackdropClick() {
-    dispatch('close');
+  // `click` fires on the nearest common ancestor of mousedown and mouseup, so
+  // a selection drag that STARTS on a log line and ends past the modal edge
+  // dispatches click on the backdrop itself - the inner `on:click|stopPropagation`
+  // never sees it and cannot help. That closed the viewer mid-drag and took
+  // the text with it. Close only when the press AND the release landed on the
+  // backdrop.
+  let pressedOnBackdrop = false;
+
+  function handleBackdropMouseDown(e: MouseEvent) {
+    pressedOnBackdrop = e.target === e.currentTarget;
+  }
+
+  function handleBackdropClick(e: MouseEvent) {
+    const shouldClose = pressedOnBackdrop && e.target === e.currentTarget;
+    pressedOnBackdrop = false;
+    if (shouldClose) dispatch('close');
   }
 
   function getStatusColor(status: RunStatus): string {
@@ -179,7 +252,13 @@
 
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
-<div class="modal-backdrop" on:click={handleBackdropClick} role="dialog" aria-modal="true">
+<div
+  class="modal-backdrop"
+  on:mousedown={handleBackdropMouseDown}
+  on:click={handleBackdropClick}
+  role="dialog"
+  aria-modal="true"
+>
   <div class="modal" data-testid="run-viewer" on:click|stopPropagation role="document">
     <header class="modal-header">
       <div class="header-info">
@@ -215,15 +294,15 @@
       <DebugPanel run={liveRun} />
 
       <div class="steps-timeline" data-testid="steps">
-        {#each liveRun.step_runs || [] as stepRun, index}
+        {#each orderedSteps as stepRun (stepRun.step_index)}
           <button
             class="step-item"
             data-testid="step"
-            data-step-index={index}
+            data-step-index={stepRun.step_index}
             data-status={stepRun.status}
-            class:selected={selectedStepIndex === index}
-            class:current={liveRun.current_step === index && liveRun.status === 'running'}
-            on:click={() => selectStep(index)}
+            class:selected={selectedStepIndex === stepRun.step_index}
+            class:current={liveRun.current_step === stepRun.step_index && liveRun.status === 'running'}
+            on:click={() => selectStep(stepRun.step_index)}
           >
             <span class="step-status" style="color: {getStatusColor(stepRun.status as RunStatus)}">
               {getStatusIcon(stepRun.status as RunStatus)}
@@ -239,7 +318,7 @@
       {#if selectedStepIndex !== null}
         <div class="step-details">
           <div class="step-details-header">
-            <h3>{liveRun.step_runs?.[selectedStepIndex]?.step_name || `Step ${selectedStepIndex + 1}`}</h3>
+            <h3>{selectedStep?.step_name || `Step ${selectedStepIndex + 1}`}</h3>
             {#if stepLogs?.error}
               <span class="error-badge">Error</span>
             {/if}
@@ -248,13 +327,29 @@
           {#if stepLogs?.error}
             <div class="error-message">{stepLogs.error}</div>
           {/if}
-          {#if loadingLogs && !displayedLogs}
+          {#if logsFetchError}
+            <div class="logs-stale" data-testid="logs-stale">
+              Log refresh failed: {logsFetchError}. Showing the last lines received.
+            </div>
+          {/if}
+          {#if loadingLogs && displayedLines.length === 0}
             <div class="loading">Loading logs...</div>
           {:else}
-            <!-- displayedLogs prefers the WS live tail while it is ahead of the
-                 last REST snapshot, so lines stream in during local execution
-                 even when no snapshot has loaded yet. -->
-            <pre class="logs" data-testid="logs">{displayedLogs || '(No logs)'}</pre>
+            <!-- ONE NODE PER LINE, keyed by position. `<pre>{wholeLog}</pre>`
+                 is a single text node: every arriving line replaced it and
+                 collapsed any selection the user had made, so highlighting a
+                 failing assertion to copy it was impossible while the step was
+                 still running. Appending a node leaves the earlier ones - and
+                 the selection over them - alone. -->
+            <div class="logs" data-testid="logs">
+              {#if displayedLines.length === 0}
+                <div class="log-line">(No logs)</div>
+              {:else}
+                {#each displayedLines as line, i (i)}
+                  <div class="log-line">{line}</div>
+                {/each}
+              {/if}
+            </div>
           {/if}
         </div>
       {:else}
@@ -498,6 +593,16 @@
     font-style: italic;
   }
 
+  .logs-stale {
+    padding: 0.4rem 0.6rem;
+    margin-bottom: 0.5rem;
+    border-radius: 4px;
+    background: rgba(249, 226, 175, 0.12);
+    border: 1px solid var(--warning-color);
+    color: var(--warning-color);
+    font-size: 0.8rem;
+  }
+
   .error-message {
     padding: 0.75rem;
     background: rgba(243, 139, 168, 0.1);
@@ -514,11 +619,17 @@
     border-radius: 6px;
     font-family: monospace;
     font-size: 0.8rem;
-    white-space: pre-wrap;
-    word-break: break-all;
     max-height: 300px;
     overflow-y: auto;
     margin: 0;
+  }
+
+  .log-line {
+    white-space: pre-wrap;
+    word-break: break-all;
+    /* An empty log line is still a line: without this it collapses to zero
+       height and the blank rows a real transcript contains disappear. */
+    min-height: 1.2em;
   }
 
   .no-logs {

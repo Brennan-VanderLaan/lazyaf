@@ -3,7 +3,16 @@
   line-height: 1.5;
   font-weight: 400;
 
-  color-scheme: light dark;
+  /* LazyAF has exactly one theme, and it is dark: the whole palette is defined
+     unconditionally on :root in App.svelte, with no light variant anywhere.
+     `color-scheme: light dark` (the Vite scaffold default) told the browser
+     otherwise, so on a machine whose OS is set to light — the Windows default —
+     everything the BROWSER paints rather than the stylesheet came out light:
+     screenshotted, the radio controls in the endpoint dialog rendered as white
+     discs on the dark form, and select popups, spinners and autofill follow the
+     same rule. Declaring `dark` makes native control chrome match the UI it
+     sits in. */
+  color-scheme: dark;
   color: rgba(255, 255, 255, 0.87);
   background-color: #242424;
 
@@ -63,15 +72,19 @@ button:focus-visible {
   outline: 4px auto -webkit-focus-ring-color;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color: #213547;
-    background-color: #ffffff;
-  }
-  a:hover {
-    color: #747bff;
-  }
-  button {
-    background-color: #f9f9f9;
-  }
-}
+/*
+ * The Vite scaffold's `@media (prefers-color-scheme: light)` block used to sit
+ * here. It flipped `:root { color }` to #213547 and `button { background-color }`
+ * to #f9f9f9 — near-black text and near-white buttons — while every surface
+ * around them stayed on the dark palette from App.svelte.
+ *
+ * Measured on a light-OS profile before removing it: zero elements were
+ * actually picking either value up, because every button in the app sets its
+ * own background and every text element its own colour. So this was not
+ * breaking anything TODAY. It was a trap: the first button added without an
+ * explicit background would render white-on-dark for every light-OS user and
+ * look perfect to anyone developing on a dark-mode machine.
+ *
+ * The app is dark-only by design. A light-mode override that contradicts it is
+ * not a theme, it is a landmine, so it is gone rather than half-maintained.
+ */

@@ -176,3 +176,64 @@ describe('cardsStore.load error handling', () => {
     expect(get(cardsStore.loading)).toBe(false);
   });
 });
+
+describe('cardsByStatus column order is stable under a refetch', () => {
+  /**
+   * `load()` replaces the whole array with the API response, and
+   * `GET /api/repos/{id}/cards` has no ORDER BY - so a resync after a dropped
+   * socket can hand the same cards back in a different order. A row that moves
+   * between a user aiming at it and clicking it is how someone opens, or
+   * deletes, the wrong card.
+   */
+  it('orders a column by creation time, not by the order the payload arrived in', async () => {
+    await seed([
+      makeCard({ id: 'c-third', created_at: '2026-01-03T00:00:00Z' }),
+      makeCard({ id: 'c-first', created_at: '2026-01-01T00:00:00Z' }),
+      makeCard({ id: 'c-second', created_at: '2026-01-02T00:00:00Z' }),
+    ]);
+
+    expect(get(cardsByStatus).todo.map(c => c.id)).toEqual(['c-first', 'c-second', 'c-third']);
+  });
+
+  it('gives the SAME order when the server returns the same cards shuffled', async () => {
+    const cards = [
+      makeCard({ id: 'a', created_at: '2026-01-01T00:00:00Z' }),
+      makeCard({ id: 'b', created_at: '2026-01-02T00:00:00Z' }),
+      makeCard({ id: 'c', created_at: '2026-01-03T00:00:00Z' }),
+    ];
+
+    await seed(cards);
+    const first = get(cardsByStatus).todo.map(c => c.id);
+
+    // The resync path: same rows, different order off the wire.
+    await seed([cards[2], cards[0], cards[1]]);
+    const second = get(cardsByStatus).todo.map(c => c.id);
+
+    expect(second).toEqual(first);
+  });
+
+  it('does not shuffle when created_at is unparseable on both sides', async () => {
+    // `timestampOrder` answers -Infinity for a timestamp it cannot parse.
+    // Subtracting those gives NaN, which makes a comparator return
+    // "unordered" and lets the engine reorder freely; the id breaks the tie.
+    await seed([
+      makeCard({ id: 'z', created_at: 'not a date' }),
+      makeCard({ id: 'y', created_at: 'not a date either' }),
+    ]);
+
+    expect(get(cardsByStatus).todo.map(c => c.id)).toEqual(['y', 'z']);
+  });
+
+  it('places a card adopted from a WebSocket frame by its creation time, not at the end', async () => {
+    await seed([
+      makeCard({ id: 'old', created_at: '2026-01-01T00:00:00Z' }),
+      makeCard({ id: 'new', created_at: '2026-01-05T00:00:00Z' }),
+    ]);
+
+    cardsStore.updateLocal(
+      makeCard({ id: 'middle', repo_id: 'repo-1', created_at: '2026-01-03T00:00:00Z' }),
+    );
+
+    expect(get(cardsByStatus).todo.map(c => c.id)).toEqual(['old', 'middle', 'new']);
+  });
+});

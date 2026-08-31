@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { setContext } from 'svelte';
   import { SvelteFlow, Background, Controls, MiniMap, type Node, type Edge, type Connection } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
 
@@ -18,6 +19,7 @@
   import GraphToolbar from './GraphToolbar.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import StepConfigModal from './StepConfigModal.svelte';
+  import { GRAPH_ACTIONS, type GraphActions } from './actions';
 
   // Special Start node ID
   const START_NODE_ID = '__start__';
@@ -51,13 +53,27 @@
     condition: ConditionEdge,
   };
 
+  // Where the Start node sits when the graph has never recorded a position for
+  // it. It has to clear the FIRST STEP, and the v1 -> v2 migration parks step 0
+  // at { x: 100, y: 0 }. The old default of { x: 50, y: 50 } put this 64x64
+  // circle at 50..114 x 50..114, which overlapped that step's 100..280 x 0..61
+  // box by 14x21px on every legacy pipeline - the START disc sat on the first
+  // step's lower-left corner.
+  //
+  // { x: 0, y: 0 } leaves a 36px gap to step 0 and shares its row. It is
+  // deliberately NOT negative: `fitView` does not reliably reframe this canvas
+  // (measured - on a client-side route into the editor the viewport transform
+  // stays translate(0,0) scale(1)), and under an identity transform a node at a
+  // negative x is simply off the left edge and invisible.
+  const DEFAULT_START_POSITION = { x: 0, y: 0 };
+
   // Convert graph model to Svelte Flow format
   function graphToNodes(g: PipelineGraphModel): Node[] {
     // Start node - always present, positioned to the left
     const startNode: Node = {
       id: START_NODE_ID,
       type: 'start',
-      position: g.start_position ?? { x: 50, y: 50 },
+      position: g.start_position ?? DEFAULT_START_POSITION,
       data: { label: 'Start' },
       deletable: false,
       draggable: true,
@@ -82,6 +98,13 @@
     return [startNode, ...stepNodes];
   }
 
+  // NOTE ON `data`: it holds PLAIN VALUES ONLY - no callbacks. Svelte Flow
+  // decides whether to warn "Use $state.raw for edges" by attempting
+  // `structuredClone(edges[0])` (node_modules/@xyflow/svelte/dist/lib/store/
+  // initial-store.svelte.js), and a function in `data` makes that throw, which
+  // it then misreports as deep reactivity. The edge's own handlers reach the
+  // editor through the GRAPH_ACTIONS context instead, keyed by edge id - which
+  // is also what the library documents `data` should be: serialisable.
   function graphToEdges(g: PipelineGraphModel): Edge[] {
     // Convert existing edges
     const existingEdges = g.edges.map(edge => ({
@@ -93,8 +116,6 @@
         condition: edge.condition,
         isActive: activeStepIds.includes(edge.from_step) || activeStepIds.includes(edge.to_step),
         isCompleted: completedStepIds.includes(edge.from_step),
-        onConditionChange: (condition: EdgeCondition) => changeEdgeCondition(edge.id, condition),
-        onDelete: () => deleteEdge(edge.id),
       },
       animated: activeStepIds.includes(edge.from_step),
     }));
@@ -117,11 +138,6 @@
             condition: 'always' as EdgeCondition,
             isActive: activeStepIds.includes(entryPoint),
             isCompleted: false,
-            onConditionChange: (condition: EdgeCondition) => {
-              // When condition changes, persist as a real edge
-              addStartEdge(entryPoint, condition);
-            },
-            onDelete: () => deleteEdge(syntheticEdgeId),
           },
           animated: false,
         });
@@ -460,6 +476,32 @@
   function onPaletteDropStep(type: StepType, position: { x: number; y: number }) {
     addStep(type, position);
   }
+
+  // Add step from the palette by KEYBOARD. The palette items advertise
+  // role="button" and take focus, so Enter/Space have to do something; drag and
+  // drop cannot be performed from a keyboard. Same landing spot the toolbar
+  // uses, so the new node cannot appear on top of an existing one.
+  function onPaletteAddStep(type: StepType) {
+    onToolbarAddStep(type);
+  }
+
+  // Edge handlers reached by ConditionEdge through context rather than through
+  // `edge.data` - see the note on graphToEdges.
+  const graphActions: GraphActions = {
+    setEdgeCondition(edgeId: string, condition: EdgeCondition) {
+      // A synthetic `__start_to_<step>` edge is a legacy entry_point that has no
+      // real edge row yet; changing its condition is what persists it.
+      if (edgeId.startsWith('__start_to_')) {
+        addStartEdge(edgeId.replace('__start_to_', ''), condition);
+        return;
+      }
+      changeEdgeCondition(edgeId, condition);
+    },
+    deleteEdge(edgeId: string) {
+      deleteEdge(edgeId);
+    },
+  };
+  setContext(GRAPH_ACTIONS, graphActions);
 </script>
 
 <div class="graph-editor" data-testid="graph-editor" class:readonly>
@@ -471,7 +513,7 @@
   <div class="graph-container">
     <!-- Node Palette (Sidebar) -->
     {#if !readonly}
-      <NodePalette onDropStep={onPaletteDropStep} />
+      <NodePalette onDropStep={onPaletteDropStep} onAddStep={onPaletteAddStep} />
     {/if}
 
     <!-- Main Flow Canvas -->

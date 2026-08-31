@@ -519,6 +519,14 @@ class DebugSessionService:
         machine refuses CLEANING while `use_count > 0`). For the FIRST step of
         a run it is also what makes the sidecar useful at all: without it a
         breakpoint on step 0 would attach to a volume that does not exist yet.
+
+        Pins the DEFAULT LANE (no `worker_key`), matching the volume
+        `debug_terminal.workspace_volume_name` mounts into the sidecar. This
+        is also the reason `use_count` stays an integer after M13-1: the pin
+        lands on a lane a paused step is ALREADY holding, so the count
+        legitimately reaches 2 and the release order is not guaranteed - a
+        boolean would let the first releaser reap a volume a live sidecar
+        still has mounted.
         """
         db = session_factory()
         try:

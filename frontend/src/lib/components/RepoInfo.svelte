@@ -232,8 +232,16 @@
               </button>
             </div>
           {/if}
-          <p class="instruction-note">Or checkout the branch directly:</p>
+          <!--
+            The label belongs INSIDE the guard with the command it introduces.
+            Outside it, a repo with no branches yet - exactly a new user's
+            state - rendered "Or checkout the branch directly:" immediately
+            followed by "Then push to GitHub:", which reads as a command that
+            failed to load. Its sibling `git merge` block above was already
+            guarded correctly; this one was the straggler.
+          -->
           {#if selectedBranch}
+            <p class="instruction-note">Or checkout the branch directly:</p>
             <div class="cmd-group">
               <code>git checkout -b {selectedBranch} lazyaf/{selectedBranch}</code>
               <button class="btn-copy-sm" on:click={() => copyToClipboard(`git checkout -b ${selectedBranch} lazyaf/${selectedBranch}`)} title="Copy">

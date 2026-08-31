@@ -3,9 +3,16 @@
 
   interface Props {
     onDropStep: (type: StepType, position: { x: number; y: number }) => void;
+    /**
+     * Keyboard route to the same outcome as a drag. Drag and drop cannot be
+     * done from a keyboard, and these items advertise role="button" and take
+     * tab focus, so Enter/Space must add the step somewhere sensible instead of
+     * doing nothing.
+     */
+    onAddStep?: (type: StepType) => void;
   }
 
-  let { onDropStep }: Props = $props();
+  let { onDropStep, onAddStep }: Props = $props();
 
   // Node type definitions
   const nodeTypes: { type: StepType; label: string; icon: string; color: string; description: string }[] = [
@@ -63,8 +70,15 @@
         draggable="true"
         ondragstart={(e) => onDragStart(e, node.type)}
         ondragend={onDragEnd}
+        onkeydown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+            e.preventDefault();
+            onAddStep?.(node.type);
+          }
+        }}
         role="button"
         tabindex="0"
+        aria-label="Add a {node.label} step"
       >
         <div class="item-icon" style:background={node.color}>
           <span>{node.icon}</span>
@@ -83,7 +97,7 @@
   <div class="palette-footer">
     <div class="tip">
       <span class="tip-icon">i</span>
-      <span class="tip-text">Double-click node to edit</span>
+      <span class="tip-text">Double-click node to edit (or press Enter)</span>
     </div>
   </div>
 </div>

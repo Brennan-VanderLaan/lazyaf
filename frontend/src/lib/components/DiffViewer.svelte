@@ -11,33 +11,80 @@
   let diff: DiffResponse | null = null;
   let loading = true;
   let error: string | null = null;
+  let staleError: string | null = null;
   let expandedFiles: Set<string> = new Set();
 
-  $: if (repoId && baseBranch && headBranch && refreshKey >= 0) {
+  /** Which branch pair the diff on screen belongs to. */
+  let loadedTarget: string | null = null;
+  $: target = JSON.stringify([repoId, baseBranch, headBranch]);
+
+  // `target` is read here on purpose: it makes Svelte evaluate it BEFORE this
+  // block, so loadDiff() can tell "the user picked different branches" from
+  // "the same diff was refreshed".
+  $: if (repoId && baseBranch && headBranch && refreshKey >= 0 && target) {
     loadDiff();
   }
+
+  // Parsed once per diff instead of once per render. It used to be called
+  // straight from the {#each}, so every unrelated state change (expanding a
+  // file, a parent re-render) re-parsed every hunk of every open file.
+  $: parsedDiffs = new Map(
+    (diff?.files ?? []).map(f => [f.path, parseDiffLines(f.diff ?? '')] as const)
+  );
 
   export function refresh() {
     loadDiff();
   }
 
   async function loadDiff() {
-    loading = true;
-    error = null;
-    // Reset expanded files when diff changes
-    expandedFiles = new Set();
-    try {
-      diff = await repos.diff(repoId, baseBranch, headBranch);
-      // Auto-expand first few files
-      if (diff.files.length > 0) {
-        expandedFiles = new Set(diff.files.slice(0, 3).map(f => f.path));
-      }
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to load diff';
+    const isNewTarget = target !== loadedTarget;
+    if (isNewTarget) {
+      // Different branches: genuinely different content, so start clean.
       diff = null;
+      expandedFiles = new Set();
+      staleError = null;
+    }
+    // The FIRST load has nothing to show, so it gets the spinner. A refresh
+    // keeps the diff on screen: swapping it for "Loading diff..." unmounted
+    // every row, which threw away the files you had expanded, where you had
+    // scrolled to, and any text you were half way through selecting.
+    if (!diff) loading = true;
+    error = null;
+    try {
+      const next = await repos.diff(repoId, baseBranch, headBranch);
+      expandedFiles = nextExpansion(next, expandedFiles, diff !== null);
+      diff = next;
+      loadedTarget = target;
+      staleError = null;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Failed to load diff';
+      if (diff) {
+        // R1: say the refresh failed, but do not delete a diff the user is
+        // reading because one poll lost the connection.
+        staleError = message;
+      } else {
+        error = message;
+        diff = null;
+      }
     } finally {
       loading = false;
     }
+  }
+
+  /**
+   * Which files are expanded after a load. A first load auto-expands the first
+   * few; a REFRESH keeps exactly what the user opened and closed, dropping
+   * only paths that have gone. Re-deriving "first three" on every refresh
+   * re-opened files the user had deliberately collapsed.
+   */
+  function nextExpansion(
+    next: DiffResponse,
+    previous: Set<string>,
+    hadDiff: boolean
+  ): Set<string> {
+    if (!hadDiff) return new Set(next.files.slice(0, 3).map(f => f.path));
+    const paths = new Set(next.files.map(f => f.path));
+    return new Set([...previous].filter(path => paths.has(path)));
   }
 
   function toggleFile(path: string) {
@@ -142,11 +189,20 @@
       </div>
     </div>
 
+    {#if staleError}
+      <div class="diff-stale" data-testid="diff-stale">
+        Refresh failed: {staleError}. Showing the last diff loaded.
+      </div>
+    {/if}
+
     {#if diff.files.length === 0}
       <div class="no-changes">No file changes between these branches.</div>
     {:else}
       <div class="file-list" data-testid="file-list">
-        {#each diff.files as file}
+        <!-- KEYED by path. Unkeyed, a refresh that adds or removes a file
+             rewrote each row in place: the row under the cursor became a
+             different file between aiming and clicking. -->
+        {#each diff.files as file (file.path)}
           <div class="file-item" data-testid="file-item" data-file-path={file.path}>
             <button
               type="button"
@@ -171,7 +227,7 @@
                 {:else}
                   <table class="diff-table">
                     <tbody>
-                      {#each parseDiffLines(file.diff) as line}
+                      {#each parsedDiffs.get(file.path) ?? [] as line, i (i)}
                         {#if line.type === 'hunk'}
                           <tr class="hunk-row">
                             <td class="line-num"></td>
@@ -297,6 +353,14 @@
   .btn-refresh:hover {
     color: var(--text-color, #cdd6f4);
     background: var(--hover-color, #313244);
+  }
+
+  .diff-stale {
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--warning-color, #f9e2af);
+    background: rgba(249, 226, 175, 0.12);
+    color: var(--warning-color, #f9e2af);
+    font-size: 0.8rem;
   }
 
   .no-changes {

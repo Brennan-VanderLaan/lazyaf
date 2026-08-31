@@ -188,11 +188,47 @@
       dispatch('close');
     }
   }
+
+  /**
+   * Was the mouse pressed down on the backdrop, or inside the modal?
+   *
+   * The DOM dispatches `click` on the nearest common ancestor of mousedown and
+   * mouseup. Press inside the modal (on a branch name, a clone URL), drag left
+   * past the edge to finish the selection, release over the dimmed backdrop -
+   * which is exactly how people select to the end of a line - and `click`
+   * fires on the BACKDROP. The inner `on:click|stopPropagation` never sees it
+   * and cannot help. The modal slammed shut mid-selection and took the text
+   * with it. Close only when the press AND the release were both on the
+   * backdrop.
+   *
+   * Four sibling modals (CardModal, PipelineRunViewer, AgentFileModal,
+   * debug/DebugRerunModal) have the identical bug and belong to other lanes;
+   * this is the same fix, applied to the one file this lane owns.
+   */
+  let pressedOnBackdrop = false;
+
+  function handleBackdropMouseDown(e: MouseEvent) {
+    pressedOnBackdrop = e.target === e.currentTarget;
+  }
+
+  function handleBackdropClick(e: MouseEvent) {
+    const releasedOnBackdrop = e.target === e.currentTarget;
+    const shouldClose = pressedOnBackdrop && releasedOnBackdrop;
+    pressedOnBackdrop = false;
+    if (shouldClose) dispatch('close');
+  }
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
 
-<div class="modal-backdrop" on:click={() => dispatch('close')} on:keydown={(e) => e.key === 'Enter' && dispatch('close')} role="button" tabindex="0">
+<div
+  class="modal-backdrop"
+  on:mousedown={handleBackdropMouseDown}
+  on:click={handleBackdropClick}
+  on:keydown={(e) => e.key === 'Enter' && dispatch('close')}
+  role="button"
+  tabindex="0"
+>
   <div class="modal" on:click|stopPropagation role="dialog" aria-modal="true">
     <div class="modal-header">
       <h2>Branch Manager</h2>

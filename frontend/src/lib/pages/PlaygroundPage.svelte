@@ -17,29 +17,47 @@
 
   // UI refs
   let logsContainer: HTMLDivElement;
-  let autoScroll = true;
-  let scrollTimeout: ReturnType<typeof setTimeout> | null = null;
 
-  // Timer for duration display
-  let elapsedSeconds = 0;
+  /**
+   * FOLLOW MODE. True while the pane should stay pinned to the newest output.
+   *
+   * This is the whole of "output wouldn't scroll up". The old code armed a
+   * 100ms debounced snap on every incoming line and re-checked only that the
+   * container still existed when the timer fired - so a snap armed by the last
+   * line before the user scrolled up still yanked them back, and because every
+   * new line RE-ARMED the timer it could only ever fire during a pause, which
+   * is what a real agent does constantly. The same snap moving content under a
+   * held mouse button is also what blew up drag-selections from 73 characters
+   * to 1781: the browser correctly extends a live selection to wherever the
+   * cursor now points.
+   */
+  let followTail = true;
+  /**
+   * When we last scrolled the pane ourselves.
+   *
+   * A timestamp rather than a boolean flag: a flag set around the assignment
+   * has to be cleared by the scroll event it expects, and a browser that
+   * coalesces that event away (or a hidden tab, where rAF never runs) leaves
+   * it armed to swallow the user's next real scroll. A window expires by
+   * itself.
+   */
+  let programmaticScrollAt = 0;
+  const PROGRAMMATIC_SCROLL_WINDOW_MS = 150;
+  /** True between pointerdown in the pane and the matching release. */
+  let selecting = false;
+  /** Distance from the bottom, in px, still counted as "at the bottom". */
+  const FOLLOW_THRESHOLD_PX = 24;
+
+  // Timer for the running duration. One plain 1s tick; the label below is a
+  // pure function of it, so it actually re-renders (it used to read '0s'
+  // forever because a no-argument function call in the template gave Svelte
+  // no dependency to invalidate on).
+  let nowTick = Date.now();
   let timerInterval: ReturnType<typeof setInterval> | null = null;
 
-  // Start/stop timer based on running state
-  $: if ($isRunning && !timerInterval) {
-    elapsedSeconds = 0;
-    timerInterval = setInterval(() => {
-      elapsedSeconds++;
-    }, 1000);
-  } else if (!$isRunning && timerInterval) {
-    clearInterval(timerInterval);
-    timerInterval = null;
-    // Calculate final elapsed time from timestamps
-    if ($playgroundStore.startedAt && $playgroundStore.completedAt) {
-      elapsedSeconds = Math.floor(
-        ($playgroundStore.completedAt.getTime() - $playgroundStore.startedAt.getTime()) / 1000
-      );
-    }
-  }
+  let copyState: 'idle' | 'copied' | 'failed' = 'idle';
+  let copyMessage = '';
+  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Load branches when repo changes
   $: if ($selectedRepoId) {
@@ -75,14 +93,47 @@
     }
   }
 
-  // Auto-scroll logs (debounced to prevent UI lockup)
-  $: if ($playgroundStore.logs.length && autoScroll && logsContainer) {
-    if (scrollTimeout) clearTimeout(scrollTimeout);
-    scrollTimeout = setTimeout(() => {
-      if (logsContainer) {
-        logsContainer.scrollTop = logsContainer.scrollHeight;
-      }
-    }, 100);
+  // Follow new output. Narrow dependency on purpose: `logs` only gets a new
+  // identity when log lines actually change, so typing in the task box does
+  // not schedule a scroll.
+  $: logLines = $playgroundStore.logs;
+  $: if (logLines && logsContainer) {
+    void keepPinned();
+  }
+
+  /**
+   * Pin the pane to the bottom, if that is still what the user wants.
+   *
+   * The intent is re-checked HERE, after the DOM has caught up - not when the
+   * scroll was scheduled. That one move is the difference between a log
+   * viewer and a fight.
+   */
+  async function keepPinned() {
+    await tick();
+    if (!logsContainer || !followTail || selecting || paneHasSelection()) return;
+    scrollToBottom();
+  }
+
+  /**
+   * True while the user has text highlighted inside the output pane.
+   *
+   * Following the tail past a selection the user just made is how a transcript
+   * gets scrolled out from under someone who highlighted it in order to copy
+   * it. Clicking anywhere collapses the selection and following resumes.
+   */
+  function paneHasSelection(): boolean {
+    if (!logsContainer) return false;
+    const selection = document.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return false;
+    return logsContainer.contains(selection.getRangeAt(0).commonAncestorContainer);
+  }
+
+  function scrollToBottom() {
+    if (!logsContainer) return;
+    const target = logsContainer.scrollHeight - logsContainer.clientHeight;
+    if (Math.abs(logsContainer.scrollTop - target) < 1) return;
+    programmaticScrollAt = Date.now();
+    logsContainer.scrollTop = logsContainer.scrollHeight;
   }
 
   async function loadBranches(repoId: string) {
@@ -154,6 +205,8 @@
   }
 
   async function handleStartTest() {
+    // A run always starts pinned; the user has not scrolled anywhere yet.
+    followTail = true;
     try {
       await playgroundStore.startTest();
     } catch (e) {
@@ -171,13 +224,84 @@
     if ($selectedRepoId) {
       playgroundStore.setConfig({ repoId: $selectedRepoId });
     }
+    followTail = true;
+  }
+
+  /**
+   * Switching runner also clears the model.
+   *
+   * Each runner has its own model vocabulary, and keeping the old id across
+   * the switch left the Model select painted BLANK (selectedIndex -1) with the
+   * run button still enabled - a run launched against a model that is not in
+   * the list. The reactive auto-select below fills a valid default back in for
+   * the runners that have a CLI model list; `openai-harness` has none, so it
+   * shows a placeholder and the run button stays disabled until you pick one.
+   */
+  function handleRunnerTypeChange(value: string) {
+    playgroundStore.setConfig({
+      runnerType: value as 'claude-code' | 'gemini' | 'openai-harness',
+      model: null,
+    });
   }
 
   function handleLogsScroll() {
     if (!logsContainer) return;
+    if (Date.now() - programmaticScrollAt < PROGRAMMATIC_SCROLL_WINDOW_MS) {
+      // Our own scroll. Reading follow mode off it is what put the user back
+      // on the leash they had just escaped: the snap landed the pane at the
+      // bottom, this handler saw "near the bottom" and re-armed following.
+      return;
+    }
     const { scrollTop, scrollHeight, clientHeight } = logsContainer;
-    // Auto-scroll if user is near the bottom
-    autoScroll = scrollHeight - scrollTop - clientHeight < 100;
+    followTail = scrollHeight - scrollTop - clientHeight <= FOLLOW_THRESHOLD_PX;
+  }
+
+  function handleLogsPointerDown() {
+    // A press in the pane is the start of a selection until proven otherwise.
+    // Nothing scrolls the pane while the button is held.
+    selecting = true;
+  }
+
+  function handleWindowPointerUp() {
+    if (!selecting) return;
+    selecting = false;
+    // Resume following if the user is still parked at the bottom. keepPinned
+    // declines on its own while a selection is standing in the pane.
+    if (followTail) void keepPinned();
+  }
+
+  async function handleCopyLogs() {
+    const text = $playgroundStore.logs.join('\n');
+    if (copyResetTimer) clearTimeout(copyResetTimer);
+    try {
+      await navigator.clipboard.writeText(text);
+      copyState = 'copied';
+      copyMessage = `Copied ${$playgroundStore.logs.length} lines`;
+    } catch (e) {
+      // R1: a copy that did not happen must not look like one that did.
+      copyState = 'failed';
+      copyMessage = `Copy failed: ${e instanceof Error ? e.message : e}`;
+    }
+    copyResetTimer = setTimeout(() => {
+      copyState = 'idle';
+      copyMessage = '';
+    }, 4000);
+  }
+
+  function handleOpenHistory(sessionId: string) {
+    followTail = true;
+    void playgroundStore.openSession(sessionId);
+  }
+
+  function formatWhen(iso: string): string {
+    const when = new Date(iso);
+    if (Number.isNaN(when.getTime())) return iso;
+    return when.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
   }
 
   function getStatusColor(status: string): string {
@@ -203,28 +327,70 @@
     }
   }
 
-  function formatDuration(): string {
-    let seconds = elapsedSeconds;
-
-    // If completed, calculate from timestamps (more accurate)
-    if ($playgroundStore.completedAt && $playgroundStore.startedAt) {
-      seconds = Math.floor(
-        ($playgroundStore.completedAt.getTime() - $playgroundStore.startedAt.getTime()) / 1000
-      );
-    } else if (!$isRunning && seconds === 0) {
-      // Not running and no elapsed time tracked
-      return '';
+  /**
+   * Render a duration. Pure, and every input is an explicit argument, so the
+   * reactive statement below actually re-runs when any of them changes.
+   */
+  function describeDuration(
+    startedAt: Date | null,
+    completedAt: Date | null,
+    serverSeconds: number | null,
+    running: boolean,
+    now: number
+  ): string {
+    let seconds: number | null = null;
+    if (running && startedAt) {
+      seconds = (now - startedAt.getTime()) / 1000;
+    } else if (serverSeconds !== null) {
+      // The server timed the run; trust it over two client clock readings.
+      seconds = serverSeconds;
+    } else if (startedAt && completedAt) {
+      seconds = (completedAt.getTime() - startedAt.getTime()) / 1000;
     }
-
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    return `${minutes}m ${seconds % 60}s`;
+    if (seconds === null) return '';
+    const whole = Math.max(0, Math.round(seconds));
+    if (whole < 60) return `${whole}s`;
+    return `${Math.floor(whole / 60)}m ${whole % 60}s`;
   }
 
-  // Set repo ID when selected repo changes
+  $: durationLabel = describeDuration(
+    $playgroundStore.startedAt,
+    $playgroundStore.completedAt,
+    $playgroundStore.durationSeconds,
+    $isRunning,
+    nowTick
+  );
+
+  // Set repo ID when selected repo changes, and pull that repo's history.
   $: if ($selectedRepoId && $selectedRepoId !== $playgroundStore.repoId) {
     playgroundStore.setConfig({ repoId: $selectedRepoId });
+    void playgroundStore.loadHistory();
   }
+
+  $: terminalStatus =
+    $playgroundStore.status === 'completed' ||
+    $playgroundStore.status === 'failed' ||
+    $playgroundStore.status === 'cancelled';
+
+  /**
+   * The prompt that produced the transcript currently on screen.
+   *
+   * "You cannot see what you asked five minutes ago" was half the history
+   * complaint. Which source is authoritative depends on what is being shown:
+   * for a run opened from history it is that row; for the run this page
+   * started it is what the user typed, because the history list may not have
+   * refreshed yet.
+   */
+  function promptOf(sessionId: string | null): string | null {
+    if (!sessionId) return null;
+    return (
+      $playgroundStore.history.find((run) => run.session_id === sessionId)?.prompt ?? null
+    );
+  }
+
+  $: shownPrompt = $playgroundStore.viewingSessionId
+    ? promptOf($playgroundStore.viewingSessionId)
+    : $playgroundStore.ranPrompt ?? promptOf($playgroundStore.sessionId);
 
   onMount(() => {
     // Load available models
@@ -234,23 +400,42 @@
 
     if ($selectedRepoId) {
       playgroundStore.setConfig({ repoId: $selectedRepoId });
+      void playgroundStore.loadHistory();
     }
+
+    // Pick the run back up: after a reload, after a navigation, or in a tab
+    // that came back to a run that is still going.
+    void playgroundStore.reattach();
+
+    timerInterval = setInterval(() => {
+      nowTick = Date.now();
+    }, 1000);
   });
 
   onDestroy(() => {
-    // Clean up SSE connection if still running
-    if ($isRunning) {
-      playgroundStore.cancel();
-    }
-    // Clean up timer
+    // NOT a cancel. This used to call `playgroundStore.cancel()`, which meant
+    // that clicking any sidebar link during a run killed the agent container
+    // - no prompt, no undo, and the user came back to a "Cancelled" badge for
+    // something they never cancelled. The store is a module singleton, so the
+    // run survives the page; only the stream is closed, and onMount re-opens
+    // it. Cancelling is the Cancel button's job.
+    playgroundStore.detach();
     if (timerInterval) {
       clearInterval(timerInterval);
+      timerInterval = null;
     }
-    if (scrollTimeout) {
-      clearTimeout(scrollTimeout);
+    if (copyResetTimer) {
+      clearTimeout(copyResetTimer);
     }
   });
 </script>
+
+<!--
+  The release that ends a drag-selection often happens OUTSIDE the pane, so
+  the pane's own pointerup would never fire and autoscroll would stay
+  suppressed forever.
+-->
+<svelte:window on:pointerup={handleWindowPointerUp} on:pointercancel={handleWindowPointerUp} />
 
 <div class="playground-page" data-testid="playground-page">
   <header class="page-header">
@@ -261,13 +446,17 @@
       {/if}
     </div>
     {#if $playgroundStore.status !== 'idle'}
-      <div class="status-badge" style="color: {getStatusColor($playgroundStore.status)}">
+      <div
+        class="status-badge"
+        data-testid="playground-status"
+        style="color: {getStatusColor($playgroundStore.status)}"
+      >
         {#if $playgroundStore.status === 'running'}
           <span class="spinner"></span>
         {/if}
         {getStatusIcon($playgroundStore.status)}
-        {#if formatDuration()}
-          <span class="duration">({formatDuration()})</span>
+        {#if durationLabel}
+          <span class="duration" data-testid="playground-duration">({durationLabel})</span>
         {/if}
       </div>
     {/if}
@@ -335,7 +524,7 @@
             <select
               id="runner-type"
               value={$playgroundStore.runnerType}
-              on:change={(e) => playgroundStore.setConfig({ runnerType: e.currentTarget.value as 'claude-code' | 'gemini' | 'openai-harness' })}
+              on:change={(e) => handleRunnerTypeChange(e.currentTarget.value)}
               disabled={$isRunning}
             >
               <option value="claude-code">Claude Code</option>
@@ -349,10 +538,20 @@
             <label for="model">Model {#if $modelsLoading}<span class="loading-indicator">(loading...)</span>{/if}</label>
             <select
               id="model"
-              value={$playgroundStore.model}
+              data-testid="model-select"
+              value={$playgroundStore.model ?? ''}
               on:change={(e) => playgroundStore.setConfig({ model: e.currentTarget.value as any })}
               disabled={$isRunning || ($playgroundStore.runnerType !== 'openai-harness' && ($modelsLoading || availableModels.length === 0))}
             >
+              <!--
+                A visible placeholder rather than a blank box. Switching runner
+                clears the model, and `openai-harness` has no CLI model list at
+                all, so without this the select painted empty with no hint that
+                a choice was owed - and the run button was still enabled.
+              -->
+              {#if !$playgroundStore.model}
+                <option value="">Select a model...</option>
+              {/if}
               {#each availableModels as model}
                 <option value={model.id} title={model.description}>{model.name}</option>
               {/each}
@@ -409,7 +608,9 @@
               class="btn-primary"
               data-testid="start-test-btn"
               on:click={handleStartTest}
-              disabled={!$playgroundStore.branch || !$playgroundStore.taskOverride}
+              disabled={!$playgroundStore.branch ||
+                !$playgroundStore.taskOverride.trim() ||
+                !$playgroundStore.model}
             >
               Test Once
             </button>
@@ -420,73 +621,193 @@
           {/if}
 
           {#if $hasResult}
-            <button class="btn-secondary" on:click={handleReset}>
+            <button class="btn-secondary" data-testid="reset-btn" on:click={handleReset}>
               Reset
             </button>
           {/if}
         </div>
 
-        {#if $playgroundStore.error}
-          <div class="error-message">
-            {$playgroundStore.error}
+        <!--
+          HISTORY. Not a new store: every playground run already leaves a
+          durable PipelineRun behind it, and this lists them. Clicking one
+          re-opens its transcript.
+        -->
+        <section class="history-section" data-testid="playground-history">
+          <div class="history-header">
+            <h3>Recent runs</h3>
+            <button
+              class="btn-small"
+              on:click={() => playgroundStore.loadHistory()}
+              disabled={$playgroundStore.historyLoading}
+            >
+              {$playgroundStore.historyLoading ? 'Loading...' : 'Refresh'}
+            </button>
           </div>
-        {/if}
+
+          {#if $playgroundStore.historyError}
+            <div class="error-message" data-testid="history-error">
+              Could not load past runs: {$playgroundStore.historyError}
+            </div>
+          {:else if $playgroundStore.history.length === 0}
+            <p class="history-empty">
+              {$playgroundStore.historyLoading
+                ? 'Loading past runs...'
+                : 'No runs yet. Your runs are kept here so you can re-read them later.'}
+            </p>
+          {:else}
+            <ul class="history-list">
+              {#each $playgroundStore.history as run (run.session_id)}
+                <li>
+                  <button
+                    class="history-item"
+                    class:active={$playgroundStore.sessionId === run.session_id}
+                    data-testid="history-item"
+                    title={run.prompt}
+                    on:click={() => handleOpenHistory(run.session_id)}
+                  >
+                    <span class="history-prompt">{run.prompt}</span>
+                    <span class="history-meta">
+                      <span style="color: {getStatusColor(run.status)}"
+                        >{getStatusIcon(run.status)}</span
+                      >
+                      <span>{formatWhen(run.created_at)}</span>
+                      {#if run.agent}<span>{run.agent}</span>{/if}
+                    </span>
+                  </button>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </section>
       </aside>
 
       <!-- Output Panel -->
       <main class="output-panel">
+        <!--
+          The failure goes WHERE THE USER IS LOOKING. It used to render only
+          in the 320px config panel, below its scroll edge, while the output
+          pane - two thirds of the screen - still read "output will appear
+          here when you run a test". The backend's message is genuinely good
+          ("...set ANTHROPIC_API_KEY in the backend's environment"); the UI
+          was hiding it.
+        -->
+        {#if $playgroundStore.error}
+          <div class="error-message" data-testid="playground-error">
+            {$playgroundStore.error}
+          </div>
+        {/if}
+
         <!-- Logs Section -->
         <section class="logs-section">
           <div class="section-header">
-            <h3>Agent Output</h3>
-            {#if $playgroundStore.logs.length > 0}
-              <button class="btn-small" on:click={() => playgroundStore.clearLogs()}>
-                Clear
-              </button>
-            {/if}
+            <div class="section-title">
+              <h3>Agent Output</h3>
+              {#if shownPrompt}
+                <p class="shown-prompt" data-testid="shown-prompt" title={shownPrompt}>
+                  {shownPrompt}
+                </p>
+              {/if}
+            </div>
+            <div class="section-actions">
+              {#if copyMessage}
+                <span
+                  class="copy-message"
+                  class:failed={copyState === 'failed'}
+                  data-testid="copy-message">{copyMessage}</span
+                >
+              {/if}
+              {#if $playgroundStore.logs.length > 0}
+                <button
+                  class="btn-small"
+                  data-testid="copy-logs-btn"
+                  on:click={handleCopyLogs}
+                >
+                  Copy
+                </button>
+                <button class="btn-small" on:click={() => playgroundStore.clearLogs()}>
+                  Clear
+                </button>
+              {/if}
+            </div>
           </div>
           <div
             class="logs-container"
             data-testid="logs-container"
             bind:this={logsContainer}
             on:scroll={handleLogsScroll}
+            on:pointerdown={handleLogsPointerDown}
           >
             {#if $playgroundStore.logs.length === 0}
               <div class="logs-empty">
                 {#if $isRunning}
                   <span class="spinner"></span>
                   <span>Waiting for output...</span>
+                {:else if terminalStatus}
+                  <span>This run produced no output.</span>
                 {:else}
                   <span>Agent output will appear here when you run a test.</span>
                 {/if}
               </div>
             {:else}
+              <!--
+                NOT KEYED, deliberately. This block only ever APPENDS, and
+                Svelte index-reconciles it without touching existing text
+                nodes - so a selection over earlier lines survives new output
+                arriving. Keying it would replace nodes on every flush and
+                CREATE the selection bug this page was reported for.
+              -->
               {#each $playgroundStore.logs as log}
                 <div class="log-line">{log}</div>
               {/each}
             {/if}
           </div>
+          {#if !followTail && $playgroundStore.logs.length > 0}
+            <button
+              class="follow-resume"
+              data-testid="follow-resume"
+              on:click={() => {
+                followTail = true;
+                void keepPinned();
+              }}
+            >
+              Jump to newest output
+            </button>
+          {/if}
         </section>
 
-        <!-- Diff Section -->
-        {#if $hasResult && ($playgroundStore.diff || $playgroundStore.filesChanged.length > 0)}
+        <!-- Changes -->
+        {#if $hasResult}
           <section class="diff-section" data-testid="diff-section">
             <div class="section-header">
               <h3>Changes</h3>
             </div>
-            <RawDiffViewer
-              diff={$playgroundStore.diff || ''}
-              filesChanged={$playgroundStore.filesChanged}
-            />
-          </section>
-        {:else if $hasResult && !$playgroundStore.diff && !$playgroundStore.error && $playgroundStore.filesChanged.length === 0}
-          <section class="diff-section">
-            <div class="section-header">
-              <h3>Changes</h3>
-            </div>
-            <div class="diff-empty">
-              No changes were made by the agent.
-            </div>
+            {#if $playgroundStore.diff || $playgroundStore.filesChanged.length > 0}
+              <RawDiffViewer
+                diff={$playgroundStore.diff || ''}
+                filesChanged={$playgroundStore.filesChanged}
+              />
+            {:else if $playgroundStore.resultSource === 'run'}
+              <!--
+                R1: "no diff on this record" is NOT "the agent changed
+                nothing", and rendering the second sentence for the first
+                situation is exactly the silent loss the house rules forbid.
+              -->
+              <div class="diff-empty" data-testid="diff-not-retained">
+                This transcript was restored from the run record. Its diff is not
+                retained - a playground branch is deleted once its diff has been
+                computed. Tick "Save changes to branch" to keep one next time.
+              </div>
+            {:else}
+              <div class="diff-empty" data-testid="diff-empty">
+                {#if $playgroundStore.status === 'cancelled'}
+                  The run was cancelled before it reported any changes.
+                {:else if $playgroundStore.status === 'failed'}
+                  The run failed before it reported any changes.
+                {:else}
+                  No changes were made by the agent.
+                {/if}
+              </div>
+            {/if}
           </section>
         {/if}
       </main>
@@ -583,10 +904,21 @@
   .form-row {
     display: flex;
     gap: 0.75rem;
+    flex-wrap: wrap;
   }
 
+  /*
+    Runner Type and Model sat side by side in a 320px panel, so the Model
+    select overflowed the panel's right edge and clipped its own label - you
+    could not read which model you had picked ("Claude Sonnet" of "Claude
+    Sonnet 4.5"). A 12rem basis makes the pair WRAP at this panel width, so
+    each control gets the full width and the label is readable; they pair up
+    again if the panel is ever given more room.
+  */
   .form-group.half {
-    flex: 1;
+    flex: 1 1 12rem;
+    /* Flex items refuse to shrink below their content without this. */
+    min-width: 0;
   }
 
   .form-group label {
@@ -609,6 +941,14 @@
     padding: 0.5rem 0.75rem;
     color: var(--text-color);
     font-size: 0.9rem;
+    /*
+      A <select> will not shrink below its widest option unless told to: the
+      Model control overflowed the 320px panel and clipped its own label
+      ("Claude Sonnet" of "Claude Sonnet 4.5"). min-width:0 lets it fit.
+    */
+    min-width: 0;
+    width: 100%;
+    box-sizing: border-box;
   }
 
   .form-group select:focus,
@@ -743,14 +1083,21 @@
     overflow: hidden;
   }
 
+  /*
+    On a page called a playground, the agent's words are the point. These
+    weights used to be the other way round, so an 8-line transcript (with its
+    top line clipped mid-glyph) sat above a one-line diff that got twice the
+    height.
+  */
   .logs-section {
-    flex: 1;
-    min-height: 150px;
+    flex: 2;
+    min-height: 220px;
+    position: relative;
   }
 
   .diff-section {
-    flex: 2;
-    min-height: 300px;
+    flex: 1;
+    min-height: 160px;
     overflow-y: auto;
   }
 
@@ -766,11 +1113,6 @@
     margin: 0;
     font-size: 1rem;
     color: var(--text-color);
-  }
-
-  .files-count {
-    font-size: 0.85rem;
-    color: var(--text-muted);
   }
 
   .logs-container {
@@ -808,6 +1150,127 @@
     color: var(--text-muted);
     font-style: italic;
     text-align: center;
+  }
+
+  .section-title {
+    min-width: 0;
+  }
+
+  .shown-prompt {
+    margin: 0.15rem 0 0;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .section-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+  }
+
+  .copy-message {
+    font-size: 0.8rem;
+    color: var(--success-color);
+  }
+
+  .copy-message.failed {
+    color: var(--error-color);
+  }
+
+  /* A visible way back to the tail, so "stop yanking the user" does not
+     become "strand the user". */
+  .follow-resume {
+    position: absolute;
+    bottom: 0.75rem;
+    right: 1rem;
+    padding: 0.3rem 0.7rem;
+    border: 1px solid var(--border-color);
+    border-radius: 999px;
+    background: var(--badge-bg);
+    color: var(--text-color);
+    font-size: 0.78rem;
+    cursor: pointer;
+  }
+
+  .follow-resume:hover {
+    background: var(--hover-color);
+  }
+
+  .history-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    border-top: 1px solid var(--border-color);
+    padding-top: 0.75rem;
+  }
+
+  .history-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .history-header h3 {
+    margin: 0;
+    font-size: 0.95rem;
+    color: var(--text-color);
+  }
+
+  .history-empty {
+    margin: 0;
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
+
+  .history-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .history-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    width: 100%;
+    text-align: left;
+    padding: 0.45rem 0.55rem;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: var(--badge-bg);
+    color: var(--text-color);
+    cursor: pointer;
+    font-size: 0.82rem;
+  }
+
+  .history-item:hover {
+    background: var(--hover-color);
+  }
+
+  .history-item.active {
+    border-color: var(--primary-color);
+  }
+
+  .history-prompt {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .history-meta {
+    display: flex;
+    gap: 0.5rem;
+    font-size: 0.72rem;
+    color: var(--text-muted);
   }
 
   .spinner {

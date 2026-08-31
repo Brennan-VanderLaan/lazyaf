@@ -15,12 +15,34 @@
   }
 
   let expandedFiles: Set<string> = new Set();
+  /** The diff text the auto-expansion below was last derived from. */
+  let autoExpandedFor: string | null = null;
 
   $: parsedFiles = parseDiff(diff);
 
-  // Auto-expand first few files when diff changes
-  $: if (parsedFiles.length > 0) {
-    expandedFiles = new Set(parsedFiles.slice(0, 3).map(f => f.path));
+  $: syncExpansion(diff, parsedFiles);
+
+  /**
+   * Auto-expand the first few files ONCE per diff, then leave the set alone.
+   *
+   * This used to re-derive `expandedFiles` from `parsedFiles` on every change,
+   * so any reassignment of the `diff` prop - a reconnect replaying the same
+   * result, a history entry reloaded - silently re-opened files the user had
+   * collapsed and closed the one they were reading. Files that survive into a
+   * new diff keep whatever the user chose for them.
+   */
+  function syncExpansion(diffText: string, files: ParsedFile[]) {
+    if (autoExpandedFor === diffText) return;
+    const first = autoExpandedFor === null;
+    autoExpandedFor = diffText;
+    if (first) {
+      expandedFiles = new Set(files.slice(0, 3).map(f => f.path));
+      return;
+    }
+    const paths = new Set(files.map(f => f.path));
+    const kept = new Set([...expandedFiles].filter(path => paths.has(path)));
+    // A brand new diff with nothing carried over still needs a starting point.
+    expandedFiles = kept.size > 0 ? kept : new Set(files.slice(0, 3).map(f => f.path));
   }
 
   function parseDiff(diffText: string): ParsedFile[] {
@@ -159,7 +181,10 @@
     <div class="no-changes">No changes to display.</div>
   {:else}
     <div class="file-list">
-      {#each parsedFiles as file}
+      <!-- KEYED by path: unkeyed, a re-parsed diff rewrote each row in place,
+           so the row under the cursor could become a different file between
+           aiming at it and clicking it. -->
+      {#each parsedFiles as file (file.path)}
         <div class="file-item">
           <button
             type="button"
@@ -184,7 +209,7 @@
               {:else}
                 <table class="diff-table">
                   <tbody>
-                    {#each file.lines as line}
+                    {#each file.lines as line, i (i)}
                       {#if line.type === 'hunk'}
                         <tr class="hunk-row">
                           <td class="line-num"></td>

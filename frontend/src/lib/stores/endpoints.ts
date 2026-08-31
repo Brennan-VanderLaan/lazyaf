@@ -2,6 +2,9 @@ import { derived, writable } from 'svelte/store';
 import type {
   EndpointHealth,
   EndpointProbeResponse,
+  Modality,
+  ModalityName,
+  ModalityState,
   ModelEndpoint,
   ModelEndpointCreate,
   ModelEndpointStatusFrame,
@@ -200,6 +203,293 @@ export function capabilityCells(endpoint: ModelEndpoint): CapabilityCell[] {
             : 'Never probed.',
     },
   ];
+}
+
+// -----------------------------------------------------------------------------
+// Modality presentation — six states, and the two collapses that would be lies
+// -----------------------------------------------------------------------------
+
+/**
+ * Presentation order. `text` is listed because the backend answers it and a
+ * list that silently omitted a modality would be a fourth way to hide one;
+ * the dense table variant filters it out (every endpoint takes text, so a
+ * green "text" chip in a 60px cell is pure noise), the panel shows it.
+ */
+export const MODALITY_ORDER: readonly ModalityName[] = ['text', 'images', 'audio', 'video'];
+
+export const MODALITY_LABEL: Record<ModalityName, string> = {
+  text: 'text',
+  images: 'images',
+  audio: 'audio',
+  video: 'video',
+};
+
+/** Icon for the modality itself — orthogonal to the state glyph. */
+export const MODALITY_ICON: Record<ModalityName, string> = {
+  text: '¶',
+  images: '👁',
+  audio: '🔊',
+  video: '🎞',
+};
+
+export interface ModalityPresentation {
+  /**
+   * One glyph per state, all six distinct. Colour NEVER carries the state on
+   * its own — `unsupported` (amber) and `probe_failed` (red) are two colours
+   * a red-green-blind operator reads as one, and `unprobed` vs `undetectable`
+   * are the same grey by design.
+   */
+  glyph: string;
+  tone: 'good' | 'warn' | 'bad' | 'unknown' | 'inert';
+  /** Border shape, the non-colour channel: solid=answered, dashed=null, dotted=200-but-useless. */
+  outline: 'solid' | 'dashed' | 'dotted';
+  /** Struck-through label: this one can never be answered, so it is not pending. */
+  struck: boolean;
+  /** Two or three words, for the panel's state column. */
+  label: string;
+  /** What this state MEANS for a step that attaches this modality. */
+  meaning: string;
+  /**
+   * The next thing a human should DO, or null when there is nothing to do.
+   * Non-null is what puts a Probe button on screen next to the cell.
+   */
+  next: string | null;
+  /** True when a probe could change this answer. Drives the inline action. */
+  actionable: boolean;
+}
+
+/**
+ * THE TABLE THIS LANE EXISTS FOR.
+ *
+ * Two collapses would each be a lie, and they are the ones to check for in
+ * review:
+ *
+ *   unprobed vs probe_failed — both are `null` in the column and both REFUSE
+ *     at dispatch, but one says "press Probe" and the other says "the probe
+ *     ran and broke; read the reason before pressing it again". Rendering
+ *     them alike turns a broken endpoint into a paperwork task.
+ *
+ *   undetectable vs unsupported — `unsupported` is a positive refusal you can
+ *     quote back ("HTTP 400: this model does not support image input").
+ *     `undetectable` is a request that SUCCEEDS while doing nothing: the
+ *     server took the image, returned 200, and the prompt token count did not
+ *     move. That is the more dangerous of the two and the one R1 exists to
+ *     surface, so it gets its own glyph, its own outline and its own sentence.
+ *
+ * And the one that matters on day one: every endpoint registered before the
+ * modality probe shipped reads `unprobed`. That is the COMMON case on first
+ * load, not an edge case, which is why it is dashed and italic rather than a
+ * bare empty cell.
+ */
+export const MODALITY_PRESENTATION: Record<ModalityState, ModalityPresentation> = {
+  supported: {
+    glyph: '✓',
+    tone: 'good',
+    outline: 'solid',
+    struck: false,
+    label: 'supported',
+    meaning:
+      'The endpoint accepted this content part, and where a usage block made it measurable the input measurably entered the prompt. It is NOT a claim that the model is any good at it.',
+    next: null,
+    actionable: false,
+  },
+  supported_unverified: {
+    glyph: '≈',
+    tone: 'qualified',
+    outline: 'dashed',
+    struck: false,
+    label: 'accepted, unverified',
+    meaning:
+      'The endpoint ACCEPTED this content part, but nothing corroborated that the model consumed it — no usage block moved, or the control was unavailable. A shim that flattens content parts into the prompt as prose looks identical from here, so this is deliberately not a plain ✓. It still dispatches: the doubt belongs in front of the human choosing, not in a refusal that would read as “this endpoint cannot do images” when we do not know that.',
+    next: 'Re-probe once the server reports usage, or send one attachment by hand and read the reply.',
+    actionable: true,
+  },
+  unsupported: {
+    glyph: '✗',
+    tone: 'warn',
+    outline: 'solid',
+    struck: false,
+    label: 'not supported',
+    meaning:
+      'Probed, and the server REFUSED this content part outright. A step that attaches one here fails at dispatch with the server’s own words — it is not silently stripped.',
+    next: null,
+    actionable: false,
+  },
+  unprobed: {
+    glyph: '?',
+    tone: 'unknown',
+    outline: 'dashed',
+    struck: false,
+    label: 'not probed',
+    meaning:
+      'Nobody has asked. This is NOT "not supported": it is the state every endpoint registered before modality detection shipped is in. Dispatch refuses an attachment rather than guessing.',
+    next: 'Probe this endpoint.',
+    actionable: true,
+  },
+  probe_failed: {
+    glyph: '!',
+    tone: 'bad',
+    outline: 'dashed',
+    struck: false,
+    label: 'probe failed',
+    meaning:
+      'Somebody asked and the ASKING broke — a timeout, a 5xx, or the probe deadline ran out before this question was reached. A failed probe is UNKNOWN, never "no".',
+    next: 'Read the reason below first; re-probing a box that timed out usually just times out again.',
+    actionable: true,
+  },
+  undetectable: {
+    glyph: '~',
+    tone: 'unknown',
+    outline: 'dotted',
+    struck: false,
+    label: 'undetectable',
+    meaning:
+      'Asked, and the answer does not decide it: the server returned 200 but the input did not change the prompt token count, so it was almost certainly discarded. The request SUCCEEDS and the input vanishes. Treat as unsupported until you have verified it by hand.',
+    next: 'Verify by hand against this server, or pick an endpoint whose chip is green.',
+    actionable: true,
+  },
+  unrepresentable: {
+    glyph: '⊘',
+    tone: 'inert',
+    outline: 'solid',
+    struck: true,
+    label: 'not expressible',
+    meaning:
+      'The OpenAI chat-completions wire format has no content part for this, so LazyAF cannot send it to ANY endpoint, whatever the model can do. Nothing to probe: this is a property of the protocol, not of this server. (vLLM’s `video_url` is a vendor extension LazyAF does not speak; frame-sampling into image parts is images.)',
+    next: null,
+    actionable: false,
+  },
+};
+
+export function modalityPresentation(state: ModalityState | string): ModalityPresentation {
+  return (
+    MODALITY_PRESENTATION[state as ModalityState] ?? {
+      glyph: '·',
+      tone: 'unknown',
+      outline: 'dashed',
+      struck: false,
+      label: String(state),
+      meaning:
+        'Unrecognised modality state — the backend vocabulary has moved ahead of this UI. Treated as unknown, which refuses rather than assumes.',
+      next: 'Update the frontend: stores/endpoints.MODALITY_PRESENTATION has no entry for this state.',
+      actionable: false,
+    }
+  );
+}
+
+export interface ModalityCell {
+  /** Doubles as the testid suffix: `endpoint-cap-<key>`. */
+  key: ModalityName | string;
+  label: string;
+  icon: string;
+  state: ModalityState | string;
+  presentation: ModalityPresentation;
+  /** The backend's provenance, rendered verbatim rather than paraphrased. */
+  source: string | null;
+  reason: string | null;
+  evidence: string | null;
+  caveat: string | null;
+  /** Tooltip / panel body: the meaning, then how we came to believe it. */
+  detail: string;
+  next: string | null;
+  actionable: boolean;
+}
+
+/**
+ * The backend answered NOTHING about modalities — either its capability
+ * projection carries no `modalities` key at all (a backend older than
+ * modality detection) or it carries an empty one.
+ *
+ * This is a FOURTH kind of "we do not know" and it deliberately does not get
+ * folded into `unprobed`: pressing Probe cannot fix it, so offering Probe
+ * would send an operator round a loop that can never terminate. It is also
+ * not allowed to render as a BLANK, which is the one rendering that reads as
+ * "no image support".
+ *
+ * A current backend always projects one entry per `MODALITY_NAMES`, so this
+ * is defensive rather than routine — which is exactly why it must not fail
+ * silently when it does happen.
+ */
+export const MODALITIES_UNREPORTED =
+  'This backend reported no modality answers: its capability projection carries no `modalities` entries. That is not "no image support" and not "never probed" — this backend has no way to answer. Probing will not change it; update the backend.';
+
+/**
+ * True when the payload carried a modality list AT ALL — the precise
+ * predicate, kept apart from "is there anything to render". The DISPLAY keys
+ * off the cell count instead, so an empty list cannot render as a blank.
+ */
+export function modalitiesReported(endpoint: ModelEndpoint): boolean {
+  return Array.isArray(endpoint?.capabilities?.modalities);
+}
+
+function toModalityCell(entry: Modality, endpoint: ModelEndpoint): ModalityCell {
+  const presentation = modalityPresentation(entry.state);
+  const name = entry.modality;
+  const provenance: string[] = [];
+  if (entry.source === 'wire_format') {
+    provenance.push('Not probed and never will be: this is a fact about the protocol.');
+  } else if (entry.source) {
+    provenance.push(`Source: ${entry.source}.`);
+  }
+  if (entry.reason) provenance.push(`Reason: ${entry.reason}.`);
+  if (entry.evidence) provenance.push(`Server said: ${entry.evidence}`);
+  if (entry.caveat) provenance.push(`Caveat: ${entry.caveat}.`);
+  if (entry.source && entry.source !== 'wire_format') {
+    const probedAt = endpoint.capabilities?.probed_at;
+    const probedFrom = endpoint.capabilities?.probed_from;
+    if (probedAt) provenance.push(`Observed ${probedAt} from ${probedFrom ?? 'unknown host'}.`);
+  }
+  return {
+    key: name,
+    label: MODALITY_LABEL[name] ?? String(name),
+    icon: MODALITY_ICON[name] ?? '·',
+    state: entry.state,
+    presentation,
+    source: entry.source ?? null,
+    reason: entry.reason ?? null,
+    evidence: entry.evidence ?? null,
+    caveat: entry.caveat ?? null,
+    detail: [presentation.meaning, ...provenance].join(' '),
+    next: presentation.next,
+    actionable: presentation.actionable,
+  };
+}
+
+/**
+ * The modality cells, in presentation order.
+ *
+ * A PROJECTION of `capabilities.modalities` and nothing else. It never
+ * consults `supports_images` / `supports_audio`: those are the same fact in a
+ * narrower shape, and reading both would be two derivations of one backend
+ * answer — the drift `ModelEndpoint.health` already refuses on the backend
+ * side. An empty array means the backend did not answer (see
+ * `MODALITIES_UNREPORTED`); it does not mean "no modalities".
+ */
+export function modalityCells(endpoint: ModelEndpoint): ModalityCell[] {
+  const list = endpoint?.capabilities?.modalities;
+  if (!Array.isArray(list)) return [];
+  const rank = new Map(MODALITY_ORDER.map((m, i) => [m as string, i]));
+  return [...list]
+    .filter((entry) => entry && typeof entry.modality === 'string')
+    .sort((a, b) => (rank.get(a.modality) ?? 99) - (rank.get(b.modality) ?? 99))
+    .map((entry) => toModalityCell(entry, endpoint));
+}
+
+/**
+ * Every cell — capability AND modality — whose answer a probe could still
+ * change. This is what puts "Probe now" beside the unknowns instead of only
+ * at the far right of the row: an operator who has just read "not probed"
+ * should not have to go hunting for the verb.
+ */
+export function unansweredCells(endpoint: ModelEndpoint): Array<{ key: string; label: string }> {
+  const out: Array<{ key: string; label: string }> = [];
+  for (const cell of capabilityCells(endpoint)) {
+    if (cell.state === 'unprobed') out.push({ key: cell.key, label: cell.label });
+  }
+  for (const cell of modalityCells(endpoint)) {
+    if (cell.actionable) out.push({ key: String(cell.key), label: cell.label });
+  }
+  return out;
 }
 
 /**

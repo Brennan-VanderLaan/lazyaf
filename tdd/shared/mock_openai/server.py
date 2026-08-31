@@ -28,6 +28,7 @@ from .scenarios import (
     MOCK_MODELS,
     SCENARIOS,
     Turn,
+    plan_show,
     plan_turn,
     render_block,
     reset_state,
@@ -160,17 +161,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if rest == "/api/show":
             # ollama's NAMED vendor extension - the probe attempts it for
-            # `server_kind == "ollama"` only.
-            self._send(
-                200,
-                {
-                    "model_info": {
-                        "mock.context_length": MOCK_MODEL_CONTEXT_WINDOW,
-                        "mock.embedding_length": 4096,
-                    },
-                    "details": {"family": "mock"},
-                },
-            )
+            # `server_kind == "ollama"` only. The payload is SCENARIO-SCOPED
+            # (M14.6): most scenarios omit `capabilities` entirely, which is
+            # what every ollama before v0.6 does and what the probe has to
+            # read as "we do not know" rather than as "no vision".
+            self._send(200, plan_show(scenario))
             return
         self._error(404, self._not_found_message(rest))
 
@@ -284,8 +279,18 @@ def _completion_payload(plan: Turn, model: str, turn: int, include_usage: bool) 
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
     }
     if include_usage:
-        payload["usage"] = usage_block(turn)
+        payload["usage"] = _usage_for(plan, turn)
     return payload
+
+
+def _usage_for(plan: Turn, turn: int) -> dict:
+    """The `usage` block for one reply.
+
+    A modality probe carries its own (M14.6): its contract is a controlled
+    `prompt_tokens` DELTA against a matched control request, and a
+    turn-derived count would move underneath that comparison.
+    """
+    return plan.usage_override if plan.usage_override is not None else usage_block(turn)
 
 
 def _stream_frames(plan: Turn, model: str, turn: int, include_usage: bool) -> list[dict]:
@@ -335,7 +340,7 @@ def _stream_frames(plan: Turn, model: str, turn: int, include_usage: bool) -> li
     if include_usage:
         final = frame({})
         final["choices"] = []
-        final["usage"] = usage_block(turn)
+        final["usage"] = _usage_for(plan, turn)
         frames.append(final)
     return frames
 

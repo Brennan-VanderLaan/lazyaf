@@ -1,4 +1,4 @@
-"""The nine named scenarios of wave8 section 8.1, and the turn planner.
+"""The named scenarios of wave8 section 8.1 (plus M14.6's), and the turn planner.
 
 A scenario is a pure function of the TURN NUMBER (and, for the tool-probe
 request, of the tool schemas the caller sent). It returns a `Turn` saying what
@@ -16,6 +16,30 @@ HTTP error. The server renders that into OpenAI wire shapes.
 | `lying_tools`      | tool-calls at PROBE time, ```lazyaf block in `content` | the probe-drift bridge and the demotion   |
 | `slow`             | the happy script, 3s per turn                          | the soft deadline                         |
 | `flaky_5xx`        | two 503s, then the happy script                        | the endpoint retry policy                 |
+
+M14.6 adds SEVEN modality scenarios. They differ from the nine above in an
+important way: the nine vary what the ASSISTANT says, and these vary how the
+server treats the REQUEST's content parts. They are therefore an overlay
+(`ModalityPolicy`) on the happy script rather than seven more reply scripts.
+
+| Scenario             | `/api/show` capabilities | image part | audio part | The row it is the ONLY test of                                  |
+|----------------------|--------------------------|------------|------------|-----------------------------------------------------------------|
+| `vision_wire`        | (absent)                 | accepted   | 400        | a vLLM-class server that genuinely sees: 200 WITH a token delta   |
+| `vision_refuses`     | (absent)                 | 400        | 400        | a positive refusal - the only `False` an operator can act on      |
+| `vision_silent_drop` | (absent)                 | **200, no delta** | 400 | THE NASTY ONE: success, and the image went nowhere -> undetectable |
+| `audio_wire`         | (absent)                 | 400        | accepted   | audio-capable (Ultravox/Qwen2-Audio class), image-blind           |
+| `vision_ollama`      | `[... vision]`           | 400        | 400        | the FREE path answers True and the wire image probe is never sent |
+| `vision_blind_ollama`| `[completion, tools]`    | accepted   | 400        | the FREE path answers False and the wire image probe is never sent|
+| `vision_ollama_old`  | **key absent**           | accepted   | 400        | ollama < 0.6: absent key is None, NOT False -> falls through      |
+
+The two contradictions in that table are deliberate and load-bearing.
+`vision_ollama` says "I see" for free and then refuses on the wire;
+`vision_blind_ollama` says "I do not see" for free and then accepts on the
+wire. No real server behaves that way. They are built that way so a test can
+prove SEQUENCING - that the free `/api/show` answer short-circuits the paid
+wire probe - by asserting an outcome the wire could not have produced. A mock
+that agreed with itself could not distinguish "the free path won" from "both
+paths happened to agree".
 
 TOKEN ACCOUNTING IS THE LOAD-BEARING PART. Every reporting turn declares
 
@@ -86,6 +110,151 @@ MOCK_MODELS: tuple[str, ...] = ("mock-model", "mock-model-notools")
 #: as `*.context_length` by the ollama `/api/show` extension. Both discovery
 #: paths therefore work against this one server.
 MOCK_MODEL_CONTEXT_WINDOW = 32768
+
+
+# -----------------------------------------------------------------------------
+# Modalities (M14.6) - the request side, not the reply side
+# -----------------------------------------------------------------------------
+
+#: ollama's own capability vocabulary (`types/model/capability.go`).
+#: **There is no `audio` member and no `video` member.** That asymmetry is not
+#: an oversight in this mock - it is the reason the free `/api/show` path can
+#: only ever answer the IMAGE question, and why audio always costs a wire
+#: request. Spelled out here so a test can assert against the real vocabulary
+#: rather than against whatever the probe happens to look for.
+OLLAMA_CAPABILITY_VOCABULARY: tuple[str, ...] = (
+    "completion",
+    "tools",
+    "insert",
+    "vision",
+    "embedding",
+    "thinking",
+)
+
+#: `prompt_tokens` a modality probe (or its matched control) reports before
+#: any surcharge. FIXED, not turn-derived: the probe's whole discriminator is
+#: a DELTA between two otherwise identical requests, so if the baseline could
+#: move between them the mock would be manufacturing the very signal it
+#: exists to test.
+MOCK_MODALITY_BASE_PROMPT_TOKENS = 120
+MOCK_MODALITY_COMPLETION_TOKENS = 2
+
+#: What a scenario that GENUINELY encodes an image adds to `prompt_tokens`.
+#: Real figures for one small image span ~6 (Qwen2-VL) to 85 (OpenAI
+#: `detail:low`) to 576 (LLaVA-1.5's fixed grid); 85 is a realistic middle and
+#: the exact number is irrelevant - only `> 0` is contract.
+MOCK_IMAGE_PROMPT_TOKENS = 85
+
+#: What a scenario that genuinely encodes audio adds. Deliberately huge:
+#: Whisper-family encoders pad to a fixed 30-SECOND mel window, so 1ms of
+#: silence is charged as a full window. This number is the mock telling the
+#: truth about the single largest cost in the whole probe.
+MOCK_AUDIO_PROMPT_TOKENS = 1500
+
+#: A server's three possible attitudes to one content-part type.
+#:   accept - 200, and the part's tokens appear in `prompt_tokens`
+#:   refuse - 400 before inference (which is why a refusal costs 0 tokens)
+#:   drop   - 200, and the part contributes NOTHING. The request SUCCEEDS and
+#:            the input vanishes. Acceptance alone cannot tell this from
+#:            `accept`, which is the entire reason the probe sends a control.
+MODALITY_ATTITUDES: tuple[str, ...] = ("accept", "refuse", "drop")
+
+
+@dataclass(frozen=True)
+class ModalityPolicy:
+    """How one scenario treats `image_url` and `input_audio` content parts."""
+
+    images: str = "refuse"
+    audio: str = "refuse"
+
+
+#: Text-only is the honest default for the nine wave8 scenarios: they mock a
+#: coding model, and a text-only server rejecting an image part is a TRUE
+#: `False`, not a fudge. It also means every pre-existing test exercises the
+#: refusal path for free, at zero tokens.
+DEFAULT_MODALITY_POLICY = ModalityPolicy(images="refuse", audio="refuse")
+
+MODALITY_POLICIES: dict[str, ModalityPolicy] = {
+    "vision_wire": ModalityPolicy(images="accept"),
+    "vision_refuses": ModalityPolicy(images="refuse"),
+    "vision_silent_drop": ModalityPolicy(images="drop"),
+    "audio_wire": ModalityPolicy(images="refuse", audio="accept"),
+    # See the module docstring: these two contradict their own /api/show on
+    # purpose, so that "the free path won" is provable rather than merely
+    # consistent.
+    "vision_ollama": ModalityPolicy(images="refuse"),
+    "vision_blind_ollama": ModalityPolicy(images="accept"),
+    "vision_ollama_old": ModalityPolicy(images="accept"),
+}
+
+#: `POST /api/show` -> `capabilities`. A scenario ABSENT from this dict omits
+#: the key entirely, which is what every ollama before v0.6 does and what the
+#: probe must read as "we do not know", never as "no vision".
+OLLAMA_SHOW_CAPABILITIES: dict[str, tuple[str, ...]] = {
+    "vision_ollama": ("completion", "tools", "vision"),
+    "vision_blind_ollama": ("completion", "tools"),
+    # `vision_ollama_old` is deliberately NOT here.
+}
+
+#: The refusal bodies, in the shapes real servers actually emit.
+_IMAGE_REFUSAL = {
+    "error": {
+        "message": "this model does not support image input",
+        "type": "invalid_request_error",
+        "param": "messages",
+        "code": None,
+    }
+}
+_AUDIO_REFUSAL = {
+    "error": {
+        "message": "invalid content type 'input_audio' for this model",
+        "type": "invalid_request_error",
+        "param": "messages",
+        "code": None,
+    }
+}
+
+
+def content_part_types(body: dict) -> tuple[str, ...]:
+    """Every content-part `type` present in the request's messages, in order.
+
+    A message's `content` is either a plain string (every wave8 scenario) or a
+    list of parts (a modality probe). Returns `()` for the string form, which
+    is what makes the modality overlay invisible to the nine original
+    scenarios.
+    """
+    found: list[str] = []
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("type"), str):
+                found.append(part["type"])
+    return tuple(found)
+
+
+def plan_show(scenario: str) -> dict:
+    """The `POST /api/show` payload for one scenario (ollama's extension).
+
+    Every scenario reports the context window; only the three named in
+    `OLLAMA_SHOW_CAPABILITIES` carry a `capabilities` array. **The key is
+    OMITTED rather than empty for the rest**, because "absent" and "[]" are
+    the two facts the probe must not conflate.
+    """
+    payload: dict[str, Any] = {
+        "model_info": {
+            "mock.context_length": MOCK_MODEL_CONTEXT_WINDOW,
+            "mock.embedding_length": 4096,
+        },
+        "details": {"family": "mock"},
+    }
+    capabilities = OLLAMA_SHOW_CAPABILITIES.get(scenario)
+    if capabilities is not None:
+        payload["capabilities"] = list(capabilities)
+    return payload
 
 
 # -----------------------------------------------------------------------------
@@ -213,6 +382,10 @@ class Turn:
     status: int = 200
     body: dict | None = None
     finish_reason: str = "stop"
+    #: When set, THIS is the `usage` block, verbatim, instead of the
+    #: turn-derived one. Used only by the modality probe replies, whose whole
+    #: contract is a controlled `prompt_tokens` delta (M14.6).
+    usage_override: dict | None = None
 
 
 def turn_number(messages: list[dict]) -> int:
@@ -256,6 +429,55 @@ def probe_tool_turn() -> Turn:
         kind="tool_calls",
         actions=[{"tool": "probe", "args": {"value": 7}}],
         finish_reason="tool_calls",
+    )
+
+
+def plan_modality_turn(scenario: str, body: dict) -> Turn | None:
+    """The reply to a MODALITY probe, or None if this is not one (M14.6).
+
+    Intercepted BEFORE the scenario handler, and deliberately so: what the
+    assistant says to an image probe is irrelevant to every judgement the
+    probe makes, and routing it through a reply script would make the control
+    request's `prompt_tokens` depend on which scenario it hit. The probe's
+    only discriminators are the HTTP status and the token ledger, so this
+    function answers in exactly those terms.
+
+    A request whose messages carry a content-part LIST is a modality probe or
+    its matched control. A `refuse` policy answers 400 - and note that a real
+    server rejects the shape BEFORE inference, which is why a refusal is the
+    one probe outcome that costs zero tokens.
+    """
+    parts = content_part_types(body)
+    if not parts:
+        return None
+
+    policy = MODALITY_POLICIES.get(scenario, DEFAULT_MODALITY_POLICY)
+    surcharge = 0
+
+    if "image_url" in parts:
+        if policy.images == "refuse":
+            return Turn(kind="http_error", status=400, body=_IMAGE_REFUSAL)
+        if policy.images == "accept":
+            surcharge += MOCK_IMAGE_PROMPT_TOKENS
+        # "drop": 200 with NO surcharge. The request succeeds and the image
+        # contributed nothing - indistinguishable from success on acceptance
+        # alone, which is the whole reason the probe sends a control.
+
+    if "input_audio" in parts:
+        if policy.audio == "refuse":
+            return Turn(kind="http_error", status=400, body=_AUDIO_REFUSAL)
+        if policy.audio == "accept":
+            surcharge += MOCK_AUDIO_PROMPT_TOKENS
+
+    prompt = MOCK_MODALITY_BASE_PROMPT_TOKENS + surcharge
+    return Turn(
+        kind="prose",
+        text="ok",
+        usage_override={
+            "prompt_tokens": prompt,
+            "completion_tokens": MOCK_MODALITY_COMPLETION_TOKENS,
+            "total_tokens": prompt + MOCK_MODALITY_COMPLETION_TOKENS,
+        },
     )
 
 
@@ -381,6 +603,21 @@ def reset_state() -> None:
     _ATTEMPTS.clear()
 
 
+#: The M14.6 scenarios all drive the happy tool-calling script; what makes
+#: them different is `MODALITY_POLICIES` and `OLLAMA_SHOW_CAPABILITIES`, not
+#: the reply. Reusing `_happy_tools` rather than writing seven near-identical
+#: scripts is what keeps "the capability record" and "the work" independent
+#: variables - each of these endpoints probes `ok` and RUNS.
+MODALITY_SCENARIO_NAMES: tuple[str, ...] = (
+    "vision_wire",
+    "vision_refuses",
+    "vision_silent_drop",
+    "audio_wire",
+    "vision_ollama",
+    "vision_blind_ollama",
+    "vision_ollama_old",
+)
+
 SCENARIOS: dict[str, Callable[[int, dict, str, str], Turn]] = {
     "happy_tools": _happy_tools,
     "happy_text": _happy_text,
@@ -391,6 +628,7 @@ SCENARIOS: dict[str, Callable[[int, dict, str, str], Turn]] = {
     "lying_tools": _lying_tools,
     "slow": _slow,
     "flaky_5xx": _flaky_5xx,
+    **{name: _happy_tools for name in MODALITY_SCENARIO_NAMES},
 }
 
 
@@ -399,6 +637,12 @@ def plan_turn(scenario: str, body: dict) -> Turn:
     handler = SCENARIOS[scenario]
     messages = body.get("messages") if isinstance(body.get("messages"), list) else []
     model = str(body.get("model") or MOCK_MODELS[0])
+    # M14.6: a content-part request is answered by the modality overlay, not
+    # by the reply script. Placed here rather than inside each handler so the
+    # nine wave8 scenarios are untouched by it and cannot drift.
+    modality = plan_modality_turn(scenario, body)
+    if modality is not None:
+        return modality
     return handler(turn_number(messages), body, target_path(messages), model)
 
 

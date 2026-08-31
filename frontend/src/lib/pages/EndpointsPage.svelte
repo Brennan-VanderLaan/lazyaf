@@ -28,6 +28,8 @@
     endpointsStore,
     capabilityCells,
     costIsShared,
+    modalityCells,
+    modalitiesReported,
     rateLabel,
     runnerShortfall,
   } from '../stores/endpoints';
@@ -69,6 +71,28 @@
     notices = { ...notices, [id]: { tone, text } };
   }
 
+  /**
+   * The one-line summary a probe writes into the row notice.
+   *
+   * It names the modality states as well as the protocol ones, because the
+   * answer an operator most needs after pressing Probe is which questions the
+   * probe actually managed to answer — and a modality that came back
+   * `probe_failed` or `undetectable` is precisely the one that would otherwise
+   * be mistaken for "no".
+   */
+  function capabilitySummary(row: ModelEndpoint): string {
+    const parts = capabilityCells(row).map((c) => `${c.label}=${c.state}`);
+    if (!modalitiesReported(row)) {
+      parts.push('modalities=not reported by this backend');
+    } else {
+      for (const cell of modalityCells(row)) {
+        if (cell.key === 'text') continue;
+        parts.push(`${cell.label}=${cell.state}`);
+      }
+    }
+    return parts.join(' ');
+  }
+
   async function save(
     payload: ModelEndpointCreate | ModelEndpointUpdate,
     isEdit: boolean,
@@ -89,11 +113,7 @@
       note(
         row.id,
         row.health === 'healthy' ? 'ok' : row.health === 'unprobed' ? 'warn' : 'bad',
-        response.detail ??
-          `Registered and probed: ${row.health}. ` +
-            capabilityCells(row)
-              .map((c) => `${c.label}=${c.state}`)
-              .join(' '),
+        response.detail ?? `Registered and probed: ${row.health}. ` + capabilitySummary(row),
       );
     }
     showModal = false;
@@ -124,10 +144,7 @@
         note(
           endpoint.id,
           row.capabilities.probe_status === 'ok' ? 'ok' : 'warn',
-          `Probed ${row.capabilities.probe_status}: ` +
-            capabilityCells(row)
-              .map((c) => `${c.label}=${c.state}`)
-              .join(' '),
+          `Probed ${row.capabilities.probe_status}: ` + capabilitySummary(row),
         );
       }
     } catch (e) {
@@ -213,7 +230,9 @@
       <p class="subtitle">
         Self-hosted OpenAI-compatible servers — ollama, vLLM, llama.cpp — on bare metal or a
         rented pod. One row is one <strong>(server, model)</strong> pair, because tool support,
-        context window, rate and concurrency are all properties of the model on that server.
+        image and audio input, context window, rate and concurrency are all properties of the
+        model on that server. Every capability is <strong>probed, never assumed</strong>, and
+        “never asked” is shown as a different fact from “asked, and no”.
       </p>
     </div>
     <div class="header-actions">
@@ -251,7 +270,13 @@
         <code>http://192.168.1.50:11434/v1</code> with model
         <code>qwen2.5-coder:32b</code>. LazyAF will probe it immediately and tell you what it can
         actually do: whether it emits real tool calls, whether it streams, whether it reports
-        token usage, and how big its context window is.
+        token usage, how big its context window is, and which input modalities it accepts.
+      </p>
+      <p class="muted">
+        Video is listed on every endpoint and can never be green: the OpenAI chat-completions wire
+        format has no video content part, so LazyAF cannot send video to <em>any</em> endpoint,
+        whatever the model can do. It is shown rather than hidden so the absence has a reason
+        attached to it.
       </p>
       <p class="muted">
         There is deliberately no default endpoint. Guessing which GPU to bill is not a recoverable
@@ -333,7 +358,22 @@
                 {/if}
               </td>
 
-              <td><CapabilityChecks {endpoint} /></td>
+              <!-- `onProbe` is what makes an unknown ACTIONABLE where it is
+                   read. The button only exists while something is unanswered,
+                   so a fully probed row costs no width; it expands the row as
+                   well as probing, because "probe failed" and "undetectable"
+                   are answers you have to read the reason for, and the reason
+                   lives in the detail row. -->
+              <td>
+                <CapabilityChecks
+                  {endpoint}
+                  onProbe={() => {
+                    expanded = { ...expanded, [endpoint.id]: true };
+                    void probe(endpoint);
+                  }}
+                  probing={busy[endpoint.id] || $endpointsProbing.includes(endpoint.id)}
+                />
+              </td>
 
               <td>
                 <span
@@ -414,6 +454,16 @@
                     <p class="detail {notice.tone}" data-testid="endpoint-notice">{notice.text}</p>
                   {/if}
                   {#if expanded[endpoint.id]}
+                    <!-- The same component as the table cell, in its panel
+                         variant: one display, two densities. The reasons the
+                         chips only hint at in a tooltip are spelled out here,
+                         which is where the page already puts probe detail. -->
+                    <CapabilityChecks
+                      {endpoint}
+                      variant="panel"
+                      onProbe={() => probe(endpoint)}
+                      probing={busy[endpoint.id] || $endpointsProbing.includes(endpoint.id)}
+                    />
                     <dl class="probe-detail" data-testid="endpoint-probe-detail">
                       <dt>probed from</dt>
                       <dd>{endpoint.capabilities.probed_from ?? 'never probed'}</dd>

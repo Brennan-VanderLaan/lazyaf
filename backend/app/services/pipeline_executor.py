@@ -54,6 +54,14 @@ from app.models import (
     TestRunStatus,
 )
 from app.models.pipeline import ExecutorMode, StepExecution, StepExecutionStatus
+# The NODE-action vocabulary, defined once (R3). `StepActions`'s validator and
+# `_run_terminal_action`'s dispatcher call the same function, so a typo is a
+# 422 at the boundary and a NAMED run failure here - never a silent no-op.
+# Module scope is safe in this direction: `app.schemas.pipeline` imports only
+# `app.models` and its sibling schemas, so there is no cycle back to any
+# service. The reverse import would be the cycle, which is why the schema
+# does not reach for `describe_step_action`.
+from app.schemas.pipeline import describe_terminal_action
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
 from app.services.workspace.pipeline_state_machine import (
@@ -2470,8 +2478,12 @@ class PipelineExecutor:
         )
 
         if route_error is not None:
+            # The StepRun exists and is already FAILED (`_dispatch_step_run`
+            # writes it before it returns), so the node's `failure` actions
+            # have a real row to be attributed to and to be blamed on.
             await self._handle_graph_step_complete(
-                db, pipeline_run, pipeline, repo, graph, step_id, False, None
+                db, pipeline_run, pipeline, repo, graph, step_id, False, None,
+                step_run=step_run,
             )
             return
 
@@ -3082,6 +3094,7 @@ class PipelineExecutor:
                     await self._handle_graph_step_complete(
                         db, pipeline_run, err.pipeline, err.repo, err.graph,
                         err.step_run.step_id, False, None,
+                        step_run=err.step_run,
                     )
                 else:
                     await self._handle_action(
@@ -4362,7 +4375,8 @@ class PipelineExecutor:
 
         if is_graph:
             await self._handle_graph_step_complete(
-                db, pipeline_run, pipeline, repo, graph, step_run.step_id, success, None
+                db, pipeline_run, pipeline, repo, graph, step_run.step_id, success, None,
+                step_run=step_run,
             )
         else:
             if step_run.step_index >= len(steps):
@@ -4499,7 +4513,8 @@ class PipelineExecutor:
             logger.info(f"[GRAPH] Using graph-based execution for step '{step_run.step_id}'")
             # Graph-based execution with parallel support
             await self._handle_graph_step_complete(
-                db, pipeline_run, pipeline, repo, graph, step_run.step_id, step_success, runner_id
+                db, pipeline_run, pipeline, repo, graph, step_run.step_id, step_success, runner_id,
+                step_run=step_run,
             )
         else:
             logger.info(f"[GRAPH] Using LEGACY execution (graph={graph is not None}, step_id={step_run.step_id})")
@@ -4523,18 +4538,30 @@ class PipelineExecutor:
         completed_step_id: str,
         step_success: bool,
         runner_id: str | None = None,
+        step_run: StepRun | None = None,
     ) -> None:
         """
         Handle completion of a graph step with parallel execution support.
 
         This method:
         1. Updates completed_step_ids and active_step_ids
-        2. Finds downstream edges based on success/failure condition
-        3. For each downstream step, checks if all upstream dependencies are satisfied (fan-in)
-        4. Executes ready downstream steps (fan-out)
-        5. Completes pipeline when all steps are done
+        2. Fires the completed node's TERMINAL ACTIONS (12.8)
+        3. Finds downstream edges based on success/failure condition
+        4. For each downstream step, checks if all upstream dependencies are satisfied (fan-in)
+        5. Executes ready downstream steps (fan-out)
+        6. Completes pipeline when all steps are done
 
-        Step 5 is where QA finding T4 lived. This method used to complete the
+        `step_run` is the row the caller just finished. Every production
+        caller has it in hand (the route-failure branch of
+        `_execute_graph_step`, `_fail_wedged_local_step`,
+        `_finish_local_step_locked` and `_on_step_complete_locked`), so the
+        actions are attributed to the EXACT row rather than to whatever a
+        lookup returns for a step that has been retried. It stays optional
+        because a caller with no row is legal - a node with no actions never
+        needs one - and `_latest_step_run_for` resolves it, with a pinned
+        ordering, only when there is actually an action to fire.
+
+        Step 6 is where QA finding T4 lived. This method used to complete the
         run the moment nothing was active and nothing new had been dispatched,
         without ever asking whether the graph had been COVERED - so a cycle, an
         unreachable step or a typo'd action each finished `passed` with a
@@ -4563,8 +4590,51 @@ class PipelineExecutor:
 
         logger.info(f"[GRAPH] After update - Active: {list(active_ids)}, Completed: {list(completed_ids)}")
 
-        # Find downstream edges based on the step result
         condition = "success" if step_success else "failure"
+
+        # Fire this node's terminal actions BEFORE fanning out. A `merge:`
+        # must land before a downstream step reads the merged branch, and an
+        # action that cannot be performed must fail the run rather than let
+        # the graph carry on over a side effect that did not happen (R1).
+        #
+        # `always` runs after the matching condition, in that order, so a node
+        # can say "merge on success, and always spawn the report card" and get
+        # both in a stated sequence. An absent `actions` key is an empty
+        # StepActions, so every pre-12.8 graph dict reads as "no actions".
+        #
+        # A step that never STARTED gets here too - `_execute_graph_step`
+        # re-enters this method with `step_success=False` when routing fails -
+        # and its `failure` actions DO fire. That is v1's behaviour exactly
+        # (`_execute_step`'s route-error branch applies `on_failure`), and it
+        # is the honest reading: the author asked for a fix card when this
+        # node does not succeed, and a node that could not be dispatched did
+        # not succeed. Silently skipping one class of failure is the dark
+        # behaviour this whole phase exists to remove.
+        node_actions = (steps_dict.get(completed_step_id) or {}).get("actions") or {}
+        pending = (
+            list(node_actions.get(condition) or [])
+            + list(node_actions.get("always") or [])
+        )
+        if pending:
+            if step_run is None:
+                step_run = await self._latest_step_run_for(
+                    db, pipeline_run, completed_step_id
+                )
+            if step_run is None:
+                await self._fail_run_on_unattributable_actions(
+                    db, pipeline_run, graph, completed_step_id, pending
+                )
+                return
+            for action in pending:
+                performed = await self._run_terminal_action(
+                    db, pipeline_run, repo, completed_step_id, step_run, action
+                )
+                if not performed:
+                    # _run_terminal_action has already FAILED the run and
+                    # written the reason onto the step. Do not fan out.
+                    return
+
+        # Find downstream edges based on the step result
         downstream_edges = get_downstream_edges(graph, completed_step_id, condition)
 
         logger.info(f"[GRAPH] Found {len(downstream_edges)} downstream edges for condition '{condition}': {downstream_edges}")
@@ -4878,6 +4948,225 @@ class PipelineExecutor:
 
         return True
 
+    # -------------------------------------------------------------------------
+    # Terminal node actions (graph, 12.8)
+    #
+    # v1's `on_success`/`on_failure` string was two things wearing one coat:
+    # FLOW (`next`, `stop`) and EFFECT (`merge:{branch}`, `trigger:{card_id}`).
+    # A graph expresses flow with edges, so what is left on a node is pure
+    # effect - and a LIST of them per condition, because one string could
+    # never say "merge AND spawn a fix card".
+    #
+    # These methods fire that list. They decide nothing about what runs next
+    # and, on the happy path, they complete nothing: the verdict remains
+    # `_verify_graph_coverage` + `_check_all_steps_passed`, always. That is
+    # the difference from the v1 handlers below, which end in
+    # `_complete_pipeline(success=True)` in three places - three false greens
+    # this split does not carry over.
+    # -------------------------------------------------------------------------
+
+    async def _run_terminal_action(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        repo: Repo,
+        step_id: str,
+        step_run: StepRun,
+        action: str,
+    ) -> bool:
+        """True when the action was performed; False having ALREADY failed the run.
+
+        Never completes the pipeline: the verdict is _check_all_steps_passed's,
+        always. A refusal names step_id, the action, and the reason.
+
+        The vocabulary is `describe_terminal_action`'s - the SAME function
+        `StepActions` validates against (R3), so this dispatcher cannot drift
+        from the schema. Two consequences worth stating, because both are
+        silent-wrong-thing candidates:
+
+        * `next` and `stop` are refused here, not quietly ignored. They are
+          flow, and flow on a graph is an edge; a node that asks for them is
+          asking for something this method cannot do.
+        * `trigger:pipeline:{id}` is retired and is refused BEFORE the
+          `trigger:` prefix can match, so it can never arrive at
+          `_spawn_fix_card` as "a card whose id is `pipeline:{id}`" - which
+          would look like a working action and spawn nothing.
+        """
+        problem = describe_terminal_action(action)
+        if problem is None:
+            if action.startswith("merge:"):
+                problem = await self._merge_step_branch(
+                    db,
+                    pipeline_run,
+                    repo,
+                    step_run,
+                    action[len("merge:"):],
+                )
+            elif action.startswith("trigger:"):
+                problem = await self._spawn_fix_card(
+                    db,
+                    pipeline_run,
+                    repo,
+                    step_index=step_run.step_index,
+                    template_card_id=action[len("trigger:"):],
+                )
+            else:  # pragma: no cover - describe_terminal_action already returned
+                raise ValueError(
+                    f"node action {action!r} passed validation but has no "
+                    f"handler; describe_terminal_action and "
+                    f"_run_terminal_action have drifted"
+                )
+
+        if problem is None:
+            logger.info(
+                "Run %s: node action '%s' fired for step '%s'",
+                pipeline_run.id[:8],
+                action,
+                step_id,
+            )
+            return True
+
+        await self._fail_run_on_terminal_action(
+            db, pipeline_run, step_id, step_run, action, problem
+        )
+        return False
+
+    async def _fail_run_on_terminal_action(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        step_id: str,
+        step_run: StepRun,
+        action: str,
+        problem: str,
+    ) -> None:
+        """Fail a run whose node action could not be performed (R1).
+
+        The graph must not carry on over a side effect that did not happen: a
+        `merge:` that never landed leaves every downstream step reading the
+        wrong branch, and a `trigger:` that never spawned leaves nobody
+        fixing what failed - both of which look exactly like success from the
+        outside.
+
+        EVERY false return writes the reason onto the step's own StepRun.
+        That is the half v1's `_merge_branch` never had: its merge-failure
+        branch logged and failed the run with no error written anywhere, so
+        the operator got a red run with nothing red in it. The reason is
+        APPENDED, because the step may already carry an error of its own (a
+        failing step firing an `on_failure` action is the common case).
+        """
+        reason = f"step '{step_id}': action '{action}' failed: {problem}"
+        logger.error(
+            "Pipeline run %s cannot continue - %s",
+            pipeline_run.id[:8],
+            reason,
+        )
+
+        step_run.error = (
+            f"{step_run.error}\n{reason}" if step_run.error else reason
+        )
+        step_run.status = RunStatus.FAILED.value
+        if step_run.completed_at is None:
+            step_run.completed_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(step_run)
+        await manager.send_step_run_status(step_run_to_ws_dict(step_run))
+
+        await self._complete_pipeline(db, pipeline_run, success=False)
+
+    async def _fail_run_on_unattributable_actions(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        graph: dict,
+        step_id: str,
+        pending: list[str],
+    ) -> None:
+        """Fail a run whose node declared actions with no StepRun to blame.
+
+        A completed graph step always has a row, so this is an invariant
+        violation rather than a user error - but it must still be loud and it
+        must still land somewhere a user looks. Refusing to fire is the only
+        safe answer (firing blind would leave the effect unattributable), and
+        refusing silently would be the same dark hole from the other side.
+        The synthetic row mirrors `_verify_graph_coverage`'s.
+        """
+        steps_dict = graph.get("steps") or {}
+        step_ids = list(steps_dict.keys())
+        node = steps_dict.get(step_id) or {}
+        reason = (
+            f"step '{step_id}' declares the node actions "
+            f"{', '.join(repr(a) for a in pending)} but this run has no step "
+            f"row to attribute them to; refusing to fire them"
+        )
+        logger.error(
+            "Pipeline run %s cannot continue - %s", pipeline_run.id[:8], reason
+        )
+
+        now = datetime.utcnow()
+        step_run = StepRun(
+            id=str(uuid4()),
+            pipeline_run_id=pipeline_run.id,
+            step_index=(
+                step_ids.index(step_id) if step_id in step_ids else len(step_ids)
+            ),
+            step_id=step_id,
+            step_name=node.get("name") or step_id,
+            status=RunStatus.FAILED.value,
+            logs="",
+            error=reason,
+            started_at=now,
+            completed_at=now,
+        )
+        db.add(step_run)
+        await db.commit()
+        await db.refresh(step_run)
+        await manager.send_step_run_status(step_run_to_ws_dict(step_run))
+
+        await self._complete_pipeline(db, pipeline_run, success=False)
+
+    async def _latest_step_run_for(
+        self, db: AsyncSession, pipeline_run: PipelineRun, step_id: str
+    ) -> StepRun | None:
+        """The most recent StepRun this run holds for a GRAPH step id.
+
+        The fallback for a caller of `_handle_graph_step_complete` that has no
+        row in hand. A step can own several rows - a retry, or QA4-06's
+        duplicate dispatch - so the ordering is PINNED (newest first) rather
+        than left to whatever the database happens to return; an action
+        attributed to an arbitrary one of two rows is a coin flip nobody can
+        see.
+
+        The `trigger:` marker StepRun deliberately carries `step_id=None`, so
+        it can never be selected here and never votes in
+        `_graph_step_outcomes` either. That is the one property that keeps a
+        fix-card marker from being mistaken for the step that spawned it.
+        """
+        result = await db.execute(
+            select(StepRun)
+            .where(StepRun.pipeline_run_id == pipeline_run.id)
+            .where(StepRun.step_id == step_id)
+            .order_by(StepRun.started_at.desc(), StepRun.id.desc())
+        )
+        return result.scalars().first()
+
+    async def _step_run_at_index(
+        self, db: AsyncSession, pipeline_run: PipelineRun, step_index: int
+    ) -> StepRun | None:
+        """The v1 lookup: this run's StepRun at an ARRAY index.
+
+        Unordered `.first()`, inherited verbatim from the two call sites this
+        replaces so the v1 path keeps behaving exactly as it did. The graph
+        path does not use it - it is handed the row, or resolves it by step
+        id through `_latest_step_run_for`.
+        """
+        result = await db.execute(
+            select(StepRun)
+            .where(StepRun.pipeline_run_id == pipeline_run.id)
+            .where(StepRun.step_index == step_index)
+        )
+        return result.scalars().first()
+
     async def _handle_action(
         self,
         db: AsyncSession,
@@ -5002,8 +5291,61 @@ class PipelineExecutor:
         current_step: int,
         template_card_id: str,
     ) -> None:
+        """v1 FLOW around the fix-card effect: spawn it, then continue.
+
+        The effect itself moved to `_spawn_fix_card`, keyed off
+        `(step_index, template_card_id)` with no array in sight, so the graph
+        path can fire the same code without inheriting v1's continuation.
+        What stays here is exactly the part that IS the array: "and then run
+        `current_step + 1`".
+
+        v1 continues past a fix it could not dispatch. That is preserved
+        verbatim - P1 adds a capability, it does not change this one - and it
+        is the deliberate difference from the graph path, where an action
+        that could not be performed FAILS the run (R1). Both behaviours are
+        now visible in one place instead of implied by an early return.
+        """
+        problem = await self._spawn_fix_card(
+            db,
+            pipeline_run,
+            repo,
+            step_index=current_step,
+            template_card_id=template_card_id,
+        )
+        if problem is not None:
+            logger.warning(
+                "Run %s: the trigger action after step %s continues past a "
+                "fix card that was not dispatched (%s) - v1 behaviour; the "
+                "graph path fails the run instead",
+                pipeline_run.id[:8],
+                current_step,
+                problem,
+            )
+
+        await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
+
+    async def _spawn_fix_card(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        repo: Repo,
+        *,
+        step_index: int,
+        template_card_id: str,
+    ) -> str | None:
         """Clone a card as template and run it, on the control layer, to fix
         issues.
+
+        THE EFFECT ONLY. Returns None when the fix run was dispatched, else
+        the reason it was not. It chooses nothing about what runs next and
+        completes nothing, because its two callers want different things:
+        v1's `_trigger_card` continues to the next array index either way,
+        while `_run_terminal_action` fails the run on a reason.
+
+        Keyed off `step_index` rather than off `(steps, current_step)`:
+        nothing here indexes the array. `step_index` is the marker StepRun's
+        own column, which survives the retirement - it is how the websocket,
+        the state machine and the execution key address a step.
 
         12.5: this was the last caller of the polling queue on the card
         path. Card START and card RETRY had already moved to the ad-hoc agent
@@ -5027,23 +5369,22 @@ class PipelineExecutor:
         run that carries it; it is terminal on creation, because the work it
         points at is not in this run.
 
-        KNOWN LIMITATION, inherited verbatim from ``trigger:pipeline:`` and
-        deliberately not changed here: when the triggering step is the LAST
-        one, continuing past it completes the run PASSED even though the
-        action fired from ``on_failure``. Fixing that means threading the
-        step's own verdict through ``_handle_action``, which is a wider
-        change than this finding.
+        KNOWN LIMITATION of the v1 CALLER, inherited verbatim from
+        ``trigger:pipeline:``: when the triggering step is the LAST one,
+        continuing past it completes the run PASSED even though the action
+        fired from ``on_failure``. It is a limitation of the continuation,
+        not of this effect, so it does not travel to the graph path: there,
+        continuation is an edge and the verdict is
+        ``_check_all_steps_passed``, which sees the failed step.
         """
         # Get the template card
         result = await db.execute(select(Card).where(Card.id == template_card_id))
         template_card = result.scalar_one_or_none()
         if not template_card:
             logger.error(f"Template card {template_card_id} not found for trigger action")
-            # Continue to next step anyway
-            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
-            return
+            return f"template card {template_card_id} not found"
 
-        logger.info(f"Triggering card template {template_card_id} to fix step {current_step}")
+        logger.info(f"Triggering card template {template_card_id} to fix step {step_index}")
 
         # The cards router owns Job creation + branch naming on the card-start
         # path; this is that path's other entry point, so it does the same
@@ -5075,10 +5416,15 @@ class PipelineExecutor:
         # run named in its logs), and deliberately carrying NO job_id - a
         # second row at this index claiming the step's job would poison
         # _resolve_merge_source_branch for a later `merge:` action.
+        #
+        # It also carries NO step_id, which is what keeps it out of the graph
+        # entirely: `_graph_step_outcomes` skips rows with no step_id, so the
+        # marker never votes on the run's verdict, and `_latest_step_run_for`
+        # can never hand it back as "the row for the step that spawned it".
         step_run = StepRun(
             id=str(uuid4()),
             pipeline_run_id=pipeline_run.id,
-            step_index=current_step,  # Same step index (sub-step)
+            step_index=step_index,  # Same step index (sub-step)
             step_name=f"[Fix] {template_card.title}",
             status=RunStatus.RUNNING.value,
             executor=ExecutorMode.LOCAL.value,
@@ -5146,7 +5492,7 @@ class PipelineExecutor:
             ),
         })
 
-        await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
+        return error
 
     async def _trigger_pipeline(
         self,
@@ -5204,7 +5550,7 @@ class PipelineExecutor:
         self,
         db: AsyncSession,
         pipeline_run: PipelineRun,
-        current_step: int,
+        step_run: StepRun | None,
     ) -> str | None:
         """Resolve which branch a merge action should merge FROM (fix 1).
 
@@ -5213,14 +5559,17 @@ class PipelineExecutor:
         context (PipelineRun.trigger_context records the triggering branch).
         Returns None when neither source resolves - the caller must FAIL the
         run, never warn-and-continue-green.
+
+        Takes the StepRun the caller is ALREADY HOLDING rather than looking
+        one up by array index. On the graph path there is no "current step"
+        integer to look up by, and both callers have the exact row: v1's
+        `_merge_branch` fetched it one line earlier for its own error
+        reporting, and the graph path is handed it by
+        `_handle_graph_step_complete`. Note this does not retire the
+        marker-row hack in `_spawn_fix_card` - v1 still resolves its row by
+        index, so a second row there would still be ambiguous.
         """
         # Legacy path: the step's job -> card -> branch_name.
-        result = await db.execute(
-            select(StepRun)
-            .where(StepRun.pipeline_run_id == pipeline_run.id)
-            .where(StepRun.step_index == current_step)
-        )
-        step_run = result.scalars().first()
         if step_run is not None and step_run.job_id:
             result = await db.execute(select(Job).where(Job.id == step_run.job_id))
             job = result.scalar_one_or_none()
@@ -5252,39 +5601,78 @@ class PipelineExecutor:
         target_branch: str,
     ) -> None:
         """
-        Merge the step's working branch to the target branch, then continue.
+        v1 FLOW around the merge effect: merge, then continue or complete.
+
+        The merge itself moved to `_merge_step_branch`, keyed off the StepRun
+        rather than an array index, so the graph path fires the same code
+        without inheriting the two `_complete_pipeline(success=True)` calls
+        below - which are v1 false greens (a merge on the LAST step reports
+        the whole run PASSED without ever asking whether the other steps
+        did). What stays here is exactly the part that IS the array.
 
         Branch resolution (fix 1): job/card branch for legacy steps, the
         run's trigger-context branch for local steps. An unresolvable branch
         FAILS the run loudly - a merge that silently does nothing is
         indistinguishable from a merge that worked.
         """
-        source_branch = await self._resolve_merge_source_branch(
-            db, pipeline_run, current_step
+        step_run = await self._step_run_at_index(db, pipeline_run, current_step)
+        problem = await self._merge_step_branch(
+            db, pipeline_run, repo, step_run, target_branch
         )
-        if not source_branch:
+
+        if problem is not None:
             logger.error(
                 f"Merge action after step {current_step} of run "
-                f"{pipeline_run.id[:8]} cannot resolve a source branch "
-                f"(no job/card branch and no trigger-context branch) - "
+                f"{pipeline_run.id[:8]} did not happen ({problem}) - "
                 f"failing the run"
             )
-            result = await db.execute(
-                select(StepRun)
-                .where(StepRun.pipeline_run_id == pipeline_run.id)
-                .where(StepRun.step_index == current_step)
-            )
-            step_run = result.scalars().first()
             if step_run is not None:
                 step_run.error = (
                     (step_run.error + "\n") if step_run.error else ""
-                ) + (
-                    f"merge:{target_branch} failed: could not resolve the "
-                    f"source branch for this run"
-                )
+                ) + problem
                 await db.commit()
             await self._complete_pipeline(db, pipeline_run, success=False)
             return
+
+        # Continue to next step or complete
+        if current_step + 1 < len(steps):
+            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
+        else:
+            await self._complete_pipeline(db, pipeline_run, success=True)
+
+    async def _merge_step_branch(
+        self,
+        db: AsyncSession,
+        pipeline_run: PipelineRun,
+        repo: Repo,
+        step_run: StepRun | None,
+        target_branch: str,
+    ) -> str | None:
+        """Merge the step's working branch into `target_branch`. Effect only.
+
+        Returns None when the merge landed - or was a deliberate no-op
+        because source and target are the same branch - else the reason it
+        did not. Keyed off the StepRun the caller holds, not off an array
+        index.
+
+        NO CONTINUATION AND NO COMPLETION. v1's `_merge_branch` ended in
+        `_complete_pipeline(success=True)` on two of its three paths; carrying
+        that into the graph would re-import a false green, because a merge is
+        an EFFECT and the run's verdict belongs to `_check_all_steps_passed`
+        after `_verify_graph_coverage`. The caller owns flow.
+        """
+        source_branch = await self._resolve_merge_source_branch(
+            db, pipeline_run, step_run
+        )
+        if not source_branch:
+            logger.error(
+                f"Run {pipeline_run.id[:8]} cannot resolve a merge source "
+                f"branch (no job/card branch and no trigger-context branch)"
+            )
+            return (
+                f"merge:{target_branch} failed: could not resolve the "
+                f"source branch for this run"
+            )
 
         if source_branch == target_branch:
             # Nothing to merge - the run already worked on the target branch.
@@ -5292,11 +5680,7 @@ class PipelineExecutor:
                 f"Merge action: source and target are both '{target_branch}' "
                 f"- nothing to merge, continuing"
             )
-            if current_step + 1 < len(steps):
-                await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
-            else:
-                await self._complete_pipeline(db, pipeline_run, success=True)
-            return
+            return None
 
         logger.info(f"Merging branch {source_branch} to {target_branch}")
 
@@ -5307,28 +5691,27 @@ class PipelineExecutor:
             target_branch=target_branch,
         )
 
-        if merge_result["success"]:
-            logger.info(f"Merge successful: {merge_result}")
-
-            # Clean up .lazyaf-context directory from merged branch (Phase 9.1d)
-            cleanup_result = git_repo_manager.delete_directory_from_branch(
-                repo_id=repo.id,
-                branch=target_branch,
-                directory=".lazyaf-context",
-            )
-            if cleanup_result["success"]:
-                logger.info(f"Context cleanup: {cleanup_result.get('message', 'done')}")
-            else:
-                logger.warning(f"Context cleanup failed: {cleanup_result.get('error', 'unknown')}")
-
-            # Continue to next step or complete
-            if current_step + 1 < len(steps):
-                await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
-            else:
-                await self._complete_pipeline(db, pipeline_run, success=True)
-        else:
+        if not merge_result["success"]:
             logger.error(f"Merge failed: {merge_result}")
-            await self._complete_pipeline(db, pipeline_run, success=False)
+            return (
+                f"merge:{target_branch} failed: "
+                f"{merge_result.get('error') or merge_result}"
+            )
+
+        logger.info(f"Merge successful: {merge_result}")
+
+        # Clean up .lazyaf-context directory from merged branch (Phase 9.1d)
+        cleanup_result = git_repo_manager.delete_directory_from_branch(
+            repo_id=repo.id,
+            branch=target_branch,
+            directory=".lazyaf-context",
+        )
+        if cleanup_result["success"]:
+            logger.info(f"Context cleanup: {cleanup_result.get('message', 'done')}")
+        else:
+            logger.warning(f"Context cleanup failed: {cleanup_result.get('error', 'unknown')}")
+
+        return None
 
     async def cancel_run(self, db: AsyncSession, pipeline_run: PipelineRun) -> PipelineRun:
         """

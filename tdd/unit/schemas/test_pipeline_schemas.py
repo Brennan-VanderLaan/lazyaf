@@ -267,6 +267,102 @@ class TestPipelineReadSchema:
         assert pipeline.is_template is False
 
 
+class TestPipelineReadDefinitionError:
+    """PipelineRead.definition_error - the one net-new schema surface (12.8).
+
+    sync_repo_pipelines swallows every parse exception into a logger.warning
+    and keeps the STALE definition on purpose ("a broken CI file must not
+    break the push"). A conversion REFUSAL landing there would be dark by
+    construction, which would make the whole refuse-loudly strategy an R1
+    violation. This field is the channel those refusals surface on.
+    """
+
+    def _read(self, **overrides):
+        kwargs = dict(
+            id="pipeline-123",
+            repo_id="repo-456",
+            name="Test Pipeline",
+            steps=[],
+            is_template=False,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        kwargs.update(overrides)
+        return PipelineRead(**kwargs)
+
+    def test_defaults_to_none_when_absent(self):
+        """A pipeline whose definition materialized carries no error."""
+        assert self._read().definition_error is None
+
+    def test_carries_the_refusal_text(self):
+        """The reason travels to the client, not just to a log line."""
+        reason = (
+            "step 'deploy': 'trigger:pipeline:' is retired (12.8); chain "
+            "pipelines with a card_complete or push trigger"
+        )
+        assert self._read(definition_error=reason).definition_error == reason
+
+    def test_it_is_on_the_wire(self):
+        assert "definition_error" in PipelineRead.model_fields
+        assert self._read().model_dump()["definition_error"] is None
+
+    def test_it_is_read_only(self):
+        """A client does not get to declare its own pipeline broken (or fixed).
+
+        The field is written by upsert_materialized_pipeline from a real
+        conversion outcome. Accepting it on the input schemas would let a
+        caller either hide a refusal or invent one.
+        """
+        assert "definition_error" not in PipelineCreate.model_fields
+        assert "definition_error" not in PipelineUpdate.model_fields
+
+    def test_from_attributes_falls_back_when_the_attribute_is_absent(self):
+        """The mechanism the sequencing rests on, isolated.
+
+        This field lands at P1; the additive ALTER that gives Pipeline the
+        matching column is the migration's, at P4. Between the two, the ORM
+        row has no such attribute at all - so `from_attributes` MUST fall
+        back to the default rather than raise, or every pipeline response
+        500s for the whole window.
+        """
+        class RowWithoutTheColumn:
+            id = "pipeline-123"
+            repo_id = "repo-456"
+            name = "Test Pipeline"
+            description = None
+            steps = "[]"
+            steps_graph = None
+            triggers = "[]"
+            is_template = False
+            created_at = datetime.utcnow()
+            updated_at = datetime.utcnow()
+
+        read = PipelineRead.model_validate(RowWithoutTheColumn())
+        assert read.definition_error is None
+        assert read.id == "pipeline-123"
+
+    def test_a_real_orm_row_serializes(self):
+        """The same claim against the actual model, and it stays true after
+        the column lands: absent today, NULL on an unflushed row tomorrow,
+        None on the wire either way."""
+        from app.models.pipeline import Pipeline
+
+        row = Pipeline(
+            id="pipeline-123",
+            repo_id="repo-456",
+            name="Test Pipeline",
+            steps="[]",
+            triggers="[]",
+            is_template=False,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        read = PipelineRead.model_validate(row)
+        assert read.definition_error is None
+        assert read.id == "pipeline-123"
+        assert read.name == "Test Pipeline"
+
+
 class TestPipelineRunCreateSchema:
     """Tests for PipelineRunCreate schema."""
 
@@ -388,3 +484,113 @@ class TestStepRunReadSchema:
             status=RunStatus.PENDING,
         )
         assert step.logs == ""
+
+
+# =============================================================================
+# 12.8 P2 - PipelineStepConfig.id (§1.6b)
+# =============================================================================
+
+
+class TestPipelineStepConfigId:
+    """§1.6(b): the array step gains an optional stable id.
+
+    `PipelineStepYaml.id` has always accepted one ("Optional stable ID for
+    context directory references") and `.lazyaf/pipelines/test-suite.yaml`
+    uses it on all ten steps - but `PipelineStepConfig`, the type
+    `array_to_graph` converts, had nowhere to put it. So the conversion
+    renamed every node to `step_{index}`, taking the context-directory names,
+    the debug breakpoint keys and the readability of the graph with it.
+
+    Optional, not required: every v1 row already persisted was written
+    without one, and `array_to_graph` falls back to `step_{index}` exactly as
+    before. Purely additive.
+    """
+
+    def test_id_defaults_to_none(self):
+        step = PipelineStepConfig(name="Test", type=StepType.SCRIPT)
+
+        assert step.id is None
+
+    def test_an_id_is_carried(self):
+        step = PipelineStepConfig(name="Tier 1", type=StepType.SCRIPT, id="tier1")
+
+        assert step.id == "tier1"
+
+    def test_a_pre_p2_step_dict_still_validates_unchanged(self):
+        """Every persisted `Pipeline.steps` row looks like this. It must keep
+        parsing, with every other field untouched."""
+        step = PipelineStepConfig.model_validate({
+            "name": "Run Tests",
+            "type": "script",
+            "config": {"command": "pytest -q"},
+            "on_success": "next",
+            "on_failure": "stop",
+            "timeout": 1800,
+            "continue_in_context": True,
+        })
+
+        assert step.id is None
+        assert step.name == "Run Tests"
+        assert step.type == StepType.SCRIPT
+        assert step.config == {"command": "pytest -q"}
+        assert step.on_success == "next"
+        assert step.on_failure == "stop"
+        assert step.timeout == 1800
+        assert step.continue_in_context is True
+
+    def test_the_yaml_step_shape_validates_straight_through(self):
+        """§4.2's caller adapter is
+        `PipelineStepConfig.model_validate(s.model_dump())` over a
+        `PipelineStepYaml`. `id` is the field that used to be dropped on that
+        hop - pinned here so the two shapes cannot drift apart again."""
+        yaml_step = {
+            "id": "verify-executor",
+            "name": "Verify Executor",
+            "type": "script",
+            "config": {"command": "python scripts/verify_executor.py"},
+            "on_success": "next",
+            "on_failure": "stop",
+            "timeout": 300,
+            "continue_in_context": False,
+        }
+
+        step = PipelineStepConfig.model_validate(yaml_step)
+
+        assert step.id == "verify-executor"
+
+    def test_id_is_on_the_wire(self):
+        step = PipelineStepConfig(name="T", type=StepType.SCRIPT, id="t")
+
+        assert step.model_dump()["id"] == "t"
+
+    def test_a_defaulted_id_serializes_as_null_not_as_a_missing_key(self):
+        """A reader distinguishing 'no id' from 'id absent' would be a second
+        code path; there is one shape."""
+        dumped = PipelineStepConfig(name="T", type=StepType.SCRIPT).model_dump()
+
+        assert "id" in dumped
+        assert dumped["id"] is None
+
+    def test_a_non_string_id_is_refused(self):
+        with pytest.raises(ValidationError):
+            PipelineStepConfig(name="T", type=StepType.SCRIPT, id=3)
+
+    def test_an_id_survives_a_pipeline_read_round_trip(self):
+        """`PipelineRead.steps` is `list[PipelineStepConfig]`, so the id has
+        to survive the JSON-string parse the ORM row goes through."""
+        pipeline = PipelineRead.model_validate({
+            "id": "p1",
+            "repo_id": "r1",
+            "name": "P",
+            "steps": json.dumps([
+                {"id": "tier1", "name": "T1", "type": "script"},
+                {"name": "T2", "type": "script"},
+            ]),
+            "steps_graph": None,
+            "triggers": "[]",
+            "is_template": False,
+            "created_at": datetime(2026, 8, 30, 12, 0, 0),
+            "updated_at": datetime(2026, 8, 30, 12, 0, 0),
+        })
+
+        assert [s.id for s in pipeline.steps] == ["tier1", None]

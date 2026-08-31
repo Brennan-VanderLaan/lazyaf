@@ -18,6 +18,7 @@ from app.schemas.playground import (
     PlaygroundTestResponse,
     PlaygroundStatus,
     PlaygroundResult,
+    PlaygroundSessionSummary,
 )
 from app.services.playground_service import PlaygroundCancelError, playground_service
 from app.services.agent_resolver import agent_resolver
@@ -119,6 +120,34 @@ async def start_test(
     )
 
 
+@router.get("/sessions", response_model=list[PlaygroundSessionSummary])
+async def list_sessions(
+    repo_id: str,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
+    """Recent playground runs for a repo, newest first.
+
+    This is the history the playground never had, and it is a READ of records
+    the platform already writes - not a new store. Every playground run leaves
+    a PipelineRun (``trigger_type='playground'``, ``trigger_ref=<session_id>``)
+    whose StepRun holds the transcript and whose hidden ad-hoc Pipeline holds
+    the prompt. See the block comment on
+    ``PlaygroundService.list_runs`` for why there is no playground table.
+    """
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=422, detail="limit must be between 1 and 100"
+        )
+
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    rows = await playground_service.list_runs(db, repo_id, limit=limit)
+    return [PlaygroundSessionSummary(**row) for row in rows]
+
+
 # Session endpoints
 
 
@@ -149,18 +178,28 @@ async def stream_logs(session_id: str):
 
 
 @session_router.get("/{session_id}/status", response_model=PlaygroundStatus)
-async def get_status(session_id: str):
-    """Get current status of a playground session."""
-    session = playground_service.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+async def get_status(session_id: str, db: AsyncSession = Depends(get_db)):
+    """Get current status of a playground session.
 
-    return PlaygroundStatus(
-        session_id=session.id,
-        status=session.status,
-        started_at=session.started_at,
-        completed_at=session.completed_at,
-    )
+    Falls back to the durable run when the in-memory session has been swept
+    (30-minute TTL, or a backend restart). A page reload lands here first: it
+    is how the client decides whether to re-open the SSE stream or just show
+    the finished transcript.
+    """
+    session = playground_service.get_session(session_id)
+    if session:
+        return PlaygroundStatus(
+            session_id=session.id,
+            status=session.status,
+            started_at=session.started_at,
+            completed_at=session.completed_at,
+            source="session",
+        )
+
+    from_run = await playground_service.get_status_from_run(db, session_id)
+    if from_run is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return PlaygroundStatus(**from_run)
 
 
 @session_router.post("/{session_id}/cancel")
@@ -188,13 +227,27 @@ async def cancel_test(session_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @session_router.get("/{session_id}/result", response_model=PlaygroundResult)
-async def get_result(session_id: str):
-    """Get diff and completion status."""
-    result = playground_service.get_result(session_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="Session not found")
+async def get_result(session_id: str, db: AsyncSession = Depends(get_db)):
+    """Get transcript, diff and completion status.
 
-    return PlaygroundResult(**result)
+    This used to 404 the moment the 30-minute in-memory session was swept -
+    about data that was still sitting in the database. It now falls back to
+    the durable run record, which carries the whole transcript.
+
+    What it CANNOT carry is the diff: the ``playground/<id>`` branch is
+    deleted once the diff has been computed, so a result read from the run
+    says ``source="run"`` and the client renders "the diff was not retained"
+    rather than the indistinguishable "no changes were made" (R1).
+    """
+    result = playground_service.get_result(session_id)
+    if result:
+        result["source"] = "session"
+        return PlaygroundResult(**result)
+
+    from_run = await playground_service.get_result_from_run(db, session_id)
+    if from_run is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return PlaygroundResult(**from_run)
 
 
 # Internal endpoints for runners.

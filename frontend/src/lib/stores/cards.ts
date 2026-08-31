@@ -2,6 +2,7 @@ import { writable, derived, get } from 'svelte/store';
 import type { Card, CardCreate, CardUpdate, CardStatus, ApproveResponse, RebaseResponse } from '../api/types';
 import { cards as cardsApi } from '../api/client';
 import { selectedRepoId } from './repos';
+import { timestampOrder } from '../utils/time';
 
 function createCardsStore() {
   const { subscribe, set, update } = writable<Card[]>([]);
@@ -192,6 +193,28 @@ export const cardsStore = createCardsStore();
 // Derived stores for each column
 const STATUSES: CardStatus[] = ['todo', 'in_progress', 'in_review', 'done', 'failed'];
 
+/**
+ * Column order is DEFINED here, not inherited from whatever order the rows
+ * happened to arrive in.
+ *
+ * `load()` replaces the whole array with the API's response, and
+ * `GET /api/repos/{id}/cards` has no ORDER BY - so a resync after a dropped
+ * socket could hand back the same cards in a different order and every column
+ * would silently reshuffle. A row that moves between a user aiming at it and
+ * clicking it is how someone opens, or deletes, the wrong card. Oldest first,
+ * with the id as a tiebreak so two cards created in the same instant cannot
+ * swap either.
+ */
+function byCreation(a: Card, b: Card): number {
+  const at = timestampOrder(a.created_at);
+  const bt = timestampOrder(b.created_at);
+  // Compared, not subtracted: `timestampOrder` answers -Infinity for a
+  // timestamp it cannot parse, and -Infinity minus -Infinity is NaN, which
+  // makes a comparator return "unordered" and shuffles the list.
+  if (at !== bt) return at < bt ? -1 : 1;
+  return a.id.localeCompare(b.id);
+}
+
 export const cardsByStatus = derived(cardsStore, ($cards) => {
   const grouped: Record<CardStatus, Card[]> = {
     todo: [],
@@ -203,6 +226,10 @@ export const cardsByStatus = derived(cardsStore, ($cards) => {
 
   for (const card of $cards) {
     grouped[card.status].push(card);
+  }
+
+  for (const column of Object.values(grouped)) {
+    column.sort(byCreation);
   }
 
   return grouped;

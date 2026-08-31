@@ -70,17 +70,32 @@ function createJobsStore() {
             completed_at: data.completed_at,
           });
         } else {
-          // Create a minimal job entry for tracking
+          // A `job_status` frame for a job this tab has never loaded. The
+          // frame carries only the six fields above, so the rest are spelled
+          // out as "not known yet" rather than left off: the object was
+          // previously typed as a `Job` while missing nine of its fields,
+          // which svelte-check reported and which let `job.test_pass_count`
+          // read `undefined` where the template tests it against `null`.
+          // A later `load()` replaces this row with the real one.
           newJobs.set(data.id, {
             id: data.id,
             card_id: data.card_id,
             runner_id: null,
+            runner_type: null,
             status: data.status,
             logs: '',
             error: data.error,
             started_at: data.started_at,
             completed_at: data.completed_at,
             created_at: new Date().toISOString(),
+            step_type: 'agent',
+            step_config: null,
+            tests_run: false,
+            tests_passed: null,
+            test_pass_count: null,
+            test_fail_count: null,
+            test_skip_count: null,
+            test_output: null,
           });
         }
         return newJobs;

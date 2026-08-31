@@ -81,9 +81,22 @@ describe('derived: hasResult', () => {
     expect(get(hasResult)).toBe(false);
   });
 
-  it('is false when completed with no diff, error, or changed files', () => {
+  /**
+   * CHANGED DELIBERATELY (QA-7, finding PG-07). This used to assert `false`,
+   * which is what made the single most natural first prompt a stranger types
+   * ("what does this repo do?") finish with no Changes section, no "nothing
+   * changed" message and no Reset button - the page looked like nothing had
+   * happened. `hasResult` now means "the run reached a terminal state", not
+   * "the run produced a diff", and the page renders the empty-changes branch.
+   */
+  it('is true when completed with no diff, error, or changed files', () => {
     playgroundStore.setConfig({ status: 'completed', diff: null, error: null, filesChanged: [] });
-    expect(get(hasResult)).toBe(false);
+    expect(get(hasResult)).toBe(true);
+  });
+
+  it('is true when a run was cancelled', () => {
+    playgroundStore.setConfig({ status: 'cancelled', diff: null, error: null, filesChanged: [] });
+    expect(get(hasResult)).toBe(true);
   });
 
   it('is true when completed with a diff', () => {

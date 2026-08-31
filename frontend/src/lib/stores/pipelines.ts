@@ -99,6 +99,22 @@ function createPipelinesStore() {
 
 export const pipelinesStore = createPipelinesStore();
 
+/**
+ * Merge one run over the copy already held, by id.
+ *
+ * Runs arrive from four places that do NOT all carry the same fields: the
+ * recent-runs poll, the per-pipeline list, the detail fetch, and WS frames -
+ * and `pipeline_run_status` frames omit `step_runs` entirely. A bare
+ * `map.set(run.id, run)` therefore wiped step state the open viewer was
+ * rendering, so its timeline emptied and refilled on a 3s cycle and the row
+ * you were about to click moved out from under you. Merging keeps whatever
+ * the newcomer does not mention.
+ */
+function mergeRun(prev: PipelineRun | undefined, run: PipelineRun): PipelineRun {
+  const step_runs = run.step_runs ?? prev?.step_runs ?? [];
+  return prev ? { ...prev, ...run, step_runs } : { ...run, step_runs };
+}
+
 // Active pipeline runs store
 function createActiveRunsStore() {
   const { subscribe, set, update } = writable<Map<string, PipelineRun>>(new Map());
@@ -132,7 +148,10 @@ function createActiveRunsStore() {
         update(prev => {
           const next = new Map<string, PipelineRun>();
           for (const run of runs) {
-            next.set(run.id, run);
+            // Membership comes from the payload (see above); CONTENT is
+            // merged over what we already held so a summary row cannot drop
+            // step state the viewer is showing.
+            next.set(run.id, mergeRun(prev.get(run.id), run));
           }
           if (runs.length > 0 && runs.length >= limit) {
             const pageFloor = Math.min(...runs.map(r => timestampOrder(r.created_at)));
@@ -162,7 +181,7 @@ function createActiveRunsStore() {
         const runs = await pipelinesApi.runs(pipelineId, limit);
         update(map => {
           for (const run of runs) {
-            map.set(run.id, run);
+            map.set(run.id, mergeRun(map.get(run.id), run));
           }
           return new Map(map);
         });
@@ -180,7 +199,7 @@ function createActiveRunsStore() {
       try {
         const run = await runsApi.get(runId);
         update(map => {
-          map.set(run.id, run);
+          map.set(run.id, mergeRun(map.get(run.id), run));
           return new Map(map);
         });
         return run;
@@ -195,7 +214,7 @@ function createActiveRunsStore() {
       try {
         const run = await runsApi.cancel(runId);
         update(map => {
-          map.set(run.id, run);
+          map.set(run.id, mergeRun(map.get(run.id), run));
           return new Map(map);
         });
         return run;
@@ -214,12 +233,7 @@ function createActiveRunsStore() {
 
     updateRun(run: PipelineRun) {
       update(map => {
-        // WS pipeline_run_status frames omit step_runs; a bare replace would
-        // wipe step state the viewer is rendering. Merge, preserving the
-        // previously-known step_runs when the incoming run lacks them.
-        const prev = map.get(run.id);
-        const step_runs = run.step_runs ?? prev?.step_runs ?? [];
-        map.set(run.id, { ...prev, ...run, step_runs });
+        map.set(run.id, mergeRun(map.get(run.id), run));
         return new Map(map);
       });
     },
@@ -315,7 +329,17 @@ export const runsByStatus = derived(activeRunsStore, ($runs) => {
 // remains authoritative once a step completes.
 // -----------------------------------------------------------------------------
 
-/** Bound on retained live lines per step so a chatty step can't grow memory unbounded. */
+/**
+ * Bound on retained live lines per step so a chatty step can't grow memory
+ * unbounded.
+ *
+ * KNOWN EDGE, deliberately left: consumers render these keyed by position, so
+ * the one flush that crosses this bound shifts every line up and rewrites the
+ * whole pane - a selection held at that moment is lost. Below the bound (every
+ * ordinary run) the list only ever grows and nothing already rendered is
+ * touched. Fixing the edge properly means giving each line a stable absolute
+ * number, which changes this store's value shape.
+ */
 const MAX_LIVE_LOG_LINES = 2000;
 
 export function stepLogKey(runId: string, stepIndex: number): string {

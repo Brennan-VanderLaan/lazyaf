@@ -1,19 +1,27 @@
 <script lang="ts">
+  import { getContext } from 'svelte';
   import { BaseEdge, EdgeLabel, getBezierPath, type EdgeProps } from '@xyflow/svelte';
   import type { EdgeCondition } from '../../api/types';
+  import { GRAPH_ACTIONS, type GraphActions } from './actions';
 
+  // `data` carries PLAIN VALUES ONLY. The edit handlers come from the editor
+  // through context, keyed by this edge's own id — a function inside `data`
+  // makes Svelte Flow's structuredClone probe throw and log a spurious
+  // "Use $state.raw for edges" warning. See ./actions.ts.
   interface Props extends EdgeProps {
     data?: {
       condition: EdgeCondition;
       isActive?: boolean;
       isCompleted?: boolean;
-      onConditionChange?: (condition: EdgeCondition) => void;
-      onDelete?: () => void;
     };
   }
 
+  const actions = getContext<GraphActions | undefined>(GRAPH_ACTIONS);
+
   let {
     id,
+    source,
+    target,
     sourceX,
     sourceY,
     targetX,
@@ -25,10 +33,22 @@
     markerEnd,
   }: Props = $props();
 
-  // Check if this is a self-loop (source and target very close)
-  let isSelfLoop = $derived(
-    Math.abs(sourceX - targetX) < 50 && Math.abs(sourceY - targetY) < 50
-  );
+  // A self-loop is an edge whose two ends are the SAME node. This used to be
+  // guessed from screen distance — `Math.abs(sourceX - targetX) < 50 &&
+  // Math.abs(sourceY - targetY) < 50` — and that proxy was wrong in BOTH
+  // directions, which is why it is now decided from the node ids the edge
+  // already carries:
+  //
+  //   - two DISTINCT nodes sitting close together got a circular loop drawn
+  //     between them instead of a connector. Measured: once the Start node was
+  //     moved clear of step_0, its source handle at x=64 sat 36px from that
+  //     step's target handle, under the threshold, and the Start -> first step
+  //     edge of every legacy pipeline rendered as a teardrop hanging in space;
+  //   - a REAL self-loop was never detected at all. A step node is 180px wide,
+  //     so its own source and target handles are ~180px apart — always over the
+  //     threshold — and a step wired back to itself drew a degenerate bezier
+  //     rather than a loop.
+  let isSelfLoop = $derived(source === target);
 
   // Generate self-loop path (circular loop above the node)
   function getSelfLoopPath(x: number, y: number): [string, number, number] {
@@ -70,7 +90,7 @@
   let showConditionPicker = $state(false);
 
   function setCondition(newCondition: EdgeCondition) {
-    data?.onConditionChange?.(newCondition);
+    actions?.setEdgeCondition(id, newCondition);
     showConditionPicker = false;
   }
 </script>
@@ -156,7 +176,7 @@
         <hr class="picker-divider" />
         <button
           class="picker-option delete"
-          onclick={() => { showConditionPicker = false; data?.onDelete?.(); }}
+          onclick={() => { showConditionPicker = false; actions?.deleteEdge(id); }}
         >
           <span class="option-icon">×</span>
           <span class="option-label">Delete Edge</span>

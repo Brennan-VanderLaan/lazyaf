@@ -11,12 +11,31 @@
 
   let job: Job | null = null;
   let logs: string = '';
+  /**
+   * The log body, ONE ENTRY PER LINE.
+   *
+   * `<pre>{logs}</pre>` was a single text node, and the 3s poll below replaces
+   * `logs` wholesale. Every poll therefore rewrote that node and collapsed any
+   * selection over it - highlighting part of a failing test to copy it was
+   * impossible while the job was still running. Split here so an unchanged
+   * line is an unchanged DOM node.
+   */
   let showLogs = false;
   let loadingLogs = false;
   let logsError: string | null = null;
   let logsInterval: ReturnType<typeof setInterval> | null = null;
   /** Ticks so a queued/running job's elapsed time advances without a store update. */
   let now = Date.now();
+
+  $: logLines = splitLogLines(logs);
+
+  function splitLogLines(text: string): string[] {
+    if (!text) return [];
+    const lines = text.split('\n');
+    // A trailing newline terminates the last line, it is not an empty one.
+    if (lines[lines.length - 1] === '') lines.pop();
+    return lines;
+  }
 
   // Subscribe to the job store for this card
   $: jobFromStore = jobId ? getJobForCard(cardId) : null;
@@ -47,11 +66,16 @@
   async function loadLogs() {
     if (!jobId) return;
     loadingLogs = true;
-    logsError = null;
+    // Cleared on SUCCESS, not here: clearing up front made a banner from a
+    // failing 3s poll blink out and back on every tick.
     try {
       const response = await jobsApi.logs(jobId);
       logs = response.logs;
+      logsError = null;
     } catch (e) {
+      // R1: name the failure, but do NOT throw away logs already on screen.
+      // A single failed poll used to replace the transcript the user was
+      // reading with a bare error line.
       logsError = e instanceof Error ? e.message : 'Failed to load logs';
     } finally {
       loadingLogs = false;
@@ -155,18 +179,23 @@
 
     {#if showLogs}
       <div class="job-logs" data-testid="job-logs">
-        {#if job?.status === 'queued'}
+        {#if logsError}
+          <div class="logs-error" data-testid="logs-error">{logsError}</div>
+        {/if}
+        {#if job?.status === 'queued' && logLines.length === 0}
           <div class="logs-empty">Waiting for runner to pick up job...</div>
-        {:else if loadingLogs && !logs}
+        {:else if loadingLogs && logLines.length === 0}
           <div class="logs-loading">Loading logs...</div>
-        {:else if logsError}
-          <div class="logs-error">{logsError}</div>
-        {:else if logs}
-          <pre>{logs}</pre>
+        {:else if logLines.length > 0}
+          <div class="logs-body" data-testid="job-logs-body">
+            {#each logLines as line, i (i)}
+              <div class="log-line">{line}</div>
+            {/each}
+          </div>
           {#if job?.status === 'running'}
             <div class="logs-streaming">Streaming... (updates every 3s)</div>
           {/if}
-        {:else}
+        {:else if !logsError}
           <div class="logs-empty">No logs available yet</div>
         {/if}
       </div>
@@ -274,15 +303,19 @@
     overflow: auto;
   }
 
-  .job-logs pre {
-    margin: 0;
+  .logs-body {
     padding: 0.75rem;
     font-family: 'Fira Code', 'Consolas', monospace;
     font-size: 0.8rem;
     line-height: 1.5;
     color: var(--text-color, #cdd6f4);
+  }
+
+  .logs-body .log-line {
     white-space: pre-wrap;
     word-break: break-all;
+    /* An empty log line is still a line. */
+    min-height: 1.2em;
   }
 
   .logs-loading,

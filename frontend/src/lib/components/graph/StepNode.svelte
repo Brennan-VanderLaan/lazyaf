@@ -75,6 +75,16 @@
   role="button"
   tabindex="0"
   ondblclick={() => data.onEdit?.()}
+  onkeydown={(e) => {
+    // This div claims role="button" and takes tab focus, so Enter and Space
+    // have to open the step the way a double-click does. Without this it was a
+    // dead end: focusable, announced as a button, and inert on every key.
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+      e.preventDefault();
+      e.stopPropagation();
+      data.onEdit?.();
+    }
+  }}
 >
   <!-- Input Handle - always shown, connections from Start node determine entry points -->
   <Handle type="target" position={Position.Left} />

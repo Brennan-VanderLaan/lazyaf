@@ -216,6 +216,12 @@ def workspace_volume_name(pipeline_run_id: str) -> str:
 
     Imported lazily from the workspace state machine so this module stays
     importable without the SQLAlchemy stack (the CLI-side contract test).
+
+    DEFAULT LANE, deliberately. Since M13-1 a run may own one workspace per
+    parallel worker (generate_volume_name takes an optional lane key), but a
+    human attaching a shell wants the trunk checkout, and every pipeline
+    that does not fan out has only that one. Attaching the sidecar to a
+    CHOSEN lane is an M13 follow-up, not something this silently guesses.
     """
     from app.services.workspace.state_machine import generate_volume_name
 

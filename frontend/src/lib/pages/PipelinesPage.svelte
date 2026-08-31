@@ -186,7 +186,7 @@
             <span class="section-hint">.lazyaf/pipelines/</span>
           </div>
           <div class="pipelines-grid" data-testid="pipeline-list">
-            {#each repoPipelines as pipeline}
+            {#each repoPipelines as pipeline (pipeline.filename ?? pipeline.name)}
               <div class="pipeline-card repo-card" data-testid="pipeline" data-pipeline-name={pipeline.name}>
                 <div class="card-header">
                   <h3 title={pipeline.name}>
@@ -242,8 +242,14 @@
         {:else if $pipelinesStore.length === 0}
           <p class="empty-section">No platform pipelines. <button class="btn-link" on:click={handleCreate}>Create one</button></p>
         {:else}
+          <!-- Keyed by id. `pipelinesStore` is rewritten by `pipeline_updated`
+               / `pipeline_deleted` WebSocket frames; unkeyed, Svelte reuses
+               each card BY POSITION, so a frame that removes a pipeline
+               rewrites the card under the cursor and a click already in flight
+               lands on Run/Edit for a DIFFERENT pipeline - which starts a paid
+               agent container. -->
           <div class="pipelines-grid" data-testid="pipeline-list">
-            {#each $pipelinesStore as pipeline}
+            {#each $pipelinesStore as pipeline (pipeline.id)}
               <div class="pipeline-card" data-testid="pipeline" data-pipeline-id={pipeline.id}>
                 <div class="card-header">
                   <h3 title={pipeline.name}>{pipeline.name}</h3>
@@ -301,7 +307,12 @@
                 </tr>
               </thead>
               <tbody>
-                {#each allRuns as run}
+                <!-- Keyed by id. `allRuns` re-derives from a Map that
+                     `loadRecent()` replaces wholesale every 3s, and a newer run
+                     sorts in at the top. Unkeyed, row 0 stayed the SAME <tr>
+                     element and simply changed which run it described, so a
+                     click aimed at one run opened another. -->
+                {#each allRuns as run (run.id)}
                   <tr class="run-row" on:click={() => handleViewRun(run)}>
                     <td>
                       <span class="status-badge" style="color: {getStatusColor(run.status as RunStatus)}">
@@ -312,7 +323,7 @@
                     <td>
                       <div class="progress-cell">
                         <div class="step-badges">
-                          {#each run.step_runs || [] as stepRun, i}
+                          {#each run.step_runs || [] as stepRun (stepRun.step_index)}
                             <span
                               class="step-badge"
                               style="background: {getStatusColor(stepRun.status as RunStatus)}"
@@ -355,11 +366,20 @@
 {/if}
 
 <style>
+  /* `overflow: hidden` here turned "off-screen" into "unreachable": the
+     sidebar keeps 260px of a 375px viewport, this page then gets 115px, and
+     "+ New Pipeline" laid out at x=484 was clipped away with no scrollbar
+     anywhere on the page to reach it. Scrolling on the x axis instead means
+     the primary action is always reachable. At every width where the content
+     fits (measured: 1024 and up) no scrollbar appears, so nothing changes on a
+     desktop. The proper narrow-width answer is a collapsing sidebar, which
+     lives in App.svelte. */
   .pipelines-page {
     flex: 1;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    overflow-x: auto;
+    overflow-y: hidden;
     padding: 1.5rem 2rem;
   }
 
@@ -368,6 +388,10 @@
     justify-content: space-between;
     align-items: center;
     margin-bottom: 1.5rem;
+    /* Matches SpecsPage / ExperimentsPage / EndpointsPage: the action drops
+       below the title rather than off the side when the row cannot fit. */
+    flex-wrap: wrap;
+    gap: 0.75rem;
   }
 
   .header-left {

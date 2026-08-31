@@ -11,10 +11,50 @@
   import SpecsPage from './lib/pages/SpecsPage.svelte';
   import ExperimentsPage from './lib/pages/ExperimentsPage.svelte';
   import EndpointsPage from './lib/pages/EndpointsPage.svelte';
+  import { get } from 'svelte/store';
   import { websocketStore } from './lib/stores/websocket';
+  import { reposStore, selectedRepoId } from './lib/stores/repos';
   import { hasRunningJobs } from './lib/stores/jobs';
   import { hasActiveRuns } from './lib/stores/pipelines';
   import { isRunning as playgroundRunning } from './lib/stores/playground';
+
+  /**
+   * Which repository you were looking at, remembered across reloads.
+   *
+   * `selectedRepoId` is in-memory only, so a refresh - or a restored tab, or
+   * following a link - dropped every page in the app back to its "select a
+   * repository" dead end with no breadcrumb. Three separate QA lenses filed
+   * this against the board, the pipelines page and the playground; it is one
+   * fact, so it is remembered in one place.
+   *
+   * This is deliberately NOT the URL. Putting the repo in the route would
+   * make boards shareable and is the better end state, but it is a routing
+   * change across every page; this is the additive half that stops the
+   * refresh from hurting.
+   */
+  const SELECTED_REPO_KEY = 'lazyaf.selected-repo';
+
+  /**
+   * A browser that refuses storage (private windows, storage disabled) makes
+   * us forget the selection - it does not make the app wrong. Nothing is
+   * swallowed here except the inability to remember a convenience.
+   */
+  function rememberSelectedRepo(id: string | null) {
+    try {
+      if (id) localStorage.setItem(SELECTED_REPO_KEY, id);
+      else localStorage.removeItem(SELECTED_REPO_KEY);
+    } catch {
+      /* storage unavailable - the selection just will not survive a reload */
+    }
+  }
+
+  function readRememberedRepo(): string | null {
+    try {
+      return localStorage.getItem(SELECTED_REPO_KEY);
+    } catch {
+      return null;
+    }
+  }
 
   const routes = {
     '/': BoardPage,
@@ -26,12 +66,49 @@
     '/endpoints': EndpointsPage,
   };
 
+  let stopRemembering: (() => void) | null = null;
+
   onMount(() => {
     websocketStore.connect();
+
+    // Read BEFORE subscribing: the persist subscription below fires
+    // immediately with the current (null) value, which would erase the key.
+    const remembered = readRememberedRepo();
+    let restored = !remembered;
+
+    // Restore only once the repo is actually in the list. Setting an id that
+    // no longer exists would leave every page asking for cards on a deleted
+    // repository, which is a worse landing than the empty state.
+    const unsubRepos = reposStore.subscribe(repos => {
+      if (restored) return;
+      if (get(selectedRepoId)) {
+        restored = true;   // the user got there first; do not move them
+        return;
+      }
+      if (repos.some(r => r.id === remembered)) {
+        restored = true;
+        selectedRepoId.set(remembered);
+      }
+    });
+
+    let primed = false;
+    const unsubSelected = selectedRepoId.subscribe(id => {
+      if (!primed) {
+        primed = true;
+        return;
+      }
+      rememberSelectedRepo(id);
+    });
+
+    stopRemembering = () => {
+      unsubRepos();
+      unsubSelected();
+    };
   });
 
   onDestroy(() => {
     websocketStore.disconnect();
+    stopRemembering?.();
   });
 </script>
 

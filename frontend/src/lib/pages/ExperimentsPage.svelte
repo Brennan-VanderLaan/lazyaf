@@ -236,12 +236,16 @@
 {/if}
 
 <style>
+  /* See the note in PipelinesPage: `overflow: hidden` made content that did
+     not fit permanently unreachable at narrow widths instead of merely
+     off-screen. No scrollbar appears at any width where the content fits. */
   .experiments-page {
     flex: 1;
     display: flex;
     flex-direction: column;
     padding: 1.5rem 2rem;
-    overflow: hidden;
+    overflow-x: auto;
+    overflow-y: hidden;
   }
 
   .page-header {
@@ -276,6 +280,15 @@
     grid-template-columns: minmax(240px, 22rem) 1fr;
     gap: 1.25rem;
     min-height: 0;
+  }
+
+  /* The 240px minimum on the list column plus a detail column does not fit
+     beside the sidebar on a phone-width screen; stack them instead of forcing
+     the page 157px wider than the space it has. */
+  @media (max-width: 760px) {
+    .columns {
+      grid-template-columns: 1fr;
+    }
   }
 
   .sidebar,

@@ -78,6 +78,65 @@ def playground_branch(session_id: str) -> str:
     return f"playground/{session_id[:8]}"
 
 
+# PipelineRun.status -> playground session status.
+#
+# The durable run and the in-memory session have always spoken two
+# vocabularies ("passed" vs "completed", "pending" vs "queued"). This is the
+# ONE place that translates between them, so a history row and a live session
+# can never disagree about what a run's state is called (R3).
+_RUN_STATUS_TO_SESSION = {
+    "pending": "queued",
+    "running": "running",
+    "passed": "completed",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
+
+
+def session_status_for_run(run_status: str | None) -> str:
+    """Translate a RunStatus into the playground session vocabulary.
+
+    An unmapped status is reported as "failed", not silently as "completed":
+    a state nobody taught this table about is not a success.
+    """
+    if run_status in _RUN_STATUS_TO_SESSION:
+        return _RUN_STATUS_TO_SESSION[run_status]
+    logger.warning(
+        "Playground history: unmapped run status %r - reporting 'failed'",
+        run_status,
+    )
+    return "failed"
+
+
+def _elapsed(started_at, completed_at) -> float | None:
+    if not started_at or not completed_at:
+        return None
+    return (completed_at - started_at).total_seconds()
+
+
+def _adhoc_step_config(pipeline) -> dict:
+    """The single agent step's config off a hidden ad-hoc pipeline row.
+
+    Returns {} for anything unreadable - a history LIST must not be taken out
+    by one malformed row, and the caller renders "(no prompt recorded)"
+    rather than pretending it knows the prompt.
+    """
+    import json as _json
+
+    try:
+        steps = _json.loads(pipeline.steps or "[]")
+    except (TypeError, ValueError):
+        logger.warning(
+            "Playground history: pipeline %s has unreadable steps JSON",
+            pipeline.id[:8],
+        )
+        return {}
+    if not isinstance(steps, list) or not steps:
+        return {}
+    config = steps[0].get("config")
+    return config if isinstance(config, dict) else {}
+
+
 @dataclass
 class PlaygroundSession:
     """Tracks an active playground test session."""
@@ -647,6 +706,142 @@ class PlaygroundService:
             "logs": "\n".join(session.logs),
             "duration_seconds": duration,
         }
+
+
+    # -------------------------------------------------------------------------
+    # Durable reads: the RUN record, not the in-memory cache
+    # -------------------------------------------------------------------------
+    #
+    # ``self._sessions`` is a live-streaming cache with a 30-minute TTL, not
+    # the system of record. Every playground run already leaves a complete
+    # durable trail behind it (12.5): a PipelineRun with
+    # ``trigger_type='playground'`` and ``trigger_ref=<session_id>``, whose
+    # single StepRun carries the whole transcript in ``logs``, hanging off a
+    # hidden ``__lazyaf_adhoc__:playground:<id>`` Pipeline whose step config
+    # carries the prompt, agent, model and branches.
+    #
+    # The endpoints below read THAT. No new table and no migration: history
+    # was never a persistence gap, it was a missing read path, and inventing a
+    # second store for facts the platform already writes would put two
+    # sources of truth on one contract (R3).
+    #
+    # ONE THING IS GENUINELY NOT DURABLE, and is reported as such rather than
+    # papered over: the DIFF. A playground run pushes to
+    # ``playground/<id[:8]>`` and ``agent_run._dispose_playground_branch``
+    # DELETES that ref as soon as the diff has been computed, so a diff read
+    # after the session is swept cannot be recomputed. ``source="run"`` on the
+    # result says so out loud instead of answering ``diff: null``, which is
+    # indistinguishable from "the agent changed nothing" (R1).
+
+    async def list_runs(self, db, repo_id: str, limit: int = 20) -> list[dict]:
+        """Recent playground runs for a repo, newest first."""
+        from sqlalchemy import select
+
+        from app.models import Pipeline, PipelineRun
+        from app.services.agent_run import TRIGGER_PLAYGROUND
+
+        result = await db.execute(
+            select(PipelineRun, Pipeline)
+            .join(Pipeline, PipelineRun.pipeline_id == Pipeline.id)
+            .where(Pipeline.repo_id == repo_id)
+            .where(PipelineRun.trigger_type == TRIGGER_PLAYGROUND)
+            .order_by(PipelineRun.created_at.desc())
+            .limit(limit)
+        )
+
+        summaries: list[dict] = []
+        for run, pipeline in result.all():
+            config = _adhoc_step_config(pipeline)
+            session = self._sessions.get(run.trigger_ref or "")
+            summaries.append(
+                {
+                    "session_id": run.trigger_ref or run.id,
+                    "run_id": run.id,
+                    "status": (
+                        session.status
+                        if session is not None
+                        else session_status_for_run(run.status)
+                    ),
+                    "prompt": (
+                        config.get("task")
+                        or config.get("description")
+                        or config.get("title")
+                        or "(no prompt recorded)"
+                    ),
+                    "agent": config.get("agent"),
+                    "model": config.get("model"),
+                    "base_branch": config.get("base_branch"),
+                    "work_branch": config.get("branch"),
+                    "created_at": run.created_at,
+                    "started_at": run.started_at,
+                    "completed_at": run.completed_at,
+                    "duration_seconds": _elapsed(run.started_at, run.completed_at),
+                    "live": session is not None,
+                }
+            )
+        return summaries
+
+    async def get_result_from_run(self, db, session_id: str) -> dict | None:
+        """Rebuild a result from the durable run when the session is gone.
+
+        Returns None when no playground run ever carried this session id -
+        which is a real 404, unlike the 404 this used to raise about data that
+        was sitting in the database the whole time.
+        """
+        run = await self._load_run(db, session_id)
+        if run is None:
+            return None
+
+        steps = sorted(run.step_runs, key=lambda s: s.step_index)
+        logs = "\n".join(step.logs for step in steps if step.logs)
+        error = next((step.error for step in steps if step.error), None)
+        return {
+            "session_id": session_id,
+            "status": session_status_for_run(run.status),
+            "diff": None,
+            "files_changed": [],
+            "branch_saved": None,
+            "error": error,
+            "logs": logs,
+            "duration_seconds": _elapsed(run.started_at, run.completed_at),
+            "source": "run",
+        }
+
+    async def get_status_from_run(self, db, session_id: str) -> dict | None:
+        """Status of a past playground run, read from its PipelineRun."""
+        run = await self._load_run(db, session_id)
+        if run is None:
+            return None
+        return {
+            "session_id": session_id,
+            "status": session_status_for_run(run.status),
+            "started_at": run.started_at,
+            "completed_at": run.completed_at,
+            "source": "run",
+        }
+
+    async def _load_run(self, db, session_id: str):
+        """The PipelineRun a playground session left behind, steps loaded.
+
+        ``step_runs`` is eager-loaded on purpose: walking a lazy relationship
+        after the await boundary raises MissingGreenlet under asyncio, which
+        is the same trap ``_cancel_run_with`` documents one screen up.
+        """
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+
+        from app.models import PipelineRun
+        from app.services.agent_run import TRIGGER_PLAYGROUND
+
+        result = await db.execute(
+            select(PipelineRun)
+            .where(PipelineRun.trigger_type == TRIGGER_PLAYGROUND)
+            .where(PipelineRun.trigger_ref == session_id)
+            .options(selectinload(PipelineRun.step_runs))
+            .order_by(PipelineRun.created_at.desc())
+            .limit(1)
+        )
+        return result.scalars().first()
 
 
 # Global instance

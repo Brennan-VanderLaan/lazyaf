@@ -180,8 +180,31 @@
     expanded = { ...expanded, [id]: !expanded[id] };
   }
 
+  function closeModal() {
+    showModal = false;
+    editing = null;
+  }
+
+  /**
+   * Escape closes the register/edit dialog.
+   *
+   * Every other modal in the app does this (CardModal, AgentFileModal,
+   * graph/StepConfigModal, debug/DebugRerunModal), so a dialog that ignores
+   * Escape breaks a habit the rest of the app teaches; measured before the fix,
+   * the only way out was the small "x". The handler lives on the page rather
+   * than in EndpointModal because the page owns `showModal`.
+   */
+  function handleKeydown(event: KeyboardEvent) {
+    if (event.key === 'Escape' && showModal) {
+      event.stopPropagation();
+      closeModal();
+    }
+  }
+
   let endpoints = $derived($endpointsStore);
 </script>
+
+<svelte:window onkeydown={handleKeydown} />
 
 <div class="page" data-testid="endpoints-page">
   <header class="page-header">
@@ -443,14 +466,7 @@
 </div>
 
 {#if showModal}
-  <EndpointModal
-    endpoint={editing}
-    onSave={save}
-    onCancel={() => {
-      showModal = false;
-      editing = null;
-    }}
-  />
+  <EndpointModal endpoint={editing} onSave={save} onCancel={closeModal} />
 {/if}
 
 <style>
@@ -579,20 +595,27 @@
     font-size: 0.85rem;
   }
 
+  /* `white-space: nowrap` made the HEADER the widest thing in four columns —
+     "CONCURRENCY" forced 114px for a cell reading "0 / 1 busy", "CAPABILITIES"
+     103px for 60px of chips, "COST BASIS" 93px for "$0.35/hr". Measured, the
+     table needed 1042px inside an 894px scroller at 1280x800; letting the
+     labels wrap onto a second line and tightening the cell padding recovers
+     enough that the whole table fits, so nothing is occluded at the width this
+     is usually demoed at. */
   th {
     text-align: left;
-    padding: 0.6rem 0.75rem;
+    padding: 0.6rem 0.5rem;
     background: var(--surface-alt);
     border-bottom: 1px solid var(--border-color);
     font-size: 0.72rem;
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--text-muted);
-    white-space: nowrap;
+    vertical-align: bottom;
   }
 
   td {
-    padding: 0.6rem 0.75rem;
+    padding: 0.6rem 0.5rem;
     border-bottom: 1px solid var(--border-color);
     vertical-align: top;
   }
@@ -605,8 +628,37 @@
     text-align: right;
   }
 
+  /* Eight columns do not fit beside a 320px sidebar: measured at 1280x800 the
+     table is 1130px inside an 894px scroller, so Probe / Edit / Delete started
+     at x=1239 - past the right edge of the window. The row's actions were
+     effectively absent unless you found the table's faint inner scrollbar, and
+     at 1024 the overflow is 452px. Pinning the last column to the right of the
+     scroller keeps the per-row actions on screen at every width; the rest of
+     the row still scrolls under it. */
   .actions {
     white-space: nowrap;
+    position: sticky;
+    right: 0;
+    z-index: 1;
+    background: var(--bg-color);
+    border-left: 1px solid var(--border-color);
+    /* At widths too narrow for the whole table the rest of the row scrolls
+       UNDER this column. The shadow is what makes that read as a pinned pane
+       rather than as content sliced in half. */
+    box-shadow: -10px 0 10px -10px rgba(0, 0, 0, 0.9);
+  }
+
+  th.right {
+    position: sticky;
+    right: 0;
+    z-index: 2;
+    background: var(--surface-alt);
+    border-left: 1px solid var(--border-color);
+    box-shadow: -10px 0 10px -10px rgba(0, 0, 0, 0.9);
+  }
+
+  .actions button {
+    padding: 0.4rem 0.6rem;
   }
 
   .actions button + button {
@@ -619,9 +671,15 @@
     margin-top: 0.15rem;
   }
 
+  /* The URL sub-line was the widest thing in the Name column and it already
+     truncates with an ellipsis and a `title` tooltip, so trimming it costs a
+     hover rather than the information. Together with the wrapping headers this
+     is what brings the table under the 894px available at 1280x800, so the
+     Enabled toggle stops being the thing that scrolls under the pinned actions
+     at the width this is usually demoed at. */
   .sub.url {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    max-width: 28ch;
+    max-width: 20ch;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

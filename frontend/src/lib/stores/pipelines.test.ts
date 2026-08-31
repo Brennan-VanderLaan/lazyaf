@@ -171,3 +171,65 @@ describe('hasActiveRuns', () => {
     expect(get(hasActiveRuns)).toBe(false);
   });
 });
+
+describe('activeRunsStore merges runs by id instead of replacing them', () => {
+  function makeStep(over: Record<string, unknown> = {}) {
+    return {
+      id: 'sr-0',
+      pipeline_run_id: 'r1',
+      step_index: 0,
+      step_name: 'build',
+      status: 'running',
+      executor: 'local',
+      job_id: null,
+      logs: null,
+      error: null,
+      started_at: '2026-01-01T00:00:00Z',
+      completed_at: null,
+      created_at: '2026-01-01T00:00:00Z',
+      ...over,
+    } as never;
+  }
+
+  /**
+   * Runs arrive from four places that do not all carry the same fields. A
+   * payload that omits `step_runs` used to blank the step timeline the open
+   * viewer was rendering - it emptied and refilled on a 3s cycle, moving the
+   * row the user was about to click.
+   */
+  it('loadRecent keeps step_runs a summary payload does not mention', async () => {
+    activeRunsStore.addRun(makeRun({ id: 'r1', status: 'running', step_runs: [makeStep()] }));
+
+    const summary = makeRun({ id: 'r1', status: 'running' });
+    delete (summary as unknown as Record<string, unknown>).step_runs;
+    listMock.mockResolvedValue([summary]);
+    await activeRunsStore.loadRecent();
+
+    expect(get(activeRunsStore).get('r1')?.step_runs).toHaveLength(1);
+  });
+
+  it('loadRecent still takes every field the payload DOES carry', async () => {
+    activeRunsStore.addRun(makeRun({ id: 'r1', status: 'running', steps_completed: 1, step_runs: [makeStep()] }));
+
+    listMock.mockResolvedValue([
+      makeRun({ id: 'r1', status: 'passed', steps_completed: 3, step_runs: [makeStep({ status: 'passed' })] }),
+    ]);
+    await activeRunsStore.loadRecent();
+
+    const run = get(activeRunsStore).get('r1');
+    expect(run?.status).toBe('passed');
+    expect(run?.steps_completed).toBe(3);
+    expect(run?.step_runs?.[0].status).toBe('passed');
+  });
+
+  it('updateRun keeps step_runs that a pipeline_run_status frame omits', () => {
+    activeRunsStore.addRun(makeRun({ id: 'r1', status: 'running', step_runs: [makeStep()] }));
+
+    const frame = makeRun({ id: 'r1', status: 'passed' });
+    delete (frame as unknown as Record<string, unknown>).step_runs;
+    activeRunsStore.updateRun(frame);
+
+    expect(get(activeRunsStore).get('r1')?.status).toBe('passed');
+    expect(get(activeRunsStore).get('r1')?.step_runs).toHaveLength(1);
+  });
+});

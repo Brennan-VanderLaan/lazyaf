@@ -1,7 +1,7 @@
 import json
 from enum import Enum
 from typing import Any, Optional
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import inspect as sa_inspect
 
 from app.models.card import StepType
@@ -20,6 +20,79 @@ class EdgeCondition(str, Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     ALWAYS = "always"
+
+
+#: Terminal actions a NODE may fire when it completes. Deliberately NOT the
+#: v1 vocabulary: `next` and `stop` are FLOW and flow lives on edges. What is
+#: left is pure side effect, which is why these are a LIST - v1 could not say
+#: "merge and also spawn a fix card", because it had one string for both the
+#: effect and the continuation.
+TERMINAL_ACTION_PREFIXES = ("trigger:", "merge:")
+
+_TERMINAL_VOCABULARY = "'trigger:{card_id}' or 'merge:{branch}'"
+
+
+def describe_terminal_action(action: Any) -> str | None:
+    """None when `action` is a dispatchable NODE action, else why it is not.
+
+    The graph twin of `describe_step_action` (pipeline_executor), and the
+    SINGLE definition of the node-action vocabulary (R3): the schema
+    validator below and the executor's dispatcher both call this, so a typo
+    is a 422 at the boundary and a named run failure at run time - never a
+    silent no-op.
+    """
+    if not isinstance(action, str):
+        return (
+            f"step action must be a string, got {type(action).__name__} "
+            f"({action!r}); valid node actions are {_TERMINAL_VOCABULARY}"
+        )
+    if action in ("next", "stop"):
+        return (
+            f"{action!r} is control FLOW, not a node action; express it with "
+            f"a graph edge (or the absence of one). Valid node actions are "
+            f"{_TERMINAL_VOCABULARY}"
+        )
+    if action.startswith("trigger:pipeline:"):
+        return (
+            "'trigger:pipeline:' is retired (12.8; it had no users and no "
+            "execution test). Chain pipelines with a card_complete or push "
+            f"trigger. Valid node actions are {_TERMINAL_VOCABULARY}"
+        )
+    for prefix in TERMINAL_ACTION_PREFIXES:
+        if action.startswith(prefix):
+            if action[len(prefix):].strip():
+                return None
+            return (
+                f"node action {action!r} names {prefix!r} with an empty "
+                f"target; valid node actions are {_TERMINAL_VOCABULARY}"
+            )
+    return (
+        f"unknown node action {action!r}; valid node actions are "
+        f"{_TERMINAL_VOCABULARY}"
+    )
+
+
+class StepActions(BaseModel):
+    """Side effects a node fires when it completes.
+
+    Keyed by the SAME condition vocabulary the edges use (EdgeCondition), so
+    the system has one notion of "when" (R3). Actions are effects ONLY: they
+    never decide what runs next and they never complete the run. The
+    executor fires them, then continues its normal fan-out and its normal
+    `_check_all_steps_passed` verdict.
+    """
+    success: list[str] = []
+    failure: list[str] = []
+    always: list[str] = []
+
+    @field_validator("success", "failure", "always")
+    @classmethod
+    def _closed_vocabulary(cls, v: list[str]) -> list[str]:
+        for action in v:
+            problem = describe_terminal_action(action)
+            if problem is not None:
+                raise ValueError(problem)
+        return v
 
 
 class PipelineNodePosition(BaseModel):
@@ -45,6 +118,16 @@ class PipelineStepV2(BaseModel):
     position: Optional[PipelineNodePosition] = None  # UI layout position
     timeout: int = 300  # Seconds
     continue_in_context: bool = False  # If true, next step runs with preserved workspace
+    # Side effects this node fires when it completes (12.8). NOT named
+    # `on_success`/`on_failure`: routers/pipelines.export_pipeline_yaml
+    # already writes those keys on a graph step meaning "the id of the node
+    # this success edge points at", so reusing them would put two
+    # vocabularies behind one key (R3). Namespacing under `actions.` also
+    # makes the condition vocabulary the SAME one the edges use.
+    #
+    # Purely additive: an absent `actions` is an empty StepActions, so every
+    # graph written before this field existed keeps its exact meaning.
+    actions: StepActions = Field(default_factory=StepActions)
 
 
 class PipelineGraphModel(BaseModel):
@@ -122,6 +205,14 @@ class TriggerConfig(BaseModel):
 
 class PipelineStepConfig(BaseModel):
     """Configuration for a pipeline step (stored in Pipeline.steps JSON array)."""
+    # Stable id for the graph node this step becomes (12.8, §1.6b). Optional
+    # because the v1 array never had one and every persisted row predates it;
+    # `array_to_graph` falls back to `step_{index}`. It exists so the ids an
+    # author already writes in `.lazyaf/pipelines/*.yaml` (PipelineStepYaml.id
+    # has always accepted them) SURVIVE the conversion instead of being
+    # renamed to `step_0..step_9` - node ids are the context-directory names,
+    # the debug breakpoint keys and what a human reads in the graph.
+    id: str | None = None
     name: str
     type: StepType
     config: dict[str, Any] = {}  # Type-specific: {command}, {image, command}, {runner_type, title, description}
@@ -176,6 +267,20 @@ class PipelineRead(PipelineBase):
     repo_id: str
     steps: list[PipelineStepConfig] = []
     steps_graph: Optional[PipelineGraphModel] = None  # Graph-based definition (v2)
+    # Why a definition failed to materialize, or None when it did (12.8,
+    # §1.7). `sync_repo_pipelines` swallows every parse exception into a
+    # logger.warning and keeps the STALE definition on purpose ("a broken CI
+    # file must not break the push"), so a conversion REFUSAL landing there
+    # would be dark by construction - the whole "refuse loudly" strategy
+    # would become an R1 violation with no channel to surface on. This is
+    # that channel: set when conversion refuses, cleared on a successful
+    # sync, rendered as a badge, and read by the run guards.
+    #
+    # Reads `None` until the column lands (the additive ALTER is B3's, and
+    # `from_attributes` falls back to the default for an attribute the ORM
+    # does not declare yet) - so this is safe to land ahead of it, and is
+    # pinned by a test.
+    definition_error: str | None = None
     triggers: list[TriggerConfig] = []
     is_template: bool
     created_at: UTCDateTime
@@ -415,27 +520,183 @@ class PipelineRunCreate(BaseModel):
 # Conversion Utilities
 # =============================================================================
 
-def array_to_graph(steps: list[PipelineStepConfig]) -> PipelineGraphModel:
+class ArrayConversionError(ValueError):
+    """A v1 array the graph cannot faithfully hold. Carries every reason.
+
+    Subclasses ValueError on purpose: `array_to_graph` has always raised one
+    for the empty array, and pydantic turns a ValueError raised inside a
+    validator into a 422 rather than a 500. `.reasons` is the list a caller
+    renders (a `definition_error` badge, §1.7); `str(exc)` joins them.
     """
-    Convert legacy array-based steps to graph model.
 
-    This preserves the sequential execution order by creating success edges
-    between consecutive steps. Auto-layout positions nodes vertically.
+    def __init__(self, reasons: list[str]):
+        self.reasons = reasons
+        super().__init__("; ".join(reasons))
 
-    Args:
-        steps: Legacy array of PipelineStepConfig
 
-    Returns:
-        PipelineGraphModel with sequential edges and auto-layout positions
+def _resolved_step_ids(steps: list[PipelineStepConfig]) -> list[str]:
+    """The graph node id for each array step: `step.id`, else `step_{i}`.
+
+    Raises ArrayConversionError on an empty id, a duplicate, or an authored
+    id that collides with the id generated for a step that has none. This
+    runs BEFORE anything is built because `graph_steps` is a dict keyed by
+    id: two steps resolving to one id would not be an error at all, it would
+    be one step silently overwriting the other (R1).
+    """
+    authored = [
+        (step.id if isinstance(step.id, str) else None) for step in steps
+    ]
+    resolved: list[str] = []
+    reasons: list[str] = []
+
+    for i, raw in enumerate(authored):
+        if raw is None:
+            resolved.append(f"step_{i}")
+            continue
+        if not raw.strip():
+            reasons.append(
+                f"step #{i} ({steps[i].name!r}) declares an empty id "
+                f"({raw!r}); give it a non-empty id, or omit `id` entirely "
+                f"to get the generated 'step_{i}'"
+            )
+            # Keep positions aligned so later reasons still name the right
+            # step; this list is discarded, we are already refusing.
+            resolved.append(f"step_{i}")
+            continue
+        resolved.append(raw)
+
+    first_seen: dict[str, int] = {}
+    for i, step_id in enumerate(resolved):
+        first = first_seen.get(step_id)
+        if first is None:
+            first_seen[step_id] = i
+            continue
+        if authored[first] and authored[i]:
+            reasons.append(
+                f"duplicate step id {step_id!r}: steps #{first} "
+                f"({steps[first].name!r}) and #{i} ({steps[i].name!r}) both "
+                "declare it, and a graph keys its steps by id"
+            )
+        else:
+            authored_index = i if authored[i] else first
+            generated_index = first if authored[i] else i
+            reasons.append(
+                f"step #{authored_index} ({steps[authored_index].name!r}) "
+                f"declares id {step_id!r}, which collides with the id "
+                f"generated for step #{generated_index} "
+                f"({steps[generated_index].name!r}) - a step without an `id` "
+                f"becomes 'step_{{index}}'. Rename it, or give step "
+                f"#{generated_index} an explicit id too"
+            )
+
+    if reasons:
+        raise ArrayConversionError(reasons)
+    return resolved
+
+
+def array_to_graph(steps: list[PipelineStepConfig]) -> PipelineGraphModel:
+    """Convert a v1 array definition to the graph the executor runs.
+
+    FAITHFUL OR REFUSING, never lossy (12.8 §1.6/§4.2). v1's `on_success` /
+    `on_failure` carried two things in one string:
+
+      * FLOW - `next` becomes an edge to the following step; `stop` becomes
+        the absence of one. Flow lives on edges and only on edges.
+      * EFFECT - `merge:{branch}` / `trigger:{card_id}` become entries in
+        the node's `actions`, keyed by the same condition. v1's `_merge_branch`
+        and `_trigger_card` BOTH continue to `current_step + 1` after firing,
+        so the faithful rendering of a non-final effect is the action AND a
+        success/failure edge. On the last step it is the action alone, since
+        `_execute_step` guards its continuation with `current_step + 1 <
+        len(steps)`.
+
+    Everything else refuses, naming the step, the offending value and the
+    vocabulary. Until 12.8 this function emitted an edge only for the literal
+    string `"next"` and dropped `merge:` / `trigger:` on the floor - and its
+    `if i < len(steps) - 1:` guard meant an action on the LAST step (the
+    common "merge when this passes" shape) was never even examined. That
+    silence is the R1 violation this whole retirement exists to remove, so
+    the one thing this function may never do is convert something it cannot
+    represent.
+
+    Raises:
+        ArrayConversionError: with every reason it found.
     """
     if not steps:
-        raise ValueError("Cannot convert empty steps array to graph")
+        raise ArrayConversionError([
+            "cannot convert an empty steps array to a graph: a graph must "
+            "have at least one entry point, so there is no such thing as an "
+            "empty pipeline definition"
+        ])
+
+    resolved = _resolved_step_ids(steps)
 
     graph_steps: dict[str, PipelineStepV2] = {}
     edges: list[PipelineEdge] = []
+    reasons: list[str] = []
+    #: Did step i emit ANY edge to step i+1? In an array conversion every
+    #: edge runs i -> i+1 and step 0 is the sole entry point, so this is the
+    #: only thing that can reach step i+1. It is recorded here as we build
+    #: rather than recomputed, and it is used ONLY to attribute a defect to
+    #: the step that caused it - the decision to refuse comes from
+    #: `graph_definition_errors` below, which is the one authority on what
+    #: makes a graph runnable (R3).
+    continues_to_next: list[bool] = [False] * len(steps)
 
     for i, step in enumerate(steps):
-        step_id = f"step_{i}"
+        step_id = resolved[i]
+        next_id = resolved[i + 1] if i + 1 < len(steps) else None
+        collected: dict[str, list[str]] = {"success": [], "failure": []}
+
+        for condition, action in (
+            (EdgeCondition.SUCCESS, step.on_success),
+            (EdgeCondition.FAILURE, step.on_failure),
+        ):
+            if action == "stop":
+                # Flow: this outcome ends the run. No edge. Whether that
+                # orphans the tail is decided below, not guessed at here.
+                continue
+
+            if action == "next":
+                # Flow: continue. On the LAST step v1's own continuation
+                # guard made this a no-op, so it is no-edge-and-no-refusal
+                # here too - the dogfood pipeline's tenth step is exactly
+                # this shape and it must stay convertible.
+                if next_id is not None:
+                    edges.append(PipelineEdge(
+                        id=f"edge_{i}_{condition.value}",
+                        from_step=step_id,
+                        to_step=next_id,
+                        condition=condition,
+                    ))
+                    continues_to_next[i] = True
+                continue
+
+            # Effect. `describe_terminal_action` is the SINGLE definition of
+            # the node-action vocabulary (R3), so a form this accepts is one
+            # the executor's dispatcher can run, and a form it refuses gets
+            # the same message here that a hand-authored graph gets at 422 -
+            # including the `trigger:pipeline:` retirement notice.
+            problem = describe_terminal_action(action)
+            if problem is not None:
+                reasons.append(
+                    f"step '{step_id}' (#{i}, {step.name!r}) declares "
+                    f"on_{condition.value}={action!r}: {problem}"
+                )
+                continue
+
+            collected[condition.value].append(action)
+            if next_id is not None:
+                # v1 fired the effect and then ran the next step. Dropping
+                # the edge here would silently truncate the pipeline.
+                edges.append(PipelineEdge(
+                    id=f"edge_{i}_{condition.value}",
+                    from_step=step_id,
+                    to_step=next_id,
+                    condition=condition,
+                ))
+                continues_to_next[i] = True
+
         graph_steps[step_id] = PipelineStepV2(
             id=step_id,
             name=step.name,
@@ -444,35 +705,56 @@ def array_to_graph(steps: list[PipelineStepConfig]) -> PipelineGraphModel:
             position=PipelineNodePosition(x=100, y=i * 150),  # Vertical layout
             timeout=step.timeout,
             continue_in_context=step.continue_in_context,
+            # Constructed, not appended into: `StepActions._closed_vocabulary`
+            # runs on construction and not on an in-place `.append`, and the
+            # converter's output has to clear the same bar a hand-authored
+            # graph does. `describe_terminal_action` has already accepted
+            # every entry, so this can only fire if the two ever drift - at
+            # which point it is a loud ValidationError here rather than an
+            # un-dispatchable action persisted into a definition (R3).
+            actions=StepActions(**collected),
         )
 
-        # Create edge to next step based on on_success
-        if i < len(steps) - 1:
-            next_id = f"step_{i + 1}"
+    if reasons:
+        # Raise on the vocabulary before checking reachability: a refused
+        # action emitted no edge, so its step would ALSO be reported as
+        # orphaning the tail. That is a consequence, not a second cause, and
+        # a reason list padded with consequences hides the one that matters.
+        raise ArrayConversionError(reasons)
 
-            # Handle on_success: "next" creates a success edge
-            if step.on_success == "next":
-                edges.append(PipelineEdge(
-                    id=f"edge_{i}_success",
-                    from_step=step_id,
-                    to_step=next_id,
-                    condition=EdgeCondition.SUCCESS,
-                ))
-
-            # Handle on_failure: "next" creates a failure edge to next step
-            if step.on_failure == "next":
-                edges.append(PipelineEdge(
-                    id=f"edge_{i}_failure",
-                    from_step=step_id,
-                    to_step=next_id,
-                    condition=EdgeCondition.FAILURE,
-                ))
-
-    entry_point = "step_0"
-
-    return PipelineGraphModel(
+    graph = PipelineGraphModel(
         steps=graph_steps,
         edges=edges,
-        entry_points=[entry_point],
+        entry_points=[resolved[0]],
         version=2,
     )
+
+    # `graph_definition_errors` is the executor's definition-time check and
+    # the single authority on whether a graph can run (R3) - imported
+    # lazily-by-value, the way app/schemas/experiment.py and
+    # app/schemas/model_endpoint.py already reach into app.services, so the
+    # schema layer does not take a module-level dependency on the executor's
+    # import graph. Running it HERE is what turns "a mid-array stop orphans
+    # the tail" from a run that fails at execution time for the wrong reason
+    # into a refusal at the boundary that names the step responsible.
+    from app.services.pipeline_executor import graph_definition_errors
+
+    defects = graph_definition_errors(graph.model_dump(mode="json"))
+    if defects:
+        for i in range(len(steps) - 1):
+            if continues_to_next[i]:
+                continue
+            step = steps[i]
+            reasons.append(
+                f"step '{resolved[i]}' (#{i}, {step.name!r}) continues on "
+                f"neither outcome (on_success={step.on_success!r}, "
+                f"on_failure={step.on_failure!r}), which leaves the "
+                f"{len(steps) - i - 1} step(s) after it unreachable - a v1 "
+                f"array reaches step #{i + 1} only from step #{i}. Move the "
+                f"remaining steps into their own pipeline, or let this one "
+                f"continue"
+            )
+        reasons.extend(defects)
+        raise ArrayConversionError(reasons)
+
+    return graph

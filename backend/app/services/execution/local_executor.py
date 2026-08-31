@@ -607,6 +607,8 @@ class LocalExecutor:
                 - pipeline_run_id: Pipeline run UUID
                 - step_run_id: Step run UUID
                 - step_index: Step index in pipeline
+                - step_id: the step's GRAPH NODE ID (12.8). Absent/None on a
+                  marker StepRun, which names no node.
                 - execution_key: Unique key for idempotency
                 - workspace_volume: Docker NAMED VOLUME for the workspace
                 - control_mode: EXPLICIT reporting-mode flag, decided at
@@ -700,7 +702,20 @@ class LocalExecutor:
         environment["LAZYAF_USAGE_PROVIDER"] = str(
             step_config.get("usage_provider") or DEFAULT_USAGE_PROVIDER
         )
+        # LAZYAF_STEP_ID (12.8): the step's GRAPH NODE ID - the id its author
+        # wrote in the pipeline definition, and the key `StepRun.step_id`
+        # carries. It travels alongside LAZYAF_STEP_INDEX rather than
+        # replacing it: the index is still how the websocket frames, the
+        # execution key and the state machine address a step, but it is
+        # DERIVED from `list(steps_dict.keys()).index(step_id)`, so anything
+        # in-container that needs to know WHICH STEP IT IS should ask by id.
+        # scripts/verify_executor.py's self-exemption is the first such
+        # reader. Emitted only when the StepRun names a node: a marker row
+        # (`_trigger_card`) deliberately carries step_id=None, and an absent
+        # variable says "this run step is not a graph node" honestly, where
+        # an empty string would read as a node whose id is "".
         for key, source in (
+            ("LAZYAF_STEP_ID", execution_context.get("step_id")),
             ("LAZYAF_ROLE", step_config.get("role")),
             ("LAZYAF_GPU_NODE_ID", execution_context.get("gpu_node_id")),
             ("LAZYAF_GPU_FRACTION", execution_context.get("gpu_fraction")),

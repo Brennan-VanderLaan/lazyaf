@@ -189,6 +189,8 @@ class RunnerFactory(BaseFactory):
 # Import Pipeline models
 from app.models.pipeline import Pipeline, PipelineRun, StepRun, RunStatus
 
+from .pipelines import graph_json
+
 
 class PipelineFactory(BaseFactory):
     """Factory for creating Pipeline instances."""
@@ -206,13 +208,30 @@ class PipelineFactory(BaseFactory):
     updated_at = factory.LazyFunction(datetime.utcnow)
 
     class Params:
-        """Parameters for creating pipelines in specific states."""
+        """Parameters for creating pipelines in specific states.
+
+        12.8: the traits write `steps_graph`, not `steps`. They used to hold
+        hand-written v1 array JSON; after the retirement that array is not a
+        definition the executor can run, so a trait producing one would build
+        a pipeline that looks defined and never executes.
+        """
 
         with_steps = factory.Trait(
-            steps='[{"name": "Test", "type": "script", "config": {"command": "npm test"}, "on_success": "next", "on_failure": "stop", "timeout": 300}]',
+            steps_graph=factory.LazyFunction(lambda: graph_json([
+                {"name": "Test", "type": "script",
+                 "config": {"command": "npm test"}},
+            ])),
         )
         multi_step = factory.Trait(
-            steps='[{"name": "Lint", "type": "script", "config": {"command": "npm run lint"}, "on_success": "next", "on_failure": "stop", "timeout": 300}, {"name": "Test", "type": "script", "config": {"command": "npm test"}, "on_success": "next", "on_failure": "stop", "timeout": 300}, {"name": "Build", "type": "script", "config": {"command": "npm run build"}, "on_success": "stop", "on_failure": "stop", "timeout": 300}]',
+            steps_graph=factory.LazyFunction(lambda: graph_json([
+                {"name": "Lint", "type": "script",
+                 "config": {"command": "npm run lint"}},
+                {"name": "Test", "type": "script",
+                 "config": {"command": "npm test"}},
+                {"name": "Build", "type": "script",
+                 "config": {"command": "npm run build"},
+                 "on_success": "stop"},
+            ])),
         )
 
 

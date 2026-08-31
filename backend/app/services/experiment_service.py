@@ -926,6 +926,7 @@ async def start_cell_run(
     """
     from app.services.agent_run import (
         adhoc_pipeline_name,
+        adhoc_steps_graph,
         build_agent_step_config,
     )
     from app.services.pipeline_executor import pipeline_executor
@@ -976,6 +977,14 @@ async def start_cell_run(
         extra=overlay,
     )
 
+    # A LINEAR chain, and `adhoc_steps_graph` joins it with SUCCESS edges
+    # only. That is what keeps the rule this cell depends on: a crashed agent
+    # produced no measurement, so verify must NOT run and paper a 0% over it
+    # (the `error` classification). Under v1 that rule was the agent step's
+    # `on_failure: "stop"`; under the graph it is the ABSENCE of a failure
+    # edge out of `agent`, which is the same statement with nowhere left to
+    # hide it. `on_success: "next"` on both steps is the agent -> verify
+    # success edge and, on the last step, was always a no-op.
     steps: list[dict[str, Any]] = [
         {
             "id": "agent",
@@ -983,10 +992,6 @@ async def start_cell_run(
             "type": "agent",
             "config": step_config,
             "timeout": experiment.cell_timeout,
-            "on_success": "next",
-            # A crashed agent produced no measurement, so verify must not run
-            # and paper a 0% over it. That is the `error` classification.
-            "on_failure": "stop",
         }
     ]
     verify = parse_verify(experiment.verify)
@@ -998,8 +1003,6 @@ async def start_cell_run(
                 "type": "script",
                 "config": {"image": verify.image, "command": verify.command},
                 "timeout": verify.timeout,
-                "on_success": "next",
-                "on_failure": "stop",
             }
         )
 
@@ -1012,8 +1015,7 @@ async def start_cell_run(
             f"{experiment.id[:8]} cell {cell.cell_index}. Hidden from "
             "GET /api/pipelines; its RUN is visible."
         ),
-        steps=json.dumps(steps),
-        steps_graph=None,
+        steps_graph=adhoc_steps_graph(steps),
         triggers="[]",
         is_template=False,
     )

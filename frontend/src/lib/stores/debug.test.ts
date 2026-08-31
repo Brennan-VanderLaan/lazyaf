@@ -4,10 +4,12 @@
  * Three things are pinned here because each of them is a way this feature can
  * fail SILENTLY, which is the only way it is allowed to fail loudly:
  *
- *  1. BREAKPOINT IDENTITY. A legacy step's key is its index-as-a-string, not
- *     its optional `config.id`; a graph step's key is its step id. Get this
- *     wrong and the backend accepts a key that no gate will ever match - a
- *     breakpoint that never fires, with no error anywhere.
+ *  1. BREAKPOINT IDENTITY. A graph step's key is its step id, and a pipeline
+ *     with no graph offers NO keys rather than invented positional ones. Get
+ *     this wrong and the backend accepts a key that no gate will ever match -
+ *     a breakpoint that never fires, with no error anywhere. (Before 12.8
+ *     there was a second rule for the v1 array - index-as-a-string, never the
+ *     optional `config.id` - and the retirement of the array retired it.)
  *  2. SNAPSHOT-THEN-DELTA. `debug_session_status` frames only arrive on a
  *     change, and a session parked at a breakpoint changes nothing for hours,
  *     so a delta-only store shows an empty panel over a wedged pipeline after
@@ -80,19 +82,18 @@ function makeSession(overrides: Partial<DebugSessionInfo> = {}): DebugSessionInf
   };
 }
 
-function legacyPipeline(): Pipeline {
+/**
+ * A row with no executable definition at all. Since 12.8 `PipelineRead` has
+ * no `steps` array to fall back to, so this is the ONLY shape that can
+ * produce an empty option list - and the point of the fixture is that it
+ * produces an empty list rather than invented keys.
+ */
+function definitionlessPipeline(): Pipeline {
   return {
     id: 'p1',
     repo_id: 'r1',
-    name: 'legacy',
+    name: 'no-definition',
     description: null,
-    steps: [
-      // `id` here is a v1 CONTEXT-DIRECTORY reference, NOT a step_run.step_id.
-      // If the resolver ever keys off it, this fixture catches it.
-      { id: 'ctx-alpha', name: 'setup', type: 'script', config: {} },
-      { name: 'build', type: 'script', config: {} },
-      { name: 'verify', type: 'test', config: {} },
-    ],
     triggers: [],
     is_template: false,
     created_at: '',
@@ -102,8 +103,8 @@ function legacyPipeline(): Pipeline {
 
 function graphPipeline(): PipelineV2 {
   return {
-    ...legacyPipeline(),
-    steps: [],
+    ...definitionlessPipeline(),
+    name: 'graph',
     steps_graph: {
       version: 2,
       // Deliberately NOT in execution order, so a pass-through of
@@ -140,17 +141,21 @@ describe('breakpoint identity (client half of ONE resolver)', () => {
     expect(debugStepKey({ step_id: 'build', step_index: 3 })).toBe('build');
   });
 
-  it('a legacy step run with no step_id is keyed by its index as a string', () => {
+  it('the graph-defect step run - the only one with no step_id - keys by index', () => {
+    // `pipeline_executor` still writes ONE StepRun without a step_id: the
+    // row it creates when a graph cannot be executed at all
+    // (step_name = "pipeline graph"). Dropping this fallback would key it
+    // the string "null".
     expect(debugStepKey({ step_id: null, step_index: 3 })).toBe('3');
   });
 
-  it('legacy pipeline options are index keys, NOT the step config id', () => {
-    const options = debugBreakpointOptions(legacyPipeline());
-    expect(options.map((o) => o.key)).toEqual(['0', '1', '2']);
-    // The regression this exists to prevent: keying off `config.id` would
-    // yield 'ctx-alpha', which no gate can ever match.
-    expect(options.map((o) => o.key)).not.toContain('ctx-alpha');
-    expect(options.map((o) => o.name)).toEqual(['setup', 'build', 'verify']);
+  it('a pipeline with no graph offers NO breakpoints, never invented index keys', () => {
+    // 12.8: the v1 array is gone, so there is nothing to fall back TO. The
+    // regression this exists to prevent is the fallback coming back in any
+    // form: positional keys for a definitionless row would be breakpoints
+    // the backend accepts and no gate can ever match.
+    expect(debugBreakpointOptions(definitionlessPipeline())).toEqual([]);
+    expect(debugBreakpointOptions({ ...definitionlessPipeline(), steps_graph: null } as unknown as PipelineV2)).toEqual([]);
   });
 
   it('graph pipeline options are step ids in entry-point-first traversal order', () => {

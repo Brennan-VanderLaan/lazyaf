@@ -125,8 +125,15 @@ def _drive(server, scenario: str, turns: int, messages=None) -> list[dict]:
 # -----------------------------------------------------------------------------
 
 class TestScenarioSet:
-    def test_all_nine_named_scenarios_are_served(self):
+    def test_every_named_scenario_is_served(self):
+        """The nine of wave8 s8.1, plus M14.6's seven modality scenarios.
+
+        Kept as an exact set rather than a subset check: a scenario that is
+        defined but not reachable, or reachable under a name nothing asserts,
+        is a scenario that quietly stops being tested.
+        """
         assert set(SCENARIOS) == {
+            # wave8 s8.1 - what the ASSISTANT says
             "happy_tools",
             "happy_text",
             "never_finishes",
@@ -136,6 +143,14 @@ class TestScenarioSet:
             "lying_tools",
             "slow",
             "flaky_5xx",
+            # M14.6 - how the SERVER treats the request's content parts
+            "vision_wire",
+            "vision_refuses",
+            "vision_silent_drop",
+            "audio_wire",
+            "vision_ollama",
+            "vision_blind_ollama",
+            "vision_ollama_old",
         }
 
     def test_control_endpoint_lists_them(self, server):

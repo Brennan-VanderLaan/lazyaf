@@ -48,28 +48,40 @@ function repo(over: Record<string, unknown> = {}) {
 }
 
 /**
- * A LEGACY (v1) pipeline: `steps_graph` is null, so PipelineEditorPage runs
- * `convertLegacyToGraph`, which parks step_0 at { x: 100, y: 0 }. Every
- * pipeline defined in `.lazyaf/pipelines/*.yaml` has this shape.
+ * A one-step pipeline, in the shape `GET /api/pipelines/{id}` returns since
+ * 12.8 P3: a GRAPH, and no `steps` array at all.
+ *
+ * It used to be a v1 row (`steps: [...]`, `steps_graph: null`) that relied on
+ * `PipelineEditorPage.convertLegacyToGraph` to build the graph on the fly.
+ * That function is gone with the array - conversion happens once, at the YAML
+ * boundary - so a fixture shaped like that now loads NOTHING and the editor
+ * (correctly) refuses to open it. The position is the one the converter used
+ * to invent, { x: 100, y: 0 }, so every layout assertion below is measuring
+ * the same geometry it always was.
  */
-function legacyPipeline(over: Record<string, unknown> = {}) {
+function graphPipeline(over: Record<string, unknown> = {}) {
   return {
     id: PIPELINE_ID,
     repo_id: REPO_ID,
     name: 'nightly',
     description: 'Runs the suite',
-    steps: [
-      {
-        name: 'Echo',
-        type: 'script',
-        config: { command: 'echo hello' },
-        on_success: 'next',
-        on_failure: 'stop',
-        timeout: 300,
-        continue_in_context: false,
+    steps_graph: {
+      version: 2,
+      entry_points: ['step_0'],
+      steps: {
+        step_0: {
+          id: 'step_0',
+          name: 'Echo',
+          type: 'script',
+          config: { command: 'echo hello' },
+          position: { x: 100, y: 0 },
+          timeout: 300,
+          continue_in_context: false,
+        },
       },
-    ],
-    steps_graph: null,
+      edges: [],
+    },
+    definition_error: null,
     triggers: [],
     is_template: false,
     created_at: naiveUtc(),
@@ -164,7 +176,7 @@ async function mockApi(
         return route.fulfill(json(opts.pipelines ?? []));
       }
       if (path === `/api/pipelines/${PIPELINE_ID}`) {
-        return route.fulfill(json(opts.pipeline ?? legacyPipeline()));
+        return route.fulfill(json(opts.pipeline ?? graphPipeline()));
       }
       if (path === '/api/model-endpoints') return route.fulfill(json(opts.endpoints ?? []));
       if (path === '/api/models') return route.fulfill(json([]));
@@ -177,14 +189,35 @@ async function mockApi(
   );
 }
 
-/** A platform pipeline row, as `/api/repos/{id}/pipelines` returns it. */
+/**
+ * A platform pipeline row, as `/api/repos/{id}/pipelines` returns it since
+ * 12.8 P3 - i.e. with a graph and no `steps` array. These rows only ever
+ * populate the list for the console-cleanliness and layout specs, so the
+ * graph is the smallest legal one.
+ */
 function platformPipeline(id: string, name: string) {
   return {
     id,
     repo_id: REPO_ID,
     name,
     description: null,
-    steps: [],
+    steps_graph: {
+      version: 2,
+      entry_points: ['step_0'],
+      steps: {
+        step_0: {
+          id: 'step_0',
+          name: 'Echo',
+          type: 'script',
+          config: { command: 'echo hello' },
+          position: { x: 100, y: 0 },
+          timeout: 300,
+          continue_in_context: false,
+        },
+      },
+      edges: [],
+    },
+    definition_error: null,
     triggers: [],
     is_template: false,
     created_at: naiveUtc(),
@@ -268,8 +301,9 @@ test.describe('console is clean', () => {
 test.describe('graph editor layout', () => {
   /**
    * The START disc sat ON the first step's lower-left corner for every legacy
-   * pipeline. Exact arithmetic: the v1->v2 migration puts step_0 at
-   * { x: 100, y: 0 } (PipelineEditorPage.svelte `convertLegacyToGraph`) while
+   * pipeline. Exact arithmetic: the v1->v2 conversion puts step_0 at
+   * { x: 100, y: 0 } (it was `PipelineEditorPage.convertLegacyToGraph`; since
+   * 12.8 it is `array_to_graph` at the YAML boundary, same coordinates) while
    * the Start node defaulted to { x: 50, y: 50 } at 64x64 — 50+64=114 runs past
    * the step's x=100, and the boxes overlapped by 14x21px. Measured on the QA
    * stack before the fix; deterministic, not a layout race.
@@ -339,7 +373,7 @@ test.describe('graph editor layout', () => {
   test('a genuine self-loop is still drawn as a loop', async ({ page }) => {
     await mockApi(page, {
       pipeline: {
-        ...legacyPipeline(),
+        ...graphPipeline(),
         steps_graph: {
           version: 2,
           entry_points: ['step_0'],

@@ -1,21 +1,25 @@
-"""QA-4: LazyAF's own YAML export cannot be re-imported by LazyAF.
+"""QA-4 (FIXED at 12.8 §4.10): LazyAF's own YAML export re-imports into LazyAF.
 
-``GET /api/pipelines/{id}/export/yaml`` (backend/app/routers/pipelines.py:490)
-serialises a v2 graph pipeline into a document that
-``app.schemas.lazyaf_yaml.PipelineYaml`` cannot validate:
+``GET /api/pipelines/{id}/export/yaml`` used to emit a THIRD dialect that
+``app.schemas.lazyaf_yaml.PipelineYaml`` could not validate:
 
-* ``steps`` is emitted as a MAPPING keyed by step id; PipelineYaml.steps is a
+* ``steps`` as a MAPPING keyed by step id; ``PipelineYaml.steps`` is a
   ``list[PipelineStepYaml]``.
-* edge targets are written into ``on_success`` / ``on_failure`` as bare step
-  ids, or as a LIST of ids on a fan-out. The action vocabulary is
-  ``next`` | ``stop`` | ``trigger:{id}`` | ``merge:{branch}``; a bare id falls
-  through ``_handle_action``'s else branch and stops the pipeline.
-* ``timeout`` and ``continue_in_context`` are dropped entirely.
-* ``entry_points`` and ``version`` are emitted but PipelineYaml has no such
-  fields, so they are discarded on the way back in.
+* edge TARGETS written into ``on_success`` / ``on_failure`` as bare step ids,
+  or as a LIST of ids on a fan-out. The action vocabulary is
+  ``next`` | ``stop`` | ``trigger:{id}`` | ``merge:{branch}``; a bare id fell
+  through to the unknown-action branch and stopped the pipeline.
+* ``timeout`` and ``continue_in_context`` dropped entirely - and, once
+  terminal actions landed at 12.8 P1, ``actions`` too, so an exported
+  ``merge:`` silently stopped merging.
 
 Net effect: export a graph pipeline, commit it to .lazyaf/pipelines/, and it
-silently disappears from the repo's pipeline list.
+silently disappeared from the repo's pipeline list.
+
+The export now emits the ARRAY AUTHORING DIALECT - the shape a human writes
+in `.lazyaf/pipelines/*.yaml` - and REFUSES (409, naming the construct) for
+any graph the array cannot express. These tests were four
+``xfail(strict=True)`` findings; they are the positive assertions now.
 """
 
 import os
@@ -37,7 +41,7 @@ pytestmark = pytest.mark.qa4
 
 @pytest.fixture()
 def exported_yaml(create_pipeline):
-    """Export a fan-out graph carrying a non-default timeout."""
+    """Export a LINEAR graph carrying a non-default timeout + continuation."""
     status, pipeline = create_pipeline({
         "name": "qa4-export-roundtrip",
         "steps_graph": graph(
@@ -46,42 +50,30 @@ def exported_yaml(create_pipeline):
                 step("b"),
                 step("c"),
             ],
-            [edge("e1", "a", "b"), edge("e2", "a", "c")],
+            [edge("e1", "a", "b"), edge("e2", "b", "c")],
             ["a"],
         ),
     })
     assert status == 201, repr(pipeline)[:300]
     status, text = api("GET", f"/api/pipelines/{pipeline['id']}/export/yaml")
-    assert status == 200, f"{status} {str(text)[:200]}"
+    assert status == 200, f"{status} {str(text)[:400]}"
     return text
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA4-10a: export emits `steps` as a mapping, but the "
-        "importer (PipelineYaml) requires a list. Committing LazyAF's own "
-        "export to .lazyaf/pipelines/ makes the pipeline silently vanish from "
-        "the repo listing."
-    ),
-)
 def test_exported_graph_yaml_uses_the_shape_the_importer_expects(exported_yaml):
+    """QA4-10a: `steps` is a LIST, which is what PipelineYaml requires."""
     data = yaml.safe_load(exported_yaml)
     assert isinstance(data.get("steps"), list), (
         f"export emits steps as {type(data.get('steps')).__name__}, importer wants a list"
     )
+    assert [node["id"] for node in data["steps"]] == ["a", "b", "c"], (
+        "export order must follow the graph's own chain, and node ids must "
+        "survive - they are the context-directory names and breakpoint keys"
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA4-10b: export writes edge TARGETS into on_success. "
-        "'on_success: [b, c]' is not in the action vocabulary at all, and "
-        "'on_success: b' is treated by _handle_action as an unknown action - "
-        "which stops the pipeline and reports the step's own verdict."
-    ),
-)
 def test_exported_on_success_stays_inside_the_action_vocabulary(exported_yaml):
+    """QA4-10b: no edge TARGET is ever written where an ACTION belongs."""
     data = yaml.safe_load(exported_yaml)
     steps = data.get("steps")
     values = []
@@ -90,6 +82,7 @@ def test_exported_on_success_stays_inside_the_action_vocabulary(exported_yaml):
         for key in ("on_success", "on_failure", "on_always"):
             if key in node:
                 values.append(node[key])
+    assert values, "export wrote no actions at all"
     for value in values:
         assert isinstance(value, str), f"{value!r} is not even a string action"
         assert (
@@ -99,29 +92,93 @@ def test_exported_on_success_stays_inside_the_action_vocabulary(exported_yaml):
         ), f"{value!r} is not an action, it is an edge target"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA4-10c: export drops per-step `timeout` and "
-        "`continue_in_context`, so a round-trip silently resets every step to "
-        "the 300s default and loses workspace continuation."
-    ),
-)
 def test_export_preserves_step_timeout_and_continuation(exported_yaml):
-    assert "777" in exported_yaml, "step timeout was dropped by export"
-    assert "continue_in_context" in exported_yaml, "continue_in_context was dropped by export"
+    """QA4-10c: a round trip must not reset every step to the 300s default."""
+    first = yaml.safe_load(exported_yaml)["steps"][0]
+    assert first["timeout"] == 777, "step timeout was dropped by export"
+    assert first["continue_in_context"] is True, "continue_in_context was dropped"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA4-10: the end-to-end proof. Export a graph pipeline, "
-        "commit it to .lazyaf/pipelines/, and the repo pipeline listing does "
-        "not contain it - the get-one endpoint answers 500 with a pydantic "
-        "'Input should be a valid list' error."
-    ),
+def test_export_preserves_terminal_actions(create_pipeline):
+    """Once `merge:` lives in `actions`, a lossy export silently un-merges.
+
+    This is the field 12.8 P1 added, and it did not exist when QA4-10 was
+    filed - an export written before it would have dropped it in exactly the
+    same silence as `timeout`.
+    """
+    merging = step("m")
+    merging["actions"] = {"success": ["merge:main"], "failure": [], "always": []}
+    status, pipeline = create_pipeline({
+        "name": "qa4-export-actions",
+        "steps_graph": graph([merging], [], ["m"]),
+    })
+    assert status == 201, repr(pipeline)[:300]
+
+    status, text = api("GET", f"/api/pipelines/{pipeline['id']}/export/yaml")
+    assert status == 200, f"{status} {str(text)[:400]}"
+    assert yaml.safe_load(text)["steps"][0]["on_success"] == "merge:main"
+
+
+@pytest.mark.parametrize(
+    "name,steps,edges,entry_points,construct",
+    [
+        pytest.param(
+            "fanout",
+            [step("start"), step("a"), step("b")],
+            [edge("e1", "start", "a"), edge("e2", "start", "b")],
+            ["start"],
+            "fan-out",
+            id="fan-out",
+        ),
+        pytest.param(
+            "fanin",
+            [step("a"), step("b"), step("join")],
+            [edge("e1", "a", "join"), edge("e2", "b", "join")],
+            ["a"],
+            "fan-in",
+            id="fan-in",
+        ),
+        pytest.param(
+            "always",
+            [step("a"), step("b")],
+            [edge("e1", "a", "b", "always")],
+            ["a"],
+            "'always' edge",
+            id="always-edge",
+        ),
+        pytest.param(
+            "twoentries",
+            [step("a"), step("b")],
+            [],
+            ["a", "b"],
+            "entry points",
+            id="two-entry-points",
+        ),
+    ],
 )
+def test_inexpressible_graph_export_refuses_naming_the_construct(
+    create_pipeline, name, steps, edges, entry_points, construct
+):
+    """A graph the array cannot say is a 409, never a silent flatten.
+
+    Flattening a fan-out would hand the user a file that re-imports as a
+    DIFFERENT pipeline - the same class of silent damage on the way out that
+    `array_to_graph` refuses on the way in.
+    """
+    status, pipeline = create_pipeline({
+        "name": f"qa4-export-{name}",
+        "steps_graph": graph(steps, edges, entry_points),
+    })
+    assert status == 201, repr(pipeline)[:300]
+
+    status, body = api("GET", f"/api/pipelines/{pipeline['id']}/export/yaml")
+    assert status == 409, f"expected a refusal, got {status}: {str(body)[:300]}"
+    detail = body["detail"] if isinstance(body, dict) else str(body)
+    assert construct in detail, f"the refusal does not name the construct: {detail}"
+
+
 def test_exported_yaml_can_be_imported_back(exported_yaml, repo_id):
+    """QA4-10, the end-to-end proof: commit the export, LazyAF reads it back."""
     if shutil.which("git") is None:
         pytest.skip("git not available")
 
@@ -161,7 +218,12 @@ def test_exported_yaml_can_be_imported_back(exported_yaml, repo_id):
 
 
 def test_legacy_pipeline_export_is_importable(create_pipeline):
-    """The legacy (list) export shape does round-trip - keep it that way."""
+    """The array-shaped export round-trips - keep it that way.
+
+    The payload goes in as the v1 array, is converted to a graph at the API
+    boundary, and comes back OUT as the array again. That round trip is the
+    whole claim.
+    """
     status, pipeline = create_pipeline({
         "name": "qa4-export-legacy",
         "steps": [{"name": "L", "type": "script", "config": {"command": "echo L"}}],
@@ -171,3 +233,4 @@ def test_legacy_pipeline_export_is_importable(create_pipeline):
     assert status == 200
     data = yaml.safe_load(text)
     assert isinstance(data["steps"], list)
+    assert data["steps"][0]["name"] == "L"

@@ -80,22 +80,55 @@ VALID_TRANSITIONS: dict[DebugState, set[DebugState]] = {
 }
 
 
+#: Prefix for the key of a row that is NOT a graph step. See
+#: `debug_step_key` - it exists so a non-step row can never be handed the
+#: identity of a real one, whatever ids the pipeline author chose.
+NON_STEP_KEY_PREFIX = "!not-a-step:"
+
+
 def debug_step_key(step_run) -> str:
     """The breakpoint identity of a step (contract C2).
 
-    Graph (v2) steps are addressed by their stable `step_id`; legacy (v1)
-    steps have no id and are addressed by index. ONE function, so the gate,
-    the create-endpoint validator and the UI checkbox list cannot drift into
+    **A step IS its `step_id`.** ONE function, so the gate, the
+    create-endpoint validator and the UI checkbox list cannot drift into
     three different notions of "which step is breakpointed" - a drift whose
     only symptom would be a breakpoint that silently never fires.
 
+    12.8: the v1 array is retired, so an INDEX is no longer an address.
+    Every step a run dispatches comes from the graph and carries a
+    `step_id`; the index fallback below did not disappear, it NARROWED, and
+    what it now covers is the two bookkeeping rows a graph run writes that
+    are not steps at all:
+
+    * `_verify_graph_coverage`'s defect row - `step_id=None`,
+      `step_name="pipeline graph"`, `step_index=len(steps)`. It is a verdict
+      about the graph, not a step, and it is written terminal at completion.
+    * `_spawn_fix_card`'s `trigger:` marker, which carries **a real step's
+      `step_index`** on purpose (that is how the websocket and the state
+      machine address it) and deliberately no `step_id`, so that
+      `_latest_step_run_for` and `_graph_step_outcomes` can never mistake it
+      for the step that spawned it.
+
+    Neither is dispatchable and neither can be named by a breakpoint:
+    `resolve_step_keys` offers graph step ids and nothing else. So the
+    fallback does not address them by index - `str(step_index)` would hand
+    the marker the identity of a real step, because `array_to_graph` honours
+    author-supplied ids since 12.8 and a step may legally be called `"2"`.
+    The prefix puts these rows outside the breakpoint vocabulary by
+    construction, which is the marker's identity rule: **a row with no
+    `step_id` is not a step, and nothing can breakpoint it.**
+
+    Total on purpose rather than raising: the gate calls this on whatever row
+    it was handed, and the right answer for a row no breakpoint can name is
+    "resume", not an exception that fails the run it was asked to debug.
+
     Accepts anything with `.step_id` / `.step_index` (a StepRun row, or a
-    step-definition shim built from a pipeline's YAML at validation time).
+    step-definition shim built from a pipeline's graph at validation time).
     """
     step_id = getattr(step_run, "step_id", None)
     if step_id:
         return str(step_id)
-    return str(getattr(step_run, "step_index", 0))
+    return f"{NON_STEP_KEY_PREFIX}{getattr(step_run, 'step_index', 0)}"
 
 
 class InvalidDebugTransitionError(Exception):
@@ -269,6 +302,7 @@ __all__ = [
     "DebugStateMachine",
     "DebugStateTransition",
     "InvalidDebugTransitionError",
+    "NON_STEP_KEY_PREFIX",
     "TERMINAL_STATES",
     "VALID_TRANSITIONS",
     "debug_step_key",

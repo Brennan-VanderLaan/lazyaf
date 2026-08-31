@@ -1,6 +1,25 @@
 import { writable, derived, get } from 'svelte/store';
-import type { PlaygroundTestRequest, PlaygroundResult, PlaygroundLogEvent, PlaygroundStatus, AgentModel } from '../api/types';
+import type {
+  PlaygroundTestRequest,
+  PlaygroundResult,
+  PlaygroundLogEvent,
+  PlaygroundStatus,
+  AgentModel,
+  ModalityName,
+  ModalityState,
+  ModelEndpoint,
+} from '../api/types';
 import { playground as playgroundApi } from '../api/client';
+// Lane B owns the modality vocabulary and every sentence it renders. This
+// module CONSUMES those; it does not restate them. A second phrasing of
+// "never probed" living here is a second thing that has to stay true (R3),
+// and the whole point of the six states is that they are not paraphrasable.
+import {
+  HARNESS_AGENT,
+  MODALITIES_UNREPORTED,
+  modalitiesReported,
+  modalityCells,
+} from './endpoints';
 
 /**
  * Where a result's facts came from. Mirrors `PlaygroundResult.source` /
@@ -88,6 +107,13 @@ export const playgroundHistoryApi = {
     apiGet<PlaygroundResult & { source: ResultSource }>(
       `/playground/${sessionId}/result`
     ),
+  /**
+   * The playground's own limits and modality answers.
+   *
+   * Read rather than hardcoded so the attach hint states the numbers the
+   * validator actually enforces - see `PlaygroundAttachmentLimits`.
+   */
+  capabilities: () => apiGet<PlaygroundCapabilities>('/playground/capabilities'),
 };
 
 /**
@@ -193,6 +219,12 @@ interface PlaygroundState {
   /** session_id of the history row currently being shown, if any. */
   viewingSessionId: string | null;
 
+  // What the PLATFORM can carry (14.5). `null` until the read lands, and a
+  // null here DISABLES the attach control rather than defaulting it open:
+  // "we could not ask" is not "yes".
+  capabilities: PlaygroundCapabilities | null;
+  capabilitiesError: string | null;
+
   // Timing
   startedAt: Date | null;
   completedAt: Date | null;
@@ -229,6 +261,8 @@ const initialState: PlaygroundState = {
   historyLoading: false,
   historyError: null,
   viewingSessionId: null,
+  capabilities: null,
+  capabilitiesError: null,
   startedAt: null,
   completedAt: null,
   durationSeconds: null,
@@ -539,6 +573,44 @@ function createPlaygroundStore() {
       }
     },
 
+    /**
+     * Read the playground's own limits and modality answers, once.
+     *
+     * Idempotent by design: it is a property of the BUILD, not of a run, so
+     * calling it twice is a wasted round trip rather than a correctness
+     * problem, and a page that re-reads it on every mount is fine.
+     *
+     * A FAILURE IS RECORDED, NOT SWALLOWED. `capabilities` stays null and
+     * `capabilitiesError` carries the server's own words; `attachmentGate`
+     * then disables the attach control and says the read failed. Defaulting to
+     * a permissive answer here is the exact shape of bug this feature exists
+     * to prevent - a file accepted because nobody could confirm it would be
+     * carried.
+     */
+    async loadCapabilities(): Promise<void> {
+      if (get({ subscribe }).capabilities) return;
+      try {
+        const capabilities = await playgroundHistoryApi.capabilities();
+        if (!isCapabilityPayload(capabilities)) {
+          // A 200 carrying the wrong shape is refused rather than stored.
+          // Writing it would put `undefined` where the template reads
+          // `.modalities.find(...)`, and a page that throws mid-render leaves
+          // the attach control with no state at all - which is worse than
+          // either answer it could have given.
+          throw new Error(
+            'the playground capability read returned an unrecognised shape',
+          );
+        }
+        update((state) => ({ ...state, capabilities, capabilitiesError: null }));
+      } catch (e) {
+        update((state) => ({
+          ...state,
+          capabilities: null,
+          capabilitiesError: e instanceof Error ? e.message : String(e),
+        }));
+      }
+    },
+
     async loadHistory(): Promise<void> {
       const repoId = get({ subscribe }).repoId;
       if (!repoId) return;
@@ -696,11 +768,19 @@ function createPlaygroundStore() {
       }
       cancelFlush();
       rememberSession(null);
-      // Genuinely back to the initial state. The page's own reactive block
-      // notices `repoId` no longer matches the selected repo and re-seeds it
-      // (and re-loads history) on the next tick, so Reset clears the RUN
-      // without this method having to keep a special exception list.
-      set(initialState);
+      // Genuinely back to the initial state, with ONE carried field. The
+      // page's own reactive block notices `repoId` no longer matches the
+      // selected repo and re-seeds it (and re-loads history) on the next tick,
+      // so Reset clears the RUN without this method having to keep a special
+      // exception list.
+      //
+      // `capabilities` is carried because it is a property of the BUILD, not
+      // of the run: dropping it would make the attach hint stop stating its
+      // limits until a second round trip landed, and a control that briefly
+      // cannot say why it is disabled is the thing this feature exists to
+      // avoid. Nothing about it can be stale within one page load.
+      const { capabilities, capabilitiesError } = get({ subscribe });
+      set({ ...initialState, capabilities, capabilitiesError });
     },
 
     clearLogs() {
@@ -741,3 +821,236 @@ export const hasResult = derived(
     $state.status === 'failed' ||
     $state.status === 'cancelled'
 );
+// ===========================================================================
+// Attachments - what the PLATFORM can carry (Milestone 14.5)
+// ===========================================================================
+
+/**
+ * The playground's own limits and modality answers, straight off
+ * `GET /api/playground/capabilities`.
+ *
+ * FETCHED RATHER THAN RE-SPELLED. The caps live in
+ * `backend/app/schemas/playground.py` because that is where they are enforced;
+ * a "max 5 MiB" typed into a Svelte template beside a `5 * 1024 * 1024` in a
+ * validator is two sources of truth for one contract (R3), and the half that
+ * drifts is always the sentence a human reads. Rendering the server's numbers
+ * means the copy is wrong only if the validator is.
+ */
+export interface PlaygroundAttachmentLimits {
+  max_files: number;
+  max_bytes_per_file: number;
+  max_bytes_total: number;
+  media_types: string[];
+}
+
+/**
+ * Whether the PLATFORM can carry one modality - deliberately not a statement
+ * about any endpoint.
+ *
+ * Two different facts have to both be true before a human can attach
+ * anything: this endpoint accepted an image content part (a probe result,
+ * `EndpointCapabilities.modalities`), and LazyAF has somewhere to put one (the
+ * harness transcript). Collapsing them would make "your endpoint cannot see"
+ * and "LazyAF cannot send" the same sentence, when they call for opposite
+ * actions - probe the endpoint, versus wait for the plumbing.
+ */
+export interface PlaygroundModalitySupport {
+  modality: string;
+  attachable: boolean;
+  /** Populated in BOTH states. A greyed control always says why. */
+  reason: string;
+}
+
+export interface PlaygroundCapabilities {
+  attachment_limits: PlaygroundAttachmentLimits;
+  modalities: PlaygroundModalitySupport[];
+}
+
+/**
+ * Does this payload actually carry both halves of the capability contract?
+ *
+ * Checked because a 200 is not a promise about shape. A dev proxy, a
+ * catch-all route or a backend one version behind can all answer this path
+ * with something that is JSON and is not this - and storing it would put
+ * `undefined` where the template reads `.modalities.find(...)`. A page that
+ * throws mid-render leaves the attach control with no state at all, which is
+ * worse than either answer it could have given.
+ */
+export function isCapabilityPayload(value: unknown): value is PlaygroundCapabilities {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const candidate = value as Partial<PlaygroundCapabilities>;
+  const limits = candidate.attachment_limits;
+  return (
+    Array.isArray(candidate.modalities) &&
+    !!limits &&
+    typeof limits === 'object' &&
+    typeof limits.max_files === 'number' &&
+    typeof limits.max_bytes_per_file === 'number' &&
+    typeof limits.max_bytes_total === 'number' &&
+    Array.isArray(limits.media_types)
+  );
+}
+
+/** Render a byte count the way the attach hint states a limit. */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return 'unknown';
+  const mib = bytes / (1024 * 1024);
+  if (mib >= 1) return `${Number.isInteger(mib) ? mib : mib.toFixed(1)} MiB`;
+  const kib = bytes / 1024;
+  return `${Number.isInteger(kib) ? kib : kib.toFixed(1)} KiB`;
+}
+
+/** One sentence stating every cap, built from the SERVER's numbers. */
+export function limitsSentence(limits: PlaygroundAttachmentLimits | null): string {
+  if (!limits) return 'Limits unknown - the playground capability read failed.';
+  const kinds = limits.media_types
+    .map((t) => t.replace(/^image\//, '').toUpperCase())
+    .join(', ');
+  return (
+    `Up to ${limits.max_files} files, ${formatBytes(limits.max_bytes_per_file)} each ` +
+    `and ${formatBytes(limits.max_bytes_total)} in total. ${kinds}. ` +
+    `Anything over is refused at the edge, before a container starts.`
+  );
+}
+
+/** Which link in the chain said no. Also the control's `data-blocked-by`. */
+export type AttachBlocker =
+  | 'runner'
+  | 'no-endpoint'
+  | 'unreported'
+  | 'endpoint'
+  | 'platform'
+  | null;
+
+export interface AttachmentGate {
+  /** True only when a human could attach this RIGHT NOW. */
+  enabled: boolean;
+  blockedBy: AttachBlocker;
+  /** Why, in one sentence a human can act on. NEVER empty. */
+  reason: string;
+  /** The next thing to DO, when there is one ("Probe this endpoint."). */
+  next: string | null;
+  /** The endpoint's own six-state answer for this modality, when it has one. */
+  state: ModalityState | null;
+}
+
+/**
+ * Whether this configuration may attach one modality, and why not when it may
+ * not.
+ *
+ * THE ORDER OF THE CHECKS IS THE DESIGN, because each one sends the human
+ * somewhere different and only the first one is shown:
+ *
+ *   runner       Claude Code and Gemini are CLI agents. Their file handling
+ *                belongs to the CLI, not to an endpoint row, so "this endpoint
+ *                cannot see images" would be answering a question nobody asked.
+ *   no-endpoint  Nothing to say yet. Pick one.
+ *   unreported   The backend has no `modalities` list at all. NOT "unprobed":
+ *                probing cannot fix it, and offering Probe here sends someone
+ *                round a loop that never terminates.
+ *   endpoint     The endpoint's own answer, in Lane B's words - not
+ *                paraphrased here, because a second paraphrase is a second
+ *                thing to keep true (R3). This is the check the brief is
+ *                really about: `unprobed` and `undetectable` are DISABLED, and
+ *                each says its own sentence, because "we never asked" and "it
+ *                took the image and dropped it" lead to different actions.
+ *   platform     The endpoint says yes and LazyAF still cannot carry it. Last
+ *                on purpose: it is the same answer for every endpoint, so
+ *                showing it to someone whose endpoint was never probed would
+ *                point them at the wrong fix.
+ *
+ * FAIL CLOSED at every unknown. A missing capability read, a missing modality
+ * list and a missing cell all DISABLE. The failure this whole feature exists
+ * to prevent is a file that is accepted and never reaches the model, and an
+ * optimistic default is exactly how that ships.
+ */
+export function attachmentGate(params: {
+  runnerType: string;
+  endpoint: ModelEndpoint | null | undefined;
+  platform: PlaygroundModalitySupport | null | undefined;
+  modality?: ModalityName;
+}): AttachmentGate {
+  const modality = params.modality ?? 'images';
+
+  if (params.runnerType !== HARNESS_AGENT) {
+    return {
+      enabled: false,
+      blockedBy: 'runner',
+      reason:
+        'Claude Code and Gemini are CLI agents, not endpoints. What they can read is a property of the CLI and of the files in the workspace, not of a model endpoint row - so this control does not apply, and their blank capability strip is not a claim that they cannot see.',
+      next: 'Switch the runner to "Self-hosted endpoint" to attach here.',
+      state: null,
+    };
+  }
+
+  const endpoint = params.endpoint ?? null;
+  if (!endpoint) {
+    return {
+      enabled: false,
+      blockedBy: 'no-endpoint',
+      reason: 'No endpoint selected, so nothing has been asked about images yet.',
+      next: 'Pick a self-hosted endpoint above.',
+      state: null,
+    };
+  }
+
+  if (!modalitiesReported(endpoint)) {
+    return {
+      enabled: false,
+      blockedBy: 'unreported',
+      reason: MODALITIES_UNREPORTED,
+      next: null,
+      state: null,
+    };
+  }
+
+  const cell = modalityCells(endpoint).find((c) => c.key === modality) ?? null;
+  if (!cell) {
+    return {
+      enabled: false,
+      blockedBy: 'unreported',
+      reason: `This backend reported modality detection but said nothing about ${modality}. That is an absence, not a "no".`,
+      next: null,
+      state: null,
+    };
+  }
+
+  if (cell.state !== 'supported') {
+    return {
+      enabled: false,
+      blockedBy: 'endpoint',
+      reason: cell.detail,
+      next: cell.next,
+      state: cell.state as ModalityState,
+    };
+  }
+
+  const platform = params.platform ?? null;
+  if (!platform) {
+    return {
+      enabled: false,
+      blockedBy: 'platform',
+      reason:
+        "The playground's own capability read failed, so whether LazyAF can carry this file is unknown. Unknown is not yes.",
+      next: 'Reload the page.',
+      state: 'supported',
+    };
+  }
+  if (!platform.attachable) {
+    return {
+      enabled: false,
+      blockedBy: 'platform',
+      reason: platform.reason,
+      next: null,
+      state: 'supported',
+    };
+  }
+
+  return {
+    enabled: true,
+    blockedBy: null,
+    reason: `${endpoint.name} accepted an image content part when it was probed.`,
+    next: null,
+    state: 'supported',
+  };
+}

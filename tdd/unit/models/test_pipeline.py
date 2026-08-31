@@ -4,6 +4,7 @@ Unit tests for Pipeline, PipelineRun, and StepRun models.
 These tests verify the model structures, status transitions,
 relationships, and JSON serialization without touching the database.
 """
+import json
 import sys
 from pathlib import Path
 
@@ -60,7 +61,14 @@ class TestPipelineModel:
         assert_model_has_id(pipeline)
 
     def test_pipeline_default_steps_is_empty_json(self):
-        """Pipeline steps should default to empty JSON array."""
+        """Pipeline steps should default to empty JSON array.
+
+        12.8 P3 keeps this deliberately. `pipelines.steps` is `nullable=False`
+        with NO server_default, so the python-side `default="[]"` is the only
+        thing that lets a row be inserted without naming the column - which is
+        exactly what every converted fixture now does. It goes at P6, with the
+        column.
+        """
         pipeline = PipelineFactory.build()
         assert pipeline.steps == "[]"
 
@@ -94,6 +102,33 @@ class TestPipelineModel:
         """Pipeline with template trait has is_template=True."""
         pipeline = PipelineFactory.build(is_template=True)
         assert pipeline.is_template is True
+
+    def test_with_steps_trait_writes_a_graph_definition(self):
+        """12.8: the factory's step traits produce v2 graphs, not v1 arrays.
+
+        Without this the traits are unreferenced, and an unreferenced trait
+        that still emitted array JSON would quietly hand the next caller a
+        pipeline the executor cannot run.
+        """
+        pipeline = PipelineFactory.build(with_steps=True)
+
+        graph = json.loads(pipeline.steps_graph)
+        assert graph["version"] == 2
+        assert [n["name"] for n in graph["steps"].values()] == ["Test"]
+        assert graph["entry_points"] == ["step_0"]
+        assert graph["edges"] == []
+
+    def test_multi_step_trait_chains_its_nodes_with_success_edges(self):
+        pipeline = PipelineFactory.build(multi_step=True)
+
+        graph = json.loads(pipeline.steps_graph)
+        assert [n["name"] for n in graph["steps"].values()] == [
+            "Lint", "Test", "Build",
+        ]
+        assert [(e["from_step"], e["to_step"], e["condition"]) for e in graph["edges"]] == [
+            ("step_0", "step_1", "success"),
+            ("step_1", "step_2", "success"),
+        ]
 
 
 class TestPipelineRunModel:

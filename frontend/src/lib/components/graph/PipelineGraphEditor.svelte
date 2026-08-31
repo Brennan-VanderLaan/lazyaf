@@ -1,6 +1,6 @@
 <script lang="ts">
   import { setContext } from 'svelte';
-  import { SvelteFlow, Background, Controls, MiniMap, type Node, type Edge, type Connection } from '@xyflow/svelte';
+  import { SvelteFlow, Background, BackgroundVariant, Controls, MiniMap, type Node, type Edge, type Connection } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
 
   import type {
@@ -18,11 +18,17 @@
   import NodePalette from './NodePalette.svelte';
   import GraphToolbar from './GraphToolbar.svelte';
   import ContextMenu from './ContextMenu.svelte';
+  import ConnectPanel from './ConnectPanel.svelte';
   import StepConfigModal from './StepConfigModal.svelte';
   import { GRAPH_ACTIONS, type GraphActions } from './actions';
+  import { graphStepList } from './order';
 
-  // Special Start node ID
+  // Special Start node ID. It is an AUTHORING device only: it never appears
+  // in `graph.steps` and never in `graph.edges` - see graphToEdges.
   const START_NODE_ID = '__start__';
+
+  // Id prefix for the display-only edges drawn from Start to each entry point.
+  const START_EDGE_PREFIX = '__start_to_';
 
   // Props
   interface Props {
@@ -87,7 +93,10 @@
       data: {
         step,
         status: stepStatuses[step.id],
-        isEntryPoint: false, // Entry points now determined by Start node connections
+        // Was hardcoded `false` under a comment saying entry points are
+        // "determined by Start node connections" - which made the flag a
+        // lie for every entry point. They are determined by `entry_points`.
+        isEntryPoint: (g.entry_points ?? []).includes(step.id),
         isActive: activeStepIds.includes(step.id),
         isCompleted: completedStepIds.includes(step.id),
         onEdit: () => openStepEditor(step.id),
@@ -98,16 +107,37 @@
     return [startNode, ...stepNodes];
   }
 
-  // NOTE ON `data`: it holds PLAIN VALUES ONLY - no callbacks. Svelte Flow
-  // decides whether to warn "Use $state.raw for edges" by attempting
-  // `structuredClone(edges[0])` (node_modules/@xyflow/svelte/dist/lib/store/
-  // initial-store.svelte.js), and a function in `data` makes that throw, which
-  // it then misreports as deep reactivity. The edge's own handlers reach the
-  // editor through the GRAPH_ACTIONS context instead, keyed by edge id - which
-  // is also what the library documents `data` should be: serialisable.
+  /**
+   * ENTRY POINTS ARE NOT EDGES.
+   *
+   * `PipelineGraphModel.entry_points` is the ONE representation of "the run
+   * starts here"; `edges` may only reference real step ids, and the backend
+   * enforces exactly that (`validate_graph_integrity`: "Edge 'X' references
+   * non-existent from_step"). The Start node is an authoring device - a
+   * visible thing to drag a connection out of - so its edges are SYNTHESIZED
+   * here for display and never enter the model.
+   *
+   * This is a bug fix, and it is the reason nothing could be saved: the
+   * editor used to push real `{from_step: '__start__'}` edges into
+   * `graph.edges`, so the moment an author declared an entry point the way
+   * the UI tells them to, POST/PATCH came back 422. The only spec that would
+   * have caught it was one of the nine skipped ones - and it was skipped
+   * because it could not reach a save without connecting Start first.
+   *
+   * NOTE ON `data`: it holds PLAIN VALUES ONLY - no callbacks. Svelte Flow
+   * decides whether to warn "Use $state.raw for edges" by attempting
+   * `structuredClone(edges[0])` (node_modules/@xyflow/svelte/dist/lib/store/
+   * initial-store.svelte.js), and a function in `data` makes that throw,
+   * which it then misreports as deep reactivity. The edge's own handlers
+   * reach the editor through the GRAPH_ACTIONS context instead, keyed by
+   * edge id - which is also what the library documents `data` should be:
+   * serialisable.
+   */
   function graphToEdges(g: PipelineGraphModel): Edge[] {
-    // Convert existing edges
-    const existingEdges = g.edges.map(edge => ({
+    // Step-to-step edges. A `__start__` edge from a graph saved by the older
+    // editor is dropped rather than rendered: it is exactly the shape the
+    // API refuses, and the entry point it stood for is in `entry_points`.
+    const existingEdges = g.edges.filter(e => e.from_step !== START_NODE_ID).map(edge => ({
       id: edge.id,
       source: edge.from_step,
       target: edge.to_step,
@@ -120,98 +150,64 @@
       animated: activeStepIds.includes(edge.from_step),
     }));
 
-    // Check for entry_points that don't have edges from Start node
-    // This handles loading old pipelines that have entry_points but no Start edges
-    const startEdgeTargets = new Set(g.edges.filter(e => e.from_step === START_NODE_ID).map(e => e.to_step));
-    const missingEntryEdges: Edge[] = [];
-
+    // One synthetic edge per entry point, drawn from Start. `__start_to_` is
+    // the marker that says "this line is an entry point, not an edge"; every
+    // handler below tests for it.
+    const entryEdges: Edge[] = [];
     for (const entryPoint of g.entry_points || []) {
-      if (!startEdgeTargets.has(entryPoint) && g.steps[entryPoint]) {
-        const syntheticEdgeId = `__start_to_${entryPoint}`;
-        // Create a synthetic edge from Start to this entry point
-        missingEntryEdges.push({
-          id: syntheticEdgeId,
-          source: START_NODE_ID,
-          target: entryPoint,
-          type: 'condition',
-          data: {
-            condition: 'always' as EdgeCondition,
-            isActive: activeStepIds.includes(entryPoint),
-            isCompleted: false,
-          },
-          animated: false,
-        });
-      }
+      if (!g.steps[entryPoint]) continue;
+      entryEdges.push({
+        id: `${START_EDGE_PREFIX}${entryPoint}`,
+        source: START_NODE_ID,
+        target: entryPoint,
+        type: 'condition',
+        data: {
+          condition: 'always' as EdgeCondition,
+          isActive: activeStepIds.includes(entryPoint),
+          isCompleted: false,
+          isEntry: true,
+        },
+        animated: false,
+      });
     }
 
-    return [...existingEdges, ...missingEntryEdges];
-  }
-
-  // Add a real edge from Start node to a step (converts synthetic edge to real)
-  function addStartEdge(targetStepId: string, condition: EdgeCondition) {
-    const newEdge: PipelineEdgeType = {
-      id: generateEdgeId(),
-      from_step: START_NODE_ID,
-      to_step: targetStepId,
-      condition,
-    };
-
-    const newEdges = [...graph.edges.filter(e => !(e.from_step === START_NODE_ID && e.to_step === targetStepId)), newEdge];
-    const newGraph: PipelineGraphModel = {
-      ...graph,
-      edges: newEdges,
-      entry_points: deriveEntryPoints(newEdges),
-    };
-
-    graph = newGraph;
-    onGraphChange?.(newGraph);
+    return [...existingEdges, ...entryEdges];
   }
 
   // Reactive nodes and edges
   let nodes = $derived(graphToNodes(graph));
   let edges = $derived(graphToEdges(graph));
 
-  // Track if we've migrated entry_points for this graph
-  let migratedGraphId = $state<string | null>(null);
-
-  // Migrate legacy entry_points to real Start edges on load
-  $effect(() => {
-    // Create a stable ID for this graph to avoid re-migration
-    const graphId = Object.keys(graph.steps).sort().join(',');
-    if (migratedGraphId === graphId) return;
-
-    const startEdgeTargets = new Set(graph.edges.filter(e => e.from_step === START_NODE_ID).map(e => e.to_step));
-    const missingEntryPoints = (graph.entry_points || []).filter(
-      ep => !startEdgeTargets.has(ep) && graph.steps[ep]
-    );
-
-    if (missingEntryPoints.length > 0) {
-      // Create real edges for legacy entry_points
-      const newEdges = [...graph.edges];
-      for (const entryPoint of missingEntryPoints) {
-        newEdges.push({
-          id: `edge_start_${entryPoint}`,
-          from_step: START_NODE_ID,
-          to_step: entryPoint,
-          condition: 'always' as EdgeCondition,
-        });
-      }
-
-      const newGraph: PipelineGraphModel = {
-        ...graph,
-        edges: newEdges,
-        entry_points: deriveEntryPoints(newEdges),
-      };
-
-      graph = newGraph;
-      onGraphChange?.(newGraph);
-    }
-
-    migratedGraphId = graphId;
-  });
-
   // Context menu state
   let contextMenu = $state<{ x: number; y: number; flowPosition: { x: number; y: number } } | null>(null);
+
+  // Connect panel state (the keyboard path to an edge - see ConnectPanel).
+  let connecting = $state(false);
+
+  /**
+   * Dismiss whatever overlay is open, from a listener that is attached for
+   * the WHOLE life of the editor.
+   *
+   * This is the fix for a real defect, and the reason it lives HERE rather
+   * than in ContextMenu: the menu used to register its own `document`
+   * keydown listener inside `onMount` -> `setTimeout(..., 0)` (the delay is
+   * there so the click that OPENS it does not immediately close it). The
+   * timeout is a macrotask, and opening the menu queues a SvelteFlow
+   * re-render ahead of it, so between the menu becoming visible and its
+   * listener existing there is a window in which Escape does nothing. It is
+   * not theoretical: pressing Escape immediately left the menu open every
+   * time, while pressing it after a pause closed it - which is exactly the
+   * shape of a bug that gets "fixed" and then reappears, because whether it
+   * reproduces depends on how fast you press the key.
+   *
+   * A `svelte:window` handler is bound when the EDITOR mounts, long before
+   * any overlay can open, so there is no window to lose.
+   */
+  function onWindowKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Escape') return;
+    if (contextMenu) contextMenu = null;
+    if (connecting) connecting = false;
+  }
 
   // Step editor modal state
   let editingStep = $state<PipelineStepV2 | null>(null);
@@ -280,12 +276,14 @@
       e => e.from_step !== stepId && e.to_step !== stepId
     );
 
-    // Entry points derived from Start node connections
+    // ...and stop calling it an entry point. A deleted step left in
+    // `entry_points` is what `validate_graph_integrity` refuses as "Entry
+    // point 'X' references non-existent step".
     const newGraph: PipelineGraphModel = {
       ...graph,
       steps: newSteps,
       edges: newEdges,
-      entry_points: deriveEntryPoints(newEdges),
+      entry_points: (graph.entry_points ?? []).filter(ep => ep !== stepId),
     };
 
     graph = newGraph;
@@ -298,27 +296,33 @@
     isNewStep = false;
   }
 
-  // Handle node position changes
-  function onNodesChange(changes: any[]) {
+  /**
+   * Persist a node's new position into the graph after a drag.
+   *
+   * THIS USED TO BE `onnodeschange`, WHICH @xyflow/svelte v1 DOES NOT HAVE.
+   * The prop was accepted as an unknown attribute and never called, so
+   * dragging a node moved it on screen and changed nothing in `graph` - the
+   * layout was lost on the next save and on every re-render from a WebSocket
+   * frame. `onnodedragstop` is the v1 event and carries the moved nodes with
+   * their final positions, which is exactly (and only) what this needs.
+   */
+  function onNodeDragStop({ nodes: dragged }: { nodes: Node[] }) {
     if (readonly) return;
 
     let updated = false;
     const newSteps = { ...graph.steps };
     let newStartPosition = graph.start_position;
 
-    for (const change of changes) {
-      if (change.type === 'position' && change.position) {
-        // Handle Start node position
-        if (change.id === START_NODE_ID) {
-          newStartPosition = change.position;
+    for (const node of dragged) {
+      if (!node.position) continue;
+      if (node.id === START_NODE_ID) {
+        newStartPosition = { ...node.position };
+        updated = true;
+      } else {
+        const step = newSteps[node.id];
+        if (step) {
+          newSteps[node.id] = { ...step, position: { ...node.position } };
           updated = true;
-        } else {
-          // Handle step node positions
-          const step = newSteps[change.id];
-          if (step) {
-            newSteps[change.id] = { ...step, position: change.position };
-            updated = true;
-          }
         }
       }
     }
@@ -330,80 +334,133 @@
     }
   }
 
-  // Helper: derive entry_points from edges connected to Start node
-  function deriveEntryPoints(edges: PipelineEdgeType[]): string[] {
-    return edges
-      .filter(e => e.from_step === START_NODE_ID)
-      .map(e => e.to_step);
+  /** Declare `stepId` an entry point (idempotent). */
+  function addEntryPoint(stepId: string) {
+    if ((graph.entry_points ?? []).includes(stepId)) return;
+    const newGraph: PipelineGraphModel = {
+      ...graph,
+      entry_points: [...(graph.entry_points ?? []), stepId],
+    };
+    graph = newGraph;
+    onGraphChange?.(newGraph);
   }
 
-  // Handle new connections
-  function onConnect(connection: Connection) {
-    if (readonly || !connection.source || !connection.target) return;
+  // (Un-declaring an entry point is `removeEdgeIds`, which is where the
+  // `__start_to_` line the author deletes actually arrives.)
 
-    // Connections from Start node use 'always' condition
-    const isFromStart = connection.source === START_NODE_ID;
-
-    // Smart defaults: check if source already has a success edge
-    const existingSuccessEdge = graph.edges.find(
-      e => e.from_step === connection.source && e.condition === 'success'
+  /**
+   * The condition a NEW edge out of `sourceId` gets when the author has not
+   * said otherwise.
+   *
+   * ONE definition, called by both authoring paths - the handle drag and the
+   * Connect panel. It used to be inline in `onConnect`, which meant the panel
+   * would have had to restate it and the two could then disagree about what
+   * "the default" is while both looked right in isolation (R3).
+   */
+  function defaultConditionFor(sourceId: string): EdgeCondition {
+    // Start feeds an ENTRY POINT; there is no outcome to branch on yet.
+    if (sourceId === START_NODE_ID) return 'always';
+    // Smart default: the first edge out of a step is its success path, the
+    // second is its failure path - the shape a v1 `on_success`/`on_failure`
+    // pair used to spell.
+    const hasSuccessEdge = graph.edges.some(
+      e => e.from_step === sourceId && e.condition === 'success'
     );
+    return hasSuccessEdge ? 'failure' : 'success';
+  }
 
-    // Default to 'always' for Start connections, otherwise success/failure logic
-    const condition: EdgeCondition = isFromStart ? 'always' :
-      (existingSuccessEdge ? 'failure' : 'success');
+  /**
+   * Draw one connection. Both authoring paths (handle drag, Connect panel)
+   * land here.
+   *
+   * A connection FROM START is not an edge - it declares an entry point. See
+   * graphToEdges for why that distinction is load-bearing rather than
+   * cosmetic.
+   */
+  function createEdge(fromStep: string, toStep: string, condition: EdgeCondition) {
+    if (readonly || !fromStep || !toStep) return;
+
+    if (fromStep === START_NODE_ID) {
+      addEntryPoint(toStep);
+      return;
+    }
 
     const newEdge: PipelineEdgeType = {
       id: generateEdgeId(),
-      from_step: connection.source,
-      to_step: connection.target,
+      from_step: fromStep,
+      to_step: toStep,
       condition,
     };
 
-    const newEdges = [...graph.edges, newEdge];
-
     const newGraph: PipelineGraphModel = {
       ...graph,
-      edges: newEdges,
-      entry_points: deriveEntryPoints(newEdges),
+      edges: [...graph.edges, newEdge],
     };
 
     graph = newGraph;
     onGraphChange?.(newGraph);
   }
 
-  // Handle edge deletion
-  function onEdgesChange(changes: any[]) {
+  // Handle new connections (handle drag)
+  function onConnect(connection: Connection) {
+    if (readonly || !connection.source || !connection.target) return;
+    createEdge(connection.source, connection.target, defaultConditionFor(connection.source));
+  }
+
+  /**
+   * Apply a library-initiated delete (the `deleteKey`, Backspace) to the graph.
+   *
+   * THIS USED TO BE `onedgeschange`, WHICH v1 DOES NOT HAVE - same dead-prop
+   * story as `onnodeschange` above, and paired with `deleteKeyCode` (v1
+   * spells it `deleteKey`), so neither half of Backspace-to-delete was
+   * connected to anything. `ondelete` is the v1 event and reports BOTH the
+   * deleted nodes and the deleted edges, so a deleted node takes its edges
+   * with it the same way the Delete button on the node already did.
+   */
+  function onDelete({ nodes: removedNodes, edges: removedEdges }: { nodes: Node[]; edges: Edge[] }) {
     if (readonly) return;
-
-    const deletedIds = changes
-      .filter(c => c.type === 'remove')
-      .map(c => c.id);
-
-    if (deletedIds.length > 0) {
-      // Filter out deleted real edges
-      const newEdges = graph.edges.filter(e => !deletedIds.includes(e.id));
-
-      // Also handle synthetic edge deletion (e.g., __start_to_step_1)
-      // These represent entry_points that don't have real edges yet
-      const deletedSyntheticTargets = deletedIds
-        .filter(id => id.startsWith('__start_to_'))
-        .map(id => id.replace('__start_to_', ''));
-
-      // Remove those from entry_points
-      const newEntryPoints = (graph.entry_points || []).filter(
-        ep => !deletedSyntheticTargets.includes(ep)
-      );
-
-      const newGraph: PipelineGraphModel = {
-        ...graph,
-        edges: newEdges,
-        entry_points: newEntryPoints.length > 0 ? newEntryPoints : deriveEntryPoints(newEdges),
-      };
-
-      graph = newGraph;
-      onGraphChange?.(newGraph);
+    for (const node of removedNodes) {
+      if (node.id !== START_NODE_ID) deleteStep(node.id);
     }
+    if (removedEdges.length > 0) {
+      removeEdgeIds(removedEdges.map(e => e.id));
+    }
+  }
+
+  /**
+   * Remove edges by id. A `__start_to_<step>` id is not an edge: deleting
+   * that line means "this step is no longer an entry point".
+   */
+  function removeEdgeIds(deletedIds: string[]) {
+    if (readonly || deletedIds.length === 0) return;
+
+    const droppedEntryPoints = deletedIds
+      .filter(id => id.startsWith(START_EDGE_PREFIX))
+      .map(id => id.slice(START_EDGE_PREFIX.length));
+
+    const newGraph: PipelineGraphModel = {
+      ...graph,
+      edges: graph.edges.filter(e => !deletedIds.includes(e.id)),
+      entry_points: (graph.entry_points ?? []).filter(ep => !droppedEntryPoints.includes(ep)),
+    };
+
+    graph = newGraph;
+    onGraphChange?.(newGraph);
+  }
+
+  /**
+   * SvelteFlow's pane callback hands over `{ event }`, NOT the event.
+   *
+   * `onpanecontextmenu={onPaneContextMenu}` therefore called
+   * `.preventDefault()` on a plain object and threw
+   * `event.preventDefault is not a function` into the console on EVERY
+   * right-click. The menu still appeared only because the native event went
+   * on to bubble to `.flow-wrapper`'s own `oncontextmenu` below - i.e. the
+   * feature looked fine while one of its two handlers was dead. This is also
+   * one of the two `svelte-check` errors this file carried.
+   */
+  function onPaneContextMenuFromFlow({ event }: { event: MouseEvent }) {
+    onPaneContextMenu(event);
   }
 
   // Handle right-click on canvas
@@ -435,31 +492,10 @@
     onGraphChange?.(newGraph);
   }
 
-  // Delete an edge by ID
+  // Delete an edge by id (the picker's "Delete Edge"). Start lines are
+  // entry points, so `removeEdgeIds` un-declares them rather than deleting.
   function deleteEdge(edgeId: string) {
-    // Handle synthetic edges (from legacy entry_points)
-    if (edgeId.startsWith('__start_to_')) {
-      const targetStep = edgeId.replace('__start_to_', '');
-      const newEntryPoints = (graph.entry_points || []).filter(ep => ep !== targetStep);
-      const newGraph: PipelineGraphModel = {
-        ...graph,
-        entry_points: newEntryPoints.length > 0 ? newEntryPoints : deriveEntryPoints(graph.edges),
-      };
-      graph = newGraph;
-      onGraphChange?.(newGraph);
-      return;
-    }
-
-    // Delete real edge
-    const newEdges = graph.edges.filter(e => e.id !== edgeId);
-    const newGraph: PipelineGraphModel = {
-      ...graph,
-      edges: newEdges,
-      entry_points: deriveEntryPoints(newEdges),
-    };
-
-    graph = newGraph;
-    onGraphChange?.(newGraph);
+    removeEdgeIds([edgeId]);
   }
 
   // Add step from toolbar
@@ -489,12 +525,14 @@
   // `edge.data` - see the note on graphToEdges.
   const graphActions: GraphActions = {
     setEdgeCondition(edgeId: string, condition: EdgeCondition) {
-      // A synthetic `__start_to_<step>` edge is a legacy entry_point that has no
-      // real edge row yet; changing its condition is what persists it.
-      if (edgeId.startsWith('__start_to_')) {
-        addStartEdge(edgeId.replace('__start_to_', ''), condition);
-        return;
-      }
+      // A `__start_to_<step>` line is an ENTRY POINT, and an entry point has
+      // no condition to set - the run starts there unconditionally. Doing
+      // nothing quietly would be dark, so the picker does not offer the three
+      // conditions on a Start line at all (ConditionEdge reads `isEntry`);
+      // this arm exists so that a stale id can never write a `__start__`
+      // edge into the model, which is what used to happen here and is
+      // exactly what the API refuses.
+      if (edgeId.startsWith(START_EDGE_PREFIX)) return;
       changeEdgeCondition(edgeId, condition);
     },
     deleteEdge(edgeId: string) {
@@ -504,10 +542,12 @@
   setContext(GRAPH_ACTIONS, graphActions);
 </script>
 
+<svelte:window on:keydown={onWindowKeydown} />
+
 <div class="graph-editor" data-testid="graph-editor" class:readonly>
   <!-- Toolbar -->
   {#if !readonly}
-    <GraphToolbar onAddStep={onToolbarAddStep} />
+    <GraphToolbar onAddStep={onToolbarAddStep} onConnect={() => connecting = true} />
   {/if}
 
   <div class="graph-container">
@@ -516,7 +556,14 @@
       <NodePalette onDropStep={onPaletteDropStep} onAddStep={onPaletteAddStep} />
     {/if}
 
-    <!-- Main Flow Canvas -->
+    <!-- Main Flow Canvas.
+         TWO PROPS BELOW WERE MISSPELLED FOR @xyflow/svelte v1 and were
+         therefore doing NOTHING: `snapToGrid` (v1 turns snapping on from
+         `snapGrid` alone) and `deleteKeyCode` (v1 spells it `deleteKey`).
+         The second one matters: Backspace-to-delete a selected node or edge
+         was simply not wired up, and in `readonly` mode the `null` that was
+         meant to disable it was not being applied either. Both showed as
+         svelte-check errors that nothing gated. -->
     <div
       class="flow-wrapper"
       data-testid="graph-canvas"
@@ -537,15 +584,14 @@
         {nodeTypes}
         {edgeTypes}
         fitView
-        snapToGrid
         snapGrid={[20, 20]}
-        deleteKeyCode={readonly ? null : 'Backspace'}
-        onnodeschange={onNodesChange}
-        onedgeschange={onEdgesChange}
+        deleteKey={readonly ? null : 'Backspace'}
+        onnodedragstop={onNodeDragStop}
+        ondelete={onDelete}
         onconnect={onConnect}
-        onpanecontextmenu={onPaneContextMenu}
+        onpanecontextmenu={onPaneContextMenuFromFlow}
       >
-        <Background variant="dots" gap={20} size={1} />
+        <Background variant={BackgroundVariant.Dots} gap={20} size={1} />
         <Controls />
         <MiniMap
           nodeColor={(node) => {
@@ -557,6 +603,19 @@
           }}
         />
       </SvelteFlow>
+
+      <!-- Connect panel: the keyboard/menu path to an edge. -->
+      {#if connecting && !readonly}
+        <ConnectPanel
+          steps={graphStepList(graph)}
+          edges={graph.edges}
+          entryPoints={graph.entry_points ?? []}
+          startNodeId={START_NODE_ID}
+          {defaultConditionFor}
+          onConnect={createEdge}
+          onClose={() => connecting = false}
+        />
+      {/if}
     </div>
   </div>
 

@@ -60,7 +60,7 @@ from app.models.pipeline import ExecutorMode, StepExecution, StepExecutionStatus
 # Module scope is safe in this direction: `app.schemas.pipeline` imports only
 # `app.models` and its sibling schemas, so there is no cycle back to any
 # service. The reverse import would be the cycle, which is why the schema
-# does not reach for `describe_step_action`.
+# owns this function rather than the executor.
 from app.schemas.pipeline import describe_terminal_action
 from app.services.websocket import manager
 from app.services.git_server import git_repo_manager
@@ -690,8 +690,6 @@ class LocalStepContextError(RuntimeError):
         pipeline: "Pipeline | None" = None,
         repo: "Repo | None" = None,
         graph: dict | None = None,
-        steps: list | None = None,
-        is_graph: bool = False,
         can_continue: bool = False,
     ):
         super().__init__(message)
@@ -700,22 +698,9 @@ class LocalStepContextError(RuntimeError):
         self.pipeline = pipeline
         self.repo = repo
         self.graph = graph
-        self.steps = steps or []
-        self.is_graph = is_graph
         # True when enough context loaded to run the NORMAL continuation
-        # (graph fan-out / linear on_failure) instead of failing the run
-        # outright.
+        # (the graph fan-out) instead of failing the run outright.
         self.can_continue = can_continue
-
-
-def parse_steps(steps_str: str | None) -> list[dict]:
-    """Parse steps from JSON string to list."""
-    if not steps_str:
-        return []
-    try:
-        return json.loads(steps_str)
-    except (json.JSONDecodeError, TypeError):
-        return []
 
 
 def parse_steps_graph(steps_graph_str: str | None) -> dict | None:
@@ -782,55 +767,19 @@ def count_total_steps(graph: dict) -> int:
 #   2. completion only ever inspected the StepRuns that were CREATED, so a step
 #      that never ran could not count against the verdict.
 #
-# `graph_definition_errors` answers (1) as a pure function over the graph dict,
-# `unreached_graph_steps` answers (2) as a pure function over the graph plus the
-# run's actual per-step outcomes, and `describe_step_action` closes the legacy
-# action vocabulary. All three are module-level and side-effect free so they can
-# be unit-tested without a database, a container or a run.
-
-
-#: The complete `on_success` / `on_failure` vocabulary for legacy (v1)
-#: pipelines - the exact set `_handle_action` can dispatch. Anything else used
-#: to be logged and treated as "stop", which is how `nextt` shipped a green
-#: badge for a third of a pipeline.
-STEP_ACTIONS = ("next", "stop")
-
-#: Prefixed actions, LONGEST FIRST so `trigger:pipeline:` is recognised before
-#: `trigger:` and an empty target is caught in the right one.
-STEP_ACTION_PREFIXES = ("trigger:pipeline:", "trigger:", "merge:")
-
-_ACTION_VOCABULARY = (
-    "'next', 'stop', 'trigger:{card_id}', 'trigger:pipeline:{pipeline_id}' "
-    "or 'merge:{branch}'"
-)
-
-
-def describe_step_action(action: Any) -> str | None:
-    """None when `action` is dispatchable, else why it is not.
-
-    The message names the offender and the whole vocabulary, because the
-    failure mode this replaces was a user staring at a green run wondering why
-    two of their three steps never happened.
-    """
-    if not isinstance(action, str):
-        return (
-            f"step action must be a string, got {type(action).__name__} "
-            f"({action!r}); valid actions are {_ACTION_VOCABULARY}"
-        )
-    if action in STEP_ACTIONS:
-        return None
-    for prefix in STEP_ACTION_PREFIXES:
-        if action.startswith(prefix):
-            if action[len(prefix):].strip():
-                return None
-            return (
-                f"step action {action!r} names {prefix!r} with an empty "
-                f"target; valid actions are {_ACTION_VOCABULARY}"
-            )
-    return (
-        f"unknown step action {action!r}; valid actions are "
-        f"{_ACTION_VOCABULARY}"
-    )
+# `graph_definition_errors` answers (1) as a pure function over the graph dict
+# and `unreached_graph_steps` answers (2) as a pure function over the graph
+# plus the run's actual per-step outcomes. Both are module-level and side-
+# effect free so they can be unit-tested without a database, a container or a
+# run.
+#
+# THE THIRD - the typo - was `describe_step_action`, the closed v1
+# `on_success`/`on_failure` vocabulary. 12.8 P5 deleted it with the array path
+# it guarded. The claim did not go with it: node actions are now validated by
+# `schemas.pipeline.describe_terminal_action`, at the API boundary AND at
+# `_run_terminal_action`, and FLOW (the half `nextt` was a typo of) is an edge,
+# which cannot be misspelled into silence - an edge naming a step the graph
+# does not define is a `graph_definition_errors` defect right here.
 
 
 def _first_cycle(
@@ -1667,8 +1616,17 @@ class PipelineExecutor:
                         machine.transition_to(PipelineStatus.COMPLETING)
                     machine.transition_to(PipelineStatus.COMPLETED)
                 else:
+                    # The index of a step that actually failed, not
+                    # `current_step`. `current_step` was written by the v1
+                    # dispatcher only; 12.8 P5 deleted it, so the column is now
+                    # permanently 0 and every graph failure would be attributed
+                    # to step 0 - a number the UI shows and the state machine
+                    # records. A graph has no single "current" step anyway: it
+                    # can have several in flight at once, which is the whole
+                    # point of the format.
                     machine.mark_step_failed(
-                        pipeline_run.current_step or 0, "pipeline failed"
+                        await self._first_failed_step_index(db, run_id),
+                        "pipeline failed",
                     )
             except ValueError as e:
                 logger.error(
@@ -1961,13 +1919,15 @@ class PipelineExecutor:
         """
         Start a new pipeline run.
 
-        For graph-based pipelines (v2): Executes ALL entry points in parallel.
-        For legacy pipelines (v1): Executes steps sequentially.
+        The definition is a GRAPH, always (12.8 P5): all entry points are
+        dispatched in parallel and flow follows edges. A pipeline row with no
+        graph is REFUSED here, loudly and with a row to look at - see
+        `_refuse_run_without_a_definition`.
 
-        Async model (R5): dispatching a step never awaits a container. Legacy
-        steps are a fast job enqueue; local steps spawn an asyncio task with
-        its own session scope that streams execution. This method returns as
-        soon as the run row exists and the entry steps are dispatched.
+        Async model (R5): dispatching a step never awaits a container. Local
+        steps spawn an asyncio task with its own session scope that streams
+        execution. This method returns as soon as the run row exists and the
+        entry steps are dispatched.
 
         trigger_context can contain:
         - branch: The branch to work on
@@ -1985,153 +1945,208 @@ class PipelineExecutor:
         """
         graph = parse_steps_graph(pipeline.steps_graph)
 
-        if graph:
-            # Graph-based (v2) pipeline - execute entry points in parallel
-            entry_points = graph.get("entry_points", [])
-            steps_dict = graph.get("steps", {})
-            total_steps = count_total_steps(graph)
-
-            logger.info(f"Using steps_graph with {total_steps} steps, {len(entry_points)} entry points")
-
-            # R1: a structurally broken graph says so at run START, not only
-            # in the post-mortem. The run is NOT aborted here on purpose - the
-            # reachable part still runs, and `_verify_graph_coverage` fails the
-            # run at the end with this same list plus what it actually
-            # observed. Aborting at dispatch would hide which steps did run,
-            # and this belongs at definition time anyway (see
-            # `graph_definition_errors`).
-            for defect in graph_definition_errors(graph):
-                logger.error(
-                    "Pipeline %s has an invalid graph: %s",
-                    pipeline.name,
-                    defect,
-                )
-
-            # Create the pipeline run
-            pipeline_run = PipelineRun(
-                id=str(uuid4()),
-                pipeline_id=pipeline.id,
-                status=RunStatus.RUNNING.value,
+        if not graph:
+            return await self._refuse_run_without_a_definition(
+                db,
+                pipeline,
                 trigger_type=trigger_type,
                 trigger_ref=trigger_ref,
-                trigger_context=json.dumps(trigger_context) if trigger_context else None,
-                current_step=0,
-                steps_completed=0,
-                steps_total=total_steps,
-                active_step_ids=json.dumps([]),
-                completed_step_ids=json.dumps([]),
-                started_at=datetime.utcnow(),
+                trigger_context=trigger_context,
+                on_run_created=on_run_created,
             )
-            db.add(pipeline_run)
-            await db.commit()
-            await db.refresh(pipeline_run)
 
-            if on_run_created is not None:
-                await on_run_created(db, pipeline_run)
+        entry_points = graph.get("entry_points", [])
+        steps_dict = graph.get("steps", {})
+        total_steps = count_total_steps(graph)
 
-            self._init_state_machine(pipeline_run.id, total_steps)
+        logger.info(f"Using steps_graph with {total_steps} steps, {len(entry_points)} entry points")
 
-            logger.info(f"Started pipeline run {pipeline_run.id[:8]} for pipeline {pipeline.name}")
-            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
-
-            # Image preflight (12.3 hardening): every distinct step image is
-            # resolved ONCE up front; a run referencing missing tags fails
-            # with ONE message before step 0 dispatches.
-            preflight_error = await self._preflight_step_images(
-                list(steps_dict.values())
+        # R1: a structurally broken graph says so at run START, not only
+        # in the post-mortem. The run is NOT aborted here on purpose - the
+        # reachable part still runs, and `_verify_graph_coverage` fails the
+        # run at the end with this same list plus what it actually
+        # observed. Aborting at dispatch would hide which steps did run,
+        # and this belongs at definition time anyway (see
+        # `graph_definition_errors`).
+        for defect in graph_definition_errors(graph):
+            logger.error(
+                "Pipeline %s has an invalid graph: %s",
+                pipeline.name,
+                defect,
             )
-            if preflight_error is not None:
-                logger.error(
-                    f"Pipeline run {pipeline_run.id[:8]} failed image "
-                    f"preflight: {preflight_error}"
-                )
-                await self._complete_pipeline(db, pipeline_run, success=False)
-                return pipeline_run
 
-            if not entry_points:
-                # Nothing to dispatch. An EMPTY graph is a vacuous pass; a
-                # graph with steps and no entry point is a run that covered
-                # none of them, and `_verify_graph_coverage` fails it rather
-                # than stamping the old unconditional `success=True`.
-                if not await self._verify_graph_coverage(
-                    db, pipeline_run, graph
-                ):
-                    await self._complete_pipeline(
-                        db, pipeline_run, success=True
-                    )
-            else:
-                # Execute ALL entry points in parallel. The run lock keeps a
-                # fast-finishing local step from clobbering active_step_ids
-                # while later entry points are still being dispatched.
-                #
-                # RESERVE THEM ALL FIRST. A step that fails to ROUTE completes
-                # synchronously inside `_execute_graph_step`, so with two entry
-                # points the first one's completion used to see an empty
-                # active set and stamp the whole run terminal while the second
-                # had not been dispatched yet. Claiming the whole batch up
-                # front makes "nothing is active" mean what it says.
-                async with self._run_lock(pipeline_run.id):
-                    self._reserve_active_steps(
-                        pipeline_run,
-                        [s for s in entry_points if s in steps_dict],
-                    )
-                    await db.commit()
-                    await db.refresh(pipeline_run)
-                    for step_id in entry_points:
-                        if step_id in steps_dict:
-                            await self._execute_graph_step(
-                                db, pipeline_run, pipeline, repo, graph, step_id, params
-                            )
-                        else:
-                            logger.warning(f"Entry point {step_id} not found in steps")
+        # Create the pipeline run
+        pipeline_run = PipelineRun(
+            id=str(uuid4()),
+            pipeline_id=pipeline.id,
+            status=RunStatus.RUNNING.value,
+            trigger_type=trigger_type,
+            trigger_ref=trigger_ref,
+            trigger_context=json.dumps(trigger_context) if trigger_context else None,
+            current_step=0,
+            steps_completed=0,
+            steps_total=total_steps,
+            active_step_ids=json.dumps([]),
+            completed_step_ids=json.dumps([]),
+            started_at=datetime.utcnow(),
+        )
+        db.add(pipeline_run)
+        await db.commit()
+        await db.refresh(pipeline_run)
 
+        if on_run_created is not None:
+            await on_run_created(db, pipeline_run)
+
+        self._init_state_machine(pipeline_run.id, total_steps)
+
+        logger.info(f"Started pipeline run {pipeline_run.id[:8]} for pipeline {pipeline.name}")
+        await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
+
+        # Image preflight (12.3 hardening): every distinct step image is
+        # resolved ONCE up front; a run referencing missing tags fails
+        # with ONE message before the entry steps dispatch.
+        preflight_error = await self._preflight_step_images(
+            list(steps_dict.values())
+        )
+        if preflight_error is not None:
+            logger.error(
+                f"Pipeline run {pipeline_run.id[:8]} failed image "
+                f"preflight: {preflight_error}"
+            )
+            await self._complete_pipeline(db, pipeline_run, success=False)
             return pipeline_run
+
+        if not entry_points:
+            # Nothing to dispatch. An EMPTY graph is a vacuous pass; a
+            # graph with steps and no entry point is a run that covered
+            # none of them, and `_verify_graph_coverage` fails it rather
+            # than stamping the old unconditional `success=True`.
+            if not await self._verify_graph_coverage(
+                db, pipeline_run, graph
+            ):
+                await self._complete_pipeline(
+                    db, pipeline_run, success=True
+                )
         else:
-            # Legacy (v1) pipeline - execute sequentially
-            steps = parse_steps(pipeline.steps)
-            logger.info(f"Using legacy steps with {len(steps)} steps")
-
-            pipeline_run = PipelineRun(
-                id=str(uuid4()),
-                pipeline_id=pipeline.id,
-                status=RunStatus.RUNNING.value,
-                trigger_type=trigger_type,
-                trigger_ref=trigger_ref,
-                trigger_context=json.dumps(trigger_context) if trigger_context else None,
-                current_step=0,
-                steps_completed=0,
-                steps_total=len(steps),
-                started_at=datetime.utcnow(),
-            )
-            db.add(pipeline_run)
-            await db.commit()
-            await db.refresh(pipeline_run)
-
-            if on_run_created is not None:
-                await on_run_created(db, pipeline_run)
-
-            self._init_state_machine(pipeline_run.id, len(steps))
-
-            logger.info(f"Started pipeline run {pipeline_run.id[:8]} for pipeline {pipeline.name}")
-            await manager.send_pipeline_run_status(pipeline_run_to_ws_dict(pipeline_run))
-
-            # Image preflight (12.3 hardening): see the graph branch above.
-            preflight_error = await self._preflight_step_images(steps)
-            if preflight_error is not None:
-                logger.error(
-                    f"Pipeline run {pipeline_run.id[:8]} failed image "
-                    f"preflight: {preflight_error}"
+            # Execute ALL entry points in parallel. The run lock keeps a
+            # fast-finishing local step from clobbering active_step_ids
+            # while later entry points are still being dispatched.
+            #
+            # RESERVE THEM ALL FIRST. A step that fails to ROUTE completes
+            # synchronously inside `_execute_step`, so with two entry
+            # points the first one's completion used to see an empty
+            # active set and stamp the whole run terminal while the second
+            # had not been dispatched yet. Claiming the whole batch up
+            # front makes "nothing is active" mean what it says.
+            async with self._run_lock(pipeline_run.id):
+                self._reserve_active_steps(
+                    pipeline_run,
+                    [s for s in entry_points if s in steps_dict],
                 )
-                await self._complete_pipeline(db, pipeline_run, success=False)
-                return pipeline_run
+                await db.commit()
+                await db.refresh(pipeline_run)
+                for step_id in entry_points:
+                    if step_id in steps_dict:
+                        await self._execute_step(
+                            db, pipeline_run, pipeline, repo, graph, step_id, params
+                        )
+                    else:
+                        logger.warning(f"Entry point {step_id} not found in steps")
 
-            if steps:
-                async with self._run_lock(pipeline_run.id):
-                    await self._execute_step(db, pipeline_run, repo, steps, 0, params)
-            else:
-                await self._complete_pipeline(db, pipeline_run, success=True)
+        return pipeline_run
 
-            return pipeline_run
+    async def _refuse_run_without_a_definition(
+        self,
+        db: AsyncSession,
+        pipeline: Pipeline,
+        *,
+        trigger_type: str,
+        trigger_ref: str | None,
+        trigger_context: dict[str, Any] | None,
+        on_run_created: Callable[
+            [AsyncSession, PipelineRun], Awaitable[None]
+        ] | None,
+    ) -> PipelineRun:
+        """A run of a pipeline with no `steps_graph`: FAILED, with a reason.
+
+        Before 12.8 P5 this was the array fork's front door - `parse_steps`
+        swallowed an absent or unparseable definition to `[]` and the run
+        completed PASSED having done nothing, which is the QA4-08 vacuous
+        pass. The graph is now the only definition there is, so "no graph" is
+        "no pipeline", and it has to say so where a user looks.
+
+        The refusal takes the shape image preflight already takes: the run row
+        is created and driven through the ONE completion path, so the caller
+        still gets a PipelineRun, the websocket still sees the run appear and
+        go terminal, and nothing has to learn a second failure protocol. On
+        top of that it writes ONE synthetic StepRun carrying the reason -
+        `PipelineRun` has no error column, and a red run with nothing red in
+        it is the same "why did this fail?" from the other direction
+        (`_fail_run_on_terminal_action`, `_verify_graph_coverage`).
+
+        `on_run_created` is still awaited exactly once, after the row is
+        committed: a debug re-run's session must be torn down by
+        `_complete_pipeline` rather than left pointing at a run that never
+        existed as far as the service is concerned.
+        """
+        reason = (
+            f"pipeline '{pipeline.name}' has no runnable definition: "
+            f"steps_graph is empty. Author the pipeline (or push its YAML) "
+            f"before running it - a run with no definition cannot pass."
+        )
+        logger.error(
+            "Refusing to start pipeline %s (%s) - %s",
+            pipeline.id[:8],
+            pipeline.name,
+            reason,
+        )
+
+        pipeline_run = PipelineRun(
+            id=str(uuid4()),
+            pipeline_id=pipeline.id,
+            status=RunStatus.RUNNING.value,
+            trigger_type=trigger_type,
+            trigger_ref=trigger_ref,
+            trigger_context=json.dumps(trigger_context) if trigger_context else None,
+            current_step=0,
+            steps_completed=0,
+            steps_total=0,
+            active_step_ids=json.dumps([]),
+            completed_step_ids=json.dumps([]),
+            started_at=datetime.utcnow(),
+        )
+        db.add(pipeline_run)
+        await db.commit()
+        await db.refresh(pipeline_run)
+
+        if on_run_created is not None:
+            await on_run_created(db, pipeline_run)
+
+        self._init_state_machine(pipeline_run.id, 0)
+        await manager.send_pipeline_run_status(
+            pipeline_run_to_ws_dict(pipeline_run)
+        )
+
+        now = datetime.utcnow()
+        step_run = StepRun(
+            id=str(uuid4()),
+            pipeline_run_id=pipeline_run.id,
+            step_index=0,
+            step_id=None,
+            step_name="pipeline definition",
+            status=RunStatus.FAILED.value,
+            logs="",
+            error=reason,
+            started_at=now,
+            completed_at=now,
+        )
+        db.add(step_run)
+        await db.commit()
+        await db.refresh(step_run)
+        await manager.send_step_run_status(step_run_to_ws_dict(step_run))
+
+        await self._complete_pipeline(db, pipeline_run, success=False)
+        return pipeline_run
 
     async def _preflight_step_images(self, step_defs: list[dict]) -> str | None:
         """Resolve every distinct explicitly-configured step image ONCE at
@@ -2425,7 +2440,7 @@ class PipelineExecutor:
     # Step dispatch (graph)
     # -------------------------------------------------------------------------
 
-    async def _execute_graph_step(
+    async def _execute_step(
         self,
         db: AsyncSession,
         pipeline_run: PipelineRun,
@@ -2437,13 +2452,15 @@ class PipelineExecutor:
         previous_runner_id: str | None = None,
     ) -> None:
         """
-        Execute a single step in a graph-based pipeline.
+        Execute a single step of the pipeline's graph.
 
         This method:
         1. Creates a StepRun for tracking (recording the routed executor)
-        2. Routes the step: local -> asyncio task around LocalExecutor,
-           legacy -> temporary Card + Job enqueued for the runner system
+        2. Routes the step to the LOCAL or REMOTE executor
         3. Updates active_step_ids to track running steps
+
+        Named `_execute_graph_step` until 12.8 P5, when the v1 array twin it
+        was distinguished from was deleted.
         """
         steps_dict = graph.get("steps", {})
         step = steps_dict.get(step_id)
@@ -2459,7 +2476,7 @@ class PipelineExecutor:
         step_ids = list(steps_dict.keys())
         step_index = step_ids.index(step_id) if step_id in step_ids else 0
 
-        logger.info(f"[GRAPH] _execute_graph_step called for step '{step_id}': {step_name} (type={step_type})")
+        logger.info(f"[GRAPH] _execute_step called for step '{step_id}': {step_name} (type={step_type})")
 
         # Add to active steps (persisted by _dispatch_step_run's commit)
         active_ids = parse_json_list(pipeline_run.active_step_ids)
@@ -2482,7 +2499,7 @@ class PipelineExecutor:
             # The StepRun exists and is already FAILED (`_dispatch_step_run`
             # writes it before it returns), so the node's `failure` actions
             # have a real row to be attributed to and to be blamed on.
-            await self._handle_graph_step_complete(
+            await self._handle_step_complete(
                 db, pipeline_run, pipeline, repo, graph, step_id, False, None,
                 step_run=step_run,
             )
@@ -2495,97 +2512,6 @@ class PipelineExecutor:
             self._log_local_continue_in_context()
         logger.info(
             f"[GRAPH] Dispatched step '{step_id}' ({step_name}) to the "
-            f"{mode.value} executor"
-        )
-
-    # -------------------------------------------------------------------------
-    # Step dispatch (legacy linear)
-    # -------------------------------------------------------------------------
-
-    async def _execute_step(
-        self,
-        db: AsyncSession,
-        pipeline_run: PipelineRun,
-        repo: Repo,
-        steps: list[dict],
-        step_index: int,
-        params: dict[str, Any] | None = None,
-        previous_runner_id: str | None = None,
-    ) -> None:
-        """
-        Execute a single step in a linear (v1) pipeline.
-
-        Routes the step: local -> asyncio task around LocalExecutor,
-        legacy -> temporary Card + Job enqueued for the runner system.
-
-        Args:
-            previous_runner_id: The runner that executed the previous step (for continuation affinity)
-        """
-        if step_index >= len(steps):
-            # All steps completed
-            await self._complete_pipeline(db, pipeline_run, success=True)
-            return
-
-        step = steps[step_index]
-        step_name = step.get("name", f"Step {step_index + 1}")
-        step_type = step.get("type", "script")
-        step_config = step.get("config", {})
-        timeout = step.get("timeout", 300)
-        continue_in_context = step.get("continue_in_context", False)
-        step_id = step.get("id")  # Optional step ID for context directory naming
-
-        # Extract agent-specific fields from step config (Phase 9.1c)
-        agent_file_ids = step_config.get("agent_file_ids", []) if step_type == "agent" else []
-        prompt_template = step_config.get("prompt_template") if step_type == "agent" else None
-
-        # Check if this step is a continuation from the previous step
-        is_continuation = False
-        previous_step_logs = None
-        if step_index > 0:
-            prev_step_config = steps[step_index - 1]
-            is_continuation = prev_step_config.get("continue_in_context", False)
-
-            # Get previous step logs
-            prev_step_run = await db.execute(
-                select(StepRun)
-                .where(StepRun.pipeline_run_id == pipeline_run.id)
-                .where(StepRun.step_index == step_index - 1)
-            )
-            prev_step = prev_step_run.scalar_one_or_none()
-            if prev_step and prev_step.logs:
-                previous_step_logs = prev_step.logs
-
-        logger.info(f"Executing step {step_index}: {step_name} (type={step_type}, continue_in_context={continue_in_context}, is_continuation={is_continuation})")
-
-        # Update pipeline run's current step (persisted by _dispatch_step_run)
-        pipeline_run.current_step = step_index
-
-        step_run, mode, route_error = await self._dispatch_step_run(
-            db,
-            pipeline_run,
-            step_index=step_index,
-            step_name=step_name,
-            step_type=step_type,
-            step_config=step_config,
-            params=params,
-        )
-
-        if route_error is not None:
-            action = step.get("on_failure", "stop")
-            await self._handle_action(
-                db, pipeline_run, repo, steps, step_index, action, step_success=False
-            )
-            return
-
-        # LOCAL and REMOTE are the only routes; a routing failure already
-        # returned above. There is no third path to fall through to, and no
-        # runner AFFINITY to arrange either: a continuation keeps its state on
-        # the run's workspace volume, which the executor addresses by name,
-        # rather than on whichever machine happened to run the previous step.
-        if continue_in_context or is_continuation:
-            self._log_local_continue_in_context()
-        logger.info(
-            f"Dispatched step {step_index} ({step_name}) to the "
             f"{mode.value} executor"
         )
 
@@ -2639,9 +2565,9 @@ class PipelineExecutor:
         WHY IT SITS IN `_run_executor_step` AND NOWHERE ELSE. The obvious
         gate is `_dispatch_step_run`, the shared LOCAL/REMOTE dispatch line.
         It is the wrong place: `_dispatch_step_run` is called from
-        `_execute_graph_step` and `_execute_step`, and BOTH run under
-        `self._run_lock(run_id)` (from `start_pipeline`, and from
-        `_finish_local_step_locked` -> `_handle_graph_step_complete`).
+        `_execute_step`, which runs under `self._run_lock(run_id)` (from
+        `start_pipeline`, and from `_finish_local_step_locked` ->
+        `_handle_step_complete`).
         Awaiting a human there holds the run lock for up to four hours, so
         every sibling step of a parallel graph wedges trying to finish - a
         gate that deadlocks the run it exists to debug.
@@ -2757,14 +2683,14 @@ class PipelineExecutor:
             except LocalStepContextError as err:
                 await self._fail_wedged_local_step(db, run_id, err)
                 return
-            pipeline_run, pipeline, repo, step_run, graph, steps, step, is_graph = loaded
+            pipeline_run, pipeline, repo, step_run, graph, step = loaded
 
             if gate.outcome is DebugGateOutcome.FAILED:
                 # A timed-out pause fails the step through the ORDINARY
                 # completion path. No new terminal path exists for debug runs.
                 await self._finish_local_step(
                     db, pipeline_run, pipeline, repo, step_run,
-                    graph, steps, step, is_graph,
+                    graph, step,
                     False, None, gate.error, None,
                 )
                 return
@@ -2948,7 +2874,7 @@ class PipelineExecutor:
                 )
                 await self._finish_local_step_fresh_session(
                     session_factory, run_id, step_run_id,
-                    pipeline, repo, graph, steps, step, is_graph,
+                    pipeline, repo, graph, step,
                     error, workspace_service if acquired else None, workspace_id,
                 )
                 return
@@ -2964,7 +2890,7 @@ class PipelineExecutor:
 
             await self._finish_local_step(
                 db, pipeline_run, pipeline, repo, step_run,
-                graph, steps, step, is_graph, success, exit_code, error,
+                graph, step, success, exit_code, error,
                 log_tail,
             )
         finally:
@@ -3028,10 +2954,8 @@ class PipelineExecutor:
         step_run_id: str,
         pipeline: Pipeline,
         repo: Repo,
-        graph: dict | None,
-        steps: list[dict],
+        graph: dict,
         step: dict,
-        is_graph: bool,
         error: str | None,
         workspace_service,
         workspace_id: str | None,
@@ -3069,7 +2993,7 @@ class PipelineExecutor:
                 return
             await self._finish_local_step(
                 fresh_db, pipeline_run, pipeline, repo, step_run,
-                graph, steps, step, is_graph, False, None, error,
+                graph, step, False, None, error,
             )
 
     async def _fail_wedged_local_step(
@@ -3078,8 +3002,9 @@ class PipelineExecutor:
         """Route a context-load failure through the normal failure flow
         (fix 2 - mirrors the route-failure path): fail the StepRun, then
         either drive the normal continuation (step definition missing but the
-        run is intact) or fail the whole run (rows missing mid-run). Never
-        warn-and-return with a RUNNING StepRun left behind.
+        run and its graph are intact) or fail the whole run (rows missing
+        mid-run, or no graph at all). Never warn-and-return with a RUNNING
+        StepRun left behind.
         """
         message = f"local step context error: {err}"
         logger.error(
@@ -3091,6 +3016,17 @@ class PipelineExecutor:
             return
         async with self._run_lock(run_id):
             await db.refresh(pipeline_run)
+            # REFRESH THE STEP ROW TOO, and not for tidiness. `PipelineRun`
+            # is loaded with `selectinload(step_runs)`, so refreshing it
+            # reloads that collection and EXPIRES every member - including
+            # the row `err` is carrying. The next `err.step_run.status` is
+            # then a lazy load from a sync attribute access, which under
+            # asyncio raises MissingGreenlet, kills this task, and strands
+            # the very RUNNING StepRun this method exists to drive terminal.
+            # (Measured, not theorised: after the refresh above, sqlalchemy's
+            # `inspect(step_run).unloaded` holds every column.)
+            if err.step_run is not None:
+                await db.refresh(err.step_run)
             if pipeline_run.status not in (
                 RunStatus.RUNNING.value,
                 RunStatus.PENDING.value,
@@ -3102,17 +3038,11 @@ class PipelineExecutor:
             ):
                 await self._fail_step_run(db, pipeline_run, err.step_run, message)
             if err.can_continue and err.step_run is not None:
-                if err.is_graph:
-                    await self._handle_graph_step_complete(
-                        db, pipeline_run, err.pipeline, err.repo, err.graph,
-                        err.step_run.step_id, False, None,
-                        step_run=err.step_run,
-                    )
-                else:
-                    await self._handle_action(
-                        db, pipeline_run, err.repo, err.steps,
-                        err.step_run.step_index, "stop", False,
-                    )
+                await self._handle_step_complete(
+                    db, pipeline_run, err.pipeline, err.repo, err.graph,
+                    err.step_run.step_id, False, None,
+                    step_run=err.step_run,
+                )
             else:
                 await self._complete_pipeline(db, pipeline_run, success=False)
 
@@ -3167,13 +3097,24 @@ class PipelineExecutor:
             )
 
         graph = parse_steps_graph(pipeline.steps_graph)
-        steps = parse_steps(pipeline.steps)
-        is_graph = bool(graph and step_run.step_id)
+        if not graph:
+            # A dispatched step whose pipeline lost its definition mid-run.
+            # `can_continue=False`: there is no graph to fan out over, so the
+            # only honest continuation is failing the run. Before 12.8 P5 this
+            # fell through to the array, where `parse_steps` swallowed the
+            # same absence to `[]` and the step "was not found" for a reason
+            # that named the wrong thing.
+            raise LocalStepContextError(
+                f"pipeline {pipeline.id} has no steps_graph; StepRun "
+                f"{step_run_id} (id={step_run.step_id}) has no definition to "
+                f"run",
+                pipeline_run=pipeline_run,
+                step_run=step_run,
+                pipeline=pipeline,
+                repo=repo,
+            )
 
-        if is_graph:
-            step = (graph.get("steps") or {}).get(step_run.step_id)
-        else:
-            step = steps[step_run.step_index] if step_run.step_index < len(steps) else None
+        step = (graph.get("steps") or {}).get(step_run.step_id)
         if step is None:
             raise LocalStepContextError(
                 f"step definition not found for StepRun {step_run_id} "
@@ -3183,12 +3124,10 @@ class PipelineExecutor:
                 pipeline=pipeline,
                 repo=repo,
                 graph=graph,
-                steps=steps,
-                is_graph=is_graph,
                 can_continue=True,
             )
 
-        return pipeline_run, pipeline, repo, step_run, graph, steps, step, is_graph
+        return pipeline_run, pipeline, repo, step_run, graph, step
 
     def _build_local_execution_config(
         self,
@@ -4133,10 +4072,8 @@ class PipelineExecutor:
         pipeline: Pipeline,
         repo: Repo,
         step_run: StepRun,
-        graph: dict | None,
-        steps: list[dict],
+        graph: dict,
         step: dict,
-        is_graph: bool,
         success: bool,
         exit_code: int | None,
         error: str | None,
@@ -4151,7 +4088,7 @@ class PipelineExecutor:
         async with self._run_lock(pipeline_run.id):
             await self._finish_local_step_locked(
                 db, pipeline_run, pipeline, repo, step_run,
-                graph, steps, step, is_graph, success, exit_code, error,
+                graph, step, success, exit_code, error,
                 log_tail,
             )
 
@@ -4300,10 +4237,8 @@ class PipelineExecutor:
         pipeline: Pipeline,
         repo: Repo,
         step_run: StepRun,
-        graph: dict | None,
-        steps: list[dict],
+        graph: dict,
         step: dict,
-        is_graph: bool,
         success: bool,
         exit_code: int | None,
         error: str | None,
@@ -4390,25 +4325,13 @@ class PipelineExecutor:
             f"{'success' if success else 'failed'} (exit_code={exit_code})"
         )
 
-        if is_graph:
-            await self._handle_graph_step_complete(
-                db, pipeline_run, pipeline, repo, graph, step_run.step_id, success, None,
-                step_run=step_run,
-            )
-        else:
-            if step_run.step_index >= len(steps):
-                logger.error(f"Step index {step_run.step_index} out of range")
-                return
-            action = step.get(
-                "on_success" if success else "on_failure",
-                "next" if success else "stop",
-            )
-            await self._handle_action(
-                db, pipeline_run, repo, steps, step_run.step_index, action, success
-            )
+        await self._handle_step_complete(
+            db, pipeline_run, pipeline, repo, graph, step_run.step_id, success, None,
+            step_run=step_run,
+        )
 
     # -------------------------------------------------------------------------
-    # Step completion (legacy job callback)
+    # Step completion (job callback)
     # -------------------------------------------------------------------------
 
     async def on_step_complete(
@@ -4423,14 +4346,11 @@ class PipelineExecutor:
 
         Called from job_callback when a job with step_run_id completes.
 
-        For graph-based pipelines:
         - Updates completed_step_ids and active_step_ids
+        - Fires the completed node's terminal actions
         - Finds all downstream edges based on success/failure
         - Triggers ready downstream steps (fan-out)
         - Handles fan-in by checking all upstream dependencies
-
-        For legacy pipelines:
-        - Uses sequential step execution with on_success/on_failure
 
         Args:
             runner_id: The runner that executed this step (for continuation affinity)
@@ -4522,30 +4442,51 @@ class PipelineExecutor:
         logger.info(f"Step {step_run.step_index} ({step_run.step_name}) completed: {'success' if step_success else 'failed'}")
         logger.info(f"[GRAPH] on_step_complete - step_run.step_id={step_run.step_id}, pipeline.steps_graph exists={pipeline.steps_graph is not None}")
 
-        # Check if this is a graph-based pipeline
+        # THE FORK THAT USED TO HIDE HERE (12.8 P5). This path is reached
+        # from `job_callback`, not from `_run_executor_step`, so it never
+        # received the two-way flag the local path threaded: it recomputed
+        # `graph and step_run.step_id` itself and kept its own `else:` into
+        # the v1 action handler. That `else:` was the last caller of the whole
+        # v1 family, with no test pointing at it - a dead limb that still ran.
+        #
+        # It is now a REFUSAL, not a fallback. A job callback for a run whose
+        # pipeline has no graph, or a StepRun with no `step_id`, cannot be
+        # continued - and continuing it as an array is what this phase
+        # deleted. The step row is already terminal above; the run is failed
+        # here so the callback never leaves it RUNNING with nobody to advance
+        # it (R1: the silent version of this is a run that hangs forever).
         graph = parse_steps_graph(pipeline.steps_graph)
-        logger.info(f"[GRAPH] Parsed graph: {graph is not None}")
-
-        if graph and step_run.step_id:
-            logger.info(f"[GRAPH] Using graph-based execution for step '{step_run.step_id}'")
-            # Graph-based execution with parallel support
-            await self._handle_graph_step_complete(
-                db, pipeline_run, pipeline, repo, graph, step_run.step_id, step_success, runner_id,
-                step_run=step_run,
+        if not graph or not step_run.step_id:
+            logger.error(
+                "Run %s: step '%s' (index %s) completed but it cannot be "
+                "continued - graph=%s, step_id=%r. Failing the run rather "
+                "than leaving it running with no owner.",
+                pipeline_run.id[:8],
+                step_run.step_name,
+                step_run.step_index,
+                graph is not None,
+                step_run.step_id,
             )
-        else:
-            logger.info(f"[GRAPH] Using LEGACY execution (graph={graph is not None}, step_id={step_run.step_id})")
-            # Legacy sequential execution
-            steps = parse_steps(pipeline.steps)
-            if step_run.step_index >= len(steps):
-                logger.error(f"Step index {step_run.step_index} out of range")
-                return
+            step_run.error = (
+                f"{step_run.error}\nthis run has no graph definition to "
+                f"continue from"
+                if step_run.error
+                else "this run has no graph definition to continue from"
+            )
+            step_run.status = RunStatus.FAILED.value
+            await db.commit()
+            await db.refresh(step_run)
+            await manager.send_step_run_status(step_run_to_ws_dict(step_run))
+            await self._complete_pipeline(db, pipeline_run, success=False)
+            return
 
-            step = steps[step_run.step_index]
-            action = step.get("on_success" if step_success else "on_failure", "stop" if not step_success else "next")
-            await self._handle_action(db, pipeline_run, repo, steps, step_run.step_index, action, step_success, runner_id=runner_id)
+        logger.info(f"[GRAPH] Using graph-based execution for step '{step_run.step_id}'")
+        await self._handle_step_complete(
+            db, pipeline_run, pipeline, repo, graph, step_run.step_id, step_success, runner_id,
+            step_run=step_run,
+        )
 
-    async def _handle_graph_step_complete(
+    async def _handle_step_complete(
         self,
         db: AsyncSession,
         pipeline_run: PipelineRun,
@@ -4570,7 +4511,7 @@ class PipelineExecutor:
 
         `step_run` is the row the caller just finished. Every production
         caller has it in hand (the route-failure branch of
-        `_execute_graph_step`, `_fail_wedged_local_step`,
+        `_execute_step`, `_fail_wedged_local_step`,
         `_finish_local_step_locked` and `_on_step_complete_locked`), so the
         actions are attributed to the EXACT row rather than to whatever a
         lookup returns for a step that has been retried. It stays optional
@@ -4586,7 +4527,7 @@ class PipelineExecutor:
         in front of every success verdict here: "no more steps I can reach" is
         not success.
         """
-        logger.info(f"[GRAPH] _handle_graph_step_complete called for step '{completed_step_id}' success={step_success}")
+        logger.info(f"[GRAPH] _handle_step_complete called for step '{completed_step_id}' success={step_success}")
         steps_dict = graph.get("steps", {})
         logger.info(f"[GRAPH] Graph has {len(steps_dict)} steps: {list(steps_dict.keys())}")
         logger.info(f"[GRAPH] Graph edges: {graph.get('edges', [])}")
@@ -4619,7 +4560,7 @@ class PipelineExecutor:
         # both in a stated sequence. An absent `actions` key is an empty
         # StepActions, so every pre-12.8 graph dict reads as "no actions".
         #
-        # A step that never STARTED gets here too - `_execute_graph_step`
+        # A step that never STARTED gets here too - `_execute_step`
         # re-enters this method with `step_success=False` when routing fails -
         # and its `failure` actions DO fire. That is v1's behaviour exactly
         # (`_execute_step`'s route-error branch applies `on_failure`), and it
@@ -4695,7 +4636,7 @@ class PipelineExecutor:
             await db.refresh(pipeline_run)
         for step_id in steps_to_execute:
             logger.info(f"[GRAPH] Triggering execution of step '{step_id}'")
-            await self._execute_graph_step(
+            await self._execute_step(
                 db, pipeline_run, pipeline, repo, graph, step_id, None, runner_id
             )
 
@@ -4714,7 +4655,7 @@ class PipelineExecutor:
             logger.info(f"[GRAPH] No active steps remaining")
 
             # A step that failed to route completes SYNCHRONOUSLY inside
-            # `_execute_graph_step` above, re-entering this method in the
+            # `_execute_step` above, re-entering this method in the
             # caller's own stack. If that inner frame already stamped the run
             # terminal, this outer frame must not stamp it a second time
             # (double `_complete_pipeline` = double workspace cleanup, double
@@ -4753,6 +4694,30 @@ class PipelineExecutor:
                 logger.info(f"[GRAPH] Steps were triggered, waiting for them to complete")
         else:
             logger.info(f"[GRAPH] Still have active steps, not completing pipeline yet")
+
+    async def _first_failed_step_index(self, db: AsyncSession, run_id: str) -> int:
+        """The step_index of this run's earliest FAILED step, or 0.
+
+        Replaces `pipeline_run.current_step`, which only ever meant anything on
+        the v1 array path and is now permanently 0. Reads the StepRuns, which
+        are the record of what actually happened - so the number the state
+        machine keeps and the UI shows names a step that really failed.
+
+        Falls back to 0 when nothing is marked failed (a run can fail without a
+        failed step: an undispatchable action, a graph-coverage defect). 0 is
+        honest there in a way it was not before - it means "the run failed, not
+        this step" rather than "step 0 failed", because there IS no failed step
+        to name.
+        """
+        result = await db.execute(
+            select(StepRun.step_index)
+            .where(StepRun.pipeline_run_id == run_id)
+            .where(StepRun.status == RunStatus.FAILED.value)
+            .order_by(StepRun.step_index)
+            .limit(1)
+        )
+        index = result.scalar_one_or_none()
+        return index if index is not None else 0
 
     def _all_upstream_satisfied(
         self,
@@ -4793,7 +4758,7 @@ class PipelineExecutor:
         Idempotent and order-preserving; the caller commits. `active_step_ids`
         means "claimed by this run", not "has a container yet" - the two differ
         by exactly the window a synchronous routing failure re-enters
-        `_handle_graph_step_complete` in, which is the window the run used to
+        `_handle_step_complete` in, which is the window the run used to
         be stamped terminal in.
         """
         active = parse_json_list(pipeline_run.active_step_ids)
@@ -4833,7 +4798,7 @@ class PipelineExecutor:
         """True when the run has been FAILED for not covering its graph.
 
         The gate in front of every success verdict in
-        `_handle_graph_step_complete` (QA finding T4). Returns False - "carry
+        `_handle_step_complete` (QA finding T4). Returns False - "carry
         on, the graph is covered" - for the overwhelmingly common case, and
         True having already stamped the run `failed` when it is not.
 
@@ -4976,10 +4941,11 @@ class PipelineExecutor:
     #
     # These methods fire that list. They decide nothing about what runs next
     # and, on the happy path, they complete nothing: the verdict remains
-    # `_verify_graph_coverage` + `_check_all_steps_passed`, always. That is
-    # the difference from the v1 handlers below, which end in
-    # `_complete_pipeline(success=True)` in three places - three false greens
-    # this split does not carry over.
+    # `_verify_graph_coverage` + `_check_all_steps_passed`, always. That was
+    # the difference from the v1 handlers that used to sit below them, which
+    # ended in `_complete_pipeline(success=True)` in three places - three
+    # false greens this split refused to carry over, and P5 then deleted
+    # along with everything else that could reach them.
     # -------------------------------------------------------------------------
 
     async def _run_terminal_action(
@@ -5147,7 +5113,7 @@ class PipelineExecutor:
     ) -> StepRun | None:
         """The most recent StepRun this run holds for a GRAPH step id.
 
-        The fallback for a caller of `_handle_graph_step_complete` that has no
+        The fallback for a caller of `_handle_step_complete` that has no
         row in hand. A step can own several rows - a retry, or QA4-06's
         duplicate dispatch - so the ordering is PINNED (newest first) rather
         than left to whatever the database happens to return; an action
@@ -5167,180 +5133,6 @@ class PipelineExecutor:
         )
         return result.scalars().first()
 
-    async def _step_run_at_index(
-        self, db: AsyncSession, pipeline_run: PipelineRun, step_index: int
-    ) -> StepRun | None:
-        """The v1 lookup: this run's StepRun at an ARRAY index.
-
-        Unordered `.first()`, inherited verbatim from the two call sites this
-        replaces so the v1 path keeps behaving exactly as it did. The graph
-        path does not use it - it is handed the row, or resolves it by step
-        id through `_latest_step_run_for`.
-        """
-        result = await db.execute(
-            select(StepRun)
-            .where(StepRun.pipeline_run_id == pipeline_run.id)
-            .where(StepRun.step_index == step_index)
-        )
-        return result.scalars().first()
-
-    async def _handle_action(
-        self,
-        db: AsyncSession,
-        pipeline_run: PipelineRun,
-        repo: Repo,
-        steps: list[dict],
-        current_step: int,
-        action: str,
-        step_success: bool,
-        runner_id: str | None = None,
-    ) -> None:
-        """
-        Handle on_success/on_failure action.
-
-        Actions:
-        - "next": Execute next step
-        - "stop": Complete pipeline (status based on step_success)
-        - "trigger:{card_id}": Clone card as template and run it
-        - "trigger:pipeline:{pipeline_id}": Start another pipeline
-        - "merge:{branch}": Merge current branch to target
-
-        THE VOCABULARY IS CLOSED (QA finding T4). Anything outside it used to
-        be logged at WARNING and then treated as "stop", which completed the
-        run with the STEP's verdict: `on_success: "nextt"` - one character -
-        stopped a three-step pipeline after step one and reported PASSED, with
-        nothing user-visible naming the typo. An action the executor cannot
-        dispatch is now a run failure that names the offender and the whole
-        vocabulary. `describe_step_action` is the single definition of that
-        vocabulary, so `PipelineStepConfig.on_success` / `on_failure` can be
-        closed at the schema against the same function.
-
-        Args:
-            runner_id: The runner that completed the previous step (for continuation affinity)
-        """
-        logger.info(f"Handling action '{action}' after step {current_step} (success={step_success})")
-
-        problem = describe_step_action(action)
-        if problem is not None:
-            await self._fail_run_on_undispatchable_action(
-                db, pipeline_run, current_step, problem
-            )
-            return
-
-        if action == "next":
-            # Execute next step, passing runner_id for affinity
-            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1, previous_runner_id=runner_id)
-
-        elif action == "stop":
-            # Complete the pipeline
-            await self._complete_pipeline(db, pipeline_run, success=step_success)
-
-        elif action.startswith("trigger:pipeline:"):
-            # Start another pipeline
-            target_pipeline_id = action[17:]  # Remove "trigger:pipeline:" prefix
-            await self._trigger_pipeline(db, pipeline_run, repo, steps, current_step, target_pipeline_id)
-
-        elif action.startswith("trigger:"):
-            # Clone card as template and run it
-            card_id = action[8:]  # Remove "trigger:" prefix
-            await self._trigger_card(db, pipeline_run, repo, steps, current_step, card_id)
-
-        elif action.startswith("merge:"):
-            # Merge the step's branch to target
-            target_branch = action[6:]  # Remove "merge:" prefix
-            await self._merge_branch(db, pipeline_run, repo, steps, current_step, target_branch)
-
-        else:  # pragma: no cover - describe_step_action already returned
-            raise ValueError(
-                f"action {action!r} passed validation but has no handler; "
-                "describe_step_action and _handle_action have drifted"
-            )
-
-    async def _fail_run_on_undispatchable_action(
-        self,
-        db: AsyncSession,
-        pipeline_run: PipelineRun,
-        current_step: int,
-        problem: str,
-    ) -> None:
-        """Fail a run whose step declared an action the executor cannot run.
-
-        The step itself is marked FAILED, not left green: its declared
-        continuation could not be honoured, so the step did not do what it
-        said it would - and a red run with nothing red in it is exactly the
-        "why did this fail?" the old silent 'treating as stop' produced from
-        the other direction. The reason is APPENDED to any error already
-        there, because this path is also reached from `_execute_step`'s
-        routing-failure branch, where the real cause is already recorded.
-        """
-        reason = f"step {current_step}: {problem}"
-        logger.error(
-            "Pipeline run %s cannot continue - %s",
-            pipeline_run.id[:8],
-            reason,
-        )
-
-        result = await db.execute(
-            select(StepRun)
-            .where(StepRun.pipeline_run_id == pipeline_run.id)
-            .where(StepRun.step_index == current_step)
-        )
-        step_run = result.scalars().first()
-        if step_run is not None:
-            step_run.error = (
-                f"{step_run.error}\n{reason}" if step_run.error else reason
-            )
-            step_run.status = RunStatus.FAILED.value
-            if step_run.completed_at is None:
-                step_run.completed_at = datetime.utcnow()
-            await db.commit()
-            await db.refresh(step_run)
-            await manager.send_step_run_status(step_run_to_ws_dict(step_run))
-
-        await self._complete_pipeline(db, pipeline_run, success=False)
-
-    async def _trigger_card(
-        self,
-        db: AsyncSession,
-        pipeline_run: PipelineRun,
-        repo: Repo,
-        steps: list[dict],
-        current_step: int,
-        template_card_id: str,
-    ) -> None:
-        """v1 FLOW around the fix-card effect: spawn it, then continue.
-
-        The effect itself moved to `_spawn_fix_card`, keyed off
-        `(step_index, template_card_id)` with no array in sight, so the graph
-        path can fire the same code without inheriting v1's continuation.
-        What stays here is exactly the part that IS the array: "and then run
-        `current_step + 1`".
-
-        v1 continues past a fix it could not dispatch. That is preserved
-        verbatim - P1 adds a capability, it does not change this one - and it
-        is the deliberate difference from the graph path, where an action
-        that could not be performed FAILS the run (R1). Both behaviours are
-        now visible in one place instead of implied by an early return.
-        """
-        problem = await self._spawn_fix_card(
-            db,
-            pipeline_run,
-            repo,
-            step_index=current_step,
-            template_card_id=template_card_id,
-        )
-        if problem is not None:
-            logger.warning(
-                "Run %s: the trigger action after step %s continues past a "
-                "fix card that was not dispatched (%s) - v1 behaviour; the "
-                "graph path fails the run instead",
-                pipeline_run.id[:8],
-                current_step,
-                problem,
-            )
-
-        await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
-
     async def _spawn_fix_card(
         self,
         db: AsyncSession,
@@ -5355,9 +5147,11 @@ class PipelineExecutor:
 
         THE EFFECT ONLY. Returns None when the fix run was dispatched, else
         the reason it was not. It chooses nothing about what runs next and
-        completes nothing, because its two callers want different things:
-        v1's `_trigger_card` continues to the next array index either way,
-        while `_run_terminal_action` fails the run on a reason.
+        completes nothing: `_run_terminal_action`, its one caller since 12.8
+        P5, fails the run on a reason and lets the edges decide the rest. The
+        split was made while v1's `_trigger_card` was still the other caller
+        (it continued to the next array index either way), and it is what let
+        that caller be deleted without touching a line of the effect.
 
         Keyed off `step_index` rather than off `(steps, current_step)`:
         nothing here indexes the array. `step_index` is the marker StepRun's
@@ -5511,58 +5305,6 @@ class PipelineExecutor:
 
         return error
 
-    async def _trigger_pipeline(
-        self,
-        db: AsyncSession,
-        pipeline_run: PipelineRun,
-        repo: Repo,
-        steps: list[dict],
-        current_step: int,
-        target_pipeline_id: str,
-    ) -> None:
-        """
-        Trigger another pipeline and wait for it to complete, then continue.
-
-        The triggered pipeline runs independently, and we continue to the next step
-        regardless of its outcome (it's fire-and-forget for now).
-        """
-        # Get the target pipeline
-        result = await db.execute(select(Pipeline).where(Pipeline.id == target_pipeline_id))
-        target_pipeline = result.scalar_one_or_none()
-        if not target_pipeline:
-            logger.error(f"Target pipeline {target_pipeline_id} not found for trigger action")
-            # Continue to next step anyway
-            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
-            return
-
-        # Get the target repo (may be different from current)
-        result = await db.execute(select(Repo).where(Repo.id == target_pipeline.repo_id))
-        target_repo = result.scalar_one_or_none()
-        if not target_repo:
-            logger.error(f"Repo {target_pipeline.repo_id} not found for triggered pipeline")
-            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
-            return
-
-        if not target_repo.is_ingested:
-            logger.error(f"Repo {target_repo.id} is not ingested, cannot run pipeline")
-            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
-            return
-
-        logger.info(f"Triggering pipeline {target_pipeline.name} (id: {target_pipeline_id})")
-
-        # Start the target pipeline (fire-and-forget for now)
-        # The triggered pipeline runs independently
-        await self.start_pipeline(
-            db=db,
-            pipeline=target_pipeline,
-            repo=target_repo,
-            trigger_type="pipeline",
-            trigger_ref=pipeline_run.id,  # Reference to the triggering pipeline run
-        )
-
-        # Continue to next step immediately (don't wait for triggered pipeline)
-        await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
-
     async def _resolve_merge_source_branch(
         self,
         db: AsyncSession,
@@ -5578,15 +5320,17 @@ class PipelineExecutor:
         run, never warn-and-continue-green.
 
         Takes the StepRun the caller is ALREADY HOLDING rather than looking
-        one up by array index. On the graph path there is no "current step"
-        integer to look up by, and both callers have the exact row: v1's
-        `_merge_branch` fetched it one line earlier for its own error
-        reporting, and the graph path is handed it by
-        `_handle_graph_step_complete`. Note this does not retire the
-        marker-row hack in `_spawn_fix_card` - v1 still resolves its row by
-        index, so a second row there would still be ambiguous.
+        one up by array index. There is no "current step" integer to look up
+        by any more, and the caller always has the exact row -
+        `_handle_step_complete` is handed it, or resolves it through
+        `_latest_step_run_for` with a pinned ordering.
+
+        The marker-row rule in `_spawn_fix_card` (`step_id=None`) is still
+        load-bearing for the OTHER reason it was written: `_latest_step_run_for`
+        selects by `step_id`, so a marker carrying one would be a second
+        candidate row for the step that spawned it.
         """
-        # Legacy path: the step's job -> card -> branch_name.
+        # A step backed by a job: job -> card -> branch_name.
         if step_run is not None and step_run.job_id:
             result = await db.execute(select(Job).where(Job.id == step_run.job_id))
             job = result.scalar_one_or_none()
@@ -5607,55 +5351,6 @@ class PipelineExecutor:
                 return branch
 
         return None
-
-    async def _merge_branch(
-        self,
-        db: AsyncSession,
-        pipeline_run: PipelineRun,
-        repo: Repo,
-        steps: list[dict],
-        current_step: int,
-        target_branch: str,
-    ) -> None:
-        """
-        v1 FLOW around the merge effect: merge, then continue or complete.
-
-        The merge itself moved to `_merge_step_branch`, keyed off the StepRun
-        rather than an array index, so the graph path fires the same code
-        without inheriting the two `_complete_pipeline(success=True)` calls
-        below - which are v1 false greens (a merge on the LAST step reports
-        the whole run PASSED without ever asking whether the other steps
-        did). What stays here is exactly the part that IS the array.
-
-        Branch resolution (fix 1): job/card branch for legacy steps, the
-        run's trigger-context branch for local steps. An unresolvable branch
-        FAILS the run loudly - a merge that silently does nothing is
-        indistinguishable from a merge that worked.
-        """
-        step_run = await self._step_run_at_index(db, pipeline_run, current_step)
-        problem = await self._merge_step_branch(
-            db, pipeline_run, repo, step_run, target_branch
-        )
-
-        if problem is not None:
-            logger.error(
-                f"Merge action after step {current_step} of run "
-                f"{pipeline_run.id[:8]} did not happen ({problem}) - "
-                f"failing the run"
-            )
-            if step_run is not None:
-                step_run.error = (
-                    (step_run.error + "\n") if step_run.error else ""
-                ) + problem
-                await db.commit()
-            await self._complete_pipeline(db, pipeline_run, success=False)
-            return
-
-        # Continue to next step or complete
-        if current_step + 1 < len(steps):
-            await self._execute_step(db, pipeline_run, repo, steps, current_step + 1)
-        else:
-            await self._complete_pipeline(db, pipeline_run, success=True)
 
     async def _merge_step_branch(
         self,

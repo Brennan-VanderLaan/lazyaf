@@ -10,6 +10,13 @@ from .models import (
     PipelineRunFactory,
     StepRunFactory,
 )
+from .pipelines import (
+    GraphFixtureError,
+    graph_json,
+    graph_pipeline_payload,
+    linear_graph,
+    make_repo_and_graph_pipeline,
+)
 from .api import (
     card_create_payload,
     card_update_payload,
@@ -46,6 +53,12 @@ __all__ = [
     "PipelineFactory",
     "PipelineRunFactory",
     "StepRunFactory",
+    # Graph pipeline fixtures (12.8)
+    "linear_graph",
+    "graph_json",
+    "graph_pipeline_payload",
+    "make_repo_and_graph_pipeline",
+    "GraphFixtureError",
     # API factories
     "repo_create_payload",
     "repo_update_payload",

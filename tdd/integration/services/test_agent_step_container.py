@@ -57,6 +57,7 @@ from build_images import (  # noqa: E402
     stage_context,
     tree_hash,
 )
+from tdd.shared.factories.pipelines import make_repo_and_graph_pipeline  # noqa: E402
 from tdd.integration.conftest import (  # noqa: E402
     advertise_addr,
     free_port,
@@ -211,25 +212,20 @@ async def env(tmp_path, monkeypatch, docker_client):
 
 
 async def make_repo_and_pipeline(factory, steps: list[dict]):
-    async with factory() as db:
-        repo = Repo(
-            id=str(uuid4()),
-            name="agent-step-repo",
-            default_branch="main",
-            is_ingested=True,
-        )
-        pipeline = Pipeline(
-            id=str(uuid4()),
-            repo_id=repo.id,
-            name="agent-step-pipeline",
-            steps=json.dumps(steps),
-        )
-        db.add(repo)
-        db.add(pipeline)
-        await db.commit()
-        await db.refresh(repo)
-        await db.refresh(pipeline)
-        return repo, pipeline
+    """A repo and a pipeline whose definition is the LINEAR GRAPH `steps` describes.
+
+    12.8: the argument shape is unchanged - the same `list[dict]` every call
+    site below already passes - and so is the persisted node ORDER, whose ids
+    are `step_0..step_N`. What changed is the column: `steps_graph`, not
+    `steps`.
+
+    This was one of seven byte-identical copies. It is now one line onto
+    `tdd/shared/factories/pipelines`, so the next change to how a test
+    pipeline is persisted happens once (R3).
+    """
+    return await make_repo_and_graph_pipeline(
+        factory, steps, name="agent-step-pipeline", repo_name="agent-step-repo",
+    )
 
 
 async def fetch_run(env, run_id: str) -> PipelineRun:

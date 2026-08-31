@@ -217,6 +217,18 @@ type Opts = {
   sessionStatus?: unknown;
   /** Collects every request path the page made, for the "did NOT cancel" test. */
   seen?: string[];
+  /** The endpoint registry, for the modality panel. Empty when omitted. */
+  endpoints?: unknown[];
+  /**
+   * What GET /api/playground/capabilities answers.
+   *
+   * Defaults to this build's real projection. Overridable so the "the limits
+   * are the server's numbers" test can serve DIFFERENT ones - which is the
+   * only way to prove the page reads them rather than reciting its own.
+   */
+  capabilities?: unknown;
+  /** Status for that read. 500 exercises the fail-closed path. */
+  capabilitiesStatus?: number;
 };
 
 async function mockApi(page: Page, opts: Opts = {}) {
@@ -252,6 +264,23 @@ async function mockApi(page: Page, opts: Opts = {}) {
       }
       if (path === `/api/repos/${REPO_ID}/branches/info`) {
         return route.fulfill(json({ branches: [], total: 0, orphaned_count: 0, damaged_count: 0 }));
+      }
+
+      // The endpoint registry behind the model select and the modality panel.
+      if (path === '/api/model-endpoints') {
+        return route.fulfill(json(opts.endpoints ?? []));
+      }
+
+      // MUST precede the `/api/playground/` prefix checks below: this is a
+      // literal path, and the catch-all `[]` at the bottom would otherwise
+      // answer it with something that is JSON and is not this.
+      if (path === '/api/playground/capabilities') {
+        if (opts.capabilitiesStatus && opts.capabilitiesStatus >= 400) {
+          return route.fulfill(
+            json({ detail: 'capability read exploded' }, opts.capabilitiesStatus),
+          );
+        }
+        return route.fulfill(json(opts.capabilities ?? PLAYGROUND_CAPABILITIES));
       }
 
       if (path === `/api/repos/${REPO_ID}/playground/sessions`) {
@@ -945,5 +974,435 @@ test.describe('rendering', () => {
       heights.logs,
       'on a page called a playground, the agent output got the smaller box',
     ).toBeGreaterThanOrEqual(heights.diff);
+  });
+});
+
+// ==========================================================================
+// Modalities: what the chosen model can be GIVEN, and what a human may
+// attach here (14.5)
+// ==========================================================================
+//
+// THE FAILURE THESE TESTS DEFEND AGAINST does not look like a failure: a file
+// accepted and never delivered, producing a right-looking answer from a prompt
+// that silently lost half its input. So every assertion below is either "this
+// control is disabled" or "the reason it is disabled is the RIGHT one" -
+// because a control disabled for the wrong reason sends a human to fix
+// something that is not broken.
+//
+// The endpoint rows here are byte-faithful to `endpoint_read`, and the states
+// are driven from the fixture rather than from a probe: the six-state chip
+// RENDERING is `endpoints.spec.ts`'s subject, and what this file owns is how
+// the Playground consumes it.
+
+function modality(
+  name: string,
+  state: string,
+  extra: Record<string, string | null> = {},
+) {
+  return { modality: name, state, source: null, reason: null, evidence: null, caveat: null, ...extra };
+}
+
+/** One registry row in the shape `endpoint_read` puts on the wire. */
+function endpointFixture(name: string, modalities: ReturnType<typeof modality>[] | null) {
+  return {
+    id: `fixture-${name}`,
+    name,
+    description: null,
+    base_url: 'http://mock:8099/v1',
+    model: 'mock-model',
+    server_kind: 'vllm',
+    auth_style: 'none',
+    auth_secret_ref: null,
+    auth_header_name: null,
+    secret_present: true,
+    reach: 'direct',
+    runner_label: null,
+    runner_count: null,
+    rate_usd_hour: '0.000000',
+    gpu_node_id: `endpoint:${name}`,
+    gpu_fraction: 1,
+    priced: true,
+    max_concurrency: 1,
+    request_timeout_seconds: 300,
+    context_window: null,
+    context_window_source: 'probe',
+    max_output_tokens: 4096,
+    capabilities: {
+      supports_tools: true,
+      supports_streaming: true,
+      reports_usage: true,
+      context_window: 32768,
+      max_output_tokens: 4096,
+      probe_status: 'ok',
+      probed_at: '2026-08-31T07:00:00Z',
+      probed_from: 'backend',
+      probe_age_seconds: 60,
+      stale: false,
+      ...(modalities === null ? {} : { modalities }),
+    },
+    pricing: { gpu_node_id: `endpoint:${name}`, gpu_fraction: 1, priced: true },
+    health: 'healthy',
+    probe_detail: {},
+    consecutive_failures: 0,
+    last_success_at: null,
+    last_error: null,
+    warning: null,
+    enabled: true,
+    in_flight: 0,
+    created_at: '2026-08-31T07:00:00Z',
+    updated_at: '2026-08-31T07:00:00Z',
+  };
+}
+
+const TEXT_OK = modality('text', 'supported', { source: 'wire_format' });
+const VIDEO_NEVER = modality('video', 'unrepresentable', {
+  source: 'wire_format',
+  reason: 'wire_format_has_no_video_content_part',
+});
+
+/** One endpoint per images-state, so each can be selected in turn. */
+const MODALITY_ENDPOINTS = [
+  endpointFixture('sees', [
+    TEXT_OK,
+    modality('images', 'supported', { source: 'wire_probe', reason: 'usage_delta_positive' }),
+    modality('audio', 'unsupported', { source: 'wire_probe', reason: 'http_400' }),
+    VIDEO_NEVER,
+  ]),
+  endpointFixture('refuses', [
+    TEXT_OK,
+    modality('images', 'unsupported', {
+      source: 'wire_probe',
+      reason: 'http_400',
+      evidence: 'This model does not support image input',
+    }),
+    modality('audio', 'unsupported', { source: 'wire_probe', reason: 'http_400' }),
+    VIDEO_NEVER,
+  ]),
+  endpointFixture('never-asked', [
+    TEXT_OK,
+    modality('images', 'unprobed'),
+    modality('audio', 'unprobed'),
+    VIDEO_NEVER,
+  ]),
+  endpointFixture('drops-silently', [
+    TEXT_OK,
+    modality('images', 'undetectable', { source: 'wire_probe', reason: 'no_usage_delta' }),
+    modality('audio', 'unprobed'),
+    VIDEO_NEVER,
+  ]),
+  // A backend one version behind: it answered, and its answer has no
+  // `modalities` list at all. That is a FOURTH unknown, not "unprobed".
+  endpointFixture('old-backend', null),
+];
+
+/** Byte-faithful to `GET /api/playground/capabilities` in this build. */
+const PLAYGROUND_CAPABILITIES = {
+  attachment_limits: {
+    max_files: 4,
+    max_bytes_per_file: 5 * 1024 * 1024,
+    max_bytes_total: 8 * 1024 * 1024,
+    media_types: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+  },
+  modalities: [
+    {
+      modality: 'images',
+      attachable: false,
+      reason:
+        'LazyAF cannot yet deliver an attachment to a model. The harness transcript types every message content as a string.',
+    },
+    { modality: 'audio', attachable: false, reason: 'Detected, deliberately not offered.' },
+    {
+      modality: 'video',
+      attachable: false,
+      reason: 'The OpenAI chat-completions wire format has no video content part.',
+    },
+  ],
+};
+
+/** Point the page at one self-hosted endpoint and wait for the panel. */
+async function selectEndpoint(page: Page, name: string) {
+  await page.locator('#runner-type').selectOption('openai-harness');
+  await page.locator('#model').selectOption(`endpoint:${name}`);
+  await expect(page.getByTestId('playground-modalities')).toBeVisible();
+}
+
+const attachBtn = (page: Page) => page.getByTestId('attach-images-btn');
+
+test.describe('the playground says what the chosen model can be given', () => {
+  test('a self-hosted endpoint gets the SHARED capability panel, not a copy', async ({ page }) => {
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+    await selectEndpoint(page, 'sees');
+
+    // `endpoint-capabilities-panel` is CapabilityChecks' own testid. Asserting
+    // it here is what proves the Playground renders the one component rather
+    // than a second, drifting copy of the six states (R3).
+    await expect(page.getByTestId('endpoint-capabilities-panel')).toBeVisible();
+
+    await expect(page.getByTestId('endpoint-cap-images')).toHaveAttribute('data-state', 'supported');
+    await expect(page.getByTestId('endpoint-cap-audio')).toHaveAttribute('data-state', 'unsupported');
+    await expect(page.getByTestId('endpoint-cap-video')).toHaveAttribute(
+      'data-state',
+      'unrepresentable',
+    );
+  });
+
+  test('video says the WIRE FORMAT cannot carry it, not that the model cannot', async ({ page }) => {
+    // A chip that is grey forever for an unstated reason is worse than no
+    // chip. This is the sentence that stops that.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+    await selectEndpoint(page, 'sees');
+
+    const video = page.getByTestId('endpoint-cap-video');
+    await expect(video).toBeVisible();
+    await expect(video).toContainText(/wire format|content part/i);
+  });
+
+  test('a CLI runner gets an explanation rather than an empty strip', async ({ page }) => {
+    // An empty capability strip next to a green one reads as "Claude cannot
+    // see images", which is false: Claude Code is a CLI agent and its inputs
+    // are not a property of anything LazyAF probed.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+
+    await expect(page.getByTestId('modality-cli-note')).toBeVisible();
+    await expect(page.getByTestId('modality-cli-note')).toContainText('CLI agent');
+    await expect(page.getByTestId('endpoint-capabilities-panel')).toHaveCount(0);
+  });
+
+  test('choosing the harness with no endpoint yet says nothing has been asked', async ({ page }) => {
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+    await page.locator('#runner-type').selectOption('openai-harness');
+
+    await expect(page.getByTestId('modality-no-endpoint')).toBeVisible();
+    await expect(page.getByTestId('endpoint-capabilities-panel')).toHaveCount(0);
+  });
+});
+
+test.describe('the attach control is disabled for the RIGHT reason', () => {
+  test('never probed: disabled, blamed on the endpoint, and it says what to do', async ({ page }) => {
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+    await selectEndpoint(page, 'never-asked');
+
+    await expect(attachBtn(page)).toBeDisabled();
+    await expect(attachBtn(page)).toHaveAttribute('data-blocked-by', 'endpoint');
+    await expect(attachBtn(page)).toHaveAttribute('data-modality-state', 'unprobed');
+    // `unprobed` is the one state with a verb attached to it.
+    await expect(page.getByTestId('attach-next')).toBeVisible();
+  });
+
+  test('probed and refused: disabled, quoting what the server actually said', async ({ page }) => {
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+    await selectEndpoint(page, 'refuses');
+
+    await expect(attachBtn(page)).toBeDisabled();
+    await expect(attachBtn(page)).toHaveAttribute('data-modality-state', 'unsupported');
+    await expect(page.getByTestId('attach-reason')).toContainText(
+      'This model does not support image input',
+    );
+  });
+
+  test('undetectable does NOT read like never-probed', async ({ page }) => {
+    // THE COLLAPSE THAT WOULD BE A LIE. `unprobed` means nobody asked;
+    // `undetectable` means the server took the image, returned 200, and the
+    // prompt token count did not move - the request SUCCEEDS and the input
+    // vanishes. They disable the same control and call for different actions.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+
+    await selectEndpoint(page, 'never-asked');
+    const unprobedReason = await page.getByTestId('attach-reason').innerText();
+
+    await page.locator('#model').selectOption('endpoint:drops-silently');
+    await expect(attachBtn(page)).toHaveAttribute('data-modality-state', 'undetectable');
+    const undetectableReason = await page.getByTestId('attach-reason').innerText();
+
+    expect(undetectableReason).not.toBe(unprobedReason);
+  });
+
+  test('a backend with no modality list is not reported as "not supported"', async ({ page }) => {
+    // A FOURTH kind of unknown. Probing cannot fix it, so it must not offer
+    // Probe - that would send an operator round a loop that never terminates.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+    await selectEndpoint(page, 'old-backend');
+
+    await expect(page.getByTestId('endpoint-modalities-unreported')).toBeVisible();
+    await expect(attachBtn(page)).toBeDisabled();
+    await expect(attachBtn(page)).toHaveAttribute('data-blocked-by', 'unreported');
+    await expect(page.getByTestId('attach-next')).toHaveCount(0);
+  });
+
+  test('an endpoint that CAN see is still refused while LazyAF cannot carry it', async ({ page }) => {
+    // Two different facts, and both have to be true. Collapsing them would
+    // make "your endpoint cannot see" and "LazyAF cannot send" one sentence
+    // when they call for opposite actions.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+    await selectEndpoint(page, 'sees');
+
+    await expect(attachBtn(page)).toBeDisabled();
+    await expect(attachBtn(page)).toHaveAttribute('data-blocked-by', 'platform');
+    await expect(attachBtn(page)).toHaveAttribute('data-modality-state', 'supported');
+    await expect(page.getByTestId('attach-reason')).toContainText('cannot yet deliver');
+  });
+
+  test('a CLI runner does not blame the endpoint for the CLI', async ({ page }) => {
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS });
+    await openPlayground(page);
+
+    await expect(attachBtn(page)).toBeDisabled();
+    await expect(attachBtn(page)).toHaveAttribute('data-blocked-by', 'runner');
+  });
+});
+
+test.describe('the attach limits are the server’s numbers', () => {
+  test('the stated caps come from GET /api/playground/capabilities', async ({ page }) => {
+    // R3: a "max 5 MiB" typed into the template beside a `5 * 1024 * 1024` in
+    // the validator is two sources of truth, and the half that drifts is
+    // always the sentence. Serving DIFFERENT numbers proves the page is
+    // reading them rather than reciting its own.
+    await mockApi(page, {
+      endpoints: MODALITY_ENDPOINTS,
+      capabilities: {
+        ...PLAYGROUND_CAPABILITIES,
+        attachment_limits: {
+          max_files: 2,
+          max_bytes_per_file: 1024 * 1024,
+          max_bytes_total: 2 * 1024 * 1024,
+          media_types: ['image/png'],
+        },
+      },
+    });
+    await openPlayground(page);
+
+    const limits = page.getByTestId('attach-limits');
+    await expect(limits).toContainText('2 files');
+    await expect(limits).toContainText('1 MiB');
+    await expect(limits).toContainText('2 MiB');
+    await expect(limits).toContainText('PNG');
+    await expect(limits).not.toContainText('5 MiB');
+  });
+
+  test('a failed capability read disables attach and SAYS the read failed', async ({ page }) => {
+    // "We could not ask" is not "yes". An optimistic default here is exactly
+    // how a file gets accepted that nothing can carry.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS, capabilitiesStatus: 500 });
+    await openPlayground(page);
+    await selectEndpoint(page, 'sees');
+
+    await expect(page.getByTestId('attach-capabilities-error')).toBeVisible();
+    await expect(attachBtn(page)).toBeDisabled();
+    await expect(attachBtn(page)).toHaveAttribute('data-blocked-by', 'platform');
+    await expect(page.getByTestId('attach-limits')).toContainText(/unknown/i);
+  });
+
+  test('a 200 carrying the wrong shape is refused, not rendered', async ({ page }) => {
+    // The catch-all `[]` a dev proxy or a stale backend can answer with. It is
+    // JSON and it is not this; storing it would put `undefined` where the
+    // template reads `.modalities`, and a page that throws mid-render leaves
+    // the attach control with no state at all.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS, capabilities: [] });
+    await openPlayground(page);
+    await selectEndpoint(page, 'sees');
+
+    await expect(page.getByTestId('attach-capabilities-error')).toBeVisible();
+    await expect(attachBtn(page)).toBeDisabled();
+    // The panel itself still rendered - a bad capability read must not take
+    // the modality display down with it.
+    await expect(page.getByTestId('endpoint-capabilities-panel')).toBeVisible();
+  });
+});
+
+test.describe('the modality panel does not disturb what already worked', () => {
+  test('the pane still follows, still yields, and history still lists, with the panel on screen', async ({
+    page,
+  }) => {
+    // The regression guard. The panel sits in the same scrolling config
+    // column as the history list and re-renders on every endpoint store
+    // update; none of that may touch the output pane's scroll contract.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS, history: [HISTORY_ROW] });
+    await openPlayground(page);
+    await selectEndpoint(page, 'sees');
+
+    await startRun(page);
+    await fillAndSettle(page, 200);
+
+    // Following still works with the panel present.
+    const followed = await metrics(page);
+    expect(Math.abs(followed.scrollTop + followed.clientHeight - followed.scrollHeight)).toBeLessThanOrEqual(2);
+
+    // And it still YIELDS to a user who scrolled up.
+    await logsContainer(page).evaluate((el) => {
+      el.scrollTop = Math.floor(el.scrollHeight * 0.3);
+    });
+    await page.waitForTimeout(120);
+    const parked = await metrics(page);
+    await page.evaluate(() => window.__sse.burst(40, 6, 'after-panel'));
+    await page.waitForTimeout(1200);
+    expect((await metrics(page)).scrollTop, 'the panel re-render moved the pane').toBe(
+      parked.scrollTop,
+    );
+
+    await expect(page.getByTestId('history-item')).toHaveCount(1);
+  });
+
+  test('a live selection in the pane survives the panel re-rendering', async ({ page }) => {
+    // The panel is reactive on `$endpointsStore` and on the capability read,
+    // both of which land after mount. A re-render that reconciled the log
+    // block would destroy a standing selection - the exact bug this page was
+    // reported for.
+    //
+    // The run is LANDED first, deliberately. The model select is disabled
+    // while a run is live (it always has been - you may not swap the model out
+    // from under a running container), so the endpoint switch this test needs
+    // is only reachable once the run is over. That also removes the autoscroll
+    // from the picture, leaving the panel re-render as the only thing that
+    // could destroy the selection.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS, result: RESULT });
+    await openPlayground(page);
+    await selectEndpoint(page, 'sees');
+    await startRun(page);
+    await fillAndSettle(page, 120);
+
+    await page.evaluate(() => window.__sse.emit('complete', 'completed'));
+    await expect(page.locator('#model')).toBeEnabled();
+
+    await logsContainer(page).evaluate((el) => {
+      const lines = el.querySelectorAll('.log-line');
+      const range = document.createRange();
+      range.setStart(lines[2], 0);
+      range.setEnd(lines[4], lines[4].childNodes.length);
+      const selection = document.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    });
+    const before = await page.evaluate(() => document.getSelection()?.toString().length ?? 0);
+    expect(before).toBeGreaterThan(0);
+
+    // Switching endpoint re-renders the whole panel.
+    await page.locator('#model').selectOption('endpoint:refuses');
+    await expect(attachBtn(page)).toHaveAttribute('data-modality-state', 'unsupported');
+
+    const after = await page.evaluate(() => document.getSelection()?.toString().length ?? 0);
+    expect(after, 'the panel re-render destroyed the selection').toBe(before);
+  });
+
+  test('Reset keeps the attach limits it already read', async ({ page }) => {
+    // They are a property of the BUILD, not of the run. Dropping them on Reset
+    // would leave the control briefly unable to state its own limits.
+    await mockApi(page, { endpoints: MODALITY_ENDPOINTS, result: RESULT });
+    await openPlayground(page);
+    await selectEndpoint(page, 'sees');
+    await startRun(page);
+    await page.evaluate(() => window.__sse.emit('complete', 'completed'));
+
+    await page.getByTestId('reset-btn').click();
+    await expect(page.getByTestId('attach-limits')).toContainText('5 MiB');
+    await expect(page.getByTestId('attach-capabilities-error')).toHaveCount(0);
   });
 });

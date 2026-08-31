@@ -19,7 +19,14 @@ from app.schemas import (
     PipelineRunCreate,
     StepRunRead,
 )
-from app.schemas.pipeline import ADHOC_TRIGGER_TYPES, DEBUG_TRIGGER_TYPES
+from app.schemas.pipeline import (
+    ADHOC_TRIGGER_TYPES,
+    DEBUG_TRIGGER_TYPES,
+    ArrayConversionError,
+    PipelineGraphModel,
+    PipelineStepConfig,
+    array_to_graph,
+)
 from app.services.agent_run import ADHOC_PREFIX
 from app.services.websocket import manager
 
@@ -60,7 +67,14 @@ def live_run_refusal(subject: str, runs: list) -> str:
 
 
 def parse_steps(steps_str: str | None) -> list:
-    """Parse steps from JSON string to list."""
+    """Parse the LEGACY v1 steps array from its JSON string.
+
+    12.8: the only two readers left are the run gate and the export fallback
+    below, and both exist solely for rows written BEFORE this phase - nothing
+    writes the column any more (`create_pipeline` / `update_pipeline` /
+    `upsert_materialized_pipeline` all write `steps_graph`). Both readers, and
+    this function, go with the column at P6.
+    """
     if not steps_str:
         return []
     try:
@@ -69,11 +83,60 @@ def parse_steps(steps_str: str | None) -> list:
         return []
 
 
-def serialize_steps(steps: list | None) -> str:
-    """Serialize steps from list to JSON string."""
+def parse_steps_graph(steps_graph_str: str | None) -> dict | None:
+    """Parse a stored steps_graph JSON string to a dict, or None."""
+    if not steps_graph_str:
+        return None
+    try:
+        parsed = json.loads(steps_graph_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed or None
+
+
+def graph_from_request(
+    steps: list[PipelineStepConfig] | None,
+    steps_graph: PipelineGraphModel | None,
+) -> PipelineGraphModel | None:
+    """The graph an API write means, or None when it authors no definition.
+
+    The API door (12.8 §4.4). One definition reaches the column, always the
+    graph, so the executor never has to ask which of two fields the caller
+    meant:
+
+      * `steps` non-empty -> converted here, once, by the same
+        `array_to_graph` the YAML door uses (R3).
+      * `steps_graph` -> used as given.
+      * neither, or an EMPTY `steps` -> None. An empty array is NOT "the
+        caller supplied a definition": the editor's create-then-author flow
+        posts `{"name": ..., "steps": []}` first and authors the graph in a
+        follow-up PATCH, and 11 test call sites do the same. The pipeline is
+        simply unrunnable until it has one, which `POST /run` already says.
+
+    BOTH non-empty is refused by `_refuse_both_dialects` on `PipelineCreate` /
+    `PipelineUpdate`, which is the single owner of that rule (R3) and runs
+    during body parsing - i.e. before this function is ever reached. It is
+    not re-checked here: a second copy of a refusal is a second thing to keep
+    in step with the first.
+
+    Raises:
+        HTTPException: 422 with the reasons, if the array cannot be held
+            faithfully by a graph.
+    """
+    if steps_graph is not None:
+        return steps_graph
     if not steps:
-        return "[]"
-    return json.dumps([s.model_dump() if hasattr(s, 'model_dump') else s for s in steps])
+        return None
+    try:
+        return array_to_graph(steps)
+    except ArrayConversionError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "`steps` cannot be expressed as a pipeline graph: "
+                + "; ".join(exc.reasons)
+            ),
+        )
 
 
 def parse_triggers(triggers_str: str | None) -> list:
@@ -94,13 +157,22 @@ def serialize_triggers(triggers: list | None) -> str:
 
 
 def pipeline_to_ws_dict(pipeline: Pipeline) -> dict:
-    """Convert a Pipeline model to a dict for websocket broadcast."""
+    """Convert a Pipeline model to a dict for websocket broadcast.
+
+    12.8: carries `steps_graph`, not `steps`. The frame REPLACES the store's
+    row on the client, so shipping the retired array meant a create or an edit
+    handed the UI a pipeline with no definition at all - the card had nothing
+    to count and nothing to render. `definition_error` rides along for the
+    same reason: it is a property of the row, and a badge that only appears
+    after a page reload is a badge nobody sees.
+    """
     return {
         "id": pipeline.id,
         "repo_id": pipeline.repo_id,
         "name": pipeline.name,
         "description": pipeline.description,
-        "steps": parse_steps(pipeline.steps),
+        "steps_graph": parse_steps_graph(pipeline.steps_graph),
+        "definition_error": pipeline.definition_error,
         "triggers": parse_triggers(pipeline.triggers),
         "is_template": pipeline.is_template,
         "created_at": pipeline.created_at.isoformat() if pipeline.created_at else None,
@@ -208,17 +280,17 @@ async def create_pipeline(repo_id: str, pipeline: PipelineCreate, db: AsyncSessi
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Repo not found")
 
-    # Serialize steps, steps_graph, and triggers to JSON
-    steps_json = serialize_steps(pipeline.steps)
+    # ONE definition reaches the row, and it is always the graph (12.8 §4.4).
+    # `steps` is not passed at all: the column keeps its python-side "[]"
+    # default until it is dropped, so nothing new is ever written into it.
+    graph = graph_from_request(pipeline.steps, pipeline.steps_graph)
     triggers_json = serialize_triggers(pipeline.triggers)
-    steps_graph_json = pipeline.steps_graph.model_dump_json() if pipeline.steps_graph else None
 
     db_pipeline = Pipeline(
         repo_id=repo_id,
         name=pipeline.name,
         description=pipeline.description,
-        steps=steps_json,
-        steps_graph=steps_graph_json,
+        steps_graph=graph.model_dump_json() if graph is not None else None,
         triggers=triggers_json,
         is_template=pipeline.is_template,
     )
@@ -251,14 +323,28 @@ async def update_pipeline(pipeline_id: str, update: PipelineUpdate, db: AsyncSes
         raise HTTPException(status_code=404, detail="Pipeline not found")
 
     update_data = update.model_dump(exclude_unset=True)
+
+    # The definition, if this PATCH touches it at all. Both keys land on the
+    # ONE column (12.8 §4.4); `steps` is converted here and `steps_graph` is
+    # taken as given, and sending both is a 422 rather than a write whose
+    # loser is silently discarded. An explicit `steps_graph: null`, or a
+    # `steps: []`, clears the definition - which is exactly what writing "[]"
+    # into the array used to mean.
+    touches_definition = bool(
+        {"steps", "steps_graph"} & set(update_data)
+    )
+    update_data.pop("steps", None)
+    update_data.pop("steps_graph", None)
+
+    if touches_definition:
+        graph = graph_from_request(update.steps, update.steps_graph)
+        pipeline.steps_graph = (
+            graph.model_dump_json() if graph is not None else None
+        )
+
     for key, value in update_data.items():
-        if key == "steps" and value is not None:
-            value = serialize_steps(value)
-        elif key == "triggers" and value is not None:
+        if key == "triggers" and value is not None:
             value = serialize_triggers(value)
-        elif key == "steps_graph" and value is not None:
-            # Serialize steps_graph dict to JSON string
-            value = json.dumps(value)
         setattr(pipeline, key, value)
 
     await db.commit()
@@ -342,6 +428,27 @@ async def run_pipeline(
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline not found")
 
+    # A definition that REFUSED to materialize must not run (12.8 §1.7). The
+    # row keeps whatever graph it had before, so without this guard a broken
+    # push would quietly re-run yesterday's definition under today's name and
+    # report green - the Y5 dark channel.
+    #
+    # Checked BEFORE the repo lookup on purpose: this is a fact about the
+    # thing the caller asked to run, and "repo not ingested" would answer a
+    # question they did not ask about a pipeline that could not run either
+    # way. No existing behaviour moves - until this phase no row could carry
+    # the field at all.
+    if pipeline.definition_error:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Pipeline '{pipeline.name}' has no runnable definition: "
+                f"{pipeline.definition_error}. Fix the definition and sync it "
+                f"again; running now would run the definition this one "
+                f"replaced."
+            ),
+        )
+
     # Get repo to check if it's ready
     result = await db.execute(select(Repo).where(Repo.id == pipeline.repo_id))
     repo = result.scalar_one_or_none()
@@ -366,6 +473,9 @@ async def run_pipeline(
         except (json.JSONDecodeError, TypeError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid steps_graph: {e}")
     else:
+        # Rows written BEFORE the graph cutover, which migration 0014 has not
+        # backfilled yet. Nothing writes the array any more; this branch and
+        # the executor's array fork die together at P5/P6.
         steps = parse_steps(pipeline.steps)
 
     if not steps:
@@ -560,78 +670,251 @@ def _content_disposition(pipeline_name: str) -> str:
     )
 
 
+#: The step keys the export writes, in this order. Pinned deliberately: this
+#: is `PipelineStepYaml`'s field set, and dropping any of them makes the
+#: round trip lossy in a way nothing would notice - `id` renames every node
+#: on re-import (and node ids are context-directory names and debug
+#: breakpoint keys), `timeout` silently resets every step to 300s, and
+#: `continue_in_context` silently loses workspace continuation.
+EXPORT_STEP_KEYS = (
+    "id", "name", "type", "config",
+    "on_success", "on_failure", "timeout", "continue_in_context",
+)
+
+
+class GraphNotExportable(Exception):
+    """A graph using a construct the v1 authoring array cannot say.
+
+    Carries the CONSTRUCT, not just "cannot export": the whole point of
+    refusing instead of flattening is that the author is told which edge or
+    action is the problem and can go and change it.
+    """
+
+    def __init__(self, construct: str):
+        self.construct = construct
+        super().__init__(construct)
+
+
+def _outgoing_by_condition(edges: list) -> dict[str, dict[str, list[str]]]:
+    """`{from_step: {condition: [to_step, ...]}}`, refusing on `always`."""
+    outgoing: dict[str, dict[str, list[str]]] = {}
+    for edge in edges:
+        condition = edge.get("condition", "success")
+        source = edge.get("from_step")
+        target = edge.get("to_step")
+        if condition == "always":
+            raise GraphNotExportable(
+                f"an 'always' edge ({source} -> {target}): the array format "
+                f"routes on success and on failure, and has no word for both"
+            )
+        if condition not in ("success", "failure"):
+            raise GraphNotExportable(
+                f"an edge condition {condition!r} ({source} -> {target}) the "
+                f"array format has no word for"
+            )
+        outgoing.setdefault(source, {}).setdefault(condition, []).append(target)
+    return outgoing
+
+
+def _condition_action(
+    step_id: str,
+    condition: str,
+    fired: list[str],
+    targets: list[str],
+    next_id: str | None,
+) -> str:
+    """The single `on_{condition}` word for one node, or a refusal.
+
+    v1 carried FLOW and EFFECT in one string, so this is the inverse of
+    `array_to_graph`'s split: an edge to the next step is `next`, no edge is
+    `stop`, and an action is the action itself (which in v1 ALWAYS continued
+    afterwards, hence the `does not continue` refusal below).
+    """
+    continues = next_id is not None and next_id in targets
+
+    if len(fired) > 1:
+        raise GraphNotExportable(
+            f"step {step_id!r} firing {len(fired)} actions on {condition} "
+            f"({', '.join(fired)}): the array format carries one action per "
+            f"outcome, which is why they became a list in the first place"
+        )
+    if fired:
+        if next_id is not None and not continues:
+            raise GraphNotExportable(
+                f"step {step_id!r} firing {fired[0]!r} on {condition} without "
+                f"continuing to {next_id!r}: in the array format an action "
+                f"always runs the following step afterwards"
+            )
+        return fired[0]
+    return "next" if continues else "stop"
+
+
+def graph_to_yaml_steps(graph: dict) -> list[dict]:
+    """The v1 authoring array for a graph, or a refusal naming the construct.
+
+    Export emits the ARRAY dialect (12.8 §4.10) because that is what
+    `.lazyaf/pipelines/*.yaml` is: the point of exporting is to commit the
+    file and have LazyAF read it back. Until 12.8 this endpoint emitted a
+    THIRD dialect - `steps` as a mapping keyed by step id, with edge TARGETS
+    written into `on_success` - which `PipelineYaml` cannot validate at all,
+    so LazyAF could not import its own export.
+
+    The down-conversion is total for a linear graph and REFUSES for
+    everything else. It does not flatten: silently dropping the second branch
+    of a fan-out would be the same class of defect on the way out that
+    `array_to_graph` exists to prevent on the way in (R1).
+
+    Raises:
+        GraphNotExportable: naming the construct that cannot be written.
+    """
+    steps = graph.get("steps") or {}
+    if not isinstance(steps, dict) or not steps:
+        raise GraphNotExportable("a graph with no steps")
+
+    entry_points = list(graph.get("entry_points") or [])
+    if len(entry_points) != 1:
+        raise GraphNotExportable(
+            f"{len(entry_points)} entry points"
+            + (f" ({', '.join(entry_points)})" if entry_points else "")
+            + ": the array format has exactly one, its first step"
+        )
+
+    outgoing = _outgoing_by_condition(graph.get("edges") or [])
+
+    incoming: dict[str, set[str]] = {}
+    for source, by_condition in outgoing.items():
+        for targets in by_condition.values():
+            for target in targets:
+                incoming.setdefault(target, set()).add(source)
+    for target, sources in incoming.items():
+        if len(sources) > 1:
+            raise GraphNotExportable(
+                f"fan-in: step {target!r} reached from {len(sources)} "
+                f"different steps ({', '.join(sorted(sources))}), and the "
+                f"array format reaches every step from exactly the one "
+                f"before it"
+            )
+
+    # Walk the chain from the single entry point. In the array format step
+    # i+1 is reachable ONLY from step i, so the walk both derives the export
+    # order and proves the graph is a chain.
+    order: list[str] = []
+    seen: set[str] = set()
+    current = entry_points[0]
+    while True:
+        if current in seen:
+            raise GraphNotExportable(f"a cycle back through step {current!r}")
+        seen.add(current)
+        order.append(current)
+        targets = {
+            target
+            for condition_targets in outgoing.get(current, {}).values()
+            for target in condition_targets
+        }
+        if not targets:
+            break
+        if len(targets) > 1:
+            raise GraphNotExportable(
+                f"fan-out: step {current!r} continuing to {len(targets)} "
+                f"different steps ({', '.join(sorted(targets))}), and the "
+                f"array format continues to exactly one"
+            )
+        current = next(iter(targets))
+
+    stranded = [step_id for step_id in steps if step_id not in seen]
+    if stranded:
+        raise GraphNotExportable(
+            f"step(s) {', '.join(repr(s) for s in stranded)} that the path "
+            f"from entry point {entry_points[0]!r} never reaches"
+        )
+
+    exported: list[dict] = []
+    for index, step_id in enumerate(order):
+        node = steps[step_id] or {}
+        actions = node.get("actions") or {}
+        if actions.get("always"):
+            raise GraphNotExportable(
+                f"step {step_id!r} firing {len(actions['always'])} 'always' "
+                f"action(s) ({', '.join(actions['always'])}): the array "
+                f"format keys an action on success or on failure, never both"
+            )
+        next_id = order[index + 1] if index + 1 < len(order) else None
+
+        record = {
+            "id": step_id,
+            "name": node.get("name", step_id),
+            "type": node.get("type", "script"),
+            "config": node.get("config") or {},
+            "timeout": node.get("timeout", 300),
+            "continue_in_context": bool(node.get("continue_in_context", False)),
+        }
+        for condition in ("success", "failure"):
+            record[f"on_{condition}"] = _condition_action(
+                step_id,
+                condition,
+                list(actions.get(condition) or []),
+                outgoing.get(step_id, {}).get(condition, []),
+                next_id,
+            )
+        exported.append({key: record[key] for key in EXPORT_STEP_KEYS})
+
+    return exported
+
+
 @router.get("/api/pipelines/{pipeline_id}/export/yaml")
 async def export_pipeline_yaml(pipeline_id: str, db: AsyncSession = Depends(get_db)):
-    """Export a pipeline to YAML format."""
+    """Export a pipeline as a `.lazyaf/pipelines/*.yaml` file.
+
+    The output is the AUTHORING dialect - the same array shape `PipelineYaml`
+    reads - so an exported file can be committed to `.lazyaf/pipelines/` and
+    synced straight back in. A graph the array cannot express is a 409 naming
+    the construct, never a quiet flatten.
+    """
     result = await db.execute(select(Pipeline).where(Pipeline.id == pipeline_id))
     pipeline = result.scalar_one_or_none()
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline not found")
 
-    # Build the YAML structure
-    export_data = {
-        "name": pipeline.name,
-        "description": pipeline.description,
-        "version": 2,
-    }
+    export_data: dict = {"name": pipeline.name}
+    if pipeline.description:
+        export_data["description"] = pipeline.description
 
-    # Use steps_graph if available, otherwise fall back to legacy steps
-    if pipeline.steps_graph:
-        graph = json.loads(pipeline.steps_graph)
-        steps = graph.get("steps", {})
-        edges = graph.get("edges", [])
-        entry_points = graph.get("entry_points", [])
+    triggers = parse_triggers(pipeline.triggers)
+    if triggers:
+        export_data["triggers"] = triggers
 
-        # Convert graph to YAML-friendly format
-        export_data["entry_points"] = entry_points
-        export_data["steps"] = {}
-
-        for step_id, step in steps.items():
-            step_export = {
-                "name": step.get("name", step_id),
-                "type": step.get("type", "script"),
-            }
-
-            # Add config if present
-            if step.get("config"):
-                step_export["config"] = step["config"]
-
-            # Find outgoing edges for this step
-            success_targets = []
-            failure_targets = []
-            always_targets = []
-
-            for edge in edges:
-                if edge.get("from_step") == step_id:
-                    target = edge.get("to_step")
-                    condition = edge.get("condition", "success")
-                    if condition == "success":
-                        success_targets.append(target)
-                    elif condition == "failure":
-                        failure_targets.append(target)
-                    elif condition == "always":
-                        always_targets.append(target)
-
-            if success_targets:
-                step_export["on_success"] = success_targets if len(success_targets) > 1 else success_targets[0]
-            if failure_targets:
-                step_export["on_failure"] = failure_targets if len(failure_targets) > 1 else failure_targets[0]
-            if always_targets:
-                step_export["on_always"] = always_targets if len(always_targets) > 1 else always_targets[0]
-
-            export_data["steps"][step_id] = step_export
+    graph = parse_steps_graph(pipeline.steps_graph)
+    if graph is not None:
+        try:
+            export_data["steps"] = graph_to_yaml_steps(graph)
+        except GraphNotExportable as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Pipeline '{pipeline.name}' cannot be exported as a "
+                    f"`.lazyaf/pipelines` yaml file: it uses {exc.construct}. "
+                    f"The export is the authoring array, so flattening this "
+                    f"would hand you a file that re-imports as a DIFFERENT "
+                    f"pipeline."
+                ),
+            )
     else:
-        # Legacy format - convert steps array to YAML
-        steps = parse_steps(pipeline.steps)
-        export_data["steps"] = []
-        for step in steps:
-            step_export = {
-                "name": step.get("name", "Unnamed"),
+        # Rows written before the graph cutover that migration 0014 has not
+        # backfilled yet. They are already the authoring dialect; fill in the
+        # keys the array left optional so the export has one shape either way.
+        export_data["steps"] = [
+            {
+                "id": step.get("id") or f"step_{index}",
+                "name": step.get("name", f"step_{index}"),
                 "type": step.get("type", "script"),
+                "config": step.get("config") or {},
+                "on_success": step.get("on_success", "next"),
+                "on_failure": step.get("on_failure", "stop"),
+                "timeout": step.get("timeout", 300),
+                "continue_in_context": bool(step.get("continue_in_context", False)),
             }
-            if step.get("config"):
-                step_export["config"] = step["config"]
-            export_data["steps"].append(step_export)
+            for index, step in enumerate(parse_steps(pipeline.steps))
+        ]
 
     # Generate YAML with nice formatting
     yaml_content = yaml.dump(export_data, default_flow_style=False, sort_keys=False, allow_unicode=True)

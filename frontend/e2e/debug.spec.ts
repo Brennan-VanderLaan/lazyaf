@@ -31,35 +31,50 @@ import { BACKEND_URL, resetBackend, seedBackend, type SeedResponse } from './hel
 /**
  * Three script steps; the LAST one fails, which is what makes the original
  * run eligible for a debug re-run. The breakpoint goes on the middle step, so
- * proving the pause requires step 0 to have actually run first - a gate that
- * fired at step 0 (or never) would not produce this state.
+ * proving the pause requires 'prepare' to have actually run first - a gate
+ * that fired on the first step (or never) would not produce this state.
+ *
+ * A GRAPH, since 12.8 P3. It was a v1 `steps` array, and the change is not
+ * cosmetic: a breakpoint key IS `StepRun.step_id`, which the executor stamps
+ * from the graph node id, so the keys asserted below went from positional
+ * ('0','1','2' - meaningful only while a pipeline was a list) to the step ids
+ * an author actually writes. That is the whole point of the debug key
+ * resolver, and this fixture is where it becomes visible.
  */
-const PIPELINE_STEPS = [
-  {
-    name: 'prepare',
-    type: 'script',
-    config: { command: 'echo debug-e2e-prepare-done' },
-    on_success: 'next',
-    on_failure: 'stop',
-    timeout: 120,
+const PIPELINE_GRAPH = {
+  version: 2,
+  entry_points: ['prepare'],
+  steps: {
+    prepare: {
+      id: 'prepare',
+      name: 'prepare',
+      type: 'script',
+      config: { command: 'echo debug-e2e-prepare-done' },
+      position: { x: 100, y: 0 },
+      timeout: 120,
+    },
+    build: {
+      id: 'build',
+      name: 'build',
+      type: 'script',
+      config: { command: 'echo debug-e2e-build-done' },
+      position: { x: 100, y: 150 },
+      timeout: 120,
+    },
+    verify: {
+      id: 'verify',
+      name: 'verify',
+      type: 'script',
+      config: { command: 'echo debug-e2e-verify-failing; exit 1' },
+      position: { x: 100, y: 300 },
+      timeout: 120,
+    },
   },
-  {
-    name: 'build',
-    type: 'script',
-    config: { command: 'echo debug-e2e-build-done' },
-    on_success: 'next',
-    on_failure: 'stop',
-    timeout: 120,
-  },
-  {
-    name: 'verify',
-    type: 'script',
-    config: { command: 'echo debug-e2e-verify-failing; exit 1' },
-    on_success: 'next',
-    on_failure: 'stop',
-    timeout: 120,
-  },
-];
+  edges: [
+    { id: 'edge_0', from_step: 'prepare', to_step: 'build', condition: 'success' },
+    { id: 'edge_1', from_step: 'build', to_step: 'verify', condition: 'success' },
+  ],
+};
 
 /** Terminal run states, as the run viewer stamps them on data-status. */
 const TERMINAL_RUN_STATUS = /^(passed|failed|cancelled)$/;
@@ -72,7 +87,7 @@ test.beforeEach(async ({ request }) => {
   seed = await seedBackend(request);
 
   const response = await request.post(`${BACKEND_URL}/api/repos/${seed.repo.id}/pipelines`, {
-    data: { name: 'debug-rerun-pipeline', steps: PIPELINE_STEPS },
+    data: { name: 'debug-rerun-pipeline', steps_graph: PIPELINE_GRAPH },
   });
   expect(response.ok(), `pipeline create failed: ${await response.text()}`).toBeTruthy();
   pipelineId = (await response.json()).id;
@@ -144,14 +159,14 @@ test.describe('Debug re-run (R8): breakpoint, pause, resume', () => {
     const items = page.locator('[data-testid="breakpoint-item"]');
     await expect(items).toHaveCount(3);
 
-    // A LEGACY (v1) pipeline's breakpoint key is the step INDEX as a string -
-    // not the step's optional config id, which the executor never writes to
-    // StepRun.step_id. A key the gate can never match is a breakpoint that
-    // silently never fires, so the identity is asserted here and not merely
-    // implied by the labels.
-    await expect(items.nth(0)).toHaveAttribute('data-step-key', '0');
-    await expect(items.nth(1)).toHaveAttribute('data-step-key', '1');
-    await expect(items.nth(2)).toHaveAttribute('data-step-key', '2');
+    // A breakpoint key is the GRAPH STEP ID, which is exactly what the
+    // executor stamps onto StepRun.step_id. A key the gate can never match is
+    // a breakpoint that silently never fires, so the identity is asserted
+    // here and not merely implied by the labels. Listing order is
+    // entry-point-first traversal, not object-key order.
+    await expect(items.nth(0)).toHaveAttribute('data-step-key', 'prepare');
+    await expect(items.nth(1)).toHaveAttribute('data-step-key', 'build');
+    await expect(items.nth(2)).toHaveAttribute('data-step-key', 'verify');
     await expect(items.nth(1)).toContainText('build');
 
     // Nothing selected by default: an accidental Enter must not silently
@@ -201,7 +216,7 @@ test.describe('Debug re-run (R8): breakpoint, pause, resume', () => {
     // Break before the MIDDLE step: reaching this pause requires step 0 to
     // have executed first.
     await page
-      .locator('[data-testid="breakpoint-item"][data-step-key="1"] input[type="checkbox"]')
+      .locator('[data-testid="breakpoint-item"][data-step-key="build"] input[type="checkbox"]')
       .check();
     await page.locator('[data-testid="start-debug-btn"]').click();
 
@@ -220,7 +235,7 @@ test.describe('Debug re-run (R8): breakpoint, pause, resume', () => {
     );
     await expect(panel.locator('[data-testid="debug-current-step"]')).toHaveAttribute(
       'data-step-key',
-      '1'
+      'build'
     );
     await expect(panel.locator('[data-testid="debug-current-step"]')).toContainText('build');
 
@@ -240,7 +255,7 @@ test.describe('Debug re-run (R8): breakpoint, pause, resume', () => {
     await openDebugModal(page);
 
     await page
-      .locator('[data-testid="breakpoint-item"][data-step-key="1"] input[type="checkbox"]')
+      .locator('[data-testid="breakpoint-item"][data-step-key="build"] input[type="checkbox"]')
       .check();
     await page.locator('[data-testid="start-debug-btn"]').click();
 
@@ -267,7 +282,7 @@ test.describe('Debug re-run (R8): breakpoint, pause, resume', () => {
     await openDebugModal(page);
 
     await page
-      .locator('[data-testid="breakpoint-item"][data-step-key="1"] input[type="checkbox"]')
+      .locator('[data-testid="breakpoint-item"][data-step-key="build"] input[type="checkbox"]')
       .check();
     await page.locator('[data-testid="start-debug-btn"]').click();
 
@@ -296,7 +311,7 @@ test.describe('Debug re-run (R8): breakpoint, pause, resume', () => {
     await openDebugModal(page);
 
     await page
-      .locator('[data-testid="breakpoint-item"][data-step-key="1"] input[type="checkbox"]')
+      .locator('[data-testid="breakpoint-item"][data-step-key="build"] input[type="checkbox"]')
       .check();
     await page.locator('[data-testid="start-debug-btn"]').click();
 
@@ -324,7 +339,7 @@ test.describe('Debug re-run (R8): breakpoint, pause, resume', () => {
     await openDebugModal(page);
 
     await page
-      .locator('[data-testid="breakpoint-item"][data-step-key="1"] input[type="checkbox"]')
+      .locator('[data-testid="breakpoint-item"][data-step-key="build"] input[type="checkbox"]')
       .check();
     await page.locator('[data-testid="start-debug-btn"]').click();
 

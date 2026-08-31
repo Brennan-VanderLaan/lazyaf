@@ -72,11 +72,18 @@ class TestCardsRunOnTheControlLayer:
         assert runs[0].trigger_ref == card["id"]
 
         # ... backed by a hidden ephemeral pipeline with ONE agent step.
+        # Read off `steps_graph`: 12.8 P3 moved every ad-hoc writer onto the
+        # graph (`agent_run.adhoc_steps_graph`) and P5 deleted the array the
+        # executor could have run instead, so the array is no longer where
+        # this claim can be checked - `pipeline.steps` is the column default
+        # here and asserting against it would pass on an empty list.
         pipeline = await db_session.get(Pipeline, runs[0].pipeline_id)
         assert agent_run.is_adhoc_pipeline_name(pipeline.name)
-        steps = json.loads(pipeline.steps)
-        assert [s["type"] for s in steps] == ["agent"]
-        assert steps[0]["config"]["agent"] == "mock"
+        graph = json.loads(pipeline.steps_graph)
+        nodes = list(graph["steps"].values())
+        assert [n["type"] for n in nodes] == ["agent"]
+        assert nodes[0]["config"]["agent"] == "mock"
+        assert graph["entry_points"] == [nodes[0]["id"]]
 
     async def test_card_retry_creates_a_second_adhoc_run(self, client, ingested_repo, db_session):
         card = await create_agent_card(client, ingested_repo["id"])
@@ -202,6 +209,16 @@ class TestFixCardActionRunsOnTheControlLayer:
     nobody notices has stopped being polled - exactly the silent-fallback
     failure mode R1 exists to catch - so the claim is asserted here rather
     than assumed.
+
+    12.8 P5 CONVERTED these two off `_trigger_card`. The action is now a
+    NODE action fired by `_handle_step_complete` -> `_run_terminal_action` ->
+    `_spawn_fix_card`, and `_trigger_card` (the v1 flow wrapper that spawned
+    the card and then ran `current_step + 1`) is deleted. The FIXTURE is
+    unchanged on purpose: the array is still the authoring dialect at the API
+    boundary, so the same POST body still produces this pipeline - it just
+    arrives as `actions.failure = ["trigger:{id}"]` plus a FAILURE edge,
+    which is what `array_to_graph` makes of a non-final effect. Both claims
+    below survive the move verbatim; only the driver changed.
     """
 
     async def _fixture_rows(self, client, db_session, repo_id):
@@ -243,34 +260,75 @@ class TestFixCardActionRunsOnTheControlLayer:
         pipeline = await db_session.get(Pipeline, pipeline_id)
         return template, repo, pipeline
 
-    async def _run_row(self, db_session, pipeline_id):
-        result = await db_session.execute(
-            select(PipelineRun).where(PipelineRun.pipeline_id == pipeline_id)
-        )
-        return result.scalars().first()
+    async def _failed_run_at_step_a(self, db_session, pipeline):
+        """A run of that pipeline whose step `a` has just FAILED.
 
-    async def test_fix_card_action_starts_an_adhoc_card_work_run(
-        self, client, ingested_repo, db_session
-    ):
-        from app.models import Card
-        from app.services.pipeline_executor import pipeline_executor
-
-        template, repo, pipeline = await self._fixture_rows(
-            client, db_session, ingested_repo["id"]
-        )
+        Returns (run, step_run). The row is real and terminal, because
+        `_run_terminal_action` attributes the action to it and
+        `_fail_run_on_terminal_action` writes the reason onto it.
+        """
         run = PipelineRun(
             id=str(uuid4()),
             pipeline_id=pipeline.id,
             status="running",
             trigger_type="manual",
             steps_total=2,
+            active_step_ids=json.dumps(["a"]),
+            completed_step_ids=json.dumps([]),
         )
         db_session.add(run)
+        step_run = StepRun(
+            id=str(uuid4()),
+            pipeline_run_id=run.id,
+            step_index=0,
+            step_id="a",
+            step_name="A",
+            status="failed",
+            executor="local",
+        )
+        db_session.add(step_run)
         await db_session.commit()
+        return run, step_run
 
-        steps = json.loads(pipeline.steps)
-        await pipeline_executor._trigger_card(
-            db_session, run, repo, steps, 0, template["id"]
+    async def _complete_step_a(
+        self, db_session, run, pipeline, repo, step_run, template_id
+    ):
+        from app.services.pipeline_executor import (
+            parse_steps_graph,
+            pipeline_executor,
+        )
+
+        graph = parse_steps_graph(pipeline.steps_graph)
+        assert graph is not None, "the API boundary must have written a graph"
+        assert graph["steps"]["a"]["actions"]["failure"] == [
+            f"trigger:{template_id}"
+        ], (
+            "the fix action must survive conversion as a NODE action - "
+            "dropping it silently is the defect 12.8 P2 closed"
+        )
+        assert any(
+            e["from_step"] == "a"
+            and e["to_step"] == "b"
+            and e["condition"] == "failure"
+            for e in graph["edges"]
+        ), "a non-final effect converts to the action AND the edge v1 took"
+
+        await pipeline_executor._handle_step_complete(
+            db_session, run, pipeline, repo, graph, "a", False, None,
+            step_run=step_run,
+        )
+
+    async def test_fix_card_action_starts_an_adhoc_card_work_run(
+        self, client, ingested_repo, db_session
+    ):
+        from app.models import Card
+
+        template, repo, pipeline = await self._fixture_rows(
+            client, db_session, ingested_repo["id"]
+        )
+        run, step_run = await self._failed_run_at_step_a(db_session, pipeline)
+        await self._complete_step_a(
+            db_session, run, pipeline, repo, step_run, template["id"]
         )
         await _settle()
 
@@ -288,27 +346,15 @@ class TestFixCardActionRunsOnTheControlLayer:
         self, client, ingested_repo, db_session
     ):
         """The legacy shape blocked the parent on a runner callback that no
-        longer comes. The action now continues the parent immediately, like
-        its `trigger:pipeline:` sibling - and the marker StepRun it leaves
-        behind is terminal, never a RUNNING row with no owner."""
-        from app.services.pipeline_executor import pipeline_executor
-
+        longer comes. The action fires as an EFFECT and the parent then
+        continues down its own FAILURE edge - and the marker StepRun it
+        leaves behind is terminal, never a RUNNING row with no owner."""
         template, repo, pipeline = await self._fixture_rows(
             client, db_session, ingested_repo["id"]
         )
-        run = PipelineRun(
-            id=str(uuid4()),
-            pipeline_id=pipeline.id,
-            status="running",
-            trigger_type="manual",
-            steps_total=2,
-        )
-        db_session.add(run)
-        await db_session.commit()
-
-        steps = json.loads(pipeline.steps)
-        await pipeline_executor._trigger_card(
-            db_session, run, repo, steps, 0, template["id"]
+        run, step_run = await self._failed_run_at_step_a(db_session, pipeline)
+        await self._complete_step_a(
+            db_session, run, pipeline, repo, step_run, template["id"]
         )
         await _settle()
 
@@ -323,12 +369,18 @@ class TestFixCardActionRunsOnTheControlLayer:
             f"complete it (error: {markers[0].error})"
         )
         assert markers[0].error is None
+        assert markers[0].step_id is None, (
+            "the marker must not claim the step's graph id: "
+            "`_latest_step_run_for` selects by step_id, and a marker "
+            "carrying one becomes a second candidate row for the step that "
+            "spawned it"
+        )
         assert markers[0].job_id is None, (
             "a second row at this index claiming the step's job would poison "
             "merge-source branch resolution"
         )
-        # ... and step 1 was dispatched.
-        assert any(sr.step_index == 1 for sr in step_runs), (
+        # ... and step `b` was dispatched down the failure edge.
+        assert any(sr.step_id == "b" for sr in step_runs), (
             "the parent run must continue past the fix action"
         )
 

@@ -177,11 +177,35 @@ async def env(tmp_path, monkeypatch):
     await engine.dispose()
 
 
-STEPS = [
-    {"name": "first", "type": "script", "config": {"command": "echo one"}},
-    {"name": "second", "type": "script", "config": {"command": "echo two"}},
-    {"name": "third", "type": "script", "config": {"command": "echo three"}},
-]
+#: A three-step LINEAR GRAPH. 12.8 retires the v1 array, so a breakpoint
+#: names a step by its graph `step_id` and never by position: these tests used
+#: index keys ("0", "1", "2"), and every one of them would now be refused at
+#: create as a key the pipeline does not define.
+STEPS_GRAPH = {
+    "version": 2,
+    "entry_points": ["first"],
+    "steps": {
+        "first": {"name": "first", "type": "script", "config": {"command": "echo one"}},
+        "second": {"name": "second", "type": "script", "config": {"command": "echo two"}},
+        "third": {"name": "third", "type": "script", "config": {"command": "echo three"}},
+    },
+    "edges": [
+        {
+            "id": "edge_0_success",
+            "from_step": "first",
+            "to_step": "second",
+            "condition": "success",
+        },
+        {
+            "id": "edge_1_success",
+            "from_step": "second",
+            "to_step": "third",
+            "condition": "success",
+        },
+    ],
+}
+
+STEP_IDS = list(STEPS_GRAPH["steps"])
 
 
 async def seed(factory, *, trigger_type="manual", context=None, card_id=None):
@@ -196,7 +220,7 @@ async def seed(factory, *, trigger_type="manual", context=None, card_id=None):
             id=str(uuid4()),
             repo_id=repo.id,
             name="svc-pipeline",
-            steps=json.dumps(STEPS),
+            steps_graph=json.dumps(STEPS_GRAPH),
         )
         db.add(pipeline)
         if card_id is not None:
@@ -219,7 +243,7 @@ async def seed(factory, *, trigger_type="manual", context=None, card_id=None):
             trigger_context=json.dumps(context) if context else None,
             current_step=0,
             steps_completed=0,
-            steps_total=len(STEPS),
+            steps_total=len(STEP_IDS),
         )
         db.add(original)
         await db.commit()
@@ -265,7 +289,7 @@ class TestMultipleBreakpointsWork:
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0", "2"],
+                breakpoints=["first", "third"],
             )
 
         # First breakpoint
@@ -274,16 +298,16 @@ class TestMultipleBreakpointsWork:
         )
         async with env.factory() as db:
             row = await db.get(DebugSession, session.id)
-            assert row.current_step_key == "0"
+            assert row.current_step_key == "first"
             _resumed, next_bp = await debug_session_service.resume(db, session.id)
             assert _resumed.status == DebugState.PENDING.value, (
                 "resume must return the session to PENDING, never ENDED"
             )
-            assert next_bp == "2"
+            assert next_bp == "third"
 
         # Second breakpoint - only reachable because the session stayed alive
         await wait_until(
-            lambda: _paused_at(env.factory, session.id, "2")
+            lambda: _paused_at(env.factory, session.id, "third")
         )
         async with env.factory() as db:
             await debug_session_service.resume(db, session.id)
@@ -294,7 +318,7 @@ class TestMultipleBreakpointsWork:
             row = await db.get(DebugSession, session.id)
         assert final.status == RunStatus.PASSED.value
         assert len(env.local.ran) == 3
-        assert json.loads(row.hit_breakpoints) == ["0", "2"]
+        assert json.loads(row.hit_breakpoints) == ["first", "third"]
         assert row.status == DebugState.ENDED.value
         assert row.end_reason == "pipeline completed"
 
@@ -306,7 +330,7 @@ class TestMultipleBreakpointsWork:
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0", "1", "2"],
+                breakpoints=["first", "second", "third"],
             )
         await wait_until(
             lambda: status_is(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -425,9 +449,64 @@ class TestBreakpointValidation:
                     original_run=original,
                     pipeline=pipeline,
                     repo=repo,
-                    breakpoints=["0", "nope"],
+                    breakpoints=["first", "nope"],
                 )
             assert "nope" in str(exc.value)
+            runs = (
+                await db.execute(
+                    select(PipelineRun).where(
+                        PipelineRun.trigger_type == "debug_rerun"
+                    )
+                )
+            ).scalars().all()
+        assert runs == [], "a refused create must not have started a run"
+
+    async def test_the_known_keys_are_named_so_a_stale_key_is_actionable(self, env):
+        """A breakpoint stored before 12.8 is an INDEX, and every index is now
+        an unknown key. The refusal has to say what the keys are, or the user
+        is told their breakpoint is wrong and not what to write instead."""
+        repo, pipeline, original = await seed(env.factory)
+        async with env.factory() as db:
+            with pytest.raises(DebugSessionError) as exc:
+                await debug_session_service.create(
+                    db,
+                    original_run=original,
+                    pipeline=pipeline,
+                    repo=repo,
+                    breakpoints=["1"],
+                )
+        message = str(exc.value)
+        assert "1" in message
+        for step_id in STEP_IDS:
+            assert step_id in message
+
+    async def test_a_pipeline_with_no_graph_cannot_be_debugged_at_all(self, env):
+        """12.8: the graph is the only execution definition, so a pipeline
+        without one can address no step. That is a refusal NAMING the
+        pipeline - not an empty breakpoint vocabulary and a session that
+        merely looks like it never paused (R1).
+
+        Note the empty `breakpoints`: the unknown-key check cannot catch this
+        case, which is exactly why the refusal lives in the resolver.
+        """
+        repo, _pipeline, original = await seed(env.factory)
+        async with env.factory() as db:
+            graphless = Pipeline(
+                id=str(uuid4()), repo_id=repo.id, name="graphless-pipeline"
+            )
+            db.add(graphless)
+            await db.commit()
+            await db.refresh(graphless)
+            with pytest.raises(DebugSessionError) as exc:
+                await debug_session_service.create(
+                    db,
+                    original_run=original,
+                    pipeline=graphless,
+                    repo=repo,
+                    breakpoints=[],
+                )
+            assert "graphless-pipeline" in str(exc.value)
+            assert "no graph definition" in str(exc.value)
             runs = (
                 await db.execute(
                     select(PipelineRun).where(
@@ -443,7 +522,7 @@ class TestAbort:
         repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
-                db, original_run=original, pipeline=pipeline, repo=repo, breakpoints=["0"]
+                db, original_run=original, pipeline=pipeline, repo=repo, breakpoints=["first"]
             )
         await wait_until(
             lambda: status_is(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -463,7 +542,7 @@ class TestAbort:
         repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
-                db, original_run=original, pipeline=pipeline, repo=repo, breakpoints=["0"]
+                db, original_run=original, pipeline=pipeline, repo=repo, breakpoints=["first"]
             )
         await wait_until(
             lambda: status_is(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -481,7 +560,7 @@ class TestExtend:
         repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
-                db, original_run=original, pipeline=pipeline, repo=repo, breakpoints=["0"]
+                db, original_run=original, pipeline=pipeline, repo=repo, breakpoints=["first"]
             )
         await wait_until(
             lambda: status_is(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -499,7 +578,7 @@ class TestExtend:
         repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
-                db, original_run=original, pipeline=pipeline, repo=repo, breakpoints=["0"]
+                db, original_run=original, pipeline=pipeline, repo=repo, breakpoints=["first"]
             )
         await wait_until(
             lambda: status_is(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -542,7 +621,7 @@ class TestSessionNeverOutlivesItsRun:
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
         await wait_until(
             lambda: status_is(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -563,7 +642,7 @@ class TestSessionNeverOutlivesItsRun:
                 original_run=original2,
                 pipeline=pipeline2,
                 repo=repo2,
-                breakpoints=["1"],
+                breakpoints=["second"],
             )
         await wait_until(
             lambda: status_is(env.factory, session2.id, DebugState.WAITING_AT_BP)
@@ -595,7 +674,10 @@ class TestSessionNeverOutlivesItsRun:
             repo = Repo(id=str(uuid4()), name="r", default_branch="main")
             db.add(repo)
             pipeline = Pipeline(
-                id=str(uuid4()), repo_id=repo.id, name="p", steps=json.dumps(STEPS)
+                id=str(uuid4()),
+                repo_id=repo.id,
+                name="p",
+                steps_graph=json.dumps(STEPS_GRAPH),
             )
             db.add(pipeline)
             run = PipelineRun(
@@ -612,6 +694,7 @@ class TestSessionNeverOutlivesItsRun:
                 id=str(uuid4()),
                 pipeline_run_id=run.id,
                 step_index=0,
+                step_id="first",
                 step_name="first",
                 status=RunStatus.RUNNING.value,
                 executor="local",
@@ -622,11 +705,11 @@ class TestSessionNeverOutlivesItsRun:
                     id=str(uuid4()),
                     pipeline_run_id=run.id,
                     status=DebugState.WAITING_AT_BP.value,
-                    breakpoints=json.dumps(["0"]),
-                    hit_breakpoints=json.dumps(["0"]),
+                    breakpoints=json.dumps(["first"]),
+                    hit_breakpoints=json.dumps(["first"]),
                     timeout_seconds=3600,
                     max_timeout_seconds=14400,
-                    current_step_key="0",
+                    current_step_key="first",
                 )
             )
             await db.commit()
@@ -660,11 +743,11 @@ class TestProjection:
             id=str(uuid4()),
             pipeline_run_id=str(uuid4()),
             status=DebugState.WAITING_AT_BP.value,
-            breakpoints=json.dumps(["0", "1"]),
-            hit_breakpoints=json.dumps(["0"]),
+            breakpoints=json.dumps(["first", "second"]),
+            hit_breakpoints=json.dumps(["first"]),
             timeout_seconds=3600,
             max_timeout_seconds=14400,
-            current_step_key="0",
+            current_step_key="first",
             current_step_name="first",
             current_step_index=0,
             current_step_executor="local",
@@ -672,8 +755,8 @@ class TestProjection:
         payload = debug_session_service.to_dict(session)
         assert "token" not in payload
         assert not any("token" in key for key in payload if key != "join_command")
-        assert payload["breakpoints_pending"] == ["1"]
-        assert payload["breakpoints_hit"] == ["0"]
+        assert payload["breakpoints_pending"] == ["second"]
+        assert payload["breakpoints_hit"] == ["first"]
 
     def test_attach_unavailable_always_states_a_reason(self):
         """R1: never a silent degrade. Every False carries a sentence."""
@@ -688,7 +771,7 @@ class TestProjection:
         for status, key, executor in (
             (DebugState.PENDING.value, None, None),
             (DebugState.ENDED.value, None, None),
-            (DebugState.WAITING_AT_BP.value, "0", "remote"),
+            (DebugState.WAITING_AT_BP.value, "first", "remote"),
         ):
             session = DebugSession(
                 status=status, current_step_key=key, current_step_executor=executor, **base
@@ -699,7 +782,7 @@ class TestProjection:
 
         local = DebugSession(
             status=DebugState.WAITING_AT_BP.value,
-            current_step_key="0",
+            current_step_key="first",
             current_step_executor="local",
             **base,
         )

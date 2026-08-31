@@ -117,6 +117,18 @@ def _elapsed(started_at, completed_at) -> float | None:
 def _adhoc_step_config(pipeline) -> dict:
     """The single agent step's config off a hidden ad-hoc pipeline row.
 
+    Reads `steps_graph`. It used to read `steps`, the v1 array column, and
+    12.8 switched every writer to graphs - so this silently began returning {}
+    and every history row rendered "(no prompt recorded)". The bug was
+    invisible to both waves: this file belonged to one and the format change
+    to the other.
+
+    A graph's `steps` is a DICT keyed by step id, not a list. An ad-hoc
+    playground pipeline has exactly one node, so the config is the only
+    value's - but sort by entry point when there is one, so a future
+    multi-node ad-hoc row reports the step a human would call first rather
+    than whichever key dict ordering happened to yield.
+
     Returns {} for anything unreadable - a history LIST must not be taken out
     by one malformed row, and the caller renders "(no prompt recorded)"
     rather than pretending it knows the prompt.
@@ -124,16 +136,32 @@ def _adhoc_step_config(pipeline) -> dict:
     import json as _json
 
     try:
-        steps = _json.loads(pipeline.steps or "[]")
+        graph = _json.loads(pipeline.steps_graph or "{}")
     except (TypeError, ValueError):
         logger.warning(
-            "Playground history: pipeline %s has unreadable steps JSON",
+            "Playground history: pipeline %s has unreadable steps_graph JSON",
             pipeline.id[:8],
         )
         return {}
-    if not isinstance(steps, list) or not steps:
+    if not isinstance(graph, dict):
         return {}
-    config = steps[0].get("config")
+    nodes = graph.get("steps")
+    if not isinstance(nodes, dict) or not nodes:
+        return {}
+
+    entry_points = graph.get("entry_points")
+    node_id = None
+    if isinstance(entry_points, list) and entry_points:
+        candidate = entry_points[0]
+        if candidate in nodes:
+            node_id = candidate
+    if node_id is None:
+        node_id = next(iter(nodes))
+
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        return {}
+    config = node.get("config")
     return config if isinstance(config, dict) else {}
 
 

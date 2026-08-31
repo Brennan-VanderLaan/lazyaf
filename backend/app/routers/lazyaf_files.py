@@ -282,11 +282,36 @@ async def run_repo_pipeline(
         raise HTTPException(status_code=404, detail="Pipeline not found in repo")
 
     # Create/refresh the materialized platform pipeline (same upsert the
-    # push-event sync uses, so description/steps/triggers stay consistent)
+    # push-event sync uses, so description/graph/triggers stay consistent)
     platform_pipeline = await upsert_materialized_pipeline(db, repo_id, pipeline_data)
 
     await db.commit()
     await db.refresh(platform_pipeline)
+
+    # This endpoint calls `pipeline_executor.start_pipeline` DIRECTLY and so
+    # skips every gate `POST /api/pipelines/{id}/run` enforces - which is how
+    # a `.lazyaf/pipelines/*.yaml` with no steps: key used to run, do nothing
+    # and report PASSED (QA4-08). The upsert above has just committed the
+    # refusal onto the row, so both failure classes are one check: a
+    # definition that would not convert, and a pipeline with no definition at
+    # all. Refuse loudly rather than run the definition this file replaced.
+    if platform_pipeline.definition_error:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{pipeline_data.name}' has no runnable definition: "
+                f"{platform_pipeline.definition_error}. Fix "
+                f"{filename} and run it again."
+            ),
+        )
+    if not platform_pipeline.steps_graph:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{pipeline_data.name}' has no steps defined, so there is "
+                f"nothing to run. Add a `steps:` block to {filename}."
+            ),
+        )
 
     # Run the pipeline
     try:

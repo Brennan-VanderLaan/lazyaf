@@ -72,34 +72,50 @@ FIX_FILE = "/workspace/repo/fix.txt"
 # shell. That is what makes "resume" a loop and not just an unpause.
 # -----------------------------------------------------------------------------
 
-STEPS = [
-    {
-        "name": "build",
-        "type": "script",
-        "config": {
-            "image": STEP_IMAGE,
-            # 0777 on purpose and stated: the step containers run as root, the
-            # sidecar execs as uid 1000 (it must, or every file it creates is
-            # root-owned and the resumed step trips over it). Without this the
-            # developer could read the workspace and not write to it.
-            "command": (
-                f"mkdir -p /workspace/repo && chmod 0777 /workspace/repo && "
-                f"echo {MARKER} > /workspace/repo/marker.txt && echo built"
-            ),
+#: A two-step LINEAR GRAPH. 12.8 retires the v1 array, so the breakpoints
+#: below name their step by graph `step_id` ("build" / "verify") instead of by
+#: position ("0" / "1"), and the ids are what the paused session reports.
+STEPS_GRAPH = {
+    "version": 2,
+    "entry_points": ["build"],
+    "steps": {
+        "build": {
+            "name": "build",
+            "type": "script",
+            "config": {
+                "image": STEP_IMAGE,
+                # 0777 on purpose and stated: the step containers run as root,
+                # the sidecar execs as uid 1000 (it must, or every file it
+                # creates is root-owned and the resumed step trips over it).
+                # Without this the developer could read the workspace and not
+                # write to it.
+                "command": (
+                    f"mkdir -p /workspace/repo && chmod 0777 /workspace/repo && "
+                    f"echo {MARKER} > /workspace/repo/marker.txt && echo built"
+                ),
+            },
+        },
+        "verify": {
+            "name": "verify",
+            "type": "script",
+            "config": {
+                "image": STEP_IMAGE,
+                "command": (
+                    f"if [ -f {FIX_FILE} ]; then echo verify-passed; else "
+                    f"echo 'missing {FIX_FILE}'; exit 1; fi"
+                ),
+            },
         },
     },
-    {
-        "name": "verify",
-        "type": "script",
-        "config": {
-            "image": STEP_IMAGE,
-            "command": (
-                f"if [ -f {FIX_FILE} ]; then echo verify-passed; else "
-                f"echo 'missing {FIX_FILE}'; exit 1; fi"
-            ),
-        },
-    },
-]
+    "edges": [
+        {
+            "id": "edge_0_success",
+            "from_step": "build",
+            "to_step": "verify",
+            "condition": "success",
+        }
+    ],
+}
 
 
 # -----------------------------------------------------------------------------
@@ -240,7 +256,7 @@ async def repo_and_pipeline(async_engine):
             id=str(uuid4()),
             repo_id=repo.id,
             name="debug-rerun-pipeline",
-            steps=json.dumps(STEPS),
+            steps_graph=json.dumps(STEPS_GRAPH),
         )
         db.add(repo)
         db.add(pipeline)
@@ -348,10 +364,12 @@ class TestDebugRerunLoop:
         stack.run_ids.append(original_id)
 
         failed = await wait_for_run(api_client, original_id, RunStatus.FAILED.value)
-        steps = {s["step_index"]: s for s in failed["step_runs"]}
-        assert steps[0]["status"] == RunStatus.PASSED.value
-        assert steps[1]["status"] == RunStatus.FAILED.value
-        assert FIX_FILE in (steps[1]["logs"] or ""), (
+        # Keyed by graph step ID, which is what a step IS after 12.8 - and
+        # what the breakpoint below names.
+        steps = {s["step_id"]: s for s in failed["step_runs"]}
+        assert steps["build"]["status"] == RunStatus.PASSED.value
+        assert steps["verify"]["status"] == RunStatus.FAILED.value
+        assert FIX_FILE in (steps["verify"]["logs"] or ""), (
             "the failing step must say what it could not find - that sentence "
             "is what a developer debugs from"
         )
@@ -359,7 +377,7 @@ class TestDebugRerunLoop:
         # --- 2. debug re-run, breakpointed before the failing step ---------
         response = await api_client.post(
             f"/api/pipeline-runs/{original_id}/debug-rerun",
-            json={"breakpoints": ["1"], "use_original_commit": True},
+            json={"breakpoints": ["verify"], "use_original_commit": True},
         )
         assert response.status_code == 200, response.text
         rerun = response.json()
@@ -372,7 +390,7 @@ class TestDebugRerunLoop:
             return info if info["status"] == DebugState.WAITING_AT_BP.value else None
 
         info = await wait_until(_paused, message="the gate never paused")
-        assert info["current_step"]["key"] == "1"
+        assert info["current_step"]["key"] == "verify"
         assert info["current_step"]["name"] == "verify"
         assert info["attach_available"] is True
         assert "token" not in info, (
@@ -423,13 +441,13 @@ class TestDebugRerunLoop:
 
         # --- 6. the pipeline completes ------------------------------------
         completed = await wait_for_run(api_client, run_id, RunStatus.PASSED.value)
-        steps = {s["step_index"]: s for s in completed["step_runs"]}
-        assert steps[1]["status"] == RunStatus.PASSED.value
-        assert "verify-passed" in (steps[1]["logs"] or ""), (
+        steps = {s["step_id"]: s for s in completed["step_runs"]}
+        assert steps["verify"]["status"] == RunStatus.PASSED.value
+        assert "verify-passed" in (steps["verify"]["logs"] or ""), (
             "THE loop: the step that failed on the first run passed on the "
             "re-run because of a file created from the debug shell"
         )
-        assert "[debug] paused before step" in (steps[1]["logs"] or "")
+        assert "[debug] paused before step" in (steps["verify"]["logs"] or "")
 
         # The session ends with the run, saying why (R1), and everything it
         # created goes with it (C9: sidecar before volume).
@@ -493,7 +511,7 @@ class TestDebugRerunLoop:
 
         response = await api_client.post(
             f"/api/pipeline-runs/{original_id}/debug-rerun",
-            json={"breakpoints": ["1"], "use_original_commit": True},
+            json={"breakpoints": ["verify"], "use_original_commit": True},
         )
         rerun = response.json()
         session_id, run_id = rerun["debug_session_id"], rerun["run_id"]
@@ -549,7 +567,7 @@ class TestDebugRerunIsNotTheOriginalRun:
 
         response = await api_client.post(
             f"/api/pipeline-runs/{original_id}/debug-rerun",
-            json={"breakpoints": ["0"], "use_original_commit": True},
+            json={"breakpoints": ["build"], "use_original_commit": True},
         )
         rerun = response.json()
         session_id, run_id = rerun["debug_session_id"], rerun["run_id"]

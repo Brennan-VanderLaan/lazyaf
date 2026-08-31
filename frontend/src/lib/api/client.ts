@@ -1,4 +1,4 @@
-import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, Feature, FeatureCreate, FeatureUpdate, UserStory, UserStoryCreate, UserStoryUpdate, AcceptanceCriterion, AcceptanceCriterionCreate, AcceptanceCriterionUpdate, PromptTemplate, PromptTemplateCreate, PromptTemplateUpdate, DebugSessionInfo, DebugRerunRequest, DebugRerunResponse, DebugJoinToken, DebugResumeRequest, DebugResumeResponse, DebugAbortResponse, DebugExtendRequest, DebugExtendResponse, Experiment, ExperimentSummary, ExperimentDetail, ExperimentCreate, ExperimentUpdate, ExperimentEstimate, ExperimentLaunchResponse, ExperimentAbortResponse, ExperimentResumeResponse, ExperimentCell, Leaderboard, ModelEndpoint, ModelEndpointCreate, ModelEndpointUpdate, EndpointProbeResponse, EndpointUsageRollup } from './types';
+import type { Repo, RepoCreate, RepoIngest, CloneUrlResponse, BranchesResponse, Card, CardCreate, CardUpdate, Job, JobLogs, Runner, CommitsResponse, DiffResponse, ApproveResponse, RebaseResponse, AgentFile, AgentFileCreate, AgentFileUpdate, Pipeline, PipelineV2, PipelineGraphModel, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, StepLogsResponse, RepoAgent, RepoPipeline, PlaygroundTestRequest, PlaygroundTestResponse, PlaygroundResult, Feature, FeatureCreate, FeatureUpdate, UserStory, UserStoryCreate, UserStoryUpdate, AcceptanceCriterion, AcceptanceCriterionCreate, AcceptanceCriterionUpdate, PromptTemplate, PromptTemplateCreate, PromptTemplateUpdate, DebugSessionInfo, DebugRerunRequest, DebugRerunResponse, DebugJoinToken, DebugResumeRequest, DebugResumeResponse, DebugAbortResponse, DebugExtendRequest, DebugExtendResponse, Experiment, ExperimentSummary, ExperimentDetail, ExperimentCreate, ExperimentUpdate, ExperimentEstimate, ExperimentLaunchResponse, ExperimentAbortResponse, ExperimentResumeResponse, ExperimentCell, Leaderboard, ModelEndpoint, ModelEndpointCreate, ModelEndpointUpdate, EndpointProbeResponse, EndpointUsageRollup } from './types';
 
 const BASE_URL = '/api';
 
@@ -288,18 +288,41 @@ export const agentFiles = {
 };
 
 // Pipelines (Phase 9)
+/**
+ * What a client SENDS to create a pipeline, since 12.8 P3: the graph, and
+ * nothing else that could describe the steps.
+ *
+ * Built with `Omit` rather than written out so the non-definition fields
+ * (name, description, triggers, is_template) keep exactly one definition
+ * (R3). `steps` is omitted because the boundary refuses a body carrying both
+ * dialects (`app/schemas/pipeline.py::_refuse_both_dialects`) - the v1 array
+ * is the AUTHORING format at the repo-YAML edge and is converted there, so a
+ * UI that already holds a graph has no business posting one.
+ */
+export type PipelineGraphCreate =
+  Omit<PipelineCreate, 'steps' | 'description'>
+  & { steps_graph: PipelineGraphModel; description?: string | null };
+export type PipelineGraphUpdate =
+  Omit<PipelineUpdate, 'steps' | 'description'>
+  & { steps_graph?: PipelineGraphModel; description?: string | null };
+
 export const pipelines = {
   list: (repoId?: string) => {
     const params = repoId ? `?repo_id=${repoId}` : '';
-    return request<Pipeline[]>(`/pipelines${params}`);
+    return request<PipelineV2[]>(`/pipelines${params}`);
   },
-  listForRepo: (repoId: string) => request<Pipeline[]>(`/repos/${repoId}/pipelines`),
-  get: (id: string) => request<Pipeline>(`/pipelines/${id}`),
-  create: (repoId: string, data: PipelineCreate) => request<Pipeline>(`/repos/${repoId}/pipelines`, {
+  listForRepo: (repoId: string) => request<PipelineV2[]>(`/repos/${repoId}/pipelines`),
+  get: (id: string) => request<PipelineV2>(`/pipelines/${id}`),
+  create: (repoId: string, data: PipelineGraphCreate) => request<PipelineV2>(`/repos/${repoId}/pipelines`, {
     method: 'POST',
     body: JSON.stringify(data),
   }),
-  update: (id: string, data: PipelineUpdate) => request<Pipeline>(`/pipelines/${id}`, {
+  // PATCH, not PUT. There has never been a PUT route on /api/pipelines/{id}
+  // (routers/pipelines.py declares get / patch / delete), so the editor's
+  // hand-rolled `fetch(..., {method: 'PUT'})` 405'd on every save of an
+  // EXISTING pipeline - the single reason this client exists is that the
+  // route and the verb are spelled once.
+  update: (id: string, data: PipelineGraphUpdate) => request<PipelineV2>(`/pipelines/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(data),
   }),

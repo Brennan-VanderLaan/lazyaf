@@ -29,6 +29,11 @@ from app.config import get_settings
 from app.database import Base, get_db
 from app.models import Card, Pipeline, Repo
 from app.models.card import CardStatus, StepType
+from app.schemas.pipeline import (
+    PipelineGraphModel,
+    PipelineNodePosition,
+    PipelineStepV2,
+)
 from app.services.execution.runner_dispatcher import runner_dispatcher
 from app.services.execution.runner_registry import runner_registry
 from app.services.git_server import git_repo_manager
@@ -45,6 +50,42 @@ logger = logging.getLogger(__name__)
 # They drifted once (the ref was never created) and the seeded demo's first
 # Approve was a red toast - so they share a constant now.
 SEED_REVIEW_BRANCH = "lazyaf/seed-review"
+
+# The seeded pipeline's only step. Its id is the graph node key, so it is the
+# breakpoint key and the context-directory name a human typing against the
+# seeded board will use - hence a word and not a generated `step_0`.
+SEED_STEP_ID = "echo"
+SEED_STEP_COMMAND = "echo seed-pipeline-ran"
+
+
+def _seed_pipeline_graph() -> str:
+    """The seeded pipeline's definition, as the v2 graph the executor runs.
+
+    Built through `PipelineGraphModel` and not as a literal JSON string so
+    the seed is validated by the same schema a user's pipeline is (R6): a
+    fixture the executor cannot dispatch is worse than no fixture, because
+    the demo it backs fails somewhere else entirely.
+
+    One node and no edges. The v1 array this replaced carried no
+    `on_success`/`on_failure` at all and took the schema defaults
+    (`next`/`stop`), both of which are no-ops on a single-step definition -
+    `next` had nowhere to continue to and `stop` ended a run that was ending
+    anyway - so nothing this seed expressed is missing here.
+    """
+    return PipelineGraphModel(
+        steps={
+            SEED_STEP_ID: PipelineStepV2(
+                id=SEED_STEP_ID,
+                name="Echo",
+                type=StepType.SCRIPT,
+                config={"command": SEED_STEP_COMMAND},
+                position=PipelineNodePosition(x=100, y=0),
+            )
+        },
+        edges=[],
+        entry_points=[SEED_STEP_ID],
+        version=2,
+    ).model_dump_json()
 
 
 # -----------------------------------------------------------------------------
@@ -442,13 +483,13 @@ async def seed_state(db: AsyncSession = Depends(get_db)):
         repo_id=repo.id,
         name="e2e-seed-pipeline",
         description="Seed pipeline (test-mode API)",
-        steps=json.dumps([
-            {
-                "name": "Echo",
-                "type": "script",
-                "config": {"command": "echo seed-pipeline-ran"},
-            }
-        ]),
+        # A v2 GRAPH, like every definition the executor runs (12.8). One
+        # script node, no edges: `on_success`/`on_failure` on a single-step v1
+        # array were already no-ops, so the graph says exactly what the array
+        # said. The node id is `echo` and not a generated `step_0` because
+        # node ids are what a debug breakpoint and a context directory are
+        # keyed on, and a seed exists to be poked at by hand.
+        steps_graph=_seed_pipeline_graph(),
         triggers="[]",
         is_template=False,
     )

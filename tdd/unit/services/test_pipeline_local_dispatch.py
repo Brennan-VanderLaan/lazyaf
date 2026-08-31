@@ -24,9 +24,13 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-# Add backend to path for imports
+# Add backend and tdd to path for imports
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
+tdd_path = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(backend_path))
+sys.path.insert(0, str(tdd_path))
+
+from shared.factories.pipelines import graph_json, linear_graph  # noqa: E402
 
 from app.database import Base
 from app.models import Pipeline, PipelineRun, Repo, StepRun, Card, Job
@@ -252,12 +256,20 @@ async def make_repo(factory) -> Repo:
 
 
 async def make_linear_pipeline(factory, repo: Repo, steps: list[dict]) -> Pipeline:
+    """A pipeline whose definition is the LINEAR GRAPH those steps describe.
+
+    12.8: the argument shape is unchanged - the same `list[dict]` every call
+    site below already passes - but the persisted definition is now v2. Node
+    ids are `step_0..step_N`, so a `step_index`-shaped assertion still reads
+    the same order; `on_success`/`on_failure` become edges and node actions
+    (`shared.factories.pipelines.linear_graph`).
+    """
     async with factory() as db:
         pipeline = Pipeline(
             id=str(uuid4()),
             repo_id=repo.id,
             name="local-dispatch-pipeline",
-            steps=json.dumps(steps),
+            steps_graph=graph_json(steps),
         )
         db.add(pipeline)
         await db.commit()
@@ -266,12 +278,16 @@ async def make_linear_pipeline(factory, repo: Repo, steps: list[dict]) -> Pipeli
 
 
 async def make_graph_pipeline(factory, repo: Repo, graph: dict) -> Pipeline:
+    """A pipeline from a HAND-AUTHORED graph dict.
+
+    Kept alongside `make_linear_pipeline` for the shapes an array can never
+    describe - two entry points, fan-out, fan-in.
+    """
     async with factory() as db:
         pipeline = Pipeline(
             id=str(uuid4()),
             repo_id=repo.id,
             name="local-dispatch-graph-pipeline",
-            steps="[]",
             steps_graph=json.dumps(graph),
         )
         db.add(pipeline)
@@ -785,7 +801,21 @@ class TestLocalFailurePaths:
         # Container never launched
         assert env.local.calls == []
 
-    async def test_linear_on_failure_next_continues_past_failed_local_step(self, env):
+    async def test_failure_edge_continues_past_a_failed_step_but_the_run_FAILS(self, env):
+        """A failure edge routes onward; the verdict still counts every step.
+
+        12.8 §1.8, stated not silent: this is the same fixture the v1 test
+        `test_linear_on_failure_next_continues_past_failed_local_step` used,
+        and the CONTINUATION assertion is unchanged - step 2 still runs. What
+        changed is the verdict. v1's `_execute_step` ran past the last step
+        and called `_complete_pipeline(success=True)` unconditionally, so a
+        run containing a FAILED step reported PASSED. The graph path asks
+        `_check_all_steps_passed`, so it reports FAILED.
+
+        That is one of the three false greens the retirement removes, and it
+        is user-visible for anyone using `on_failure: next`, which is why it
+        is pinned here rather than left to be discovered.
+        """
         class PerCommandExecutor(FakeLocalExecutor):
             async def execute_step(self, step_config, execution_context):
                 self.calls.append((dict(step_config), dict(execution_context)))
@@ -811,15 +841,18 @@ class TestLocalFailurePaths:
 
         run = await start_and_wait(env, pipeline, repo)
 
-        # Step 1 failed but on_failure=next carried on; run completes.
+        # UNCHANGED from the v1 test: the failure edge carried execution on,
+        # so step 2 ran and passed.
         assert len(run.step_runs) == 2
         statuses = {sr.step_index: sr.status for sr in run.step_runs}
         assert statuses[0] == RunStatus.FAILED.value
         assert statuses[1] == RunStatus.PASSED.value
-        # Behavior-compat with main's legacy linear semantics: running past
-        # the last step completes the run as passed even if an earlier step
-        # failed under on_failure=next (graph pipelines DO check all steps).
-        assert run.status == RunStatus.PASSED.value
+        by_id = {sr.step_id: sr.status for sr in run.step_runs}
+        assert by_id == {"step_0": RunStatus.FAILED.value,
+                         "step_1": RunStatus.PASSED.value}
+        # CHANGED, deliberately (§1.8): a run containing a FAILED step is a
+        # FAILED run. v1 reported PASSED here.
+        assert run.status == RunStatus.FAILED.value
 
 
 # -----------------------------------------------------------------------------
@@ -1021,7 +1054,8 @@ class TestMergeActionBranchResolution:
 # -----------------------------------------------------------------------------
 
 class TestWedgePaths:
-    async def _make_running_row_pair(self, env, pipeline_id, step_index=0):
+    async def _make_running_row_pair(self, env, pipeline_id, step_index=0,
+                                     step_id=None):
         from datetime import datetime
 
         run = PipelineRun(
@@ -1035,6 +1069,7 @@ class TestWedgePaths:
             id=str(uuid4()),
             pipeline_run_id=run.id,
             step_index=step_index,
+            step_id=step_id,
             step_name="Ghost",
             status=RunStatus.RUNNING.value,
             executor=ExecutorMode.LOCAL.value,
@@ -1052,7 +1087,9 @@ class TestWedgePaths:
         repo = await make_repo(env.factory)
         pipeline = await make_linear_pipeline(env.factory, repo, [script_step()])
         run_id, step_run_id = await self._make_running_row_pair(
-            env, pipeline.id, step_index=7  # out of range: definition missing
+            env, pipeline.id,
+            step_index=7,
+            step_id="a-node-this-graph-does-not-have",
         )
 
         await env.executor._run_local_step(env.factory, run_id, step_run_id)

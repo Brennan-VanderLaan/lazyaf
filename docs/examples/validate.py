@@ -18,15 +18,17 @@ WHAT IT CHECKS
      (model_endpoints.resolve.parse_endpoint_reference). There is no default
      for either, by design, so an example that omits one would fail at
      dispatch rather than at parse.
-  3. Every on_success / on_failure is in the dispatchable vocabulary
-     (pipeline_executor.describe_step_action).
-  4. Every example survives `schemas.pipeline.array_to_graph` - the 12.8
-     converter, which is FAITHFUL OR REFUSING. An example that cannot be
-     converted is one that will stop working when the v1 array format is
-     retired, and that is worth knowing now rather than then.
-  5. Every full pipeline YAML fenced in catalog.md appears VERBATIM in one of
+  3. Every example survives `schemas.pipeline.array_to_graph` - the 12.8
+     converter, which is FAITHFUL OR REFUSING, and since 12.8 P5 the ONLY
+     authority on the on_success / on_failure vocabulary: the executor's
+     `describe_step_action` was deleted with the array path it guarded, and
+     the converter refuses strictly more than it did (an unknown action, a
+     retired `trigger:pipeline:`, an empty target, a duplicate id, AND a
+     `stop` that orphans the tail, which the old check accepted). An example
+     that cannot be converted is one that does not run.
+  4. Every full pipeline YAML fenced in catalog.md appears VERBATIM in one of
      the files - the fences and the files cannot drift apart.
-  6. Nothing in docs/examples/ has been copied into .lazyaf/pipelines/, which
+  5. Nothing in docs/examples/ has been copied into .lazyaf/pipelines/, which
      is live and runs on the next push.
 
 Exit 0 = every example is valid. Exit 1 = at least one is not.
@@ -56,7 +58,6 @@ from app.schemas.pipeline import (  # noqa: E402
 from app.services.pipeline_executor import (  # noqa: E402
     DEFAULT_AGENT_IMAGE,
     HARNESS_AGENT,
-    describe_step_action,
 )
 from app.services.model_endpoints.resolve import (  # noqa: E402
     parse_endpoint_reference,
@@ -82,10 +83,6 @@ def check_pipeline(label: str, text: str) -> list[str]:
 
     for index, step in enumerate(pipeline.steps):
         where = f"{label}: step #{index} ({step.name!r})"
-        for field in ("on_success", "on_failure"):
-            problem = describe_step_action(getattr(step, field))
-            if problem is not None:
-                problems.append(f"{where}: {field}: {problem}")
         if step.type not in ("script", "docker", "agent"):
             problems.append(
                 f"{where}: unknown step type {step.type!r} "
@@ -105,7 +102,7 @@ def check_pipeline(label: str, text: str) -> list[str]:
                 "(config.endpoint, or config.model: 'endpoint:<name>')"
             )
 
-    # 4: forward-compatible with the 12.8 retirement of the array format.
+    # 3: the converter is the vocabulary authority as well as the shape one.
     try:
         array_to_graph(
             [PipelineStepConfig(**step.model_dump()) for step in pipeline.steps]

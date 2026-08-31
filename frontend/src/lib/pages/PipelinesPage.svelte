@@ -3,8 +3,9 @@
   import { push } from 'svelte-spa-router';
   import { pipelinesStore, activeRunsStore, hasActiveRuns } from '../stores/pipelines';
   import { selectedRepoId, selectedRepo } from '../stores/repos';
-  import type { Pipeline, PipelineRun, RunStatus, RepoPipeline } from '../api/types';
+  import type { Pipeline, PipelineV2, PipelineStepV2, PipelineRun, RunStatus, RepoPipeline } from '../api/types';
   import { lazyafFiles } from '../api/client';
+  import { graphStepList } from '../components/graph/order';
   import PipelineRunViewer from '../components/PipelineRunViewer.svelte';
   // T1: naive-UTC timestamps rendered `-14399s` durations and a "Started"
   // column hours in the future. One shared parser now, no local copies.
@@ -83,6 +84,29 @@
   function handleEdit(pipeline: Pipeline) {
     // Navigate to graph editor for existing pipeline
     push(`/pipelines/${pipeline.id}/edit`);
+  }
+
+  /**
+   * The steps a PLATFORM pipeline card renders, read from the graph.
+   *
+   * This is the fix for a live bug, not a refactor: the card read
+   * `pipeline.steps` - the v1 ARRAY - which every graph pipeline in the
+   * product has been persisting as `[]` since graphs landed. So every graph
+   * pipeline's card said "0 steps", showed no type chips and no step preview,
+   * and nothing failed anywhere; the array was simply the wrong field to ask.
+   * `PipelineRead` no longer carries it at all (12.8 P3), which is what made
+   * the bug impossible to leave.
+   *
+   * Order comes from `graphStepList`, shared with the debug modal, so the two
+   * surfaces agree about which step is first (R3).
+   *
+   * REPO pipeline cards deliberately keep their array: they render the
+   * authoring FILE from `GET /api/repos/{id}/lazyaf/pipelines`, where the
+   * array is still the format a human writes. Array = authoring,
+   * graph = execution, two endpoints.
+   */
+  function graphSteps(pipeline: Pipeline | PipelineV2): PipelineStepV2[] {
+    return graphStepList((pipeline as PipelineV2).steps_graph);
   }
 
   async function handleRun(pipeline: Pipeline) {
@@ -250,6 +274,8 @@
                agent container. -->
           <div class="pipelines-grid" data-testid="pipeline-list">
             {#each $pipelinesStore as pipeline (pipeline.id)}
+              {@const steps = graphSteps(pipeline)}
+              {@const definitionError = (pipeline as PipelineV2 & { definition_error?: string | null }).definition_error}
               <div class="pipeline-card" data-testid="pipeline" data-pipeline-id={pipeline.id}>
                 <div class="card-header">
                   <h3 title={pipeline.name}>{pipeline.name}</h3>
@@ -265,22 +291,41 @@
                 {#if pipeline.description}
                   <p class="card-description">{pipeline.description}</p>
                 {/if}
+                <!-- The channel a conversion refusal surfaces on (12.8 §1.7).
+                     `sync_repo_pipelines` keeps the STALE definition and logs
+                     a warning when a YAML will not convert, on purpose - so
+                     without this badge the refusal is invisible and the whole
+                     "refuse loudly" strategy is dark. `POST /run` refuses the
+                     same rows. -->
+                {#if definitionError}
+                  <p class="definition-error" data-testid="pipeline-definition-error" title={definitionError}>
+                    <span class="definition-error-label">Definition error</span>
+                    {definitionError}
+                  </p>
+                {/if}
                 <div class="card-meta">
-                  <span class="step-count">{pipeline.steps.length} step{pipeline.steps.length === 1 ? '' : 's'}</span>
+                  {#if steps.length === 0}
+                    <!-- NOT "0 steps": a graph with no steps is not a
+                         pipeline that does nothing, it is a pipeline with no
+                         definition, and the two must not read the same. -->
+                    <span class="step-count empty" data-testid="pipeline-step-count">No steps defined</span>
+                  {:else}
+                    <span class="step-count" data-testid="pipeline-step-count">{steps.length} step{steps.length === 1 ? '' : 's'}</span>
+                  {/if}
                   <div class="step-types">
-                    {#each [...new Set(pipeline.steps.map(s => s.type))] as type}
-                      <span class="step-type-badge">{type}</span>
+                    {#each [...new Set(steps.map(s => s.type))] as type}
+                      <span class="step-type-badge" data-testid="pipeline-step-type">{type}</span>
                     {/each}
                   </div>
                 </div>
                 <div class="step-preview">
-                  {#each pipeline.steps.slice(0, 4) as step, i}
+                  {#each steps.slice(0, 4) as step, i}
                     <span class="step-chip" title={step.name}>
                       {i + 1}. {step.name}
                     </span>
                   {/each}
-                  {#if pipeline.steps.length > 4}
-                    <span class="step-chip more">+{pipeline.steps.length - 4} more</span>
+                  {#if steps.length > 4}
+                    <span class="step-chip more">+{steps.length - 4} more</span>
                   {/if}
                 </div>
               </div>
@@ -662,6 +707,34 @@
   .step-count {
     font-size: 0.85rem;
     color: var(--text-muted);
+  }
+
+  .step-count.empty {
+    color: var(--warning-color);
+    font-style: italic;
+  }
+
+  .definition-error {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin: 0;
+    padding: 0.4rem 0.6rem;
+    border-radius: 4px;
+    background: rgba(243, 139, 168, 0.1);
+    border: 1px solid var(--error-color);
+    color: var(--error-color);
+    font-size: 0.8rem;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+
+  .definition-error-label {
+    flex: none;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.7rem;
+    font-weight: 600;
   }
 
   .step-types {

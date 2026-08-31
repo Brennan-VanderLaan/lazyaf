@@ -194,6 +194,16 @@ def expect_clone_url_response(
 
 # -----------------------------------------------------------------------------
 # Pipeline API Factories
+#
+# These build the v1 ARRAY authoring dialect, which survives 12.8 at the API
+# door: `POST`/`PATCH /api/pipelines` still accept `steps` and convert it
+# once, into the graph the executor runs (§4.4). What does NOT survive is
+# `steps` on the RESPONSE - `PipelineRead` is graph-only, so read a created
+# pipeline's definition off `steps_graph`.
+#
+# To author a graph directly, use `graph_pipeline_payload` from
+# `shared.factories.pipelines`. Sending both `steps` and `steps_graph` in one
+# body is a 422, so do not combine them.
 # -----------------------------------------------------------------------------
 
 def pipeline_step_payload(

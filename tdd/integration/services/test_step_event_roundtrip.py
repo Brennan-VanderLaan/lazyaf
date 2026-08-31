@@ -29,7 +29,11 @@ from sqlalchemy.orm import selectinload
 
 # Add backend to path for imports
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
+tdd_path = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(backend_path))
+sys.path.insert(0, str(tdd_path))
+
+from shared.factories.pipelines import make_repo_and_graph_pipeline  # noqa: E402
 
 from app.database import Base
 from app.models import Pipeline, PipelineRun, Repo, StepRun
@@ -114,32 +118,24 @@ async def env(tmp_path, monkeypatch, docker_client):
 
 
 async def make_repo_and_pipeline(factory, command: str, timeout: int = 300):
-    async with factory() as db:
-        repo = Repo(
-            id=str(uuid4()),
-            name="roundtrip-repo",
-            default_branch="main",
-            is_ingested=True,
-        )
-        pipeline = Pipeline(
-            id=str(uuid4()),
-            repo_id=repo.id,
-            name="roundtrip-pipeline",
-            steps=json.dumps([
-                {
-                    "name": "Echo",
-                    "type": "script",
-                    "timeout": timeout,
-                    "config": {"command": command, "image": STEP_IMAGE},
-                }
-            ]),
-        )
-        db.add(repo)
-        db.add(pipeline)
-        await db.commit()
-        await db.refresh(repo)
-        await db.refresh(pipeline)
-        return repo, pipeline
+    """One echo step, persisted as the one-node GRAPH it describes (12.8).
+
+    The node id is `step_0`; nothing here asserts on it, but the StepRun
+    carries it and that is what the debug and log routes key on.
+    """
+    return await make_repo_and_graph_pipeline(
+        factory,
+        [
+            {
+                "name": "Echo",
+                "type": "script",
+                "timeout": timeout,
+                "config": {"command": command, "image": STEP_IMAGE},
+            }
+        ],
+        name="roundtrip-pipeline",
+        repo_name="roundtrip-repo",
+    )
 
 
 async def fetch_run(env, run_id: str) -> PipelineRun:

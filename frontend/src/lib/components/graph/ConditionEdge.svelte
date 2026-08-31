@@ -13,6 +13,15 @@
       condition: EdgeCondition;
       isActive?: boolean;
       isCompleted?: boolean;
+      /**
+       * True for the display-only line from Start to an entry point. An
+       * entry point is where the run BEGINS, so there is no outcome for it
+       * to be conditional on - offering "On success / On failure / Always"
+       * there would be offering a choice the model cannot hold, and the one
+       * that used to be accepted wrote a `__start__` edge that the API
+       * refused with a 422 on save.
+       */
+      isEntry?: boolean;
     };
   }
 
@@ -85,6 +94,7 @@
   let style = $derived(conditionStyles[condition]);
   let isActive = $derived(data?.isActive ?? false);
   let isCompleted = $derived(data?.isCompleted ?? false);
+  let isEntry = $derived(data?.isEntry ?? false);
 
   // Condition selector dropdown
   let showConditionPicker = $state(false);
@@ -149,6 +159,11 @@
     <!-- Condition Picker Dropdown -->
     {#if showConditionPicker}
       <div class="condition-picker">
+        {#if isEntry}
+          <p class="picker-note">
+            Entry point - the run starts here, so there is no condition to set.
+          </p>
+        {:else}
         <button
           class="picker-option success"
           class:active={condition === 'success'}
@@ -173,13 +188,14 @@
           <span class="option-icon">-></span>
           <span class="option-label">Always</span>
         </button>
+        {/if}
         <hr class="picker-divider" />
         <button
           class="picker-option delete"
           onclick={() => { showConditionPicker = false; actions?.deleteEdge(id); }}
         >
           <span class="option-icon">×</span>
-          <span class="option-label">Delete Edge</span>
+          <span class="option-label">{isEntry ? 'Remove Entry Point' : 'Delete Edge'}</span>
         </button>
       </div>
     {/if}
@@ -266,6 +282,15 @@
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
     z-index: 1001;
     min-width: 120px;
+  }
+
+  .picker-note {
+    margin: 0;
+    padding: 6px 10px;
+    max-width: 180px;
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.35;
   }
 
   .picker-option {

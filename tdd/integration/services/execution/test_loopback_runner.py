@@ -68,6 +68,7 @@ sys.path.insert(0, str(_repo_root / "backend"))
 sys.path.insert(0, str(_repo_root / "scripts"))
 
 from build_images import build_image, tree_hash  # noqa: E402
+from tdd.shared.factories.pipelines import graph_json  # noqa: E402
 from tdd.integration.conftest import (  # noqa: E402
     advertise_addr,
     free_port,
@@ -404,7 +405,7 @@ async def make_pipeline(lane, steps: list[dict]):
             id=str(uuid4()),
             repo_id=repo.id,
             name=f"loopback-{uuid4().hex[:8]}",
-            steps=json.dumps(steps),
+            steps_graph=graph_json(steps),
         )
         db.add(pipeline)
         await db.commit()

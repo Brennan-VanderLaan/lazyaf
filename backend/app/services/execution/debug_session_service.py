@@ -280,19 +280,28 @@ class DebugSessionService:
         Uses the same `debug_step_key` the gate does (contract C2), fed by a
         shim carrying the step's id/index - so the validator cannot drift
         from the runtime.
+
+        12.8: the graph is the only definition, so a pipeline that has none
+        is REFUSED here rather than answered with an empty vocabulary. The
+        empty list was the quiet version of this: a debug re-run created with
+        no breakpoints against a definition that can address no step is a
+        session that watches a run it can never stop, and nothing anywhere
+        would have said so (R1).
         """
-        from app.services.pipeline_executor import parse_steps, parse_steps_graph
+        from app.services.pipeline_executor import parse_steps_graph
 
         graph = parse_steps_graph(pipeline.steps_graph)
+        steps = (graph or {}).get("steps") or {}
+        if not steps:
+            raise DebugSessionError(
+                f"pipeline {getattr(pipeline, 'name', None) or pipeline.id} has "
+                "no graph definition, so no step can be addressed by a "
+                "breakpoint. Re-save the pipeline to materialize its graph."
+            )
         keys: list[tuple[str, str]] = []
-        if graph:
-            for step_id, step in (graph.get("steps") or {}).items():
-                shim = _StepKeyShim(step_id=step_id, step_index=0)
-                keys.append((debug_step_key(shim), step.get("name") or step_id))
-        else:
-            for index, step in enumerate(parse_steps(pipeline.steps)):
-                shim = _StepKeyShim(step_id=None, step_index=index)
-                keys.append((debug_step_key(shim), step.get("name") or f"step {index}"))
+        for step_id, step in steps.items():
+            shim = _StepKeyShim(step_id=step_id, step_index=0)
+            keys.append((debug_step_key(shim), step.get("name") or step_id))
         return keys
 
     async def create(

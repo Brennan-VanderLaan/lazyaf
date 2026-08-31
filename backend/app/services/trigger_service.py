@@ -13,12 +13,14 @@ from typing import Any
 from uuid import uuid4
 
 import yaml
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Pipeline, Repo, Card
 from app.models.pipeline import PipelineRun
-from app.schemas.lazyaf_yaml import PipelineYaml
+from app.schemas.lazyaf_yaml import PipelineYaml, pipeline_yaml_to_graph
+from app.schemas.pipeline import ArrayConversionError
 from app.services.workspace.trigger_dedup import (
     TriggerDeduplicator,
     generate_trigger_key,
@@ -66,6 +68,27 @@ def materialized_pipeline_name(yaml_name: str) -> str:
     return f"{MATERIALIZED_PIPELINE_PREFIX}{yaml_name}"
 
 
+def describe_conversion_refusal(exc: Exception) -> str:
+    """The `definition_error` text for a refused conversion.
+
+    `ArrayConversionError` already carries a list of reasons, each naming the
+    step it blames. A bare pydantic `ValidationError` can still reach here if
+    the graph models and `describe_terminal_action` ever drift (12.8 §4.2
+    constructs `StepActions` rather than appending into it precisely so that
+    drift is loud), so it is rendered rather than str()'d - a pydantic repr
+    pasted into a UI badge is unreadable.
+    """
+    if isinstance(exc, ArrayConversionError):
+        return "; ".join(exc.reasons)
+    if isinstance(exc, ValidationError):
+        return "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or '<pipeline>'}: "
+            f"{error['msg']}"
+            for error in exc.errors()
+        )
+    return str(exc)
+
+
 async def upsert_materialized_pipeline(
     db: AsyncSession,
     repo_id: str,
@@ -74,7 +97,22 @@ async def upsert_materialized_pipeline(
     """
     Create or refresh the materialized platform Pipeline row for a
     repo-defined pipeline yaml. The yaml is the source of truth for these
-    rows: description, steps AND triggers are overwritten. Does not commit.
+    rows: description, the execution GRAPH and triggers are overwritten.
+    Does not commit.
+
+    The array in the yaml is converted to a graph HERE, at the boundary
+    (12.8 §4.4): the executor runs graphs and only graphs, and the file stays
+    an array because that is the authoring format. `Pipeline.steps` is no
+    longer written - it is dead weight from here until the column is dropped.
+
+    A conversion that REFUSES is recorded on `Pipeline.definition_error` and
+    the previous graph is LEFT IN PLACE, unruntime-able: both run guards
+    (`POST /api/pipelines/{id}/run` and `run_repo_pipeline`) read the field
+    and refuse, so a broken CI file cannot silently re-run yesterday's
+    definition under today's name. It also does not raise: `sync_repo_pipelines`
+    calls this OUTSIDE its per-file `except Exception: continue`, under an
+    `except Exception: rollback; raise`, so one unconvertible file raising
+    here would discard every other pipeline the same push synced.
     """
     result = await db.execute(
         select(Pipeline)
@@ -83,23 +121,38 @@ async def upsert_materialized_pipeline(
     )
     pipeline = result.scalar_one_or_none()
 
-    steps_json = json.dumps([step.model_dump() for step in pipeline_yaml.steps])
     triggers_json = json.dumps([t.model_dump() for t in pipeline_yaml.triggers])
+
+    steps_graph_json: str | None = None
+    definition_error: str | None = None
+    try:
+        steps_graph_json = pipeline_yaml_to_graph(pipeline_yaml).model_dump_json()
+    except (ArrayConversionError, ValidationError) as exc:
+        definition_error = describe_conversion_refusal(exc)
+        logger.warning(
+            "Pipeline yaml %r in repo %s cannot be converted to a graph: %s",
+            pipeline_yaml.name,
+            repo_id[:8],
+            definition_error,
+        )
 
     if pipeline:
         pipeline.description = pipeline_yaml.description
-        pipeline.steps = steps_json
         pipeline.triggers = triggers_json
-        # The executor prefers steps_graph over steps; a stale graph (e.g.
-        # from a UI edit of the materialized row) would shadow the yaml
-        pipeline.steps_graph = None
+        pipeline.definition_error = definition_error
+        if definition_error is None:
+            # The yaml is the source of truth for a materialized row, so a
+            # successful sync always replaces the graph - including one a UI
+            # edit put there, which would otherwise shadow the file forever.
+            pipeline.steps_graph = steps_graph_json
     else:
         pipeline = Pipeline(
             id=str(uuid4()),
             repo_id=repo_id,
             name=materialized_pipeline_name(pipeline_yaml.name),
             description=pipeline_yaml.description,
-            steps=steps_json,
+            steps_graph=steps_graph_json,
+            definition_error=definition_error,
             triggers=triggers_json,
             is_template=False,
         )

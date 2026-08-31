@@ -24,6 +24,7 @@ from app.services.agent_run import (
     ADHOC_TRIGGER_TYPES as DISPATCHED_ADHOC_TRIGGER_TYPES,
 )
 from shared.factories import (
+    graph_pipeline_payload,
     repo_ingest_payload,
     pipeline_create_payload,
     pipeline_step_payload,
@@ -81,6 +82,40 @@ async def empty_pipeline(client, ingested_repo):
 
 class TestRunPipeline:
     """Tests for POST /api/pipelines/{pipeline_id}/run endpoint."""
+
+    async def test_a_graph_authored_pipeline_runs_the_same_as_an_array_one(
+        self, client, ingested_repo, clean_runner_registry
+    ):
+        """The OTHER door (12.8 §4.4), which every fixture in the tree now uses.
+
+        Every other test in this file authors with `steps` - the v1 array that
+        survives as the authoring dialect and that the API converts once, at
+        the boundary. This one posts the graph directly, the way
+        `tdd/shared/factories/pipelines` persists one, and asserts the run
+        looks identical. Without it, the array door is the only one an
+        integration test ever opens, while the graph door is what the
+        executor, the migration and every converted fixture actually depend on.
+        """
+        response = await client.post(
+            f"/api/repos/{ingested_repo['id']}/pipelines",
+            json=graph_pipeline_payload(
+                [
+                    {"name": "Lint", "type": "script",
+                     "config": {"command": "echo linting..."}},
+                    {"name": "Test", "type": "script",
+                     "config": {"command": "echo testing..."},
+                     "on_success": "stop"},
+                ],
+                name="Graph-authored CI",
+            ),
+        )
+        assert_status_code(response, 201)
+        pipeline = response.json()
+        assert list(pipeline["steps_graph"]["steps"]) == ["step_0", "step_1"]
+
+        run = await client.post(f"/api/pipelines/{pipeline['id']}/run", json={})
+        assert_status_code(run, 200)
+        assert run.json()["steps_total"] == 2
 
     async def test_run_pipeline_creates_run(self, client, pipeline_with_steps, clean_runner_registry):
         """Running a pipeline creates a pipeline run."""

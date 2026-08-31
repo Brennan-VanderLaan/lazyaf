@@ -2,9 +2,21 @@
 
 > Visual orchestrator for AI agents to handle feature development via Trello-style cards
 
-> **Reconciled against the tree 2026-08-30.** Status claims in this file name
+> **Reconciled against the tree 2026-08-31.** Status claims in this file name
 > their evidence. History lives in `historical-documents/`; this file is about
 > what is next.
+>
+> The 2026-08-30 ledger below was re-verified against HEAD (`744376b`) on
+> 2026-08-31 by four independent lanes, after three waves had landed on top of
+> it (`4f529e1`, `b54dd19`, `08e356d`, `744376b`). Items that closed are in the
+> closed table; items whose evidence had drifted carry corrected file:line;
+> items nobody could execute say so instead of being asserted.
+>
+> **Tree caveat, 2026-08-31.** HEAD is clean, but a concurrent wave is editing
+> `backend/app/schemas/pipeline.py`, `backend/app/services/agent_run.py`,
+> `backend/app/services/experiment_service.py` and `tdd/shared/factories/`.
+> Every line number in this file is **HEAD-relative**; re-check those four
+> before trusting a line number in them.
 
 ---
 
@@ -30,22 +42,39 @@ plan of record, with the strict file-ownership split and the acceptance gate, is
 | P1 | The graph gains terminal actions: `StepActions`, `describe_terminal_action`, `_run_terminal_action` | **COMPLETE** — `b79bb7f`; `STEP_ACTION_PREFIXES` and `_run_terminal_action` both live in `backend/app/services/pipeline_executor.py` |
 | P2 | `array_to_graph` becomes the faithful, *refusing* boundary converter | **COMPLETE** — `b79bb7f`; `backend/app/schemas/pipeline.py:597` |
 | **P3** | **Every writer emits graphs; every reader stops reading the array; `steps` leaves the wire** | **NOT STARTED — this is the next action.** `PipelineRead.steps`, `PipelineCreate.steps` and `PipelineUpdate.steps` are all still on the wire (`backend/app/schemas/pipeline.py:236,255,268`) |
-| P4 | Migration (next free revision id): backfill `steps` -> `steps_graph`, add the `definition_error` column | NOT STARTED. The `definition_error` *schema field* already exists (`schemas/pipeline.py:283`) but there is no column and no backfill revision. (The uncommitted `0012_workspaces_per_worker.py` in the tree is a **different** concurrent wave's migration — 12.8's backfill will need the next free revision id.) |
-| P5 | Delete the executor's array fork | NOT STARTED — `is_graph`, `_handle_action` and `parse_steps` all still branch in `pipeline_executor.py` |
+| P4 | Migration **`0013`**: backfill `steps` -> `steps_graph`, add the `definition_error` column | NOT STARTED. The `definition_error` *schema field* already exists (`schemas/pipeline.py:283`) but there is no column and no backfill revision. **Corrected 2026-08-31:** `0012_workspaces_per_worker.py` is **committed** (`08e356d`), so the committed head is `0012` and the next free id is **`0013`**, not "the next free id, pending". |
+| P5 | Delete the executor's array fork | NOT STARTED — every named identifier still branches at HEAD: `parse_steps` (`pipeline_executor.py:711`), `STEP_ACTIONS`/`STEP_ACTION_PREFIXES` (`:793-800`), `describe_step_action` (`:808`), `is_graph` threaded at `:694,704,3034,3171,4139,4306,4393`, `_handle_action` dispatch at `:2575,3112,4406,4546`, `Pipeline.has_graph_definition` (`models/pipeline.py:53`) |
 | — | **ACCEPTANCE GATE** (`wave10-v1-retirement.md` §5). Nothing below runs until it passes. | — |
-| P6 | Migration (the revision after P4's): drop the `steps` column; the tombstone lands | NOT STARTED |
+| P6 | Migration **`0014`** (the revision after P4's): drop the `steps` column; the tombstone lands | NOT STARTED |
 
-Two things to carry into P3 that the wave doc flags and the tree confirms:
+Three things to carry into P3 that the tree confirms:
 
-- `PipelineRead.definition_error` must land **with** P4's column, not before it —
-  until the column exists the API would read an attribute the ORM does not have.
-- YAML export is a P3-adjacent hazard, not a cosmetic one. `export_pipeline_yaml`
-  (`backend/app/routers/pipelines.py:576`) writes a graph as a `steps` **dict**
-  keyed by step id, while `PipelineYaml.steps` is a **list** — so a graph export
-  cannot be re-imported — and it drops `timeout`, `continue_in_context` and, since
-  P1, `actions` entirely. Once actions are the only way a graph can express
-  `merge:`/`trigger:`, a lossy export silently discards auto-merge. See T18 in the
-  ledger.
+- ~~`PipelineRead.definition_error` must land **with** P4's column, not before
+  it.~~ **WRONG AND OBSOLETE — corrected 2026-08-31.** The field already landed
+  at P1 (`b79bb7f`), deliberately ahead of the column, and
+  `schemas/pipeline.py:279-283` documents exactly why that is safe:
+  `from_attributes` falls back to the default for an attribute the ORM does not
+  declare. Two tests pin it
+  (`tdd/unit/schemas/test_pipeline_schemas.py::TestPipelineReadDefinitionError`
+  — 6 passed). **The constraint that actually survives** is about the ORM
+  *model*, not the schema: `backend/app/models/pipeline.py` must not gain a
+  `definition_error` attribute before the `ALTER`, because SQLAlchemy emits the
+  model's full column list in every `SELECT`. That is the version stated
+  correctly in `upcoming/wave10-v1-retirement.md:723`.
+- **The revision numbers in `upcoming/wave10-v1-retirement.md` are a live
+  trap.** Fourteen lines there hardcode `0012`/`0013`, including the filenames
+  it tells B3 to create (`:283`, `:454`, `:463`) and the acceptance-gate test
+  names (`:522-523`). `0012` is now taken. §4.7 (`:449`) does hedge — "if M14
+  has taken `0012`, take `0013`/`0014`" — and its answer is now literally
+  correct, but it names the wrong wave (M13-1 took it, not M14) and `:445` still
+  asserts "head `0011`". An agent reading §3.5's ownership table before §4.7
+  would author `0012_pipeline_steps_to_graph.py` and fork the chain into two
+  heads.
+- YAML export is a P3-adjacent hazard, not a cosmetic one — and it is **worse
+  than the 08-30 ledger said**. See T18 below: on top of the steps-as-dict,
+  `timeout`, `continue_in_context` and `actions` losses, `triggers` is never
+  written at all, and the *legacy* branch re-imports **cleanly** while silently
+  resetting every step's `on_success`/`on_failure` to `next`/`stop`.
 
 ### 2. Then — Milestone 13: the benchmark & evaluation harness
 
@@ -55,33 +84,79 @@ exactly one hit, and it is a comment
 (`backend/app/services/agent_run.py:15`). The design is complete and lives in
 this document plus `docs/milestone-13/`. Start at **13.1 (corpus & fixtures)**.
 
-**One blocker the design does not mention.** `backend/app/models/workspace.py` at
-HEAD declares `pipeline_run_id` with `unique=True`, so a pipeline run owns
-exactly one workspace — meaning K parallel agents would share a single checkout.
-That directly contradicts 13.2's "a branch and a workspace per worker", which is
-the substrate the whole parallel-strategy thesis rests on. A concurrent wave is
-fixing it (an uncommitted `backend/alembic/versions/0012_workspaces_per_worker.py`
-is in the working tree). **Confirm that has landed and is migrated before
-starting 13.2.**
+**BLOCKER 1 — the workspace constraint — is CLOSED (2026-08-31, `08e356d`).**
+The old note here told the reader to confirm it; the answer is **yes**.
+`backend/app/models/workspace.py:79` maps `pipeline_run_id` with **no**
+`unique=True`; the uniqueness moved to `:65-67`
+`Index("uq_workspaces_run_worker", "pipeline_run_id", "worker_key", unique=True)`
+with `worker_key` NOT NULL + `"default"` sentinel (`:81-88`). Migration
+`0012_workspaces_per_worker.py` (revision `0012`, down `0011`) is committed, and
+`tdd/integration/test_migrations.py` pins both the index swap and volume-name
+stability. Two lanes of one run are insertable, a duplicate lane is rejected, and
+`tdd/integration/services/test_workspace_lifecycle.py:261` writes into and reads
+back four independent volumes. **Isolation was checked and is intact**: volume
+names still carry the full run id (`models/workspace.py:93-94`), so two runs
+never share a volume — "per worker" means per lane *within* one run.
+13.2's substrate exists.
+
+**BLOCKER 2 (new, and it is now the hard gate on 13.1) — the oracle only sees
+`@pytest.mark.lazyaf_test_id`, which no upstream repo carries.**
+`runner-common/runner_common/pytest_lazyaf.py:161-163` returns early for any
+unannotated test, and `:210-211` writes no manifest at all when nothing was
+recorded — so an unmodified third-party repo POSTs nothing and every imported
+case fails validation. Making `psf/requests` scorable therefore means forking and
+editing its test files, which makes `base_commit_sha` a commit that exists only
+in LazyAF's git server and breaks the `fetch/` reproduction path.
+**This is diagnosed and specified, not open-ended**:
+`docs/milestone-13/leaderboards-and-corpus.md:287-322` quotes those same three
+lines and prescribes `LAZYAF_TEST_ID_MODE=nodeid` (marker wins, then an optional
+`LAZYAF_TEST_ID_MAP` overlay, then the pytest nodeid). Zero implementation — a
+grep for `LAZYAF_TEST_ID_MODE` across `runner-common/`, `backend/`, `cli/` and
+`tdd/` hits only that document. Small change, hard gate.
+
+**BLOCKER 3 (new) — 13.1's exit gate is unsatisfiable for its own normal case.**
+`docs/milestone-13/leaderboards-and-corpus.md:261-285`: `api-surface.md:141-143`
+says a `fail_to_pass` test "may not exist yet at `base_commit_sha`, which for
+`fail_to_pass` is the normal case", while the validator (and Phase 13.1 below)
+demands every `fail_to_pass` id **FAIL** at base. A missing test is not a failing
+test. And if the agent writes the `fail_to_pass` test, the measured party writes
+the measurement. Decide the rule — present-and-red at base, or `missing` as a
+third state — **before** cases are authored; it is cheap now and expensive later.
+
+**Read `docs/milestone-13/leaderboards-and-corpus.md` before starting 13.1.** It
+landed in `4f529e1` as an adversarial review of this document's own M13 design
+and it **contradicts the design in at least two places** (repo pinning by name,
+and the oracle id mode). The M13 body below still carries the reviewed design and
+does not mark itself superseded.
 
 Both of Milestone 13's mandatory in-12.x hooks are in place: `StepUsage` (12.5,
 migration `0005_step_usage.py`) and the cost axis in 12.6.5.
 
 ### 3. Waiting — Phase 14.5: runner images with inference baked in
 
-**DESIGNED, zero implementation.** No `vllm` or `ollama` appears anywhere under
-`images/` or `scripts/`, and no GPU-yield / drain mechanism exists. Wiring doc:
+**DESIGNED, zero implementation.** Evidence corrected 2026-08-31: the old
+"no `vllm` or `ollama` anywhere under `images/` or `scripts/`" line was **false
+when written** — `scripts/seed_dogfood_endpoints.py:68,85` set
+`"server_kind": "vllm"` (M14's endpoint layer, `4b429c6`). The status is still
+right; the honest evidence is the *absent 14.5 identifiers*: no
+`images/node-layer/`, `images/runner-ollama/` or `images/runner-vllm/`
+(`images/` holds only agent-base, base, claude, debug-sidecar, gemini,
+test-runner); no `scripts/build_inference_images.py`; no `refuses_without_gpu`;
+no `gpu.py` `detect()`/`verdict()`; and no GPU-yield/drain mechanism (the only
+`drain` hits are M12.6's runner registry). Wiring doc:
 `upcoming/wave9-145-runner-images.md`. It blocks nothing today, but it is what
 makes Milestone 13's headline experiment — an expensive planner directing K
 cheap local workers — runnable on hardware the owner already owns.
 
 ### 4. Standing — the open-item ledger
 
-The [verified open items](#open-items-verified-2026-08-30) below are the
-non-phase work: two security-posture problems, four correctness defects, and a
-handful of validation gaps. They are carried here so they are not lost between
-milestones. Each was re-checked against the tree on 2026-08-30; the ones fixed
-that day were removed.
+The [verified open items](#open-items-verified-2026-08-31) below are the
+non-phase work: the security posture (S1 and its five sub-items, S2), seven
+correctness defects, a handful of validation gaps, and — **new on 2026-08-31** —
+five defects in the **test gates themselves**, which had never been surveyed.
+They are carried here so they are not lost between milestones. Each was
+re-checked against the tree on 2026-08-31; the ones fixed are in the closed
+table so the shrinkage is visible.
 
 ---
 
@@ -95,7 +170,7 @@ that day were removed.
 | **12 — Runner architecture + spec/eval layer** | **IN PROGRESS** — every phase through 12.7 COMPLETE; **12.8 open** | Detail retired to [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md); 12.8 tracked below |
 | **13 — Benchmark & evaluation harness** | **NOT STARTED** | Zero implementation. Grep for `BenchmarkCase` / `StrategyTemplate` / `TrialIteration` / `fail_to_pass` / `cost_to_solve` across `backend/`, `frontend/`, `cli/`, `tdd/` returns one hit, a comment at `backend/app/services/agent_run.py:15`. Design: this document + `docs/milestone-13/` |
 | **14 — Self-hosted OpenAI-compatible endpoints** | **COMPLETE** (2026-08-30) | Commit `4b429c6`: 56 files, ~21.5k lines. `ModelEndpoint` + migration `0011_model_endpoints.py`, capability probe, agent harness in `runner-common/runner_common/harness/`, stdlib mock OpenAI server, Endpoints UI. Out of the 12.x sequence |
-| **14.5 — Runner images with inference baked in** | **DESIGNED** | Zero implementation: no `vllm`/`ollama` anywhere under `images/` or `scripts/`; no GPU-yield mechanism exists. Doc: `upcoming/wave9-145-runner-images.md` |
+| **14.5 — Runner images with inference baked in** | **DESIGNED** | Zero implementation. Evidence corrected 2026-08-31 — the old "no `vllm`/`ollama` anywhere" line was false (M14's endpoint layer uses both words). The absent 14.5 identifiers are the evidence: no `images/node-layer/`, `images/runner-ollama/`, `images/runner-vllm/`; no `scripts/build_inference_images.py`; no `refuses_without_gpu`; no `gpu.py` `detect()`/`verdict()`; no GPU-yield mechanism. Doc: `upcoming/wave9-145-runner-images.md` |
 
 ### Milestone 12 phases
 
@@ -133,23 +208,23 @@ exit gates: [`historical-documents/phase-12-runner-architecture.md`](historical-
 
 | Thing | Value | Source |
 |---|---|---|
-| T1 (unit + non-Docker integration) | **4724 executed, 0 failed** | Measured on the 12.8 P1-P2 landing (`b79bb7f`), which added ~2,240 lines of test. `tdd/tier_floors.json` still records the previous green measurement — floor 4432, measured 4523 on 2026-08-30 — because the floor is only raised on a deliberate ratchet. **The floor is stale-low by design, not by neglect; raise it on the next green T1.** |
-| T2 (Docker integration) | 77 executed, floor 75 | `tdd/tier_floors.json` |
-| T3 (e2e quick) | 22 executed, floor 21 | `tdd/tier_floors.json` |
-| Alembic head (committed) | **`0011_model_endpoints`** | `git ls-files backend/alembic/versions/` — 0001-0007, 0009, 0010, 0011. There is no `0008`. `0012_workspaces_per_worker.py` exists in the working tree but is **not committed** (a concurrent wave) |
+| T1 (unit + non-Docker integration) | **4836 passed / 0 failed / 0 errors, 1 baselined skip, 0 xfailed** (executed = 4836) | Measured 2026-08-31 against the current tree; the count is re-derivable by tallying `junit-t1.xml` with `ci_gate`'s own rules. Floor in `tdd/tier_floors.json` is **4432** (measured 4523, stamped 2026-08-30) — three waves behind. **RATCHET DUE: raise the floor to ~4739 (4836 minus ~2% slack) and set `measured` to 4836.** The floor was stale-low *by design* at 08-30; as of 08-31 it is stale-low by **neglect**, and the file's own standing instruction ("raise on the next green T1: measured minus ~2%") is now due twice over. |
+| T2 (Docker integration) | **83 passed / 0 failed / 0 errors, 1 baselined skip** (executed = 83) | Measured 2026-08-31, same method, against `junit-t2.xml`. Floor 75 / measured 77 in `tdd/tier_floors.json`. **RATCHET DUE: raise to ~81.** |
+| T3 (e2e quick) | floor 21, **measured 22 on 2026-08-30 — NOT re-measured on 2026-08-31** | `tdd/tier_floors.json`. Stated rather than assumed: `junit-t3.xml` **does not exist on this host**, so "both tiers green" covers T1 and T2 only and T3's 22 tests are unmeasured here. |
+| Alembic head (committed) | **`0012_workspaces_per_worker`** | Corrected 2026-08-31. `git ls-files backend/alembic/versions/` — 0001-0007, 0009, 0010, 0011, **0012**. There is no `0008`. `0012` (revision `0012`, down `0011`) landed in `08e356d`; `tdd/integration/test_migrations.py:42` pins `ALEMBIC_HEAD_REVISION = "0012"`. The next free id is **`0013`**, and only one wave wants it (12.8 P4). |
 | MCP tools | 45 | `grep -c '@mcp.tool' backend/app/mcp/server.py` |
 | Release CI | Publishes **9 images** to GHCR: 3 service (`backend`, `frontend`, `runner-agent`) + 6 step (`base`, `agent-base`, `claude`, `gemini`, `test-runner`, `debug-sidecar`) | `.github/workflows/images.yml`; the step list is read from `scripts/build_images.py`'s `IMAGES` table, not duplicated |
 | Release tags | **None. `git tag` is empty.** `release.yml` triggers only on `push: tags: ['v*']` (plus manual dispatch), so the tag path has never fired. `images.yml` also runs on push to `main`. | `.github/workflows/release.yml:51-54`, `images.yml:60-64` |
 
 ---
 
-## Open items (verified 2026-08-30)
+## Open items (verified 2026-08-31)
 
 Findings from the adversarial QA pass (`upcoming/qa-triage.md`, which keeps the
 reproductions) plus the security review, carried here so they survive between
-milestones. **Every item below was re-checked against the tree on 2026-08-30**
-and the file:line evidence is the check. Items fixed that day were removed —
-they are listed at the bottom so the shrinkage is visible rather than silent.
+milestones. **Every item below was re-checked against the tree on 2026-08-31**
+and the file:line evidence is the check. Items fixed are in the closed table at
+the bottom so the shrinkage is visible rather than silent.
 
 These are not a phase. Fold them into whatever phase touches the same file, or
 schedule the security block on its own.
@@ -157,87 +232,367 @@ schedule the security block on its own.
 ### Security posture
 
 **S1 — No authentication on any human-facing router, while compose binds
-`0.0.0.0` and mounts the Docker socket.** CONFIRMED.
-Not one of `cards.py`, `pipelines.py`, `repos.py`, `spec.py`, `experiments.py`,
-`model_endpoints.py` or `jobs.py` declares any dependency other than `get_db` —
-there is no auth dependency anywhere on the human-facing surface. Machine
-surfaces are the exception and *are* authenticated: `steps.py` and
-`ws_runners.py` verify the step / runner JWT.
+`0.0.0.0` and mounts the Docker socket.** CONFIRMED, re-verified 2026-08-31,
+statically and live.
 
-Meanwhile `docker-compose.yml:5` publishes `"8000:8000"` — no `127.0.0.1`
-prefix, so the API listens on every interface — and `docker-compose.yml:14`
-mounts `/var/run/docker.sock` into the backend, which is root-equivalent on the
-host. The internal git server rides the same unauthenticated port.
+A decorator-walk over all 20 files in `backend/app/routers/` finds only three
+non-`get_db` `Depends(` in the whole tree, and none of them is auth
+(`debug.py:353` session factory, `ws_runners.py:644` session factory,
+`test_api.py:134` `require_test_mode`). Only two middlewares are registered
+(`main.py:247` `UnhandledErrorBoundary`, `:249` `CORSMiddleware`); neither
+authenticates.
 
-The README is honest about the posture ("No authentication, and it holds your
-Docker socket… Run it somewhere you trust, bound to localhost") but **no compose
-file in the repo actually binds to localhost** — the only `127.0.0.1` in
-`docker-compose.yml` is inside a healthcheck (line 144). So the instruction and
-the shipped default disagree, and the default is the permissive one. Minimum
-fix: make `127.0.0.1:8000:8000` the default binding and require an explicit
-opt-out to widen it.
+**Corrected count of authenticated surfaces — there are FOUR, not two.** The
+08-30 ledger said "`steps.py` and `ws_runners.py`". Also authenticated:
+`model_endpoints.py:515` `POST /{reference}/probe-result` (step JWT) and the
+debug terminal socket (`debug.py:361-370`, join-token). In HTTP terms exactly
+six routes carry a credential check: `steps.py:187,260,293,336,375`
+(`verify_step_auth`, defined at `steps.py:121`) plus that probe-result route;
+plus two websockets. Everything else — cards, pipelines, repos, spec,
+spec_context, experiments, jobs, agent_files, lazyaf_files, models, playground,
+runners, test_results, git, and every HTTP route in `debug.py` — is open.
+LIVE on the isolated QA sandbox (`:8790`): `POST /api/repos` with zero headers
+returned **HTTP 201** and created a repo (then `DELETE` → 204);
+`GET /git/{id}.git/info/refs?service=git-upload-pack` **and**
+`?service=git-receive-pack` both returned 200 with a full ref advertisement — so
+the git server serves clone **and** push to anyone.
 
-Related and still open: **T21** — the playground `internal/*` endpoints were
-reported unauthenticated. *Not re-verified this pass:*
-`backend/app/routers/playground.py` and `services/playground_service.py` were
-under concurrent edit and deliberately not opened. Re-check before closing.
+**Two specifics the 08-30 ledger did not name:**
 
-**S2 — Step containers have no CPU or PID limit, and there is no fan-out cap.**
-CONFIRMED. `backend/app/services/execution/local_executor.py:773-774` sets
-`mem_limit` when a step asks for one and sets nothing else — no `nano_cpus`, no
-`cpu_quota`, no `pids_limit`. And `pipeline_executor.py` has no semaphore or
-`max_parallel` of any kind, so a wide graph fans out as far as its edges allow.
-One pipeline can starve the host the backend is running on.
+- `POST /git/{repo_id}.git/_internal/push-event` (`routers/git.py:180-199`) is
+  unauthenticated and calls `trigger_service.on_push`. An anonymous caller can
+  **forge a push event and start pipeline runs** — i.e. spawn containers on the
+  host daemon — without pushing anything.
+- **CORS is one of the few things NOT wide open, and this is written down so
+  nobody "fixes" it.** `config.py:313` defaults `cors_origins` to
+  `["http://localhost:5173"]` with `allow_credentials=True` (`main.py:249-255`) —
+  not a wildcard. It blocks a drive-by from a victim's browser and does nothing
+  about `curl`, which is how every probe above reached the API. **Do not credit
+  CORS with mitigating S1.**
+
+**S1-bind — every compose file still publishes on `0.0.0.0` by default, and
+`.env.example` ships a portless value that keeps it that way.** OPEN.
+`docker compose -f docker-compose.yml config` shows three published ports with
+**no `host_ip` line at all**: 8000 (`docker-compose.yml:5`), 5173 (`:35`), 8099
+(`:135`). `docker-compose.dev.yml:5` is the same hardcoded `"8000:8000"` with
+`uvicorn --host 0.0.0.0`. `docker-compose.release.yml:53` defaults to
+`"${LAZYAF_BACKEND_PORT:-8000}:8000"` — and `.env.example:49` ships
+`LAZYAF_BACKEND_PORT=8000` with no host IP, so a user who copies the template
+(which is what QUICKSTART tells them to do) gets `0.0.0.0` even on the release
+stack that supports loopback. Two edits, different costs: `.env.example:49-50`
+→ `127.0.0.1:8000` / `127.0.0.1:5173` fixes the release stack for every new user
+at zero risk; `docker-compose.yml:5` → `"127.0.0.1:8000:8000"` fixes the dev
+stack but breaks anyone reaching it from another machine on purpose.
+
+**S1-e2e — `backend-e2e` publishes a fourth `0.0.0.0` port that carries an
+unauthenticated database wipe.** OPEN, and **not in the 08-30 ledger**, which
+counted only the two main compose files. `docker-compose.yml:151-186` defines
+`backend-e2e` with `ports: - "8765:8000"` (no host IP), the host docker socket,
+and `profiles: [e2e]`. `frontend/e2e/compose.test-mode.yml:8-11` overlays
+`LAZYAF_TEST_MODE=true` onto exactly that service, which mounts
+`POST /api/test/reset` and `/api/test/seed` behind `require_test_mode`
+(`test_api.py:123-135`) — a **config gate returning 403 when off, not
+authentication**. While the e2e profile is up, port 8765 offers an anonymous
+"clear every table" button on every interface. The scoping is done right (a
+separate overlay file, one service, profile-gated); what is left is the binding:
+`127.0.0.1:8765`.
+
+**S1-debug — `POST /api/debug/{id}/join-token` mints a terminal JWT with no auth
+of its own.** OPEN. `debug.py:252-273` takes `(session_id, db)` and nothing else;
+it calls `mint_join_token` (`:88-103`), which signs
+`{debug_session_id, iat, exp}` with `settings.step_auth_secret`. Session ids are
+enumerable from the equally-open `GET /api/debug` (`:233`). LIVE:
+`POST /api/debug/does-not-exist/join-token` with zero headers returned **404
+from the handler**, not 401 from a gate — which is the proof there is no gate.
+The token itself is well built (bounded by `min(now+TTL, session.expires_at)`,
+409 after the session ends, re-checked at the socket); the only missing piece is
+a caller credential, and that **cannot be fixed independently of S1** because
+there is no notion of a user to bind it to.
+
+**S1-docker-sock — the socket is mounted into the backend and a step can still
+take it with `needs: [docker]`.** OPEN, and deliberately so. Mounts:
+`docker-compose.yml:14`, `docker-compose.release.yml:61`, `backend-e2e:176`, and
+the runner services. Step path: `pipeline_executor.py:3268-3287` turns
+`needs: [docker]` into a bind mount of `DOCKER_SOCKET_SOURCE`;
+`local_executor.py:200-225` gates bind sources against `bind_mount_allowlist()`,
+whose default (`:134-145`) is `(DOCKER_SOCKET_SOURCE,)` — the socket is the one
+thing on the allowlist. Covered by
+`tdd/unit/services/test_pipeline_local_dispatch.py:890` and
+`tdd/unit/services/execution/test_local_executor_hardening.py:239-264`. **Nothing
+to fix in isolation** — this is the DooD tradeoff and `README.md:216-219` and
+`docker-compose.release.yml:57-60` both say so. It stays on the ledger as the
+reason S1 is a *takeover* rather than a data leak. **One-line drift worth
+fixing**: `local_executor.py:137-142` says the allowlist is "settings-driven via
+`step_bind_mount_allowlist`" and reads it with a defensive `getattr` — that
+parallel change never landed. A grep for `step_bind_mount_allowlist` across
+`backend/` and `tdd/` returns only those two lines. The allowlist is hardcoded
+and the comment says otherwise.
+
+**T21 — the playground `internal/*` endpoints are unauthenticated.** The 08-30
+ledger deferred this ("not re-verified — under concurrent edit"). **Re-verified
+2026-08-31, and it is worse than reported.** `playground.py:277-309` declares
+four routes on `session_router` (prefix `/api/playground`, mounted at
+`main.py:408`): `POST /{session_id}/internal/status`, `/internal/result`,
+`/internal/log`, `/internal/runner`. Every signature is `(session_id, data)` —
+no `Header`, no `Depends`, no step JWT, no runner secret. LIVE:
+`POST /api/playground/bogus-session/internal/log` with a body of log lines
+returned **HTTP 200 `{"ok":true}` for a session id that does not exist**, so
+there is no existence check either (`playground_service.append_logs` at
+`services/playground_service.py:445-448` iterates and swallows). Anyone who can
+reach the port can forge status, results, diffs and log lines into any playground
+session. **This one does not need S1 to fix**: these are machine callbacks and
+should take the same Bearer step JWT `/api/steps/*` already uses
+(`steps.py:121-141` is the pattern), plus a 404 for an unknown session.
+
+**S2 — Step containers have no CPU or PID limit.** CONFIRMED, and re-confirmed
+**live** on 2026-08-31 rather than only read.
+`backend/app/services/execution/local_executor.py:755-774` builds `run_kwargs`
+and sets `mem_limit` only `if memory_limit:` (`:773-774`). A repo-wide grep for
+`nano_cpus|cpu_quota|pids_limit|cpu_shares|cpuset` across `backend/app` returns
+**exactly one hit** — that `mem_limit` line. Against the QA sandbox:
+`LAZYAF_QA_BASE_URL=http://127.0.0.1:8790 python -m pytest -c tdd/qa/pytest.ini tdd/qa/test_step_resource_limits_qa4.py`
+→ **2 passed, 2 xfailed** in 10.4 s. Both xfails are `strict=True`, so they are
+current confirmations rather than stale annotations:
+`test_step_container_has_a_memory_limit` (observed `HostConfig.Memory=0`) and
+`test_step_container_has_a_cpu_limit` (`NanoCpus=0`, `CpuShares=0`). The two that
+PASS are worth keeping green: the container is not privileged, and it carries the
+`lazyaf.pipeline_run_id` label so orphans are findable. Fix: platform defaults for
+`mem_limit`, `nano_cpus` and `pids_limit` at `local_executor.py:755-774`, sourced
+from `config.py` so an operator can raise them. **Note PID limits have no test at
+all** — QA-4 covers memory and CPU only, so a fork bomb in a script step is
+neither bounded nor detected.
+
+**S2-fanout — no fan-out cap for script steps.** OPEN, but the 08-30 ledger's
+sentence was **wrong** and is corrected here: it said "`pipeline_executor.py` has
+no semaphore or `max_parallel` of any kind". There **is** one —
+`_admit_to_endpoint` (`pipeline_executor.py:1554`) holds one of a model
+endpoint's concurrency slots before the container starts. Its only call site is
+`:2857`, guarded by `if endpoint is not None`, so it covers agent/endpoint-bound
+steps and nothing else; a plain `script` step passes no gate. (The other
+`Semaphore`, `model_endpoints.py:730-740`, is per-endpoint proxying.) The
+conclusion survives, the sentence did not. Standing finding:
+`tdd/qa/test_graph_execution_qa4.py:284-325 test_fanout_is_capped`,
+`xfail(strict=True)`, QA4-12 — "a 20-way fan-out put all 20 into
+`active_step_ids` at once". **NOT EXECUTED this pass** (it is `@pytest.mark.heavy`
+and would start 20 containers), so it is carried on its marker, not on a run.
+Fix: a run-level or platform-level cap on concurrently active graph steps; the
+endpoint gate is the shape to copy.
 
 ### Correctness
 
-**T5 — The run-list serializer ships every step's full logs.** CONFIRMED.
-`GET /api/pipeline-runs` and `GET /api/pipelines/{id}/runs`
-(`backend/app/routers/pipelines.py:399,420`) both return
-`list[PipelineRunRead]`; `PipelineRunRead.step_runs` is `list[StepRunRead]`
-and `StepRunRead.logs` is a plain `str` (`schemas/pipeline.py:349`). With
-`limit` up to 100 runs, a dashboard poll drags every log line of every step of
-every listed run across the wire. The fix is a list-shaped read model without
-`logs`; the per-step log endpoint already exists
-(`GET /api/pipeline-runs/{run_id}/steps/{step_index}/logs`).
+**T5 — The run-list serializer ships every step's full logs.** CONFIRMED, and
+now **measured** against the live dev backend (`:8000`) on 2026-08-31 rather than
+only read. `GET /api/pipeline-runs?limit=100` → **5,834,441 bytes**, of which
+**5,641,837 (96.7%) is the `logs` field**, across 87 runs / 237 step_runs;
+largest single step log 285,077 bytes. `GET /api/pipelines/{id}/runs?limit=100` →
+5,767,973 bytes (same defect, second endpoint). At the limit the **frontend
+actually uses** (`pipelines.ts:181`, `loadForPipeline` default `limit=10`) it is
+still **1,665,472 bytes per pipeline-detail open**. Mechanism unchanged:
+`backend/app/routers/pipelines.py:399,420` both declare
+`response_model=list[PipelineRunRead]`; `PipelineRunRead.step_runs` is
+`list[StepRunRead]` and `StepRunRead.logs` is a plain `str`
+(`schemas/pipeline.py:349`); no `response_model_exclude` anywhere. Fix: a
+list-shaped read model without `logs` (`PipelineRunListRead` /
+`StepRunListRead`) on those two routes. The per-step log endpoint already exists
+(`routers/pipelines.py:498`), so nothing is lost. Drops the default dashboard
+payload ~30x.
 
 **T9 — Duplicate graph edges dispatch a step twice — and now fire its effects
 twice.** CONFIRMED.
-`graph_definition_errors` says so in its own docstring: duplicate entry points
-and duplicate parallel edges are "NOT checked here (deliberately)"
-(`pipeline_executor.py:891-894`). In `_handle_graph_step_complete`, the fan-out
-loop appends one entry to `steps_to_execute` per matching edge
-(`pipeline_executor.py:4645-4665`), and the already-completed/already-active
-guard is evaluated *before* `_reserve_active_steps` runs — so two identical
-`A -> B` edges both pass the guard and `_execute_graph_step` is called twice
-for B.
+Both halves re-confirmed 2026-08-31; **line numbers corrected** (the 08-30
+ledger cited `:4645-4665` and `:4613-4634`; the code is at `:4662-4679` and
+`:4630-4655`).
 
-Since 12.8 P1 this got sharper. Terminal actions are keyed to node *completion*,
-not to the edge (`pipeline_executor.py:4613-4634`), and there is no
-already-handled guard at the entry of `_handle_graph_step_complete` — so a node
-that completes twice fires its `merge:` / `trigger:` twice. A duplicated edge is
-now a double merge or a duplicate spawned card, not just a wasted container.
-Cheapest fix: reject duplicate edges in `graph_definition_errors` (422 at the
-boundary), and de-duplicate `steps_to_execute` as defence in depth.
+*Half 1 — validation permits it, deliberately.* `graph_definition_errors` says so
+in its own docstring: duplicate entry points and duplicate parallel edges are
+"NOT checked here (deliberately)" (`pipeline_executor.py:892-895`), and the edge
+loop at `:925-946` does `successors.setdefault(source, []).append(target)` with
+no de-dup. Executed: `graph_definition_errors({'entry_points':['a','a'], two
+identical a->b edges})` returns `[]`, and `get_downstream_edges(g,'a','success')`
+returns 2. The 422 boundary is `schemas/pipeline.py:740-742` calling the same
+permissive function, so the API accepts it too.
+
+*Half 2 — dispatch and effects both double.* The fan-out loop at
+`pipeline_executor.py:4662-4679` appends one entry to `steps_to_execute` per
+matching edge with no de-dup, and its guard (`:4670`) reads sets loaded at
+`:4595-4596`, **before** `_reserve_active_steps` runs at `:4693` — so both copies
+pass. `_reserve_active_steps` (`:4788-4803`) dedupes `active_step_ids` but **not**
+`steps_to_execute`, so `_execute_graph_step` is still called twice. Terminal
+actions are keyed to node *completion* (`:4630-4655`) and
+`_handle_graph_step_complete` has **no already-handled guard** at its entry
+(`:4589-4601` does an unconditional `completed_ids.add(...)`) — so a node that
+completes twice fires its `merge:` / `trigger:` twice. `_spawn_fix_card` has no
+idempotency key (two cards); `_merge_step_branch` (`:5660-5729`) is **not** a
+no-op on re-entry — it re-resolves a source branch and re-runs the
+`.lazyaf-context` delete-and-commit against the target. The entry-point half is
+the same defect at `:2080` (`for step_id in entry_points:` over the raw list).
+`:4810` even admits it in a docstring: "the duplicate dispatch of QA4-06".
+
+Four `xfail(strict=True)` tests already name this as QA4-06 and all four still
+xfail today: `tdd/qa/test_graph_definition_qa4.py::test_duplicate_entry_points_are_rejected`,
+`::test_parallel_duplicate_edges_are_rejected`,
+`tdd/qa/test_graph_execution_qa4.py::test_duplicate_entry_points_dispatch_the_step_once`,
+`::test_duplicate_edges_dispatch_the_target_once`. Fix: reject duplicate
+`entry_points` and duplicate `(from,to,condition)` triples in
+`graph_definition_errors` (422 at the boundary); de-duplicate `steps_to_execute`
+at `:4679` as defence in depth; add an already-completed guard at the top of
+`_handle_graph_step_complete` so terminal actions cannot fire twice. Then flip the
+four xfails — **and update their reason strings, which cite the stale
+`pipeline_executor.py:3405-3420`.**
 
 **T10 — `POST /api/pipelines/{id}/run` walks the whole graph inside the request
-handler.** CONFIRMED. `run_pipeline` still does
-`await pipeline_executor.start_pipeline(...)` inline
-(`backend/app/routers/pipelines.py:309,378`), and there is no bound anywhere on
-graph size — no `MAX_STEPS`, no step-count check in `pipeline_executor.py` or
-`schemas/pipeline.py`. This is the one place the codebase departs from standing
-rule **R5** (async-first: "HTTP/git-push handlers return a run id immediately").
-Measured at 299 s on a 400-step chain in the QA pass.
+handler.** CONFIRMED, unchanged. `run_pipeline` is at
+`backend/app/routers/pipelines.py:310` (the 08-30 ledger's `:309` is the
+decorator) and still does `await pipeline_executor.start_pipeline(...)` inline at
+`:378`. A grep for `MAX_STEPS|max_steps|MAX_GRAPH` across `backend/app` returns
+**nothing** — no bound on graph size anywhere. This is the one place the codebase
+departs from standing rule **R5** (async-first: "HTTP/git-push handlers return a
+run id immediately"). Measured at 299 s on a 400-step chain in the QA pass. Fix:
+create the run row, return the run id, dispatch the graph on a background task;
+add a `MAX_STEPS` bound at the schema boundary so a 400-step chain is a 422.
 
-**T18 — YAML export is lossy, and for graphs not re-importable.** CONFIRMED, and
-worse since 12.8 P1. `export_pipeline_yaml`
-(`backend/app/routers/pipelines.py:576-620`) emits a graph's `steps` as a **dict
-keyed by step id** with `on_success` holding a list on fan-out, while the import
-schema `PipelineYaml.steps` is a `list[PipelineStepYaml]` whose `on_success` is a
-single `str` (`schemas/lazyaf_yaml.py:35-60,101`). The export also drops
-`timeout`, `continue_in_context`, and — the new one — `actions`, which since P1
-is the *only* way a graph expresses `merge:` and `trigger:`. Exporting a pipeline
-that auto-merges and re-importing it produces a pipeline that does not.
+**T18 — YAML export is lossy, and for graphs not re-importable.** CONFIRMED **by
+a live round trip** on the QA sandbox on 2026-08-31, and **worse in two ways the
+08-30 ledger does not mention.** A graph pipeline was created carrying
+`timeout=900/120`, `continue_in_context=true` and
+`actions={success:[merge:main], always:[trigger:card-abc]}`;
+`GET /api/pipelines/{id}/export/yaml` returned 200 with exactly `name`,
+`description`, `version`, `entry_points`, and a `steps:` **mapping** whose
+entries carry only `name`/`type`/`config`/`on_success`. Feeding it back through
+`PipelineYaml(**yaml.safe_load(...))` fails: *"steps / Input should be a valid
+list"*. What a round trip loses **today**, exactly:
+
+1. it does not re-import at all — `export_pipeline_yaml`
+   (`routers/pipelines.py:564`, graph branch `:586-621`) writes `steps` as a dict
+   keyed by step id while `schemas/lazyaf_yaml.py:99-101` declares
+   `steps: list[PipelineStepYaml]`;
+2. `timeout` — dropped, silently reverts to the schema default 300
+   (`lazyaf_yaml.py:58`);
+3. `continue_in_context` — dropped, reverts to `False` (`:59`);
+4. `actions` — dropped entirely, which since P1 is the **only** way a graph
+   expresses `merge:`/`trigger:`, so an auto-merging pipeline round-trips into
+   one that does not;
+5. **NEW — `triggers` is never written into `export_data` on either branch**
+   (`:572-576` sets only name/description/version). Every trigger binding is
+   silently dropped, so an exported pipeline never fires again;
+6. **NEW, and the worst of the set — the LEGACY/v1 branch (`:623-634`) emits only
+   `name`/`type`/`config` per step and DOES produce a valid list, so it
+   re-imports CLEANLY while silently resetting every step's
+   `on_success`/`on_failure` to the defaults `next`/`stop`.** A v1 step that said
+   `on_success: merge:main` round-trips into one that merely falls through — a
+   silent behaviour change, where the graph case at least fails loudly.
+
+Fix: emit exactly what `PipelineYaml` accepts — `steps` as a **list**, each
+carrying `id`/`name`/`type`/`config`/`on_success`/`on_failure`/`timeout`/
+`continue_in_context`/`actions`, plus top-level `triggers`. `PipelineStepYaml`
+has no `actions` field yet, so the import schema needs it too. Gate it with an
+export → import → compare round-trip test covering **both** branches.
+
+**T1 (RE-OPENED as PARTIAL, 2026-08-31) — naive UTC timestamps are fixed on the
+REST/pydantic path and still open on every hand-built wire payload.** The 08-30
+closed table listed T1 as fully fixed. It is not. **Proof the two transports
+disagree**: the REST list ships `2026-08-30T21:01:46.573700+00:00` (offset
+present — `UTCDateTime` doing its job), while `datetime.utcnow().isoformat()` —
+what the WebSocket dicts call — produces `2026-08-31T10:59:10.667047` with **no
+offset**, which a browser parses as LOCAL time. Same row, two transports, two
+answers.
+
+Full census of `.isoformat()` in `backend/app`: 39 matching lines = 4 prose /
+docstring mentions + 1 correct helper (`schemas/_datetime.py:80`,
+`to_utc(value).isoformat()`) + **34 real bare call sites**. Of those 34:
+
+- **LIVE WIRE, 23 sites** — `routers/pipelines.py:106,107` (`pipeline_to_ws_dict`,
+  sent at `:230,268`); `services/pipeline_executor.py:1087,1088,1089`
+  (`pipeline_run_to_ws_dict`) and `:1105,1106` (`step_run_to_ws_dict`), broadcast
+  from 17 call sites; `pipeline_executor.py:5506,5508` (hand-built job dict);
+  `services/playground_service.py:255,437,461,475,488,495,523,604` (8 SSE
+  payloads); `routers/steps.py:233,234,313` (machine-facing, but a runner
+  computing a timeout off a naive string has the same bug);
+  `services/model_endpoints/health.py:96`; `services/model_endpoints/probe.py:741`;
+  `services/execution/debug_session_service.py:1145`.
+- **DEAD wire code, 5 sites** — `routers/pipelines.py:133,134,135,150,151`. See
+  T27; they need **deleting**, not fixing.
+- **INTERNAL, not wire, 6 sites** — `services/workspace_service.py:218` (a Docker
+  volume label), `services/execution/runner_state.py:262,263,271` and
+  `debug_state.py:238,243` (persisted into `DebugSession.state_history`, which
+  reaches no client). **Leave these alone.**
+
+The fix already exists and was applied unevenly: `utc_isoformat` is imported and
+used in `routers/cards.py`, `routers/jobs.py`, `routers/repos.py`,
+`services/agent_run.py` and `services/execution/runner_registry.py` — and in
+**none** of the 23 live-wire sites. Sharpest instance:
+`pipeline_executor.py:5506-5508` hand-builds a job status frame with bare
+`isoformat`, while `routers/jobs.py:130-131` builds the same frame with
+`utc_isoformat`. **The pipeline WebSocket path is the busiest live surface in the
+product and is the one the sweep missed.** 23 mechanical swaps plus seven
+imports.
+
+**T25 — the workspace orphan sweep is not scoped per backend instance; two
+backends on one Docker daemon GC each other.** OPEN, **new**, and this is the
+**live configuration on this machine right now**, not a hypothesis. `docker ps`
+shows `lazyaf-backend-1` (`:8000`) and `lazyaf-qa-backend-qa-1` (`:8790`); both
+mount the Docker socket and both use **disjoint databases**. Both run the sweep
+(`main.py:48,130`; `workspace_service.py:940-966`, every 300 s with the first
+sweep immediate on startup). Sweep 3 (`workspace_service.py:822-859`) builds
+`live_volumes` from `select(Workspace.volume_name)` against **this** backend's
+database, then lists volumes with
+`filters={"label": "lazyaf.workspace=true"}` (`:252`) — **a filter with no
+instance component** — and removes anything not in its own live set older than
+`stuck_threshold` (default 15 min). Creation (`:214-219`) stamps only
+`lazyaf.workspace=true` and `lazyaf.created_at`; **no owner id**. So backend A's
+live workspace volume is, to backend B, an unmatched old volume — and B deletes
+it out from under a running step. The docstring at `:743-753` reasons carefully
+about lanes and about the row-before-volume ordering invariant, but that
+invariant is **per-database**, and the sweep's premise ("a volume with no row is
+garbage") is false the moment a second database exists on the same daemon. Fix:
+stamp an instance-id label at `:214-219` and add it to the sweep's list filter at
+`:252`. Cheap and fully local to `workspace_service.py`. **Operationally: the QA
+sandbox is not a safe bystander — it can delete the owner's live workspace
+volumes after 15 minutes, and vice versa. Know this before the next long dogfood
+run.**
+
+**T26 — runner-provisioned workspace volumes are unreapable by anything after a
+runner restart: 54 of 55 on this daemon.** OPEN, **new**, and the mechanism is
+**not** what a prior pass concluded. Current daemon: **55 volumes named
+`lazyaf-ws-*`; exactly 1 carries `lazyaf.workspace=true`.** The other 54 are not
+simply unlabeled — **36 carry a different label namespace**
+(`lazyaf.runner-workspace` / `lazyaf.retain_key` / `lazyaf.created_at`) and 18
+have no labels at all. There are **two creators sharing one name prefix with two
+label vocabularies**: the backend (`workspace_service.py:83`,
+`lazyaf.workspace`) and the runner agent
+(`runner-agent/lazyaf_runner/workspace.py:62-64`). The backend sweep filters on
+`lazyaf.workspace=true`, so **54 of 55 are structurally invisible to it**. The
+runner side is worse: `cleanup(retain_key)` (`workspace.py:223-234`),
+`reap_idle(...)` (`:236-256`) and `cleanup_all()` (`:259-265`) **all iterate
+`self._provisioned`, a plain in-memory dict initialised empty at `:155` with no
+persistence**, and `VOLUME_LABEL`/`RETAIN_KEY_LABEL` are **write-only** — set at
+`:107-108` and never used in any `volumes.list(filters=...)`. The instant a
+runner-agent process restarts, every volume it created becomes permanently
+unreachable by **both** reapers. 36 leaked volumes is that mechanism's receipt.
+Disk today is small (10 at 0 B, 19 at ~27.7 kB), so this is a leak, not yet an
+outage — but it is unbounded and there are 9 runner containers on this host. Fix:
+make the runner reaper **label-driven instead of memory-driven** (list
+`lazyaf.runner-workspace=true`, read `retain_key`/`created_at` off the volume);
+**separately decide, and write down**, whether the backend sweep should also reap
+the runner namespace — the two namespaces sharing the `lazyaf-ws-` prefix is
+exactly the ambiguity that produced this. The 18 unlabeled ones need a one-time
+manual `docker volume rm`; nothing in the tree can ever reap them.
+
+**T27 — `pipeline_run_to_ws_dict` and `step_run_to_ws_dict` are defined twice,
+and the `routers/pipelines.py` copies are dead code that has already drifted.**
+OPEN, **new**. Both functions exist at `routers/pipelines.py:121,139` **and**
+`services/pipeline_executor.py:1074,1093`. A grep across `backend/app` and `tdd`
+finds **zero callers** of the router pair: all 17
+`send_pipeline_run_status`/`send_step_run_status` call sites are in
+`pipeline_executor.py` and use the executor's copy, and the only test imports are
+from `pipeline_executor` (`tdd/unit/services/test_pipeline_executor.py:30-31`).
+Only `pipeline_to_ws_dict` (`routers/pipelines.py:96`) is live (`:230,268`). The
+dead copies have **already drifted**: the router version emits `trigger_context`
+and `logs` and **omits** `active_step_ids`, `completed_step_ids`, `step_id` and
+`executor`. `step_id` is the only field that says which graph node a frame refers
+to, so the dead copy would silently break every graph UI if anyone wired it up.
+Fix: delete `routers/pipelines.py:121-155`. That removes 5 of T1's 34 naive
+timestamp sites for free and closes the drift trap.
 
 ### Validation and robustness
 
@@ -272,17 +627,248 @@ CONFIRMED. `routers/git.py:71,73,100,104,154,156`,
 interpolate a caught exception straight into the response body.
 
 **T24 — Assorted polish.** Partly fixed on 2026-08-30 ("1 steps" and the
-long-name overflow landed in `a39cb24`). The remainder — 400-vs-409
-inconsistency, unbounded `commits?limit`, silent PATCH drops — was not
-re-verified this pass.
+long-name overflow landed in `a39cb24`). **The unbounded `commits?limit`
+sub-item is CLOSED** (2026-08-31): `backend/app/routers/repos.py:373` now reads
+`get_commit_log(repo_id, branch, max_count=min(limit, 100))`, and
+`GET /api/repos/{id}/commits?limit=999999` returns normally on the sandbox. The
+neighbouring list endpoints were already bounded declaratively
+(`pipelines.py:402,424`, `Query(20, ge=1, le=100)`). **One cosmetic remnant**:
+`repos.py:361` declares `limit: int = 20` with no `Query` bounds, so `?limit=-5`
+reaches `min(-5, 100) = -5` and returns HTTP 200 with an empty list instead of
+422 (verified live). Making it `Query(20, ge=1, le=100)` matches `pipelines.py`
+and deletes the `min()` too. **Still not re-verified**: the 400-vs-409
+inconsistency and the silent PATCH drops.
 
-### Closed on 2026-08-30 — verified fixed, not just claimed
+### The test gates themselves (new section, 2026-08-31)
 
-Kept as a short list so a reader can tell the ledger shrank on evidence.
+The 08-30 ledger surveyed product defects only; nobody had audited the ratchet.
+These five are what that audit found. They are **not** a rewrite of
+`ci_gate.py` — see the closed table for the parts of the gate that were verified
+sound.
+
+**L3-1 — the stale-junit trap: a tier can report OK having run zero tests.**
+OPEN. `scripts/run_tier.py:142-183` never unlinks `REPO_ROOT/junit-t{N}.xml`
+before launching pytest, and `scripts/ci_gate.py:49-70` accepts any file that
+satisfies `path.is_file()`; `main()` catches only `FileNotFoundError` and
+`ET.ParseError`. There is no mtime, no freshness, no invocation-time check
+anywhere in either file. **REPRODUCED**: `python scripts/run_tier.py T1 -- --help`
+printed `CI GATE [T1]: OK - executed=4836 (floor=4432) passed=4836 failed=0` and
+exited 0 while **zero tests ran** — `junit-t1.xml`'s md5 and mtime were unchanged
+across the whole invocation. `-- --markers` does the same. **The sharp boundary,
+which reading alone would not reveal**: `-- --collect-only -q` DOES write a junit
+and the gate correctly **FAILED** (`executed count 0 below committed floor
+4432`). So the floor defends against "pytest ran and executed nothing" and is
+**completely blind to "pytest never wrote a report at all"** — which is why the
+floor felt like protection and was not. Third vector, same class: the artifact is
+a fixed name at repo root (`run_tier.py:145`), so two concurrent tier runs share
+one file. Fix, two halves, both wanted: **(a)** `junit_path.unlink(missing_ok=True)`
+in `run_tier()` immediately before the `pytest_cmd` block — that converts every
+non-writing pytest exit into `ci_gate`'s existing `FileNotFoundError` path;
+**(b)** a `--not-before EPOCH` argument on `ci_gate.py` that refuses a junit older
+than the invocation, with `run_tier.py` passing `time.time()` — **(b) is the half
+that protects the documented standalone invocation in `ci_gate.py`'s own
+docstring, which is the invocation the survey agents used**; (a) does not help
+them. Also derive the junitxml path per-invocation so concurrent runs cannot
+collide.
+
+**L3-2 — `xfail` is ungated, and `tdd/README.md` recommends it as the documented
+way around the skip baseline.** OPEN. `ci_gate.py:63-67` routes any
+`<skipped type="pytest.xfail">` into `counts['xfailed']` and never into `skips`;
+`:106` prints the number and **nothing in `main()` ever compares it to
+anything**. `tdd/skip_baseline.json` holds three entries, all skips. **Worse than
+ungated — it is pinned and recommended**: `tdd/unit/scripts/test_ci_gate.py:134`
+`test_xfail_is_not_gated_as_skip` asserts `returncode == 0` with an xfailed case
+present (the hole is a passing test), and `tdd/README.md:271-272`, in the section
+headed *The ratchet rules*, says "Prefer `xfail(strict=True)` when the target is
+known-missing — xfails are not gated." **Hole size, measured** against the real
+`junit-t1.xml`: an xfail subtracts from `executed`, so the floor's ~2% slack is
+the only backstop — flipping **404** passing testcases to xfailed still yields
+`OK - executed=4432 (floor=4432) ... xfailed=404`, exit 0; at 405 it fails and
+even then misdiagnoses ("Tests are silently not running"). Headroom: 404 in T1,
+8 in T2, 1 in T3. **The good-news half**: xfailed is **0** in both gated
+artifacts, and all 44 `@pytest.mark.xfail` markers in the repo are in `tdd/qa`,
+which no tier runs — the hatch is wide open and currently unused. Fix, cheapest
+honest version: fold `xfailed` into `executed` at `ci_gate.py:101` so an xfail
+cannot buy floor headroom. Fuller version: a `tdd/xfail_baseline.json` keyed by
+reason prefix, checked beside the skip loop. **Either way, three things change in
+one commit**: the gate, `test_ci_gate.py:134` (inverted, not deleted), and
+`tdd/README.md:271-272` — leaving the rulebook saying "xfails are not gated"
+after gating them is how the next drift starts.
+
+**L3-3 — 870 tests run in no tier; the R4 "stated exclusion" list names 21 of
+them.** OPEN. `scripts/run_tier.py:73-139` selects `tdd/unit`, `tdd/demos`,
+`tdd/integration` (minus `services`), `runner-common/tests` for T1;
+`tdd/integration/services` for T2; `tdd/e2e -m 'not slow'` for T3. Outside all
+three, **measured not estimated**: `tdd/qa` **208** collected (own
+`tdd/qa/pytest.ini`; referenced only by `upcoming/qa-findings-*.md` prose);
+frontend vitest **284** in 15 files, **all green** (`vitest run` → 284 passed in
+1.5 s; only caller is `npm run test:unit`, which nothing invokes);
+`frontend/e2e` Playwright **189** in 17 files (only callers are the human
+`scripts/test.ps1:155` / `test.sh:91` e2e lanes); `runner-agent/tests` **189**,
+**all green** in 2.4 s (in no tier, no pipeline, no workflow — and it needs the
+`--extra dev` incantation or pytest is not even importable);
+`.github/scripts` **940 LOC across 6 modules with ZERO tests anywhere in the
+repo**. Against that, the stated-exclusion text names only the 21 `@slow` e2e
+tests (`tdd/README.md:235`), and `run_tier.py:15-28` adds a one-line aside that
+the frontend suites "run by their own lanes" — **they do not; nothing runs
+them**, and `runner-agent/tests` is not named at all. Two separable pieces of
+work: **TRIVIAL, do now** — correct the exclusion text in `tdd/README.md:235-240`
+and `run_tier.py:15-28` to name all five lanes with their counts, because R4 says
+stated-not-silent and it is currently silent about 870 tests. **MEDIUM, the real
+fix** — `runner-agent/tests` (189, green, pure-Python, 2.4 s) is the obvious first
+candidate for T1: same shape as `runner-common/tests`, which 12.7 folded in for
+exactly this reason. Frontend vitest (284, green, 1.5 s) wants a tier of its own
+or a node step in `test-suite.yaml`. `tdd/qa` cannot be tiered as-is (L3-4);
+Playwright needs the compose e2e stack, same blocker as the `@slow` tests.
+
+**L3-4 — the QA lane is not merely ungated, it is RED at HEAD, and one 82-test
+file cannot run in the repo's standard environment.** OPEN.
+*Red test #1, a close nobody harvested*:
+`tdd/qa/test_qa3_concurrent_readers.py::test_a_single_run_list_request_is_not_pathologically_slow`
+**FAILS at HEAD with `[XPASS(strict)]`** — QA3-13 ("a single
+`GET /api/pipeline-runs` takes 0.6-1.6 s on a nearly-empty database") is
+**FIXED**, and the strict marker at `:93` is now the lie. Because no gate runs
+this lane, it has been red-because-fixed for an unknown period.
+*Broken file*: `cd backend && uv run pytest -c ../tdd/qa/pytest.ini
+../tdd/qa/test_api_fuzz_findings.py` → **19 xfailed, 63 errors, zero passed**,
+every error `ScopeMismatch: ... session scoped request object` from
+`pytest_base_url`. Cause: `backend/pyproject.toml:38` declares
+`pytest-playwright`, which pulls in `pytest-base-url`, whose session-scoped
+fixture collides with the module's own function-scoped `base_url` at
+`tdd/qa/test_api_fuzz_findings.py:86`. Under **bare system python** — the
+invocation `upcoming/qa-findings-api-fuzz.md:13` documents — the same file is
+**63 passed, 19 xfailed**. A suite whose result depends on which interpreter you
+happen to use is not evidence of anything. Fix, in order: (1) harvest QA3-13 —
+remove the strict xfail at `:93`, leaving a plain regression guard, the same move
+`5334b09` made four times; (2) rename the `base_url` fixture (or add
+`-p no:base_url` to `tdd/qa/pytest.ini`); (3) then it is a candidate for L3-3's
+tiering work. **Until it is green under one documented invocation it cannot be
+gated at all** — and it holds the sharpest security evidence in the repo (QA4-12
+fan-out, QA4-21 resource limits) while being unrunnable by a newcomer: `grep` for
+"qa" returns **zero hits** in `tdd/README.md`, `README.md`, `QUICKSTART.md`,
+this file and `docs/`, and no compose file, script or doc brings up the stack on
+`:8790` that `tdd/qa/qa4_support.py:29` targets by default.
+
+**L3-5 — the five workspace-service doubles are ALREADY drifted from the real
+service, one commit after `08e356d` unified them.** OPEN. The five:
+`tdd/conftest.py:154` `_T1StubWorkspaceService`, plus `FakeWorkspaceService` in
+`tdd/unit/execution/test_debug_gate.py:60`,
+`tdd/unit/execution/test_debug_session_service.py:51`,
+`tdd/unit/services/test_control_mode_dispatch.py:88`,
+`tdd/unit/services/test_pipeline_local_dispatch.py:87`. AST-diffed against
+`backend/app/services/workspace_service.py`; **two live drifts, both in all
+five**: (1) the real `cleanup(self, db, pipeline_run_id, *, worker_key=None)`
+(`:552-557`) versus five doubles declaring `cleanup(self, db, pipeline_run_id)`
+with **no `worker_key` at all** — and the real docstring says `worker_key=None`
+is "what every caller passes today", i.e. the per-lane cleanup caller is the next
+thing to land, and when it does **all five break at once: the identical failure
+`08e356d` just paid for, re-armed**; (2) the real
+`get_or_create(..., commit_sha=None, *, worker_key=None)` (`:323-332`) makes
+`worker_key` **keyword-only**, while all five doubles declare it as an ordinary
+positional parameter — so `get_or_create(db, run, repo, branch, sha, "w1")`
+passes against every stub and raises `TypeError` against the real service. Nothing
+is red because the only production callers are
+`pipeline_executor.py:2807` (keyword) and `:1788` (no `worker_key`). Fix — the
+guard, concretely: `tdd/unit/services/test_workspace_double_parity.py` (under
+`tdd/unit`, so `run_tier.py:78` gates it on every push; **not** in
+`runner-agent/tests`, which runs in no tier and would put the instrument in the
+same blind spot as the thing it watches). `ast.parse` `workspace_service.py`,
+extract the parameter shape of the four seam methods
+(`get_or_create`/`acquire`/`release`/`cleanup`), then `ast.parse` each double from
+a **committed** `(path, classname)` list, assert every entry still resolves (a
+deleted double is a failure, not a silent shrink), and assert each double accepts
+every call the real signature accepts. Parametrize over `(file, class, method)` so
+a failure names which double drifted. AST rather than `inspect.signature` for the
+reason `runner-agent/tests/test_control_archive_parity.py:17-22` gives — importing
+a test module to introspect its stub gives the check a way to skip itself, and
+AST parsing cannot skip. **Run it once as written and it is RED; that is the
+acceptance test for the guard.** Cheaper alternative worth naming: hoist ONE
+double into `tdd/shared/` and have all five import it — that removes the drift
+surface instead of instrumenting five copies of it, but it does not catch the
+shared double drifting from the real service, so the parity test is wanted either
+way.
+
+### Written-record drift (the failure this survey exists to catch)
+
+- **The dogfood pipeline stored in the platform is FOUR steps behind the YAML
+  file.** `.lazyaf/pipelines/test-suite.yaml` has **11** steps at HEAD; the dev
+  backend's stored `[repo] Test Suite` (last updated 2026-08-30T11:36:15Z) has
+  **7**, missing `secret-scan`, `seed-endpoints`, `harness-probe` and
+  `harness-probe-notools`; the two most recent runs both start at step 0 =
+  "Sync Dependencies". `trigger_service.on_push` syncs repo-defined definitions
+  from the pushed commit (`routers/git.py:186-196`), so **the next push to `main`
+  re-ingests all 11**. Standing caveat worth keeping: *"what the dogfood pipeline
+  runs"* and *"what `test-suite.yaml` says"* are two different facts.
+- **`tdd/unit/schemas/test_graph_pipeline_schemas.py:1178-1204` is a stale
+  mirror.** Its docstring says it encodes "The shape of
+  `.lazyaf/pipelines/test-suite.yaml`: ten steps" and it asserts a hardcoded
+  10-id list with 9 edges. The real file has 11. It **passes** (the list is
+  synthetic), so nothing goes red — but it claims to track a file it does not
+  read, and the real-file test its docstring defers to ("B1's (§5.1)") **does not
+  exist anywhere in `tdd/`**. Deleting the leak gate from the YAML would go
+  unnoticed by every tier.
+- **The dogfood pipeline's own leak gate is untested code.** `.github/scripts`
+  holds 940 LOC across six modules and **zero tests**; `scan_repo_secrets.py`
+  became the FIRST step of every push in `b54dd19`. The pipeline's own comment
+  says "a leak gate that could not look is not a leak gate that found nothing" —
+  and nothing verifies the scanner can look. (It *was* proved by hand on
+  2026-08-31 against a scratch repo: a planted `sk-ant-` key, a Google `AIza`
+  key, a GitHub `ghp_`, an `AKIA`, a stripped `.gitignore` and a force-added
+  `.env` each produced the right non-zero exit; a non-git directory exits 2; the
+  real repo at HEAD scans 688 of 688 tracked files and exits 0. That is a manual
+  proof, not coverage.)
+- **`docs/examples/validate.py` is wired to NOTHING.** `b54dd19` shipped
+  `docs/examples/` (catalog, mechanisms, pipelines/, validate.py) and a grep for
+  `docs/examples` across `scripts/`, `tdd/`, `.lazyaf/` and `.github/workflows/`
+  returns **zero hits**. A broken example rots invisibly, which is the failure
+  mode `docs/examples` exists to prevent.
+- **`tdd/tier_floors.json` is stale in the same direction as this file** — see
+  the Numbers table. Both ratchets are due.
+- **The tree's best measurement currently lives only in a commit log**:
+  `08e356d`'s message records "T1 4836 passed / 0 failed", a number that appeared
+  in neither this file nor `tier_floors.json` until now.
+
+### What was NOT verified on 2026-08-31 (stated, not quietly asserted)
+
+Carried on a marker, a commit message or a prior pass — **not** on a run or a
+read this pass. Do not treat any of these as evidenced.
+
+- **T3.** No `junit-t3.xml` on this host; the tier was not run. "Both tiers
+  green" means T1 and T2.
+- **QA4-12, the fan-out cap** (`tdd/qa/test_graph_execution_qa4.py:284-325`).
+  `@pytest.mark.heavy` — it would start 20 containers. Carried on its strict
+  marker.
+- **`tdd/qa/test_qa3_workspace_race.py`** and the 6 `heavy`/`containers` cases
+  deselected from `test_graph_execution_qa4.py` — too slow to finish in budget.
+- **T24's remaining halves**: the 400-vs-409 inconsistency and the silent PATCH
+  drops.
+- **T15's second half** — "force-merges invented content with no conflict
+  present" — still not re-verified since 08-30. Treat it as open.
+- **T7** (UI resync after a dropped socket) still rests on `a39cb24`'s commit
+  message, not a read.
+- The **secret-scan step has never actually run in a real pipeline**: it entered
+  `.lazyaf/pipelines/test-suite.yaml` in `b54dd19` at 2026-08-30 23:05, after the
+  last push, and the platform's stored definition predates it. The script was
+  proved by hand against a scratch repo; the *step* is unexercised until the next
+  push.
+
+### Closed — verified fixed, not just claimed
+
+Kept as a list so a reader can tell the ledger shrank on evidence. **Closed on
+2026-08-31** first, then the 08-30 set.
 
 | Was | Fixed by | Verified how |
 |---|---|---|
-| T1 — every timestamp naive UTC, durations render negative | `db5f9f5` | `UTCDateTime` is the serialization type throughout `schemas/pipeline.py` |
+| **M13 BLOCKER — `Workspace.pipeline_run_id` was `unique=True`, so K parallel agents would share one checkout** | `08e356d` | `models/workspace.py:79` has no `unique=True`; the composite `Index("uq_workspaces_run_worker", "pipeline_run_id", "worker_key", unique=True)` is at `:65-67`; migration `0012_workspaces_per_worker.py` committed (down `0011`), `worker_key` NOT NULL with a `"default"` sentinel (deliberately not nullable — both SQLite and Postgres treat NULLs as distinct in a unique index). `tdd/integration/test_migrations.py` pins the index swap **and** volume-name stability; `tdd/unit/services/test_workspace_service.py` 66 passed; `tdd/integration/services/test_workspace_lifecycle.py:261` writes into and reads back four independent volumes |
+| **The M13-1 change did not weaken run isolation** (checked because "per worker" could have meant volumes shared across runs) | — | Volume names still carry the full run id (`models/workspace.py:93-94`): `lazyaf-ws-{run_id}` for the default lane, `-{slug}` otherwise. A lane is a checkout **within** one run; two runs never share a volume, and `HOME=/workspace/home` does not bleed between runs |
+| **The `08e356d` `populate_existing` race fix** — `expire_on_commit=False` served a stale cached row to `_get_lane` and a rival caller deleted a populated volume | `08e356d` | Present and documented with the failure mode written out at `workspace_service.py:266-300` |
+| **The README/compose contradiction** — "the instruction and the shipped default disagree" | `b54dd19` | `README.md:198-245` gained *"Before you expose it: what this actually opens"*, and it is accurate on every point checked, including that the release stack interpolates the port variable while `docker-compose.yml` hardcodes its mapping. **VERIFIED BY RUNNING IT**: `LAZYAF_BACKEND_PORT=127.0.0.1:8000 LAZYAF_FRONTEND_PORT=127.0.0.1:5173 docker compose -f docker-compose.release.yml config` emits `host_ip: 127.0.0.1` on **both** published ports. The README even tells the reader to verify with `docker compose config` rather than trust the paragraph. *(The binding half is still open — see S1-bind.)* |
+| **T24 — unbounded `commits?limit`** | — | `routers/repos.py:373` `max_count=min(limit, 100)`; `?limit=999999` returns normally on the sandbox. *(Missing lower bound remains — see T24.)* |
+| **QA3-13 — a single `GET /api/pipeline-runs` took 0.6-1.6 s on a nearly-empty database** | — | The strict xfail at `tdd/qa/test_qa3_concurrent_readers.py:93` now **XPASSes**, which is the proof it is fixed. The marker must be removed — see L3-4. **A ledger that only grows is as useless as one that lies: this one shrank and nobody noticed for lack of a gate.** |
+| **T23 — step/runner JWT secrets defaulted to published constants** (re-confirmed 2026-08-31) | `acb7408` | `graph_definition_errors` could not even be imported without a real secret: `app/config.py:245` raised `MissingSecretError` with the full remediation text, and only `LAZYAF_DEV_EPHEMERAL_SECRETS=1` got past it, printing the intended warning. The refusal works exactly as claimed |
+| **The four `5334b09` xfail flips stayed flipped** (re-counted 2026-08-31) | `5334b09` | `tdd/qa/test_demo_polish_api.py` → 11 passed, zero xfail (the three removed markers were the pipeline-name length bound and the two repo-name emptiness cases); `test_graph_definition_qa4.py::test_empty_pipeline_name_is_rejected` → 1 passed; whole file 10 passed / 10 xfailed, **zero xpass**. Everything else executable still xfails honestly: `test_yaml_pipelines_qa4` + `test_qa5_card_state_machine` + `test_qa5_timestamps` + `test_pipeline_export_qa4` → 11 passed / 17 xfailed, zero xpass. Marker census: 44 in `tdd/qa`, 42 strict, 2 non-strict — and **both non-strict ones are the honest use**: `test_graph_execution_qa4.py:83` (QA4-05) and `test_qa3_state_races.py:225` (QA3-14) assert absolute wall-clock bounds and both XPASSED on this idle host, exactly as their own reason text predicts ("a strict marker therefore lies in BOTH directions depending on load") |
+| **The parts of the CI gate that DO work** — stated so the L3-1/L3-2 fixes do not get over-scoped into a rewrite | — | The gate refuses red input however it is invoked (`ci_gate.py:116-123`, with the comment explaining it was added because a direct invocation once read "GATE OK" beside `failed=3`); the floor catches a run that executed nothing but DID write a report (demonstrated live: `-- --collect-only` → `FAIL - executed count 0 below committed floor 4432`); the floors match the artifacts and both baselined skips match a `reason_prefix` in `tdd/skip_baseline.json`; `run_tier.py:176-179` returns red before ever calling the gate, so a genuinely failing pytest is never laundered. **The three gate defects above are narrow additions to sound core logic** |
+| ~~T1 — every timestamp naive UTC~~ **RE-OPENED as PARTIAL 2026-08-31** | `db5f9f5` (REST path only) | Closed on the pydantic/REST path — measured, REST ships `+00:00`. **Open on 23 live hand-built wire payloads**, including every pipeline-run and step-run WebSocket frame. See T1 in Correctness. *A "verified closed" entry that overstated is the exact failure this survey exists to catch, so this one matters more than its effort suggests.* |
 | T2 — card lifecycle had no state guards; `PATCH` could fabricate `done` | `db5f9f5` | `_require_status` + one transition table in `routers/cards.py` |
 | T3 — unhandled DB exceptions returned plain-text 500s and killed the connection | `db5f9f5` | Structured JSON handler; connection preserved |
 | T4 — structurally broken graphs reported PASSED | `db5f9f5` | `_verify_graph_coverage` now gates every success verdict (`pipeline_executor.py:2055`) |
@@ -437,11 +1023,14 @@ Part 1.)
 - **Alembic migrations land serialized on `main` only**; a parallel wave rebases
   before generating one. Startup runs `alembic upgrade head`; an existing
   unversioned dev DB is stamped at baseline first.
-- Committed head is **`0011_model_endpoints`** (there is no `0008`). Two waves
-  currently want the next id — 12.8 P4's backfill and the uncommitted
-  `0012_workspaces_per_worker.py` — so **check `git ls-files
-  backend/alembic/versions/` before you generate**, not just the directory
-  listing.
+- Committed head is **`0012_workspaces_per_worker`** (there is no `0008`) —
+  corrected 2026-08-31; it landed in `08e356d` and
+  `tdd/integration/test_migrations.py:42` pins it. **One** wave now wants the
+  next id: 12.8 P4 takes **`0013`**, P6 takes **`0014`**. Keep doing what caught
+  this: **check `git ls-files backend/alembic/versions/` before you generate**,
+  not just the directory listing — and note that
+  `upcoming/wave10-v1-retirement.md` still hardcodes `0012`/`0013` in 14 places
+  (see the P3 carry-forwards above).
 
 ---
 
@@ -491,11 +1080,18 @@ happens *between* the two revisions.
 #### Also in 12.8
 
 - The dogfood pipeline converts to a v2 graph. That conversion is what proves
-  the retirement, not a unit test.
+  the retirement, not a unit test. **NOT DONE** (checked 2026-08-31 because
+  `b54dd19` edited this file): `.lazyaf/pipelines/test-suite.yaml:31` still
+  declares `steps:` as a YAML **list** (`- id: "secret-scan"` at `:62`), with no
+  `version: 2` and no `entry_points:`. `b54dd19` added the secret-scan step at
+  the front and kept the v1 format — so the file this must convert is now **one
+  step longer (11)**.
 - Retire completed phase sections to `historical-documents/`. **Done
   2026-08-30**: the 12.0-12.7 narrative moved to
   [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md),
-  taking this file from 3,858 lines to roughly a third of that.
+  taking this file from 3,858 lines to **about 45%** of that (~1,744 lines before
+  this reconcile). *(Earlier revisions said "roughly a third"; the arithmetic was
+  wrong.)*
 - `runner-common` adopted everywhere. **Already true** — see the 12.0 row in the
   status tables; the open question in the decision log about whether 12.0
   "counts as done" is resolved.
@@ -737,14 +1333,26 @@ Decisions made DURING implementation (all shipped and gate-verified):
 > `StepUsage` (12.5, migration `0005_step_usage.py`) and the cost axis in
 > 12.6.5.
 >
-> **Known blocker, not mentioned in the design below.**
-> `backend/app/models/workspace.py` declares `pipeline_run_id` with
-> `unique=True`, so a pipeline run owns exactly one workspace and K parallel
-> agents would share a single checkout — which contradicts 13.2's "a branch and
-> a workspace per worker", the substrate the whole parallel-strategy thesis
-> rests on. A concurrent wave is fixing it (an uncommitted
-> `backend/alembic/versions/0012_workspaces_per_worker.py` sits in the working
-> tree). Confirm it has landed and migrated before starting 13.2.
+> **The workspace blocker is CLOSED** (`08e356d`, verified 2026-08-31 — see the
+> closed table). 13.2's "a branch and a workspace per worker" substrate exists:
+> the composite `(pipeline_run_id, worker_key)` unique index replaced the
+> per-run one, migration `0012` is committed, and run-to-run isolation was
+> checked and is intact.
+>
+> **Two blockers stand in its place, and the first is a hard gate on 13.1:**
+> (1) the oracle only records `@pytest.mark.lazyaf_test_id`, which no upstream
+> repo carries (`runner_common/pytest_lazyaf.py:161-163`, `:210-211`) — fix
+> specified as `LAZYAF_TEST_ID_MODE=nodeid` in
+> `docs/milestone-13/leaderboards-and-corpus.md:287-322`, zero implementation;
+> (2) 13.1's exit gate demands every `fail_to_pass` test FAIL at
+> `base_commit_sha`, while the design's own normal case is that the test does
+> not exist there yet (`leaderboards-and-corpus.md:261-285`). Both are stated in
+> full in [What to do next §2](#2-then--milestone-13-the-benchmark--evaluation-harness).
+>
+> **`docs/milestone-13/leaderboards-and-corpus.md` (Amendment A, `4f529e1`) is an
+> adversarial review of the design below and supersedes it where they
+> disagree** — repo pinning by name and the oracle id mode at minimum. The body
+> below has not been rewritten to match.
 
 
 > **The question this answers:** take a repo at a known state, set the AI loop
@@ -860,6 +1468,7 @@ the same split `historical-documents/` uses for completed phases):
 | `docs/milestone-13/strategy-catalog.md` | The StrategyTemplate graph contract (reserved `lazyaf_*` keys, the six-pass `expand_strategy_graph`, strict two-way role-binding, K-parameterization) and a 7-entry catalog with REAL v2 graph JSON: one-shot, test-first, adversarial-review, planner-fanout (expanded at K=4), planner-fanout-resolver, one-shot-gated, composed-full. Plus the integration-policy x on-conflict matrix, including the cells that are rejected as incoherent. |
 | `docs/milestone-13/api-surface.md` | Every endpoint (`/api/bench/*`), the full `POST /api/steps/{id}/usage` contract for Phase 12.5, how the benchmark layer joins the spec layer without double-counting criterion history in the dogfood corpus, MCP tools, `lazyaf bench` CLI, and the indexes the read-heavy board queries need. |
 | `docs/milestone-13/phase-specs-and-metrics.md` | Phase deliverables 13.1-13.5 with contract test files and Definition-of-Done checklists; the metrics defined mathematically; the variance/separability rules; and the `METHOD.md` template that ships in every exported bundle. |
+| `docs/milestone-13/leaderboards-and-corpus.md` **(Amendment A, `4f529e1` — added to this table 2026-08-31; it had been missing)** | An **adversarial review of the three documents above and of this plan's M13 body**, which it contradicts in at least two places (repo pinning by name; the oracle id mode). It holds both live M13 blockers: `LAZYAF_TEST_ID_MODE=nodeid` (§2.5, `:287-322`) and the `fail_to_pass`-missing-at-base contradiction (`:261-285`), plus the corpus on-disk format, the `lazyaf-oracle` binary that was specified nowhere, and the bundle-hash bug that must be fixed before the first published bundle. **Read it before starting 13.1.** |
 
 **The one thing from those docs that belongs in the plan itself** — because it
 governs how every number is allowed to be stated:
@@ -883,6 +1492,16 @@ cases from a real repo state. A case-validation command that proves a case is
 well-formed: at `base_commit_sha` every `fail_to_pass` test FAILS and every
 `pass_to_pass` test PASSES (a case whose oracle is already green is broken).
 Seed a starter suite spanning verticals x complexity.
+   **CONTESTED, 2026-08-31 — reconcile before writing the validator.** The
+   sentence above is the unqualified version, and
+   `docs/milestone-13/leaderboards-and-corpus.md:261-285` shows it is
+   unsatisfiable for the design's own declared normal case: a `fail_to_pass`
+   test "may not exist yet at `base_commit_sha`", and a missing test observes
+   `missing`, not `failed`. Either the test must be present-and-red at base (and
+   the corpus author supplies it, not the agent), or `missing` becomes a third
+   state with its own rule. Cheap to decide now, expensive after cases are
+   authored. **And nothing here works at all until the oracle can see an
+   unannotated repo** (`LAZYAF_TEST_ID_MODE=nodeid`).
    EXIT GATE: `lazyaf bench validate <suite>` green on the starter suite;
    validation catches a deliberately-miswired case.
 

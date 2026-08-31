@@ -16,6 +16,7 @@ Usage:
     python3 scripts/ci_gate.py --tier T1 junit-t1.xml [more.xml ...]
 """
 import argparse
+import time
 import json
 import re
 import sys
@@ -70,13 +71,59 @@ def tally(xml_paths: list[Path]):
     return counts, skips
 
 
+#: A junitxml older than this is refused as stale. T1 - the longest tier -
+#: measures 11 to 13 minutes, so this is roughly 2.4x the worst observed run
+#: plus the gate's own invocation. Deliberately NOT an hour: the stale reports
+#: that actually fooled people were 40 to 90 minutes old, and a threshold that
+#: admits those admits the bug.
+DEFAULT_MAX_AGE_SECONDS = 1800
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("xml", nargs="+", type=Path, help="junitxml file(s) for this tier")
     parser.add_argument("--tier", required=True, help="tier name, e.g. T1")
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
     parser.add_argument("--floors", type=Path, default=DEFAULT_FLOORS)
+    parser.add_argument(
+        "--max-age-seconds",
+        type=int,
+        default=DEFAULT_MAX_AGE_SECONDS,
+        help=(
+            "refuse a junitxml older than this (default "
+            f"{DEFAULT_MAX_AGE_SECONDS}s). 0 disables the check."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # A junitxml is written at the END of a pytest session, so a run that never
+    # STARTS - a bad plugin, an import error, a stray `--help`, a killed
+    # process - writes nothing and leaves the PREVIOUS run's file in place.
+    # This gate then reads hours-old results and calls them today's.
+    #
+    # That is not hypothetical: `run_tier.py T1 -- --help` printed
+    # "CI GATE [T1]: OK - executed=4836" having executed nothing, and three
+    # separate agents were fooled by the same shape while it went unnoticed.
+    # A gate that cannot tell "the suite passed" from "the suite never ran" is
+    # not a gate, and every green number that rests on it is unearned.
+    if args.max_age_seconds > 0:
+        now = time.time()
+        for path in args.xml:
+            if not path.exists():
+                continue  # the read below reports a missing file properly
+            age = now - path.stat().st_mtime
+            if age > args.max_age_seconds:
+                print(
+                    f"CI GATE [{args.tier}]: FAIL - {path} is {age / 60:.0f} "
+                    f"minutes old, older than the {args.max_age_seconds}s "
+                    "limit. It is almost certainly a PREVIOUS run's report: "
+                    "pytest writes this file when a session ENDS, so a run "
+                    "that failed to start leaves the old one behind. Re-run "
+                    "the tier. (Pass --max-age-seconds 0 only if you really "
+                    "mean to gate on an archived report.)",
+                    file=sys.stderr,
+                )
+                return 1
 
     baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
     floors = json.loads(args.floors.read_text(encoding="utf-8"))

@@ -157,6 +157,16 @@ def run_tier(tier: str, extra_pytest_args: list[str]) -> int:
             )
             return rc or 1
 
+    # Delete any previous report BEFORE pytest runs. A junitxml is written at
+    # the END of a session, so a run that never starts - a bad plugin, an
+    # import error, a stray `--help` - leaves the PREVIOUS run's file sitting
+    # there, and ci_gate happily reports it as this run's result. Measured:
+    # `run_tier.py T1 -- --help` printed "CI GATE [T1]: OK - executed=4836"
+    # having executed nothing. The gate refuses a stale file on its own now
+    # too; this is the other half, because the freshest possible fix is not
+    # writing the trap in the first place.
+    junit_path.unlink(missing_ok=True)
+
     pytest_cmd = [
         "uv",
         "run",

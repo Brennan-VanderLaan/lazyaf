@@ -562,7 +562,7 @@ Detailed documentation for completed phases is in `historical-documents/`.
 | 8 | Test Result Capture | COMPLETE | Test results displayed in UI |
 | 8.5 | CI/CD Foundation | COMPLETE | Script/docker step types |
 | 9-9.1 | Pipelines | COMPLETE | Multi-step workflows with context |
-| 12.0 | Unify Entrypoints | PARTIAL | runner-common package exists + tested; runner images do not import it yet (12.5/12.8) |
+| 12.0 | Unify Entrypoints | COMPLETE | runner-common installed system-wide in images/agent-base (import asserted at build time) and the three monolithic entrypoints are deleted from HEAD (2026-08-30) |
 | 12.1 | LocalExecutor + State Machine | COMPLETE | Step state machine, idempotency, LocalExecutor, crash recovery |
 | 0 | Self-Hosting Bootstrap | COMPLETE | LazyAF runs LazyAF's CI: tiered dogfood pipeline + ci_gate floors/skip baseline, alembic, test-mode API |
 | 12.2-INT | Workspace Persistence + Executor Wiring | COMPLETE | Workspace model/service, repo population, router -> LocalExecutor by default, per-step `executor` recorded |
@@ -573,14 +573,17 @@ Detailed documentation for completed phases is in `historical-documents/`.
 
 ## Current Status
 
-> Last updated 2026-08-29 (end of session). Plan of record: "Milestone 12 —
+> Last updated 2026-08-30. Plan of record: "Milestone 12 —
 > Attempt #3 Roadmap" below. Salvage map + post-mortem of the abandoned first
 > attempt: `upcoming/failure_01-salvage-audit.md`.
 
-**Milestone 12 progress: Phase 0, 12.2-INT, 12.2.5 and 12.3 are COMPLETE**, each
-signed off by its own dogfood exit gate (LazyAF's CI, running on LazyAF). Twelve
-green push-triggered self-hosted runs to date; ~1,520 backend tests + 78 frontend
-unit tests green; last stable commit `69f3ef0`, pushed to origin.
+**Milestone 12 progress: every phase through 12.7 is COMPLETE**, each signed off
+by its own dogfood exit gate (LazyAF's CI, running on LazyAF). 12.8 is the only
+one open, and it is now unblocked: the owner retired the v1 array format on
+2026-08-30. T1 stands at 4523 passed / 0 failed (floor 4432), T2 at 77, T3 at 22.
+
+Milestone 14 (self-hosted OpenAI-compatible model endpoints) landed the same
+day and is OUT of the 12.x sequence - it is listed separately below.
 
 | Phase | Status | Evidence |
 |-------|--------|----------|
@@ -592,8 +595,8 @@ unit tests green; last stable commit `69f3ef0`, pushed to origin.
 | 12.4 — Script/docker steps fully ephemeral | COMPLETE | Runners agent-only; script/docker deleted from the three images AND runner-common; DooD anchor retired |
 | 12.5 — Agent steps via the control layer | COMPLETE | Runners idle on every default path (asserted); StepUsage live at 1163/7 tokens on the gate |
 | 12.6 — RemoteExecutor + runner agents | COMPLETE | 74 dormant contract tests now execute (0 skipped), polling stack DELETED, all 7 polling endpoints 404 on a live probe |
-| 12.6.5 / 12.6.6 / 12.7 | IN PROGRESS | Three parallel lanes (experiments, spec-curated context, debug re-run) |
-| 12.8 — Cleanup & polish | NOT STARTED | Epilogue; needs the owner's v1-format call |
+| 12.6.5 / 12.6.6 / 12.7 | COMPLETE | Experiment finalize is one atomic CAS; spec context reaches the agent; debug re-run ships its gated T2/T3 coverage and the CLI client. Landed 2026-08-30, T1 green at 4523 |
+| 12.8 — Cleanup & polish | IN PROGRESS | Owner retired the v1 array format (2026-08-30). Plan: upcoming/wave10-v1-retirement.md. P1 (graph gains terminal actions) and P2 (faithful refusing converter) are landing; P3-P6 not started |
 
 **Phase 12.6: COMPLETE (2026-08-30).** The 74 contract tests ported dormant in
 Phase 0 all execute now, zero skipped, and git diff proves neither file was

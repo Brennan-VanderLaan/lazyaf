@@ -2,12 +2,37 @@
 Unit tests for PipelineExecutor service.
 
 These tests verify the pipeline execution logic including:
-- Action handler branching (next, stop, trigger, merge)  [v1 array path]
 - Terminal NODE actions on the graph path (12.8)
 - Graph edge dispatch for every condition (success/failure/always)
+- The run verdict, which is the StepRuns' and never an action's
 - Step state transitions
-- Step branching based on on_success/on_failure
-- Parse steps utility function
+- start_pipeline's refusal to run a pipeline with no graph definition
+
+12.8 P5 DELETED the v1 array fork, and with it the classes that drove it:
+`TestParseSteps`, `TestPipelineExecutorActionHandlers` and
+`TestStepBranchingLogic`. Nothing was dropped on the floor - each claim
+either moved to the surviving surface or was already there:
+
+  parse_steps                       -> tdd/unit/schemas/test_pipeline_schemas.py
+                                       (`_GRAPH_JSON`, the PipelineRead parse
+                                       tests, converted at P3)
+  the closed action vocabulary      -> test_graph_pipeline_schemas.py
+  (`describe_step_action`)             ::TestDescribeTerminalActionVocabulary
+  on_success: next                  -> TestGraphEdgeConditions
+                                       ::test_a_success_edge_fires_when_the_source_passes
+  on_success/on_failure: stop       -> TestTheRunVerdictIsTheStepRuns (below)
+  trigger:{card} / merge:{branch}   -> TestTheFixCardAction,
+                                       TestAnActionNeverCompletesThePipeline
+  on_failure: next continues        -> TestTheRunVerdictIsTheStepRuns
+                                       ::test_a_failure_edge_that_continues_still_ends_the_run_failed
+                                       (and the verdict INVERTS - plan 1.8)
+
+`TestStepBranchingLogic`'s five tests were `step = {...}; assert
+step.get("on_success", "next") == "next"` - tests of `dict.get`, with no
+production surface at either end (plan 7.5). The one claim among them that
+named real behaviour (`on_failure: next` continues past a failed step) is the
+converted test named above, which now drives the real executor and pins the
+verdict change that conversion brings.
 """
 import json
 import sys
@@ -23,58 +48,17 @@ import pytest
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
 sys.path.insert(0, str(backend_path))
 
+from app.schemas.pipeline import TERMINAL_ACTION_PREFIXES
 from app.services.pipeline_executor import (
+    LocalStepContextError,
     PipelineExecutor,
     describe_terminal_action,
-    parse_steps,
+    parse_steps_graph,
     pipeline_run_to_ws_dict,
     step_run_to_ws_dict,
 )
 from app.models import Card, Pipeline, PipelineRun, Repo, StepRun
 from app.models.pipeline import ExecutorMode, RunStatus
-
-
-class TestParseSteps:
-    """Tests for parse_steps utility function."""
-
-    def test_parse_steps_valid_json(self):
-        """parse_steps should parse valid JSON string to list."""
-        steps_json = '[{"name": "Test", "type": "script"}]'
-        result = parse_steps(steps_json)
-        assert result == [{"name": "Test", "type": "script"}]
-
-    def test_parse_steps_empty_string(self):
-        """parse_steps should return empty list for empty string."""
-        result = parse_steps("")
-        assert result == []
-
-    def test_parse_steps_none(self):
-        """parse_steps should return empty list for None."""
-        result = parse_steps(None)
-        assert result == []
-
-    def test_parse_steps_invalid_json(self):
-        """parse_steps should return empty list for invalid JSON."""
-        result = parse_steps("not valid json")
-        assert result == []
-
-    def test_parse_steps_empty_array(self):
-        """parse_steps should return empty list for '[]'."""
-        result = parse_steps("[]")
-        assert result == []
-
-    def test_parse_steps_multiple_steps(self):
-        """parse_steps should handle multiple steps."""
-        steps_json = '''[
-            {"name": "Lint", "type": "script", "config": {"command": "npm run lint"}},
-            {"name": "Test", "type": "script", "config": {"command": "npm test"}},
-            {"name": "Build", "type": "docker", "config": {"image": "node:20", "command": "npm build"}}
-        ]'''
-        result = parse_steps(steps_json)
-        assert len(result) == 3
-        assert result[0]["name"] == "Lint"
-        assert result[1]["name"] == "Test"
-        assert result[2]["name"] == "Build"
 
 
 class TestPipelineRunToWsDict:
@@ -175,355 +159,160 @@ class TestStepRunToWsDict:
         assert result["completed_at"] is None
 
 
-def _fake_step_run(mock_db, *, step_index=0, status=None):
-    """Wire `mock_db.execute` to return one StepRun-shaped row.
-
-    `_fail_run_on_undispatchable_action` looks the offending step up so it can
-    put the reason where a user will see it; an AsyncMock session hands back
-    coroutines for the sync `.scalars()` call, so the shape has to be stated.
-    """
-    step_run = MagicMock()
-    step_run.id = "step-run-1"
-    step_run.pipeline_run_id = "run-123"
-    step_run.step_index = step_index
-    step_run.step_id = None
-    step_run.step_name = "Step 1"
-    step_run.status = status or RunStatus.PASSED.value
-    step_run.job_id = None
-    step_run.executor = "local"
-    step_run.error = None
-    step_run.started_at = datetime.utcnow()
-    step_run.completed_at = None
-
-    result = MagicMock()
-    result.scalars.return_value.first.return_value = step_run
-    result.scalars.return_value.all.return_value = [step_run]
-    result.scalar_one_or_none.return_value = step_run
-    mock_db.execute.return_value = result
-    return step_run
-
-
-class TestPipelineExecutorActionHandlers:
-    """Tests for PipelineExecutor action handling logic."""
-
-    @pytest.fixture
-    def executor(self):
-        """Create a PipelineExecutor instance."""
-        return PipelineExecutor()
-
-    @pytest.fixture
-    def mock_db(self):
-        """Create a mock database session."""
-        return AsyncMock()
-
-    @pytest.fixture
-    def mock_pipeline_run(self):
-        """Create a mock pipeline run."""
-        run = MagicMock()
-        run.id = "run-123"
-        run.pipeline_id = "pipeline-456"
-        run.status = RunStatus.RUNNING.value
-        run.current_step = 0
-        run.steps_completed = 0
-        run.steps_total = 2
-        run.completed_at = None
-        run.started_at = datetime.utcnow()
-        run.created_at = datetime.utcnow()
-        run.trigger_type = "manual"
-        run.trigger_ref = None
-        return run
-
-    @pytest.fixture
-    def mock_repo(self):
-        """Create a mock repo."""
-        repo = MagicMock()
-        repo.id = "repo-789"
-        repo.default_branch = "main"
-        repo.remote_url = "https://github.com/test/repo.git"
-        return repo
-
-    @pytest.mark.asyncio
-    async def test_handle_action_next_executes_next_step(self, executor, mock_db, mock_pipeline_run, mock_repo):
-        """Action 'next' should call _execute_step with incremented index."""
-        steps = [
-            {"name": "Step 1", "type": "script"},
-            {"name": "Step 2", "type": "script"},
-        ]
-
-        with patch.object(executor, "_execute_step", new_callable=AsyncMock) as mock_execute:
-            await executor._handle_action(
-                db=mock_db,
-                pipeline_run=mock_pipeline_run,
-                repo=mock_repo,
-                steps=steps,
-                current_step=0,
-                action="next",
-                step_success=True,
-            )
-
-            mock_execute.assert_called_once_with(
-                mock_db, mock_pipeline_run, mock_repo, steps, 1, previous_runner_id=None
-            )
-
-    @pytest.mark.asyncio
-    async def test_handle_action_stop_success_marks_passed(self, executor, mock_db, mock_pipeline_run, mock_repo):
-        """Action 'stop' with success should mark pipeline as passed."""
-        steps = [{"name": "Step 1", "type": "script"}]
-
-        with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
-            mock_manager.send_pipeline_run_status = AsyncMock()
-
-            await executor._handle_action(
-                db=mock_db,
-                pipeline_run=mock_pipeline_run,
-                repo=mock_repo,
-                steps=steps,
-                current_step=0,
-                action="stop",
-                step_success=True,
-            )
-
-            assert mock_pipeline_run.status == RunStatus.PASSED.value
-            assert mock_pipeline_run.completed_at is not None
-            mock_db.commit.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_handle_action_stop_failure_marks_failed(self, executor, mock_db, mock_pipeline_run, mock_repo):
-        """Action 'stop' with failure should mark pipeline as failed."""
-        steps = [{"name": "Step 1", "type": "script"}]
-
-        with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
-            mock_manager.send_pipeline_run_status = AsyncMock()
-
-            await executor._handle_action(
-                db=mock_db,
-                pipeline_run=mock_pipeline_run,
-                repo=mock_repo,
-                steps=steps,
-                current_step=0,
-                action="stop",
-                step_success=False,
-            )
-
-            assert mock_pipeline_run.status == RunStatus.FAILED.value
-            assert mock_pipeline_run.completed_at is not None
-
-    @pytest.mark.asyncio
-    async def test_handle_action_trigger_calls_trigger_card(self, executor, mock_db, mock_pipeline_run, mock_repo):
-        """Action 'trigger:{card_id}' should call _trigger_card."""
-        steps = [{"name": "Step 1", "type": "script"}]
-
-        with patch.object(executor, "_trigger_card", new_callable=AsyncMock) as mock_trigger:
-            await executor._handle_action(
-                db=mock_db,
-                pipeline_run=mock_pipeline_run,
-                repo=mock_repo,
-                steps=steps,
-                current_step=0,
-                action="trigger:card-123",
-                step_success=False,
-            )
-
-            mock_trigger.assert_called_once_with(
-                mock_db, mock_pipeline_run, mock_repo, steps, 0, "card-123"
-            )
-
-    @pytest.mark.asyncio
-    async def test_handle_action_merge_calls_merge_branch(self, executor, mock_db, mock_pipeline_run, mock_repo):
-        """Action 'merge:{branch}' should call _merge_branch."""
-        steps = [{"name": "Step 1", "type": "script"}]
-
-        with patch.object(executor, "_merge_branch", new_callable=AsyncMock) as mock_merge:
-            await executor._handle_action(
-                db=mock_db,
-                pipeline_run=mock_pipeline_run,
-                repo=mock_repo,
-                steps=steps,
-                current_step=0,
-                action="merge:main",
-                step_success=True,
-            )
-
-            mock_merge.assert_called_once_with(
-                mock_db, mock_pipeline_run, mock_repo, steps, 0, "main"
-            )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "action",
-        [
-            "nextt",          # the one-character typo from QA finding T4
-            "invalid_action",
-            "b",              # an edge TARGET, which the YAML exporter emits
-            "merge:",         # a prefix with no target
-            "trigger:",
-            "",
-            None,
-            42,
-        ],
-    )
-    async def test_an_undispatchable_action_fails_the_run(
-        self, executor, mock_db, mock_pipeline_run, mock_repo, action
-    ):
-        """QA finding T4: an action outside the vocabulary FAILS the run.
-
-        This used to log `Unknown action '<x>', treating as 'stop'` and then
-        complete with the STEP's verdict - so `on_success: "nextt"` reported
-        PASSED for a three-step pipeline that ran one step. A false green is
-        the worst defect class a CI product has; an action the executor cannot
-        dispatch is a failure, and the reason has to be somewhere a user
-        looks.
-        """
-        steps = [{"name": "Step 1", "type": "script"}]
-        step_run = _fake_step_run(mock_db)
-
-        with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
-            mock_manager.send_pipeline_run_status = AsyncMock()
-            mock_manager.send_step_run_status = AsyncMock()
-
-            await executor._handle_action(
-                db=mock_db,
-                pipeline_run=mock_pipeline_run,
-                repo=mock_repo,
-                steps=steps,
-                current_step=0,
-                action=action,
-                step_success=True,   # the STEP passed; the RUN still must not
-            )
-
-        assert mock_pipeline_run.status == RunStatus.FAILED.value
-        assert mock_pipeline_run.completed_at is not None
-        # The offending step carries the explanation: a red run with nothing
-        # red in it is the same "why?" from the other direction.
-        assert step_run.status == RunStatus.FAILED.value
-        assert "step 0" in step_run.error
-        assert "'next', 'stop'" in step_run.error
-
-    @pytest.mark.asyncio
-    async def test_a_route_error_reason_is_not_overwritten_by_the_action_check(
-        self, executor, mock_db, mock_pipeline_run, mock_repo
-    ):
-        """`_execute_step`'s routing-failure branch reaches `_handle_action`
-        with the step already failed and the real cause recorded. The action
-        complaint is APPENDED, never substituted for it."""
-        step_run = _fake_step_run(mock_db)
-        step_run.error = "execution routing failed: no such executor 'legacy'"
-
-        with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
-            mock_manager.send_pipeline_run_status = AsyncMock()
-            mock_manager.send_step_run_status = AsyncMock()
-
-            await executor._handle_action(
-                db=mock_db,
-                pipeline_run=mock_pipeline_run,
-                repo=mock_repo,
-                steps=[{"name": "Step 1", "type": "script"}],
-                current_step=0,
-                action="onfailure",
-                step_success=False,
-            )
-
-        assert "routing failed" in step_run.error
-        assert "unknown step action" in step_run.error
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "action",
-        ["next", "stop", "trigger:card-1", "trigger:pipeline:p1", "merge:main"],
-    )
-    async def test_the_whole_vocabulary_still_dispatches(
-        self, executor, mock_db, mock_pipeline_run, mock_repo, action
-    ):
-        """The gate must reject only what `_handle_action` genuinely cannot
-        run. Every vocabulary member reaches a handler."""
-        with patch.object(executor, "_execute_step", new_callable=AsyncMock), \
-             patch.object(executor, "_trigger_card", new_callable=AsyncMock), \
-             patch.object(executor, "_trigger_pipeline", new_callable=AsyncMock), \
-             patch.object(executor, "_merge_branch", new_callable=AsyncMock), \
-             patch.object(executor, "_complete_pipeline", new_callable=AsyncMock), \
-             patch.object(
-                 executor,
-                 "_fail_run_on_undispatchable_action",
-                 new_callable=AsyncMock,
-             ) as refused:
-            await executor._handle_action(
-                db=mock_db,
-                pipeline_run=mock_pipeline_run,
-                repo=mock_repo,
-                steps=[{"name": "Step 1", "type": "script"}],
-                current_step=0,
-                action=action,
-                step_success=True,
-            )
-
-        refused.assert_not_called()
-
-
 class TestPipelineExecutorStartPipeline:
-    """Tests for PipelineExecutor.start_pipeline method."""
+    """Tests for PipelineExecutor.start_pipeline method.
 
-    @pytest.fixture
-    def executor(self):
-        return PipelineExecutor()
+    The two tests here were the v1 array pair (`steps = "[]"` marks the run
+    PASSED; `steps = '[{...}]'` dispatches index 0). 12.8 P5 converts both:
+    the definition is a graph, and the first of the two INVERTS - see
+    `test_a_pipeline_with_no_graph_definition_is_refused_not_passed`.
+    """
 
-    @pytest.mark.asyncio
-    async def test_start_pipeline_with_no_steps_marks_passed(self, executor):
-        """Starting a pipeline with no steps should immediately mark as passed."""
-        # Use MagicMock for db but set async methods explicitly
-        mock_db = MagicMock()
-        mock_db.add = MagicMock()  # Synchronous
-        mock_db.commit = AsyncMock()
-        mock_db.refresh = AsyncMock()
+    pytestmark = pytest.mark.asyncio
 
-        mock_pipeline = MagicMock()
-        mock_pipeline.id = "pipeline-123"
-        mock_pipeline.name = "Empty Pipeline"
-        mock_pipeline.steps = "[]"
+    async def test_a_pipeline_with_no_graph_definition_is_refused_not_passed(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """THE VACUOUS PASS, INVERTED (plan 1.6c / QA4-08).
 
-        mock_repo = MagicMock()
-        mock_repo.id = "repo-456"
+        The v1 twin of this test asserted that a pipeline with `steps = "[]"`
+        "should immediately mark as passed" - a run that did nothing,
+        reporting green, which every downstream gate then trusts. That was
+        only ever tolerable because `parse_steps` swallowed a missing
+        definition to `[]` and there was no other answer available.
 
-        with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
-            mock_manager.send_pipeline_run_status = AsyncMock()
+        There is now: the graph is the only definition, so no graph is no
+        pipeline. The run row still exists (callers get a PipelineRun, the
+        websocket still sees it appear and go terminal) and it ends FAILED
+        with the reason on a row a user actually looks at.
+        """
+        repo = Repo(id=str(uuid4()), name=f"repo-{uuid4().hex[:6]}", is_ingested=True)
+        db_session.add(repo)
+        pipeline = Pipeline(
+            id=str(uuid4()),
+            repo_id=repo.id,
+            name="Not Authored Yet",
+            steps="[]",
+            steps_graph=None,
+        )
+        db_session.add(pipeline)
+        await db_session.commit()
 
-            result = await executor.start_pipeline(
-                db=mock_db,
-                pipeline=mock_pipeline,
-                repo=mock_repo,
+        run = await graph_executor.start_pipeline(
+            db=db_session, pipeline=pipeline, repo=repo
+        )
+
+        assert run.status == RunStatus.FAILED.value
+        assert run.completed_at is not None
+
+        rows = await _step_rows(db_session, run)
+        assert len(rows) == 1, "the refusal must leave exactly one row to look at"
+        assert rows[0].status == RunStatus.FAILED.value
+        assert rows[0].step_id is None
+        assert "no runnable definition" in rows[0].error
+        assert "Not Authored Yet" in rows[0].error
+
+    async def test_an_unparseable_graph_is_refused_the_same_way(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """`parse_steps_graph` swallows a JSONDecodeError to None (a known
+        dark channel, pinned in test_pipeline_schemas.py and owned by
+        migration 0014). Whatever the cause, the run must not be green: this
+        pins that the swallow lands in the REFUSAL and not in a pass."""
+        repo = Repo(id=str(uuid4()), name=f"repo-{uuid4().hex[:6]}", is_ingested=True)
+        db_session.add(repo)
+        pipeline = Pipeline(
+            id=str(uuid4()),
+            repo_id=repo.id,
+            name="Corrupt",
+            steps="[]",
+            steps_graph="{not json",
+        )
+        db_session.add(pipeline)
+        await db_session.commit()
+
+        run = await graph_executor.start_pipeline(
+            db=db_session, pipeline=pipeline, repo=repo
+        )
+
+        assert run.status == RunStatus.FAILED.value
+        rows = await _step_rows(db_session, run)
+        assert [r.status for r in rows] == [RunStatus.FAILED.value]
+
+    async def test_an_empty_graph_still_passes_and_the_guard_is_named(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """A graph object with ZERO steps is a vacuous pass HERE, and that is
+        deliberate - `_verify_graph_coverage` has nothing to be uncovered.
+
+        It is pinned rather than fixed because the guard belongs at the
+        boundary, not the executor: `array_to_graph` refuses an empty array,
+        `PipelineGraphModel` refuses empty `entry_points`, and
+        `POST /api/pipelines/{id}/run` refuses a pipeline with no steps. This
+        shape can only be reached by writing the column directly. The test
+        exists so the behaviour is a recorded decision with its owners named,
+        not something a reader discovers from a green run.
+        """
+        empty = {"steps": {}, "edges": [], "entry_points": [], "version": 2}
+        repo, pipeline, _ = await _graph_rows(db_session, empty)
+
+        run = await graph_executor.start_pipeline(
+            db=db_session, pipeline=pipeline, repo=repo
+        )
+
+        assert run.status == RunStatus.PASSED.value
+        assert run.steps_total == 0
+
+    async def test_start_pipeline_dispatches_the_entry_point(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """The graph twin of "executes the first step": entry points are what
+        dispatch, and the run stays RUNNING while they do."""
+        graph_dict = _graph(
+            [_node("a"), _node("b")],
+            [_graph_edge("e", "a", "b")],
+            ["a"],
+        )
+        repo, pipeline, _ = await _graph_rows(db_session, graph_dict)
+
+        dispatched = []
+        with patch.object(
+            graph_executor, "_execute_step", new=_recording_dispatch(dispatched)
+        ):
+            run = await graph_executor.start_pipeline(
+                db=db_session, pipeline=pipeline, repo=repo
             )
 
-            assert result.status == RunStatus.PASSED.value
-            assert result.completed_at is not None
+        assert run.status == RunStatus.RUNNING.value
+        assert dispatched == ["a"], "only the entry point dispatches"
+        assert run.steps_total == 2
 
-    @pytest.mark.asyncio
-    async def test_start_pipeline_with_steps_executes_first_step(self, executor):
-        """Starting a pipeline with steps should execute the first step."""
-        # Use MagicMock for db but set async methods explicitly
-        mock_db = MagicMock()
-        mock_db.add = MagicMock()  # Synchronous
-        mock_db.commit = AsyncMock()
-        mock_db.refresh = AsyncMock()
+    async def test_every_entry_point_dispatches_in_parallel(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """v1 had one start; a graph has as many as it declares."""
+        graph_dict = _graph(
+            [_node("a"), _node("b"), _node("z")],
+            [
+                _graph_edge("e1", "a", "z", "always"),
+                _graph_edge("e2", "b", "z", "always"),
+            ],
+            ["a", "b"],
+        )
+        repo, pipeline, _ = await _graph_rows(db_session, graph_dict)
 
-        mock_pipeline = MagicMock()
-        mock_pipeline.id = "pipeline-123"
-        mock_pipeline.name = "Test Pipeline"
-        mock_pipeline.steps = '[{"name": "Test", "type": "script"}]'
+        dispatched = []
+        with patch.object(
+            graph_executor, "_execute_step", new=_recording_dispatch(dispatched)
+        ):
+            run = await graph_executor.start_pipeline(
+                db=db_session, pipeline=pipeline, repo=repo
+            )
 
-        mock_repo = MagicMock()
-        mock_repo.id = "repo-456"
-
-        with patch("app.services.pipeline_executor.manager", new_callable=MagicMock) as mock_manager:
-            mock_manager.send_pipeline_run_status = AsyncMock()
-
-            with patch.object(executor, "_execute_step", new_callable=AsyncMock) as mock_execute:
-                result = await executor.start_pipeline(
-                    db=mock_db,
-                    pipeline=mock_pipeline,
-                    repo=mock_repo,
-                )
-
-                assert result.status == RunStatus.RUNNING.value
-                mock_execute.assert_called_once()
+        assert dispatched == ["a", "b"]
+        assert sorted(json.loads(run.active_step_ids)) == ["a", "b"], (
+            "both entry points must be RESERVED before either is dispatched"
+        )
 
 
 class TestPipelineExecutorCancelRun:
@@ -599,40 +388,6 @@ class TestPipelineExecutorCancelRun:
             assert mock_step_run.status == RunStatus.CANCELLED.value
             assert mock_step_run.completed_at is not None
             assert mock_step_run.error == "Cancelled by user"
-
-
-class TestStepBranchingLogic:
-    """Tests verifying step branching based on on_success/on_failure."""
-
-    def test_step_default_on_success_is_next(self):
-        """Default on_success action should be 'next'."""
-        step = {"name": "Test", "type": "script"}
-        on_success = step.get("on_success", "next")
-        assert on_success == "next"
-
-    def test_step_default_on_failure_is_stop(self):
-        """Default on_failure action should be 'stop'."""
-        step = {"name": "Test", "type": "script"}
-        on_failure = step.get("on_failure", "stop")
-        assert on_failure == "stop"
-
-    def test_step_custom_on_success(self):
-        """Custom on_success action should be used."""
-        step = {"name": "Test", "type": "script", "on_success": "merge:main"}
-        on_success = step.get("on_success", "next")
-        assert on_success == "merge:main"
-
-    def test_step_custom_on_failure(self):
-        """Custom on_failure action should be used."""
-        step = {"name": "Test", "type": "script", "on_failure": "trigger:fix-card"}
-        on_failure = step.get("on_failure", "stop")
-        assert on_failure == "trigger:fix-card"
-
-    def test_step_on_failure_next_continues(self):
-        """on_failure='next' allows continuing despite failure."""
-        step = {"name": "Lint", "type": "script", "on_failure": "next"}
-        on_failure = step.get("on_failure", "stop")
-        assert on_failure == "next"
 
 
 # =============================================================================
@@ -789,7 +544,7 @@ class _FakeGit:
 
 
 def _recording_dispatch(dispatched, events=None):
-    """Stands in for `_execute_graph_step`: records the fan-out without
+    """Stands in for `_execute_step`: records the fan-out without
     running anything, so the reserved batch stays active and the run stays
     RUNNING - exactly the state a real in-flight fan-out is in."""
 
@@ -895,9 +650,9 @@ class TestAnActionNeverCompletesThePipeline:
             return await real_complete(db, pipeline_run, success=success)
 
         with patch.object(
-            graph_executor, "_execute_graph_step", new=_recording_dispatch(dispatched)
+            graph_executor, "_execute_step", new=_recording_dispatch(dispatched)
         ), patch.object(graph_executor, "_complete_pipeline", new=counting_complete):
-            await graph_executor._handle_graph_step_complete(
+            await graph_executor._handle_step_complete(
                 db_session, run, pipeline, repo, g, "a", True, None,
                 step_run=step_run,
             )
@@ -930,7 +685,7 @@ class TestAnActionNeverCompletesThePipeline:
         run.completed_step_ids = json.dumps(["a"])
         await db_session.commit()
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "b", True, None, step_run=b_run
         )
 
@@ -966,9 +721,9 @@ class TestAnActionThatCannotBePerformedFailsTheRun:
 
         dispatched = []
         with patch.object(
-            graph_executor, "_execute_graph_step", new=_recording_dispatch(dispatched)
+            graph_executor, "_execute_step", new=_recording_dispatch(dispatched)
         ):
-            await graph_executor._handle_graph_step_complete(
+            await graph_executor._handle_step_complete(
                 db_session, run, pipeline, repo, g, "a", True, None,
                 step_run=step_run,
             )
@@ -986,7 +741,7 @@ class TestAnActionThatCannotBePerformedFailsTheRun:
         repo, pipeline, run = await _graph_rows(db_session, g)
         step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None, step_run=step_run
         )
 
@@ -1011,7 +766,7 @@ class TestAnActionThatCannotBePerformedFailsTheRun:
         )
         step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None, step_run=step_run
         )
 
@@ -1031,7 +786,7 @@ class TestAnActionThatCannotBePerformedFailsTheRun:
         repo, pipeline, run = await _graph_rows(db_session, g)
         step_run = await _finished_step_run(db_session, run, g, "a", passed=False)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", False, None, step_run=step_run
         )
 
@@ -1053,7 +808,7 @@ class TestAnActionThatCannotBePerformedFailsTheRun:
         step_run.error = "exit code 1: the suite is red"
         await db_session.commit()
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", False, None, step_run=step_run
         )
 
@@ -1071,7 +826,7 @@ class TestAnActionThatCannotBePerformedFailsTheRun:
         repo, pipeline, run = await _graph_rows(db_session, g)
         step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None, step_run=step_run
         )
 
@@ -1093,7 +848,7 @@ class TestAnActionThatCannotBePerformedFailsTheRun:
         repo, pipeline, run = await _graph_rows(db_session, g)
         step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None, step_run=step_run
         )
 
@@ -1108,7 +863,7 @@ class TestAnActionThatCannotBePerformedFailsTheRun:
         repo, pipeline, run = await _graph_rows(db_session, g)
         step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None, step_run=step_run
         )
 
@@ -1134,7 +889,7 @@ class TestAnActionThatCannotBePerformedFailsTheRun:
         )
         step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None, step_run=step_run
         )
 
@@ -1177,10 +932,10 @@ class TestAMergeLandsBeforeTheFanOut:
         dispatched = []
         with patch.object(
             graph_executor,
-            "_execute_graph_step",
+            "_execute_step",
             new=_recording_dispatch(dispatched, events),
         ):
-            await graph_executor._handle_graph_step_complete(
+            await graph_executor._handle_step_complete(
                 db_session, run, pipeline, repo, g, "a", True, None,
                 step_run=step_run,
             )
@@ -1218,7 +973,7 @@ class TestAMergeLandsBeforeTheFanOut:
         )
         step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None, step_run=step_run
         )
 
@@ -1246,7 +1001,7 @@ class TestTheFixCardAction:
         await db_session.commit()
         step_run = await _finished_step_run(db_session, run, g, "a", passed=False)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", False, None, step_run=step_run
         )
 
@@ -1271,7 +1026,7 @@ class TestTheFixCardAction:
         g["steps"]["a"]["actions"] = _actions(failure=[f"trigger:{template.id}"])
         step_run = await _finished_step_run(db_session, run, g, "a", passed=False)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", False, None, step_run=step_run
         )
 
@@ -1290,7 +1045,7 @@ class TestTheFixCardAction:
 
 
 class TestTheStepRowAnActionIsAttributedTo:
-    """Adversarial review item 2: `_handle_graph_step_complete` held no
+    """Adversarial review item 2: `_handle_step_complete` held no
     StepRun, and `StepRun.step_id == completed_step_id` matches a retry's
     second row. Both halves are pinned here."""
 
@@ -1305,7 +1060,7 @@ class TestTheStepRowAnActionIsAttributedTo:
         )
         await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None
         )
 
@@ -1326,7 +1081,7 @@ class TestTheStepRowAnActionIsAttributedTo:
             started_at=datetime(2024, 1, 15, 11, 0, 0),
         )
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None
         )
 
@@ -1367,7 +1122,7 @@ class TestTheStepRowAnActionIsAttributedTo:
             db_session, g, trigger_context={"branch": "feature-x"}
         )
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None
         )
 
@@ -1401,9 +1156,9 @@ class TestTerminalActionEdgeCases:
 
         dispatched = []
         with patch.object(
-            graph_executor, "_execute_graph_step", new=_recording_dispatch(dispatched)
+            graph_executor, "_execute_step", new=_recording_dispatch(dispatched)
         ):
-            await graph_executor._handle_graph_step_complete(
+            await graph_executor._handle_step_complete(
                 db_session, run, pipeline, repo, g, "a", True, None,
                 step_run=step_run,
             )
@@ -1419,7 +1174,7 @@ class TestTerminalActionEdgeCases:
         repo, pipeline, run = await _graph_rows(db_session, g)
         step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None, step_run=step_run
         )
 
@@ -1446,7 +1201,7 @@ class TestTerminalActionEdgeCases:
         )
         step_run = await _finished_step_run(db_session, run, g, "a", passed=False)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", False, None, step_run=step_run
         )
 
@@ -1461,7 +1216,7 @@ class TestTerminalActionEdgeCases:
         )
         step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
 
-        await graph_executor._handle_graph_step_complete(
+        await graph_executor._handle_step_complete(
             db_session, run, pipeline, repo, g, "a", True, None, step_run=step_run
         )
 
@@ -1487,7 +1242,7 @@ class TestTerminalActionEdgeCases:
         with patch.object(
             graph_executor, "_decide_route", side_effect=RuntimeError("no route")
         ):
-            await graph_executor._execute_graph_step(
+            await graph_executor._execute_step(
                 db_session, run, pipeline, repo, g, "a"
             )
 
@@ -1531,9 +1286,9 @@ class TestGraphEdgeConditions:
         )
         dispatched = []
         with patch.object(
-            executor, "_execute_graph_step", new=_recording_dispatch(dispatched)
+            executor, "_execute_step", new=_recording_dispatch(dispatched)
         ):
-            await executor._handle_graph_step_complete(
+            await executor._handle_step_complete(
                 db, run, pipeline, repo, self.BRANCHY, "a", success, None,
                 step_run=step_run,
             )
@@ -1605,9 +1360,489 @@ class TestGraphEdgeConditions:
             )
 
         with patch.object(graph_executor, "_dispatch_step_run", new=fake_dispatch):
-            await graph_executor._execute_graph_step(
+            await graph_executor._execute_step(
                 db_session, run, pipeline, repo, g, "third"
             )
 
         assert captured["step_id"] == "third"
         assert captured["step_index"] == 2
+
+
+# =============================================================================
+# THE RUN VERDICT - what v1's `stop` / `next` words used to decide
+#
+# On the array path the WORD decided the run: `stop` completed it with the
+# step's own verdict and `next` moved on. Three classes of false green came
+# out of that, and the third is a behaviour CHANGE this phase ships rather
+# than a bug it fixes (plan 1.8):
+#
+#   `on_failure: next` completed the run PASSED even though a step FAILED.
+#
+# On a graph, continuation is an EDGE and the verdict is
+# `_verify_graph_coverage` + `_check_all_steps_passed`. A run containing a
+# failed step ends FAILED, whatever the edges did afterwards. These are the
+# converted `TestPipelineExecutorActionHandlers` stop/next claims, driven
+# against the real executor and real rows instead of against a mock's
+# `assert_called_once_with`.
+# =============================================================================
+
+
+class TestTheRunVerdictIsTheStepRuns:
+    pytestmark = pytest.mark.asyncio
+
+    SOLO = _graph([_node("only")], [], ["only"])
+
+    #: a -FAILURE-> b. The graph spelling of v1's `on_failure: "next"`: the
+    #: run carries on past a failed step, deliberately, to a cleanup or a
+    #: reporting step. v1 then reported the whole run PASSED.
+    CONTINUE_PAST_FAILURE = _graph(
+        [_node("a"), _node("b")],
+        [_graph_edge("e", "a", "b", "failure")],
+        ["a"],
+    )
+
+    async def test_a_terminal_node_that_passes_ends_the_run_passed(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """v1: `on_success: "stop"` with a passing step. The graph spelling
+        is "no outgoing edge", and the verdict is the StepRun's."""
+        repo, pipeline, run = await _graph_rows(db_session, self.SOLO)
+        step_run = await _finished_step_run(
+            db_session, run, self.SOLO, "only", passed=True
+        )
+
+        await graph_executor._handle_step_complete(
+            db_session, run, pipeline, repo, self.SOLO, "only", True, None,
+            step_run=step_run,
+        )
+
+        assert run.status == RunStatus.PASSED.value
+        assert run.completed_at is not None
+
+    async def test_a_terminal_node_that_fails_ends_the_run_failed(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """v1: `on_failure: "stop"`."""
+        repo, pipeline, run = await _graph_rows(db_session, self.SOLO)
+        step_run = await _finished_step_run(
+            db_session, run, self.SOLO, "only", passed=False
+        )
+
+        await graph_executor._handle_step_complete(
+            db_session, run, pipeline, repo, self.SOLO, "only", False, None,
+            step_run=step_run,
+        )
+
+        assert run.status == RunStatus.FAILED.value
+        assert run.completed_at is not None
+
+    async def test_a_failure_edge_that_continues_still_ends_the_run_failed(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """THE BEHAVIOUR CHANGE, PINNED (plan 1.8, risk 9).
+
+        `TestLocalFailurePaths::test_linear_on_failure_next_continues_past_
+        failed_local_step` pinned the v1 answer and said so in a comment:
+        "Behavior-compat with main's legacy linear semantics... (graph
+        pipelines DO check all steps)". There was no graph equivalent
+        anywhere - this is it, and it deliberately records the OPPOSITE
+        verdict, because a run containing a failed step reporting PASSED is
+        the false green this whole phase exists to remove.
+
+        Note what does NOT change: the continuation still happens. `b` runs.
+        Only the verdict differs.
+        """
+        g = self.CONTINUE_PAST_FAILURE
+        repo, pipeline, run = await _graph_rows(db_session, g)
+        a_run = await _finished_step_run(db_session, run, g, "a", passed=False)
+
+        dispatched = []
+        with patch.object(
+            graph_executor, "_execute_step", new=_recording_dispatch(dispatched)
+        ):
+            await graph_executor._handle_step_complete(
+                db_session, run, pipeline, repo, g, "a", False, None,
+                step_run=a_run,
+            )
+
+        assert dispatched == ["b"], "the failure edge must still carry on"
+        assert run.status == RunStatus.RUNNING.value, (
+            "the run must not be stamped terminal while `b` is in flight"
+        )
+
+        b_run = await _finished_step_run(db_session, run, g, "b", passed=True)
+        await graph_executor._handle_step_complete(
+            db_session, run, pipeline, repo, g, "b", True, None,
+            step_run=b_run,
+        )
+
+        assert run.status == RunStatus.FAILED.value, (
+            "a run containing a FAILED step ends FAILED even when every edge "
+            "it took succeeded - v1 reported PASSED here"
+        )
+
+
+# =============================================================================
+# THE FORK THAT GETS MISSED - `_on_step_complete_locked`
+#
+# The JOB-callback path is reached from `job_callback`, never from
+# `_run_executor_step`, so it did not receive the local path's two-way flag:
+# it recomputed `graph and step_run.step_id` itself and kept its own `else:`
+# into the v1 action handler. That `else:` was the LAST caller of the entire
+# v1 family and had no test pointing at it - deleting the array by following
+# the flag alone would have left it alive, dispatching an action vocabulary
+# nothing else could reach.
+#
+# P5 turns it into a REFUSAL. These tests are what stops it quietly becoming a
+# fallback again: a callback that cannot be continued must FAIL the run, not
+# leave it RUNNING with nobody left to advance it.
+# =============================================================================
+
+
+def _completed_job(**overrides):
+    """The shape `on_step_complete` reads off a Job (it is passed one, never
+    queried for one)."""
+    job = SimpleNamespace(
+        id=str(uuid4()),
+        status="completed",
+        tests_run=0,
+        tests_passed=0,
+        logs="all good\n",
+        error=None,
+    )
+    for key, value in overrides.items():
+        setattr(job, key, value)
+    return job
+
+
+async def _running_step_run(db, run, *, step_id, step_index=0, step_name="step"):
+    step_run = StepRun(
+        id=str(uuid4()),
+        pipeline_run_id=run.id,
+        step_index=step_index,
+        step_id=step_id,
+        step_name=step_name,
+        status=RunStatus.RUNNING.value,
+        executor=ExecutorMode.LOCAL.value,
+        started_at=datetime.utcnow(),
+    )
+    db.add(step_run)
+    await db.commit()
+    await db.refresh(step_run)
+    return step_run
+
+
+class TestTheJobCallbackHasNoArrayFallback:
+    pytestmark = pytest.mark.asyncio
+
+    SOLO = _graph([_node("only")], [], ["only"])
+
+    async def test_a_callback_for_a_pipeline_with_no_graph_fails_the_run(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        repo = Repo(
+            id=str(uuid4()), name=f"repo-{uuid4().hex[:6]}", is_ingested=True
+        )
+        db_session.add(repo)
+        pipeline = Pipeline(
+            id=str(uuid4()),
+            repo_id=repo.id,
+            name="graphless",
+            steps=json.dumps([{"name": "Step 1", "type": "script"}]),
+            steps_graph=None,
+        )
+        db_session.add(pipeline)
+        run = PipelineRun(
+            id=str(uuid4()),
+            pipeline_id=pipeline.id,
+            status=RunStatus.RUNNING.value,
+            steps_total=1,
+            completed_step_ids=json.dumps([]),
+            active_step_ids=json.dumps([]),
+        )
+        db_session.add(run)
+        await db_session.commit()
+        step_run = await _running_step_run(db_session, run, step_id=None)
+
+        await graph_executor.on_step_complete(
+            db_session, step_run.id, _completed_job()
+        )
+
+        await db_session.refresh(run)
+        await db_session.refresh(step_run)
+        assert run.status == RunStatus.FAILED.value, (
+            "the array fallback used to read `pipeline.steps` here and "
+            "dispatch v1's `on_success` action"
+        )
+        assert step_run.status == RunStatus.FAILED.value
+        assert "no graph definition" in (step_run.error or "")
+
+    async def test_a_callback_for_a_step_run_with_no_step_id_fails_the_run(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """The second half of the old condition. A graph is present, so a
+        fallback here would look even more reasonable - and would be
+        continuing an array the pipeline does not have."""
+        repo, pipeline, run = await _graph_rows(db_session, self.SOLO)
+        step_run = await _running_step_run(db_session, run, step_id=None)
+
+        await graph_executor.on_step_complete(
+            db_session, step_run.id, _completed_job()
+        )
+
+        await db_session.refresh(run)
+        await db_session.refresh(step_run)
+        assert run.status == RunStatus.FAILED.value
+        assert "no graph definition" in (step_run.error or "")
+
+    async def test_the_refusal_does_not_swallow_the_ordinary_callback(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """The guard must reject only what it genuinely cannot continue: a
+        real graph step still completes and still reaches the verdict."""
+        repo, pipeline, run = await _graph_rows(db_session, self.SOLO)
+        step_run = await _running_step_run(db_session, run, step_id="only")
+
+        await graph_executor.on_step_complete(
+            db_session, step_run.id, _completed_job()
+        )
+
+        await db_session.refresh(run)
+        await db_session.refresh(step_run)
+        assert step_run.status == RunStatus.PASSED.value
+        assert run.status == RunStatus.PASSED.value
+        assert json.loads(run.completed_step_ids) == ["only"]
+
+    async def test_an_existing_step_error_is_kept_when_the_callback_refuses(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """The job's own error is the real cause; the refusal is APPENDED to
+        it, never substituted for it."""
+        repo, pipeline, run = await _graph_rows(db_session, self.SOLO)
+        step_run = await _running_step_run(db_session, run, step_id=None)
+
+        await graph_executor.on_step_complete(
+            db_session,
+            step_run.id,
+            _completed_job(status="failed", error="container exited 137"),
+        )
+
+        await db_session.refresh(step_run)
+        assert "container exited 137" in step_run.error
+        assert "no graph definition" in step_run.error
+
+
+# =============================================================================
+# TWO CLAIMS THE DELETED v1 CLASSES OWNED, ON THEIR SURVIVING SURFACE
+#
+# `TestParseSteps` tested `parse_steps`, deleted with the array. Its twin on
+# the graph column, `parse_steps_graph`, had NO unit coverage of its own -
+# and it now feeds `start_pipeline`'s refusal, so exactly what it swallows and
+# what it returns decides whether a definition-less run is loud or green.
+#
+# `test_the_whole_vocabulary_still_dispatches` tested that the v1 gate
+# rejected only what `_handle_action` genuinely could not run. The node-action
+# dispatcher has the same two-sided contract and the same drift hazard: a
+# vocabulary member with no handler reaches `_run_terminal_action`'s
+# `raise ValueError(... have drifted)`, which is marked `pragma: no cover`
+# precisely because nothing is supposed to reach it.
+# =============================================================================
+
+
+class TestParseStepsGraph:
+    def test_a_graph_json_string_parses_to_the_dict(self):
+        raw = json.dumps(
+            {"steps": {"a": {"id": "a"}}, "edges": [], "entry_points": ["a"]}
+        )
+        assert parse_steps_graph(raw)["entry_points"] == ["a"]
+
+    @pytest.mark.parametrize("raw", [None, "", "   ", "not valid json", "{"])
+    def test_absent_or_unparseable_yields_none_not_an_empty_definition(self, raw):
+        """None, never `{}`. The difference is the whole refusal: `{}` is
+        falsy too, but a caller that treated it as "a graph with no steps"
+        would take the EMPTY-GRAPH branch and pass vacuously. `None` has no
+        such reading."""
+        assert parse_steps_graph(raw) is None
+
+    def test_the_swallow_is_a_known_dark_channel_with_an_owner(self):
+        """`parse_steps_graph` cannot tell "no definition" from "a definition
+        that will not parse", exactly as `parse_steps` could not. That is
+        pinned rather than fixed because the looking belongs upstream:
+        migration 0014 refuses to convert a row whose `steps` will not parse
+        and names the pipeline id, and `PipelineRead.parse_steps_graph` pins
+        the same swallow on the wire side (plan 4.7).
+
+        What P5 adds is that the swallow can no longer end in a PASS - see
+        `TestPipelineExecutorStartPipeline`.
+        """
+        assert parse_steps_graph("{not json") is parse_steps_graph(None)
+
+
+class TestEveryNodeActionReachesAHandler:
+    """The converted `test_the_whole_vocabulary_still_dispatches`.
+
+    Driven off `TERMINAL_ACTION_PREFIXES` rather than a literal list, so a
+    prefix added to the vocabulary without a handler fails HERE instead of
+    reaching the drift `ValueError` at run time.
+    """
+
+    pytestmark = pytest.mark.asyncio
+
+    @pytest.mark.parametrize("prefix", list(TERMINAL_ACTION_PREFIXES))
+    async def test_every_accepted_prefix_dispatches(
+        self, db_session, graph_executor, quiet_manager, prefix
+    ):
+        action = f"{prefix}target"
+        assert describe_terminal_action(action) is None, (
+            "the fixture must be a form the vocabulary accepts"
+        )
+
+        g = _graph([_node("a")], [], ["a"])
+        repo, pipeline, run = await _graph_rows(db_session, g)
+        step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
+
+        with patch.object(
+            graph_executor, "_merge_step_branch", new=AsyncMock(return_value=None)
+        ), patch.object(
+            graph_executor, "_spawn_fix_card", new=AsyncMock(return_value=None)
+        ), patch.object(
+            graph_executor,
+            "_fail_run_on_terminal_action",
+            new=AsyncMock(),
+        ) as refused:
+            performed = await graph_executor._run_terminal_action(
+                db_session, run, repo, "a", step_run, action
+            )
+
+        assert performed is True
+        refused.assert_not_called()
+
+    async def test_an_action_outside_the_vocabulary_never_reaches_a_handler(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """The other side of the same gate: the dispatcher must refuse, not
+        fall through to a handler that would half-perform something."""
+        g = _graph([_node("a")], [], ["a"])
+        repo, pipeline, run = await _graph_rows(db_session, g)
+        step_run = await _finished_step_run(db_session, run, g, "a", passed=True)
+
+        with patch.object(
+            graph_executor, "_merge_step_branch", new=AsyncMock(return_value=None)
+        ) as merged, patch.object(
+            graph_executor, "_spawn_fix_card", new=AsyncMock(return_value=None)
+        ) as spawned:
+            performed = await graph_executor._run_terminal_action(
+                db_session, run, repo, "a", step_run, "deploy"
+            )
+
+        assert performed is False
+        merged.assert_not_called()
+        spawned.assert_not_called()
+        assert run.status == RunStatus.FAILED.value
+
+
+# =============================================================================
+# THE LOCAL STEP TASK'S OWN CONTEXT LOAD
+#
+# `_load_local_step_context` runs in the per-step asyncio task, on its own
+# session, and it used to end in the array: `is_graph = bool(graph and
+# step_run.step_id)`, and anything falsy fell through to
+# `steps[step_run.step_index]`. With the array gone that fall-through is a
+# missing graph, and a missing graph has to RAISE - the class it raises exists
+# precisely because "no early return may leave a RUNNING StepRun with no
+# owner", and an unguarded `graph.get(...)` on None is an AttributeError that
+# escapes the task and does exactly that.
+# =============================================================================
+
+
+class TestALocalStepWithNoGraphIsNotStranded:
+    pytestmark = pytest.mark.asyncio
+
+    SOLO = _graph([_node("only")], [], ["only"])
+
+    async def _graphless_rows(self, db):
+        repo = Repo(
+            id=str(uuid4()), name=f"repo-{uuid4().hex[:6]}", is_ingested=True
+        )
+        db.add(repo)
+        pipeline = Pipeline(
+            id=str(uuid4()),
+            repo_id=repo.id,
+            name="graphless",
+            steps=json.dumps([{"name": "Step 1", "type": "script"}]),
+            steps_graph=None,
+        )
+        db.add(pipeline)
+        run = PipelineRun(
+            id=str(uuid4()),
+            pipeline_id=pipeline.id,
+            status=RunStatus.RUNNING.value,
+            steps_total=1,
+            completed_step_ids=json.dumps([]),
+            active_step_ids=json.dumps([]),
+        )
+        db.add(run)
+        await db.commit()
+        step_run = await _running_step_run(db, run, step_id="only")
+        return repo, pipeline, run, step_run
+
+    async def test_a_missing_graph_raises_rather_than_reading_an_array(
+        self, db_session, graph_executor
+    ):
+        _, pipeline, run, step_run = await self._graphless_rows(db_session)
+
+        with pytest.raises(LocalStepContextError) as caught:
+            await graph_executor._load_local_step_context(
+                db_session, run.id, step_run.id
+            )
+
+        assert "no steps_graph" in str(caught.value)
+        assert caught.value.can_continue is False, (
+            "there is no graph to fan out over, so the only honest "
+            "continuation is failing the run"
+        )
+        assert caught.value.step_run is step_run, (
+            "the error must carry the row, or the handler cannot drive it "
+            "out of RUNNING"
+        )
+
+    async def test_the_wedged_step_and_its_run_both_reach_terminal(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """The half that matters operationally: a RUNNING StepRun nobody owns
+        is invisible until someone wonders why a run never finished."""
+        _, pipeline, run, step_run = await self._graphless_rows(db_session)
+
+        try:
+            await graph_executor._load_local_step_context(
+                db_session, run.id, step_run.id
+            )
+        except LocalStepContextError as err:
+            await graph_executor._fail_wedged_local_step(db_session, run.id, err)
+        else:
+            raise AssertionError("the context load must have refused")
+
+        await db_session.refresh(run)
+        await db_session.refresh(step_run)
+        assert step_run.status == RunStatus.FAILED.value
+        assert "local step context error" in (step_run.error or "")
+        assert run.status == RunStatus.FAILED.value
+
+    async def test_a_step_id_the_graph_does_not_define_still_continues(
+        self, db_session, graph_executor, quiet_manager
+    ):
+        """The neighbouring branch, which must NOT be swept up: the graph is
+        intact and only this node is missing, so the run keeps its normal
+        continuation (`can_continue=True`) instead of being failed outright.
+        Without this the refusal above would be indistinguishable from a
+        blanket "any load problem kills the run"."""
+        repo, pipeline, run = await _graph_rows(db_session, self.SOLO)
+        step_run = await _running_step_run(db_session, run, step_id="ghost")
+
+        with pytest.raises(LocalStepContextError) as caught:
+            await graph_executor._load_local_step_context(
+                db_session, run.id, step_run.id
+            )
+
+        assert caught.value.can_continue is True
+        assert caught.value.graph is not None

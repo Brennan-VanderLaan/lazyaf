@@ -3,9 +3,11 @@
 
   interface Props {
     onAddStep: (type: StepType) => void;
+    /** Open the Connect panel - the non-drag way to draw an edge. */
+    onConnect: () => void;
   }
 
-  let { onAddStep }: Props = $props();
+  let { onAddStep, onConnect }: Props = $props();
 
   // Quick add buttons
   const stepTypes: { type: StepType; label: string; icon: string; color: string; shortcut: string }[] = [
@@ -38,13 +40,24 @@
   <div class="toolbar-divider"></div>
 
   <div class="toolbar-section">
+    <span class="section-label">Connect:</span>
+    <button class="add-btn connect-btn" data-testid="toolbar-connect" onclick={onConnect} title="Connect two steps (C)">
+      <span class="btn-icon connect-icon">-&gt;</span>
+      <span class="btn-label">Connect Steps</span>
+      <span class="btn-shortcut">C</span>
+    </button>
+  </div>
+
+  <div class="toolbar-divider"></div>
+
+  <div class="toolbar-section">
     <span class="section-label">Tips:</span>
     <div class="tips">
       <span class="tip">Right-click canvas for menu</span>
       <span class="tip-sep">|</span>
       <span class="tip">Drag from sidebar</span>
       <span class="tip-sep">|</span>
-      <span class="tip">Connect nodes by dragging handles</span>
+      <span class="tip">Drag handles, or use Connect Steps</span>
     </div>
   </div>
 </div>
@@ -92,6 +105,14 @@
   .add-btn:hover {
     border-color: var(--btn-color);
     background: var(--hover-color);
+  }
+
+  .connect-btn {
+    --btn-color: var(--success-color);
+  }
+
+  .connect-icon {
+    background: var(--success-color);
   }
 
   .btn-icon {

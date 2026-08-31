@@ -479,7 +479,8 @@ def build_execute_step_config(
             `secret_environment` are NOT read here - they belong inside the
             control file the caller already produced.
         exec_context: the executor's execution_context - pipeline_run_id,
-            step_run_id, step_index, step_execution_id, execution_key,
+            step_run_id, step_index, step_id (the graph node id, absent on a
+            marker StepRun), step_execution_id, execution_key,
             workspace_volume, and the workspace provisioning inputs
             (repo_id, clone_url, branch, commit_sha, retain_key).
         step_config_file: verbatim `generate_step_config` output, or None for
@@ -536,7 +537,14 @@ def build_execute_step_config(
             step_config.get("usage_provider") or DEFAULT_USAGE_PROVIDER
         ),
     }
+    # LAZYAF_STEP_ID (12.8) - see the note in local_executor.py. It matters
+    # MORE on this lane than on the local one: the remote step's container is
+    # created on another host by an agent that never sees the graph, so the
+    # node id its author wrote is only knowable in-container if it travels
+    # here. scripts/verify_executor.py runs on the local lane today, but
+    # `requires:` could move it tomorrow and the gate must not care which.
     for key, source in (
+        ("LAZYAF_STEP_ID", exec_context.get("step_id")),
         ("LAZYAF_ROLE", step_config.get("role")),
         ("LAZYAF_GPU_NODE_ID", exec_context.get("gpu_node_id")),
         ("LAZYAF_GPU_FRACTION", exec_context.get("gpu_fraction")),

@@ -791,8 +791,10 @@ def debug():
     multiple=True,
     metavar="STEP_KEY",
     help=(
-        "Pause BEFORE this step. A graph step's key is its step_id; a legacy "
-        "step's key is its index. Repeatable. An unknown key is refused."
+        "Pause BEFORE this step, named by its step id in the pipeline graph "
+        "(NOT its position - index keys were the v1 array's address and are "
+        "retired). Repeatable. An unknown key is refused, so a breakpoint "
+        "either fires or says why it cannot."
     ),
 )
 @click.option("--commit", default=None, help="Re-run at this commit instead of the original")

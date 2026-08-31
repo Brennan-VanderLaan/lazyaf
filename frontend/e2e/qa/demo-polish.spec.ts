@@ -53,9 +53,27 @@ function pipeline(over: Record<string, unknown> = {}) {
     repo_id: REPO_ID,
     name: 'nightly',
     description: 'Runs the suite',
-    steps: [
-      { name: 'build', type: 'script', config: { command: 'make' }, on_success: 'next', on_failure: 'stop', timeout: 300, continue_in_context: false },
-    ],
+    // A GRAPH, since 12.8 P3: `PipelineRead` has no `steps` array any more,
+    // and a fixture that still sends one describes a row the API can no
+    // longer produce - the card would render "No steps defined" and every
+    // assertion about its step count would be measuring the wrong thing.
+    steps_graph: {
+      version: 2,
+      entry_points: ['build'],
+      steps: {
+        build: {
+          id: 'build',
+          name: 'build',
+          type: 'script',
+          config: { command: 'make' },
+          position: { x: 100, y: 0 },
+          timeout: 300,
+          continue_in_context: false,
+        },
+      },
+      edges: [],
+    },
+    definition_error: null,
     triggers: [],
     is_template: false,
     created_at: naiveUtc(),
@@ -210,12 +228,17 @@ test.describe('QA-6 finding 1: naive UTC vs local time', () => {
 // --------------------------------------------------------------------------
 
 /**
- * `{pipeline.steps.length} steps` is unconditional, so the single-step
- * pipeline a demo starts with reads "1 steps".
- * Root cause: PipelinesPage.svelte — `.step-count` span, both the repo-card
- * and platform-card branches.
+ * FIXED, so this is a positive assertion now rather than a strict xfail.
+ *
+ * The finding: `{steps.length} steps` was unconditional, so the single-step
+ * pipeline a demo starts with read "1 steps". `.step-count` pluralizes on
+ * both the repo-card and platform-card branches of PipelinesPage.svelte.
+ *
+ * It was still spelled `test.fail` after the fix landed, which means it was
+ * REPORTING A FAILURE ("Expected to fail, but passed") on every run of this
+ * file - the noisiest possible way to record a fixed bug (R4).
  */
-test.fail('a one-step pipeline reads "1 step", not "1 steps"', async ({ page }) => {
+test('a one-step pipeline reads "1 step", not "1 steps"', async ({ page }) => {
   await mockApi(page, { pipelines: [pipeline()] });
   await openPipelines(page);
 

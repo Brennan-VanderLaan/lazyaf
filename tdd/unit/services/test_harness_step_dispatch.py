@@ -826,7 +826,12 @@ class TestRunnerLocalProbeRun:
         assert run.id == "run-123"
         assert captured["trigger_type"] == "endpoint_probe"
         assert captured["trigger_ref"] == endpoint.id
-        step = _json.loads(captured["pipeline"].steps)[0]
+        # 12.8: the ad-hoc probe pipeline is authored as a GRAPH. Its
+        # single node is keyed `probe` by `start_endpoint_probe_run`.
+        graph = _json.loads(captured["pipeline"].steps_graph)
+        assert list(graph["steps"]) == ["probe"]
+        assert graph["entry_points"] == ["probe"]
+        step = graph["steps"]["probe"]
         assert step["type"] == "script"
         assert step["config"]["requires"] == {"has": ["endpoint:local-4090"]}
         assert step["config"]["command"] == "python3 -m runner_common.endpoint_probe"
@@ -844,7 +849,7 @@ class TestRunnerLocalProbeRun:
         endpoint = await _make_endpoint(db_session, reach="runner-local")
 
         _run, captured = await self._schedule(db_session, endpoint, monkeypatch)
-        step = _json.loads(captured["pipeline"].steps)[0]
+        step = _json.loads(captured["pipeline"].steps_graph)["steps"]["probe"]
         decision = ExecutionRouter().decide("script", step["config"])
 
         assert (decision.mode, decision.reason) == ("remote", "runner-pin")

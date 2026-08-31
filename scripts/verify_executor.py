@@ -105,16 +105,49 @@ Asserts, for the CURRENT pipeline run:
      'openai-compatible'. That value is what the board reads as "the provider
      billed us this amount", and no self-hosted endpoint can make that claim.
 
-A vacuous pass is a failure (R4) in six separate ways: no script/docker step
-runs, no agent step run, no REMOTE step run, no connected runner, no HARNESS
-step run, and no forced-text harness step run.
+ 19. (12.8) every StepRun's `step_index` equals its step's POSITION in the
+     graph definition's `steps` mapping. `step_index` survives the v1 array
+     retirement as the ADDRESS of a step: the execution key
+     (`{run_id}:{step_index}:{step_run_id}`), LAZYAF_STEP_INDEX, the
+     step_update / step_log websocket frames the UI renders by index, and the
+     state machine's completion bookkeeping all key on it - while the
+     executor DERIVES it from `list(steps_dict.keys()).index(step_id)`.
+     Nothing else in the tree asserts the two agree, and a disagreement is
+     silent in both directions: log lines land on the wrong step in the UI,
+     and an idempotency key collides with a different step's.
 
-Env contract (injected into every step container by LocalExecutor; the
-backend URL default matches settings.container_backend_url):
+A vacuous pass is a failure (R4) in seven separate ways: no graph step
+definitions at all, no script/docker step runs, no agent step run, no REMOTE
+step run, no connected runner, no HARNESS step run, and no forced-text
+harness step run.
+
+THE DEFINITION IS THE GRAPH (12.8). `PipelineRead.steps` - the v1 array - has
+left the wire. The array survives only as the AUTHORING format at the
+repo-YAML edge; `GET /api/pipelines/{id}` serves `steps_graph`, the definition
+the executor actually ran. So every per-step expectation in this gate is a
+lookup into `steps_graph["steps"]`, a MAPPING KEYED BY STEP ID, correlated
+with the run's StepRuns through `StepRun.step_id`. The old
+`enumerate(pipeline["steps"])` correlation could not survive the retirement:
+a graph's steps have no array positions to enumerate, and an id is what the
+author actually wrote.
+
+Env contract (injected into every step container by LocalExecutor and by the
+remote lane's `build_execute_step_config`; the backend URL default matches
+settings.container_backend_url):
   LAZYAF_PIPELINE_RUN_ID  - required; the run to verify
-  LAZYAF_STEP_INDEX       - optional; this step's own index (exempt from
-                            the log-delivery and usage checks)
+  LAZYAF_STEP_ID          - optional; this step's own GRAPH NODE ID (exempt
+                            from the log-delivery and usage checks). Absent
+                            when the StepRun names no graph node, in which
+                            case NOTHING is exempted and this gate fails on
+                            its own still-streaming logs - loudly, which is
+                            the correct direction for a missing identity.
   LAZYAF_BACKEND_URL      - optional; defaults to http://backend:8000
+
+LAZYAF_STEP_INDEX is still injected and still means what it always meant, but
+this gate no longer reads it: keying the gate's OWN identity on a graph's
+`list(steps_dict.keys())` insertion order was the single most fragile thing in
+the ratchet, and assertion 19 now watches that ordering from the outside
+instead of depending on it.
 
 Stdlib-only on purpose: this runs inside a bare lazyaf-base step container.
 """
@@ -204,6 +237,52 @@ def has_delivered_logs(logs) -> bool:
     return False
 
 
+def graph_step_definitions(pipeline: dict) -> dict:
+    """`{step_id: step definition}` from a pipeline's GRAPH definition.
+
+    THE ONE READ of the pipeline definition (12.8). It returns the mapping
+    every other expectation in this gate is derived from, and it is the only
+    place that knows the shape `GET /api/pipelines/{id}` serves.
+
+    AN EMPTY OR MISSING DEFINITION IS A FAILURE, NOT A DEFAULT. Every
+    per-step lookup below carries a fallback - `.get(step_id, "script")`,
+    `.get(step_id, LOCAL_EXECUTOR)` - because a definition the gate did not
+    write may legitimately omit a key. Those fallbacks are safe only while
+    the mapping is real: over an EMPTY mapping every step becomes "expected
+    local, expected script", assertions 8 and 11 stop being able to fail, and
+    the gate prints OK over any run at all. That is the exact vacuous pass R4
+    forbids, and it is the shape the retirement of `PipelineRead.steps` could
+    have introduced in silence - the field simply stops arriving and
+    `pipeline.get("steps", [])` becomes `[]` forever. So the absence is
+    checked here, once, and it is fatal.
+    """
+    graph = pipeline.get("steps_graph")
+    steps = graph.get("steps") if isinstance(graph, dict) else None
+    if not isinstance(steps, dict) or not steps:
+        raise SystemExit(
+            f"FAIL: pipeline {pipeline.get('id')!r} carries NO graph step "
+            f"definitions (steps_graph={graph!r}). Every per-step "
+            "expectation in this gate - the step's type, its lane, its "
+            "harness mode, the endpoint it names - is derived from the "
+            "definition, so an empty one would make the gate report 'all "
+            "local, all script' and pass over ANY run whatsoever (vacuous "
+            "pass = fail, R4). Either the pipeline never materialized, or "
+            "its definition failed to convert and the row carries a "
+            "`definition_error` - GET /api/pipelines/{id} reports it"
+        )
+    return steps
+
+
+def step_label(step_run: dict) -> str:
+    """How a StepRun is named in every failure message.
+
+    The GRAPH NODE ID first, because that is the handle an author can act on
+    (it is what they wrote in the YAML and what a breakpoint keys on), then
+    the display name.
+    """
+    return f"step '{step_run.get('step_id')}' '{step_run.get('step_name')}'"
+
+
 def step_requires_remote(step: dict) -> bool:
     """True iff this pipeline STEP DEFINITION pins itself to a runner.
 
@@ -275,7 +354,7 @@ def fetch_json(base_url: str, path: str, timeout: float = 30.0):
         return json.load(resp)
 
 
-def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str:
+def verify_run(base_url: str, run_id: str, self_id: str | None = None) -> str:
     """Verify executor routing, log delivery and the usage channel.
 
     Returns an OK message on success; raises SystemExit with a FAIL
@@ -283,23 +362,58 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
     """
     run = fetch_json(base_url, f"/api/pipeline-runs/{run_id}")
     pipeline = fetch_json(base_url, f"/api/pipelines/{run['pipeline_id']}")
+    steps_by_id = graph_step_definitions(pipeline)
     step_types = {
-        i: s.get("type", "script") for i, s in enumerate(pipeline["steps"])
+        step_id: s.get("type", "script") for step_id, s in steps_by_id.items()
     }
-    # 12.6: the EXPECTED lane per step index, re-derived from the pipeline
+    # 12.6: the EXPECTED lane per step, re-derived from the pipeline
     # definition. Comparing against a derived expectation (rather than
     # against the constant "local") is what makes assertion 11 possible: a
     # run in which everything flipped to remote fails here just as loudly as
     # one in which the pinned step fell back to local.
-    expected = {i: expected_executor(s) for i, s in enumerate(pipeline["steps"])}
+    expected = {
+        step_id: expected_executor(s) for step_id, s in steps_by_id.items()
+    }
+    # 12.8 assertion 19: a step's POSITION in the graph's steps mapping is
+    # the number the executor stamps onto StepRun.step_index, and therefore
+    # the number the execution key, LAZYAF_STEP_INDEX and every step_update /
+    # step_log websocket frame address the step by.
+    positions = {step_id: i for i, step_id in enumerate(steps_by_id)}
 
     checked = 0
     agents_checked = 0
     remote_checked = 0
+    markers = 0
     bad = []
     silent = []
+    misindexed = []
+    strangers = []
     for sr in run["step_runs"]:
-        step_type = step_types.get(sr["step_index"], "script")
+        step_id = sr.get("step_id")
+        if step_id is None:
+            # A MARKER row, not an executed step. `_trigger_card` records one
+            # (step_id deliberately NULL, so a fix-card marker can never be
+            # mistaken for the step that spawned it) and so does
+            # `_verify_graph_coverage`. A marker names no definition, spawned
+            # no container and therefore has no lane, no type and no usage
+            # row to check it against. Counted, so it is visible in the OK
+            # line rather than merely absent from it.
+            markers += 1
+            continue
+        if step_id not in steps_by_id:
+            # The run executed a step the CURRENT definition does not
+            # contain. Every expectation below is a lookup into that
+            # definition, so continuing would mean checking this step
+            # against a fallback rather than against anything.
+            strangers.append(step_label(sr))
+            continue
+        if sr.get("step_index") != positions[step_id]:
+            misindexed.append(
+                f"{step_label(sr)} ran at step_index="
+                f"{sr.get('step_index')!r}, but its step is at position "
+                f"{positions[step_id]} in the graph definition"
+            )
+        step_type = step_types.get(step_id, "script")
         if step_type == AGENT_STEP_TYPE:
             # 12.5: agent steps left the legacy queue and are lane-checked
             # exactly like script steps - the whole point of that phase was
@@ -311,12 +425,12 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
             continue
         else:
             checked += 1
-        want = expected.get(sr["step_index"], LOCAL_EXECUTOR)
+        want = expected.get(step_id, LOCAL_EXECUTOR)
         if want == REMOTE_EXECUTOR:
             remote_checked += 1
         if sr["executor"] != want:
             bad.append(
-                f"step {sr['step_index']} '{sr['step_name']}' ({step_type}) -> "
+                f"{step_label(sr)} ({step_type}) -> "
                 f"executor={sr['executor']!r}, expected {want!r} "
                 f"({'has' if want == REMOTE_EXECUTOR else 'no'} `requires:` "
                 f"block in the pipeline definition)"
@@ -326,15 +440,26 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
         # if the in-container runtime's POST /api/steps/{id}/logs batches
         # landed. Backend-appended '[lazyaf] ' marker lines don't count.
         if (
-            sr["step_index"] != self_index
+            step_id != self_id
             and sr.get("status") == "passed"
             and not has_delivered_logs(sr.get("logs"))
         ):
             silent.append(
-                f"step {sr['step_index']} '{sr['step_name']}' passed "
+                f"{step_label(sr)} passed "
                 f"with EMPTY logs (no non-marker log lines)"
             )
 
+    if strangers:
+        raise SystemExit(
+            "FAIL: this run executed step(s) the pipeline's CURRENT graph "
+            "definition does not contain. The gate correlates a StepRun to "
+            "its definition through `StepRun.step_id`, so there is nothing "
+            "left to check these against - and a definition that changed "
+            "under a live run is itself the finding (a second push "
+            "re-materialized the pipeline mid-run, or a step id was renamed "
+            f"without a new run). Known step ids: {sorted(steps_by_id)}:\n  "
+            + "\n  ".join(strangers)
+        )
     if not checked:
         raise SystemExit(
             "FAIL: no script/docker step runs found (vacuous pass = fail, R4)"
@@ -345,6 +470,23 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
     if bad:
         raise SystemExit(
             "FAIL: steps did not run on the lane their definition asks for (`requires:` -> remote, otherwise local):\n  " + "\n  ".join(bad)
+        )
+    # 12.8 assertion 19, and it is a live regression like `bad` is, so it is
+    # reported before the ratchet-completeness checks below.
+    if misindexed:
+        raise SystemExit(
+            "FAIL: a StepRun's step_index does not match its step's POSITION "
+            "in the graph definition. `step_index` survives the v1 array "
+            "retirement as the ADDRESS of a step - the execution key "
+            "('{run_id}:{step_index}:{step_run_id}'), LAZYAF_STEP_INDEX, the "
+            "step_update / step_log websocket frames the UI renders, and the "
+            "state machine's completion bookkeeping all key on it - while "
+            "the executor DERIVES it from "
+            "`list(steps_dict.keys()).index(step_id)`. When the two "
+            "disagree, log lines land on a different step in the UI and an "
+            "idempotency key collides with a different step's, and both are "
+            "silent. Nothing else in the tree watches this:\n  "
+            + "\n  ".join(misindexed)
         )
     if not agents_checked:
         raise SystemExit(
@@ -380,13 +522,9 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
     for sr in run["step_runs"]:
         for line in (sr.get("logs") or "").splitlines():
             if "[control] WARNING: test results manifest" in line:
-                manifest_problems.append(
-                    f"step {sr.get('step_index')} '{sr.get('step_name')}': {line.strip()}"
-                )
+                manifest_problems.append(f"{step_label(sr)}: {line.strip()}")
             elif SCRAPE_FAILED_LOG_MARKER in line:
-                scrape_problems.append(
-                    f"step {sr.get('step_index')} '{sr.get('step_name')}': {line.strip()}"
-                )
+                scrape_problems.append(f"{step_label(sr)}: {line.strip()}")
     if manifest_problems:
         raise SystemExit(
             "FAIL: test-result manifests did not reach the backend (12.2.6 "
@@ -408,7 +546,7 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
     # and the remote-lane gate ask different questions of the same rows.
     rollup = fetch_json(base_url, f"/api/pipeline-runs/{run['id']}/usage")
     usage_msg = verify_usage(
-        base_url, run, step_types, self_index=self_index, rollup=rollup
+        base_url, run, step_types, self_id=self_id, rollup=rollup
     )
     remote_msg = verify_remote_lane(base_url, run, expected, rollup)
     harness_msg = verify_harness_lane(base_url, run, pipeline, rollup)
@@ -416,8 +554,10 @@ def verify_run(base_url: str, run_id: str, self_index: int | None = None) -> str
     return (
         f"OK: {checked} script step run(s) and {agents_checked} agent step "
         f"run(s) ran on the lane their definition asks for "
-        f"({remote_checked} remote), passed steps delivered logs, no "
-        f"manifest delivery problems, {usage_msg}, {remote_msg}, {harness_msg}"
+        f"({remote_checked} remote), each at its graph position, passed "
+        f"steps delivered logs, no manifest delivery problems, {usage_msg}, "
+        f"{remote_msg}, {harness_msg}"
+        + (f" [{markers} marker step run(s) skipped]" if markers else "")
     )
 
 
@@ -425,7 +565,7 @@ def verify_usage(
     base_url: str,
     run: dict,
     step_types: dict,
-    self_index: int | None = None,
+    self_id: str | None = None,
     rollup: dict | None = None,
 ) -> str:
     """12.5: the usage channel must have written a row for every step.
@@ -439,7 +579,9 @@ def verify_usage(
     THE ONE EXEMPTION, stated rather than silent: this script's own step runs
     with `control: false` (gate independence - the gate must not depend on
     the runtime it verifies). A stdout-mode step has no control runtime and
-    therefore cannot POST usage. It is exempted by index, not by guesswork.
+    therefore cannot POST usage. It is exempted by its GRAPH NODE ID, taken
+    from LAZYAF_STEP_ID - never by guesswork, and (from 12.8) never by an
+    array position the graph no longer has.
     """
     if rollup is None:
         rollup = fetch_json(base_url, f"/api/pipeline-runs/{run['id']}/usage")
@@ -452,18 +594,22 @@ def verify_usage(
     missing = []
     agent_rows = []
     for sr in run["step_runs"]:
-        if sr["step_index"] == self_index:
+        step_id = sr.get("step_id")
+        if step_id is None:
+            # Marker row (see verify_run): it spawned no container, so there
+            # is no control runtime that could ever have POSTed usage for it.
+            continue
+        if step_id == self_id:
             continue  # stdout-mode gate step: no control runtime, no usage
         if sr.get("status") != "passed":
             continue  # still running / failed: its usage POST has not landed
         row = by_step_run.get(sr["id"])
         if row is None:
             missing.append(
-                f"step {sr['step_index']} '{sr['step_name']}' "
-                f"({step_types.get(sr['step_index'], 'script')})"
+                f"{step_label(sr)} ({step_types.get(step_id, 'script')})"
             )
             continue
-        if step_types.get(sr["step_index"]) == AGENT_STEP_TYPE:
+        if step_types.get(step_id) == AGENT_STEP_TYPE:
             agent_rows.append((sr, row))
 
     if missing:
@@ -497,20 +643,14 @@ def verify_usage(
         raw = detail.get("raw")
         if isinstance(raw, dict) and raw.get(RAW_SCRAPE_FAILED):
             scrape_failures.append(
-                f"agent step {sr['step_index']} '{sr['step_name']}': "
+                f"agent {step_label(sr)}: "
                 f"{raw.get(RAW_SCRAPE_ERROR) or 'the scraper found no CLI report'}"
             )
         for field in ("input_tokens", "output_tokens"):
             if detail.get(field) is None:
-                problems.append(
-                    f"agent step {sr['step_index']} '{sr['step_name']}': "
-                    f"{field} is null"
-                )
+                problems.append(f"agent {step_label(sr)}: {field} is null")
         if not detail.get("cost_source"):
-            problems.append(
-                f"agent step {sr['step_index']} '{sr['step_name']}': "
-                "cost_source is empty"
-            )
+            problems.append(f"agent {step_label(sr)}: cost_source is empty")
     if scrape_failures:
         raise SystemExit(
             "FAIL: an agent step's usage row is stamped as a SCRAPE FAILURE "
@@ -611,16 +751,13 @@ def verify_remote_lane(
     strangers = []
     assigned_to = set()
     for sr in run["step_runs"]:
-        if expected.get(sr["step_index"]) != REMOTE_EXECUTOR:
+        if expected.get(sr.get("step_id")) != REMOTE_EXECUTOR:
             continue
         runner_id = step_runner_id(sr, usage_by_step_run.get(sr["id"]))
         if not runner_id:
-            unassigned.append(f"step {sr['step_index']} '{sr['step_name']}'")
+            unassigned.append(step_label(sr))
         elif runner_id not in known_ids:
-            strangers.append(
-                f"step {sr['step_index']} '{sr['step_name']}' -> "
-                f"runner_id={runner_id!r}"
-            )
+            strangers.append(f"{step_label(sr)} -> runner_id={runner_id!r}")
         else:
             assigned_to.add(runner_id)
 
@@ -670,10 +807,9 @@ def verify_harness_lane(
     silently disappeared from the pipeline" a failure rather than a green run
     with nothing in it.
     """
-    steps = pipeline.get("steps") or []
     harness_steps = {
-        index: step
-        for index, step in enumerate(steps)
+        step_id: step
+        for step_id, step in graph_step_definitions(pipeline).items()
         if (step.get("config") or {}).get("agent") == HARNESS_AGENT
     }
     if not harness_steps:
@@ -693,7 +829,7 @@ def verify_harness_lane(
     # this specifically means "no turn of any step reported a usage block",
     # which is the shape only an N-turn accumulator can produce.
     scrape_lines = [
-        f"step {sr.get('step_index')} '{sr.get('step_name')}': {line.strip()}"
+        f"{step_label(sr)}: {line.strip()}"
         for sr in run["step_runs"]
         for line in (sr.get("logs") or "").splitlines()
         if SCRAPE_FAILED_LOG_MARKER in line
@@ -737,21 +873,25 @@ def verify_harness_lane(
     endpoints_named = {}
     checked = 0
 
-    for index, step in sorted(harness_steps.items()):
-        name = step.get("name") or step.get("id") or f"step {index}"
+    # Sorted by step id for a stable report: the graph's mapping order is
+    # insertion order, which is meaningful (assertion 19) but is not the
+    # order a human scans a failure list in.
+    for step_id, step in sorted(harness_steps.items()):
+        name = step.get("name") or step_id
+        label = f"step '{step_id}' '{name}'"
         endpoint_name = step_harness_endpoint(step)
         mode = step_harness_mode(step)
         if endpoint_name:
             endpoints_named.setdefault(endpoint_name, mode)
 
-        runs = [sr for sr in run["step_runs"] if sr.get("step_index") == index]
+        runs = [sr for sr in run["step_runs"] if sr.get("step_id") == step_id]
         if not runs:
-            problems.append(f"step {index} '{name}': the harness step never ran")
+            problems.append(f"{label}: the harness step never ran")
             continue
         step_run = runs[-1]
         if step_run.get("status") != "passed":
             problems.append(
-                f"step {index} '{name}': status={step_run.get('status')!r}, "
+                f"{label}: status={step_run.get('status')!r}, "
                 "expected 'passed'"
             )
             continue
@@ -759,9 +899,8 @@ def verify_harness_lane(
         row = by_step_run.get(step_run["id"])
         if row is None:
             problems.append(
-                f"step {index} '{name}': no StepUsage row (the harness wrote "
-                "no usage manifest, or it never reached POST "
-                "/api/steps/{id}/usage)"
+                f"{label}: no StepUsage row (the harness wrote no usage "
+                "manifest, or it never reached POST /api/steps/{id}/usage)"
             )
             continue
         detail = fetch_json(
@@ -771,7 +910,7 @@ def verify_harness_lane(
         # 13a. provider
         if detail.get("provider") != HARNESS_USAGE_PROVIDER:
             problems.append(
-                f"step {index} '{name}': provider="
+                f"{label}: provider="
                 f"{detail.get('provider')!r}, expected "
                 f"{HARNESS_USAGE_PROVIDER!r}"
             )
@@ -783,14 +922,14 @@ def verify_harness_lane(
 
         if not isinstance(turns, int) or turns < MIN_HARNESS_TURNS:
             problems.append(
-                f"step {index} '{name}': raw.harness.turns={turns!r}. The gate "
+                f"{label}: raw.harness.turns={turns!r}. The gate "
                 f"needs at least {MIN_HARNESS_TURNS} turns for the summation "
                 "check to mean anything - with one turn 'summed' and 'last "
                 "response' are the same number"
             )
         elif input_tokens is None or output_tokens is None:
             problems.append(
-                f"step {index} '{name}': input_tokens={input_tokens!r} "
+                f"{label}: input_tokens={input_tokens!r} "
                 f"output_tokens={output_tokens!r} - a harness step that ran "
                 f"{turns} turns against a usage-reporting endpoint must have "
                 "both"
@@ -801,7 +940,7 @@ def verify_harness_lane(
             largest_out = MOCK_COMPLETION_TOKENS_PER_TURN * turns
             if input_tokens <= largest_in or output_tokens <= largest_out:
                 problems.append(
-                    f"step {index} '{name}': usage was NOT summed across "
+                    f"{label}: usage was NOT summed across "
                     f"turns. Over {turns} turns the mock endpoint's largest "
                     f"single turn declares {largest_in} prompt / {largest_out} "
                     f"completion tokens; this row records {input_tokens} / "
@@ -818,7 +957,7 @@ def verify_harness_lane(
         # 14. gpu-node pricing.
         if detail.get("cost_source") != GPU_NODE_COST_SOURCE:
             problems.append(
-                f"step {index} '{name}': cost_source="
+                f"{label}: cost_source="
                 f"{detail.get('cost_source')!r}, expected "
                 f"{GPU_NODE_COST_SOURCE!r}. The dogfood endpoints carry a real "
                 "rate_usd_hour, so the 12.5 gpu-node pricing branch must have "
@@ -827,7 +966,7 @@ def verify_harness_lane(
             )
         elif detail.get("cost_usd") is None:
             problems.append(
-                f"step {index} '{name}': cost_source is "
+                f"{label}: cost_source is "
                 f"{GPU_NODE_COST_SOURCE!r} but cost_usd is null - a priced "
                 "source with no price is the one combination that means "
                 "nothing"
@@ -837,13 +976,13 @@ def verify_harness_lane(
         if mode == "text":
             if record.get("mode") != "text":
                 problems.append(
-                    f"step {index} '{name}': pinned harness.mode='text' but "
+                    f"{label}: pinned harness.mode='text' but "
                     f"raw.harness.mode={record.get('mode')!r}. The step did "
                     "not run the no-tools fallback protocol it was told to"
                 )
             elif "malformed_responses" not in record:
                 problems.append(
-                    f"step {index} '{name}': raw.harness has no "
+                    f"{label}: raw.harness has no "
                     "'malformed_responses' key. The fallback parser must "
                     "record its own miss count (0 is a fine value; the KEY "
                     "missing means the path did not account for itself)"
@@ -923,9 +1062,16 @@ def main() -> None:
             "FAIL: LAZYAF_PIPELINE_RUN_ID is not set - the local "
             "execution path did not inject its env contract"
         )
-    raw_index = os.environ.get("LAZYAF_STEP_INDEX")
-    self_index = int(raw_index) if raw_index is not None else None
-    print(verify_run(base_url, run_id, self_index=self_index))
+    # 12.8: the gate identifies ITSELF by graph node id. LAZYAF_STEP_INDEX is
+    # still injected and still addresses the step everywhere else, but this
+    # one read moved: the index is derived from the graph's key insertion
+    # order, and a gate whose self-exemption depends on that ordering is a
+    # gate that silently starts exempting a different step when the order
+    # changes. An empty or absent value is None - nothing is exempted, and
+    # the gate fails on its own still-streaming logs rather than quietly
+    # exempting nobody-knows-which step.
+    self_id = os.environ.get("LAZYAF_STEP_ID") or None
+    print(verify_run(base_url, run_id, self_id=self_id))
 
 
 if __name__ == "__main__":

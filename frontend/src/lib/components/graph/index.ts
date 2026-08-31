@@ -7,4 +7,6 @@ export { default as ConditionEdge } from './ConditionEdge.svelte';
 export { default as NodePalette } from './NodePalette.svelte';
 export { default as GraphToolbar } from './GraphToolbar.svelte';
 export { default as ContextMenu } from './ContextMenu.svelte';
+export { default as ConnectPanel } from './ConnectPanel.svelte';
 export { default as StepConfigModal } from './StepConfigModal.svelte';
+export { graphStepOrder, graphStepList } from './order';

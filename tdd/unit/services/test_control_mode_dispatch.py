@@ -47,9 +47,13 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
-# Add backend to path for imports
+# Add backend and tdd to path for imports
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
+tdd_path = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(backend_path))
+sys.path.insert(0, str(tdd_path))
+
+from shared.factories.pipelines import make_repo_and_graph_pipeline  # noqa: E402
 
 from app.database import Base
 from app.models import Pipeline, PipelineRun, Repo, StepRun
@@ -233,25 +237,20 @@ async def env(tmp_path):
 
 
 async def make_repo_and_pipeline(factory, steps: list[dict]):
-    async with factory() as db:
-        repo = Repo(
-            id=str(uuid4()),
-            name="control-dispatch-repo",
-            default_branch="main",
-            is_ingested=True,
-        )
-        pipeline = Pipeline(
-            id=str(uuid4()),
-            repo_id=repo.id,
-            name="control-dispatch-pipeline",
-            steps=json.dumps(steps),
-        )
-        db.add(repo)
-        db.add(pipeline)
-        await db.commit()
-        await db.refresh(repo)
-        await db.refresh(pipeline)
-        return repo, pipeline
+    """A repo and a pipeline whose definition is the LINEAR GRAPH `steps` describes.
+
+    12.8: the argument shape is unchanged - the same `list[dict]` every call
+    site below already passes - and so is the persisted node ORDER, whose ids
+    are `step_0..step_N`. What changed is the column: `steps_graph`, not
+    `steps`.
+
+    This was one of seven byte-identical copies. It is now one line onto
+    `tdd/shared/factories/pipelines`, so the next change to how a test
+    pipeline is persisted happens once (R3).
+    """
+    return await make_repo_and_graph_pipeline(
+        factory, steps, name="control-dispatch-pipeline", repo_name="control-dispatch-repo",
+    )
 
 
 async def run_pipeline(env, steps: list[dict]) -> str:

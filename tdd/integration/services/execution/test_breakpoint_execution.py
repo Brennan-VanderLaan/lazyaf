@@ -45,7 +45,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import selectinload
 
 backend_path = Path(__file__).resolve().parents[4] / "backend"
+tdd_path = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(backend_path))
+sys.path.insert(0, str(tdd_path))
+
+from shared.factories.pipelines import make_repo_and_graph_pipeline  # noqa: E402
 
 from app.database import Base
 from app.models import Pipeline, PipelineRun, Repo, StepRun
@@ -195,25 +199,20 @@ def script_step(name: str, command: str) -> dict:
 
 
 async def make_repo_and_pipeline(factory, steps: list[dict]):
-    async with factory() as db:
-        repo = Repo(
-            id=str(uuid4()),
-            name="breakpoint-repo",
-            default_branch="main",
-            is_ingested=True,
-        )
-        pipeline = Pipeline(
-            id=str(uuid4()),
-            repo_id=repo.id,
-            name="breakpoint-pipeline",
-            steps=json.dumps(steps),
-        )
-        db.add(repo)
-        db.add(pipeline)
-        await db.commit()
-        await db.refresh(repo)
-        await db.refresh(pipeline)
-        return repo, pipeline
+    """A repo and a pipeline whose definition is the LINEAR GRAPH `steps` describes.
+
+    12.8: the argument shape is unchanged - the same `list[dict]` every call
+    site below already passes - and so is the persisted node ORDER, whose ids
+    are `step_0..step_N`. What changed is the column: `steps_graph`, not
+    `steps`.
+
+    This was one of seven byte-identical copies. It is now one line onto
+    `tdd/shared/factories/pipelines`, so the next change to how a test
+    pipeline is persisted happens once (R3).
+    """
+    return await make_repo_and_graph_pipeline(
+        factory, steps, name="breakpoint-pipeline", repo_name="breakpoint-repo",
+    )
 
 
 async def start_and_wait(env, pipeline, repo, **kwargs) -> PipelineRun:
@@ -415,14 +414,14 @@ class TestBreakpointLoopOnRealDocker:
         assert original.status == RunStatus.PASSED.value
 
         session_id, run_id = await start_debug_rerun(
-            env, original, pipeline, repo, ["1", "2"]
+            env, original, pipeline, repo, ["step_1", "step_2"]
         )
 
         # --- paused before step 1 -----------------------------------------
-        session = await wait_for_pause(env, session_id, "1")
+        session = await wait_for_pause(env, session_id, "step_1")
         assert session.current_step_name == "Middle"
         assert session.current_step_executor == "local"
-        assert json.loads(session.hit_breakpoints) == ["1"]
+        assert json.loads(session.hit_breakpoints) == ["step_1"]
 
         run = await fetch_run(env, run_id)
         assert run.trigger_type == TRIGGER_TYPE_DEBUG_RERUN
@@ -499,8 +498,8 @@ class TestBreakpointLoopOnRealDocker:
 
         # --- resume into the SECOND breakpoint (C5) -----------------------
         await resume(env, session_id)
-        second = await wait_for_pause(env, session_id, "2")
-        assert json.loads(second.hit_breakpoints) == ["1", "2"], (
+        second = await wait_for_pause(env, session_id, "step_2")
+        assert json.loads(second.hit_breakpoints) == ["step_1", "step_2"], (
             "resume must return the session to PENDING so the next breakpoint "
             "has a live session to pause into - failure_01 ended it here"
         )
@@ -548,9 +547,9 @@ class TestWorkspacePreservedAtBreakpoint:
         assert original.status == RunStatus.PASSED.value
 
         session_id, run_id = await start_debug_rerun(
-            env, original, pipeline, repo, ["0"]
+            env, original, pipeline, repo, ["step_0"]
         )
-        await wait_for_pause(env, session_id, "0")
+        await wait_for_pause(env, session_id, "step_0")
 
         assert volume_exists(env.docker, run_id), (
             "a breakpoint on step 0 must still have a workspace volume - that "
@@ -594,9 +593,9 @@ class TestAbortAtBreakpoint:
         original = await start_and_wait(env, pipeline, repo)
 
         session_id, run_id = await start_debug_rerun(
-            env, original, pipeline, repo, ["1"]
+            env, original, pipeline, repo, ["step_1"]
         )
-        await wait_for_pause(env, session_id, "1")
+        await wait_for_pause(env, session_id, "step_1")
         container_id, _stream = await sidecar_shell(env, session_id, run_id)
         assert env.docker.containers.get(container_id).status == "running"
 
@@ -623,9 +622,9 @@ class TestOrphanSidecarSweep:
         )
         original = await start_and_wait(env, pipeline, repo)
         session_id, run_id = await start_debug_rerun(
-            env, original, pipeline, repo, ["1"]
+            env, original, pipeline, repo, ["step_1"]
         )
-        await wait_for_pause(env, session_id, "1")
+        await wait_for_pause(env, session_id, "step_1")
         container_id, _stream = await sidecar_shell(env, session_id, run_id)
 
         # A sweep that still knows about this session must NOT touch it.

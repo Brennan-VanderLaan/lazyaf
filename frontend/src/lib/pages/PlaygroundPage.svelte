@@ -1,9 +1,20 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
-  import { playgroundStore, isRunning, canStart, hasResult } from '../stores/playground';
+  import {
+    playgroundStore,
+    isRunning,
+    canStart,
+    hasResult,
+    attachmentGate,
+    limitsSentence,
+  } from '../stores/playground';
   import { modelsStore, claudeModels, geminiModels, modelsLoading } from '../stores/models';
-  import { EndpointOptionGroup } from '../components/endpoint';
-  import { endpointsStore } from '../stores/endpoints';
+  // CapabilityChecks is THE capability display (Lane B). Imported, never
+  // reimplemented: a second copy is a second place for "never probed" to start
+  // quietly looking like "not supported", which is the one thing the six-state
+  // vocabulary exists to prevent (R3).
+  import { CapabilityChecks, EndpointOptionGroup } from '../components/endpoint';
+  import { endpointModelValue, endpointsStore, HARNESS_AGENT } from '../stores/endpoints';
   import { selectedRepoId, selectedRepo } from '../stores/repos';
   import { agentFilesStore } from '../stores/agentFiles';
   import { repos, lazyafFiles } from '../api/client';
@@ -91,6 +102,66 @@
         }
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Modalities: what the chosen model can be GIVEN, and what a human may
+  // attach here (14.5)
+  // -------------------------------------------------------------------------
+
+  /** `endpointsStore.probing` is its own store; `$` needs a local binding. */
+  const endpointProbing = endpointsStore.probing;
+
+  /**
+   * The endpoint this page is pointed at, or null.
+   *
+   * Matched by PRODUCING the option value and comparing, never by parsing
+   * `endpoint:<name>` apart. `resolve_step_endpoint` is the only parser of
+   * that sugar spelling by construction (cross-agent contract #4), and the
+   * whole reason `stores/endpoints` exports `endpointModelValue` is so that
+   * surfaces like this one can round-trip the value without becoming a second
+   * parser that drifts.
+   */
+  $: selectedEndpoint =
+    $playgroundStore.model
+      ? $endpointsStore.find((e) => endpointModelValue(e.name) === $playgroundStore.model) ?? null
+      : null;
+
+  /** The PLATFORM's answer for images, from GET /api/playground/capabilities. */
+  $: imagesPlatform =
+    $playgroundStore.capabilities?.modalities?.find((m) => m.modality === 'images') ?? null;
+
+  /**
+   * May a human attach an image right now, and if not, WHICH link said no.
+   *
+   * Every state is a disabled control with its own sentence. The two that must
+   * never read alike are `unprobed` ("nobody asked - probe it") and
+   * `undetectable` ("the server took the image, returned 200, and the prompt
+   * token count did not move"); the second is the dangerous one, because the
+   * request succeeds while the input vanishes.
+   */
+  $: attachGate = attachmentGate({
+    runnerType: $playgroundStore.runnerType,
+    endpoint: selectedEndpoint,
+    platform: imagesPlatform,
+  });
+
+  /** The caps, in the SERVER's numbers rather than a second copy of them. */
+  $: attachLimits = limitsSentence($playgroundStore.capabilities?.attachment_limits ?? null);
+
+  $: attachAccept = ($playgroundStore.capabilities?.attachment_limits?.media_types ?? []).join(',');
+
+  /** True while this page is pointed at a self-hosted endpoint. */
+  $: harnessSelected = $playgroundStore.runnerType === HARNESS_AGENT;
+
+  function handleProbeSelectedEndpoint() {
+    if (!selectedEndpoint) return;
+    // Never swallowed: the store surfaces a failed REQUEST by throwing, and a
+    // probe that reports a broken endpoint is a 200 with a red record, which
+    // arrives through the normal store update.
+    void endpointsStore.probe(selectedEndpoint.id).catch((e) => {
+      console.error('[playground] probe failed', e);
+    });
   }
 
   // Follow new output. Narrow dependency on purpose: `logs` only gets a new
@@ -397,6 +468,10 @@
     modelsStore.load();
     // M14: the merged selector needs the endpoint registry too.
     void endpointsStore.load();
+    // 14.5: what the PLAYGROUND can carry, as opposed to what an endpoint can
+    // receive. Both have to be true before anything may be attached, and a
+    // failed read leaves the attach control disabled saying exactly that.
+    void playgroundStore.loadCapabilities();
 
     if ($selectedRepoId) {
       playgroundStore.setConfig({ repoId: $selectedRepoId });
@@ -565,6 +640,111 @@
             </select>
           </div>
         </div>
+
+        <!--
+          WHAT THIS MODEL CAN BE GIVEN (14.5).
+
+          Directly under the model select, because it is an answer about the
+          thing that was just chosen and it changes what the box below it may
+          contain. The strip itself is `CapabilityChecks` - the SAME component
+          the Endpoints page and the endpoint modal render, in its `panel`
+          variant. There is deliberately no playground-specific copy of it: a
+          second copy is a second place for "never probed" to start looking
+          like "not supported".
+        -->
+        <section class="modality-section" data-testid="playground-modalities">
+          <h3>What this model can be given</h3>
+
+          {#if !harnessSelected}
+            <!--
+              R1, in the quiet direction. Claude Code and Gemini are CLI
+              agents driven by /api/models, not endpoint rows, so there is no
+              capability record to render for them - and an empty strip beside
+              a green one would read as "Claude cannot see images", which is
+              false. Say what is actually true instead.
+            -->
+            <p class="modality-note" data-testid="modality-cli-note">
+              <strong>{$playgroundStore.runnerType === 'gemini' ? 'Gemini' : 'Claude Code'}</strong>
+              is a CLI agent, not a model endpoint. What it can read is a property
+              of that CLI and of the files in the workspace, not of anything LazyAF
+              probed - so there is no capability record to show here. A blank strip
+              is not a claim that it cannot see images.
+            </p>
+          {:else if !selectedEndpoint}
+            <p class="modality-note" data-testid="modality-no-endpoint">
+              Pick a self-hosted endpoint above to see what it accepts. Nothing
+              has been asked about this configuration yet.
+            </p>
+          {:else}
+            <CapabilityChecks
+              endpoint={selectedEndpoint}
+              variant="panel"
+              onProbe={handleProbeSelectedEndpoint}
+              probing={$endpointProbing.includes(selectedEndpoint.id)}
+            />
+          {/if}
+
+          <!--
+            THE ATTACH CONTROL.
+
+            Rendered in every state and DISABLED with the reason, never hidden.
+            That is the same doctrine `toOption` applies to an unusable
+            endpoint: a control that vanishes is indistinguishable from a
+            feature that does not exist, and someone who cannot see why they
+            cannot attach will go looking for the wrong fix.
+
+            It is a BUTTON and not an `<input type="file">` on purpose. A file
+            input that is enabled by accident consumes a file and drops it;
+            a button that is enabled by accident does nothing. When the
+            delivery path lands (see ATTACHMENT_DELIVERY_GAP in
+            backend/app/schemas/playground.py) the picker is wired HERE, and
+            the gate above already computes when it may open.
+          -->
+          <div class="attach-block" data-testid="playground-attach">
+            <div class="attach-head">
+              <button
+                type="button"
+                class="btn-secondary attach-btn"
+                data-testid="attach-images-btn"
+                data-enabled={attachGate.enabled ? 'true' : 'false'}
+                data-blocked-by={attachGate.blockedBy ?? ''}
+                data-modality-state={attachGate.state ?? ''}
+                data-accept={attachAccept}
+                disabled={!attachGate.enabled || $isRunning}
+                title={attachGate.reason}
+              >
+                Attach images
+              </button>
+              {#if attachGate.state}
+                <span class="attach-state" data-testid="attach-state">
+                  images: {attachGate.state.replace('_', ' ')}
+                </span>
+              {/if}
+            </div>
+
+            <p class="attach-reason" data-testid="attach-reason">{attachGate.reason}</p>
+
+            {#if attachGate.next}
+              <p class="attach-next" data-testid="attach-next">{attachGate.next}</p>
+            {/if}
+
+            <!--
+              The limits are the SERVER's numbers, read from
+              GET /api/playground/capabilities. A "max 5 MiB" typed in here
+              beside a `5 * 1024 * 1024` in the validator is two sources of
+              truth for one contract (R3), and the half that drifts is always
+              the sentence.
+            -->
+            <p class="attach-limits" data-testid="attach-limits">{attachLimits}</p>
+
+            {#if $playgroundStore.capabilitiesError}
+              <p class="attach-error" data-testid="attach-capabilities-error">
+                The playground's own limits could not be read:
+                {$playgroundStore.capabilitiesError}
+              </p>
+            {/if}
+          </div>
+        </section>
 
         <div class="form-group">
           <label for="task">Task Description</label>
@@ -992,6 +1172,89 @@
     font-size: 0.8rem;
     color: var(--text-muted);
     font-style: italic;
+  }
+
+  /* Modalities (14.5) ----------------------------------------------------- */
+
+  .modality-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: var(--badge-bg);
+  }
+
+  .modality-section h3 {
+    margin: 0;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+  }
+
+  .modality-note {
+    margin: 0;
+    font-size: 0.8rem;
+    line-height: 1.45;
+    color: var(--text-muted);
+  }
+
+  .attach-block {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid var(--border-color);
+  }
+
+  .attach-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .attach-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .attach-state {
+    font-size: 0.75rem;
+    font-variant: small-caps;
+    color: var(--text-muted);
+  }
+
+  /* The reason is not a tooltip. A control disabled for a reason nobody wrote
+     down on screen is the failure this whole section exists to avoid, and a
+     `title` is invisible to anyone not holding a mouse over it. */
+  .attach-reason {
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    color: var(--text-color);
+  }
+
+  .attach-next {
+    margin: 0;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--warning-color);
+  }
+
+  .attach-limits {
+    margin: 0;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+
+  .attach-error {
+    margin: 0;
+    font-size: 0.75rem;
+    color: var(--error-color);
   }
 
   .button-group {

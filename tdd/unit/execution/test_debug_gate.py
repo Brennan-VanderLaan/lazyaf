@@ -32,6 +32,7 @@ from app.models.pipeline import RunStatus, StepExecution
 from app.services.execution import debug_session_service as service_module
 from app.services.execution.debug_session_service import (
     DebugGateOutcome,
+    DebugSessionError,
     debug_session_service,
 )
 from app.services.execution.debug_state import DebugState
@@ -208,7 +209,8 @@ async def env(tmp_path, monkeypatch):
     await engine.dispose()
 
 
-async def seed(factory, steps=None, graph=None):
+async def seed(factory, graph=None):
+    graph = SCRIPT_GRAPH if graph is None else graph
     async with factory() as db:
         repo = Repo(
             id=str(uuid4()), name="debug-repo", default_branch="main", is_ingested=True
@@ -220,8 +222,7 @@ async def seed(factory, steps=None, graph=None):
             id=str(uuid4()),
             repo_id=repo.id,
             name="debug-pipeline",
-            steps=json.dumps(steps) if steps is not None else None,
-            steps_graph=json.dumps(graph) if graph is not None else None,
+            steps_graph=json.dumps(graph),
         )
         db.add(pipeline)
         await db.commit()
@@ -234,7 +235,7 @@ async def seed(factory, steps=None, graph=None):
             trigger_context=json.dumps({"branch": "main", "commit_sha": "abc1234"}),
             current_step=0,
             steps_completed=0,
-            steps_total=len(steps or []),
+            steps_total=len(graph.get("steps") or {}),
         )
         db.add(original)
         await db.commit()
@@ -242,10 +243,35 @@ async def seed(factory, steps=None, graph=None):
         return repo, pipeline, original
 
 
-SCRIPT_STEPS = [
-    {"name": "first", "type": "script", "config": {"command": "echo one"}},
-    {"name": "second", "type": "script", "config": {"command": "echo two"}},
-]
+#: The default fixture: a two-step LINEAR GRAPH. 12.8 retires the v1 array,
+#: so a breakpoint names a step by its graph `step_id` ("first"/"second") and
+#: never by position - the index keys these tests used to pass could not
+#: address a step any more, and a breakpoint that cannot be named is a
+#: breakpoint that silently never fires.
+SCRIPT_GRAPH = {
+    "version": 2,
+    "entry_points": ["first"],
+    "steps": {
+        "first": {
+            "name": "first",
+            "type": "script",
+            "config": {"command": "echo one"},
+        },
+        "second": {
+            "name": "second",
+            "type": "script",
+            "config": {"command": "echo two"},
+        },
+    },
+    "edges": [
+        {
+            "id": "edge_0_success",
+            "from_step": "first",
+            "to_step": "second",
+            "condition": "success",
+        }
+    ],
+}
 
 
 async def wait_until(predicate, timeout=20.0, interval=0.02):
@@ -273,7 +299,7 @@ async def read_session(factory, session_id) -> DebugSession:
 
 class TestGateIsInertForOrdinaryRuns:
     async def test_no_session_means_resume_without_pausing(self, env):
-        repo, pipeline, _original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, _original = await seed(env.factory)
         async with env.factory() as db:
             run = await env.executor.start_pipeline(db, pipeline, repo)
         await env.executor.wait_for_run(run.id)
@@ -283,7 +309,7 @@ class TestGateIsInertForOrdinaryRuns:
         assert len(env.local.ran) == 2
 
     async def test_gate_result_reports_it_never_paused(self, env):
-        repo, pipeline, _original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, _original = await seed(env.factory)
         async with env.factory() as db:
             run = await env.executor.start_pipeline(db, pipeline, repo)
         await env.executor.wait_for_run(run.id)
@@ -300,14 +326,14 @@ class TestGateIsInertForOrdinaryRuns:
         assert result.paused is False
 
     async def test_a_step_not_named_by_a_breakpoint_is_not_paused(self, env):
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["1"],
+                breakpoints=["second"],
             )
         # Step 0 is not breakpointed: it runs, and the run reaches step 1.
         await wait_until(
@@ -331,14 +357,14 @@ async def _session_status(factory, session_id, state) -> bool:
 
 class TestGatePausesAndResumes:
     async def test_breakpoint_pauses_before_the_step_executes(self, env):
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
         await wait_until(
             lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -346,10 +372,10 @@ class TestGatePausesAndResumes:
         assert env.local.ran == [], "the step must NOT have executed at the gate"
 
         row = await read_session(env.factory, session.id)
-        assert row.current_step_key == "0"
+        assert row.current_step_key == "first"
         assert row.current_step_name == "first"
         assert row.current_step_executor == "local"
-        assert json.loads(row.hit_breakpoints) == ["0"]
+        assert json.loads(row.hit_breakpoints) == ["first"]
         assert row.expires_at is not None
 
         async with env.factory() as db:
@@ -360,7 +386,7 @@ class TestGatePausesAndResumes:
     async def test_the_session_row_exists_before_any_step_run_does(self, env):
         """The create-ordering fix: failure_01 never started the run at all,
         and starting it before the row lands is a race the entry step wins."""
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         observed: list[bool] = []
 
         original_gate = debug_session_service.gate
@@ -385,7 +411,7 @@ class TestGatePausesAndResumes:
                     original_run=original,
                     pipeline=pipeline,
                     repo=repo,
-                    breakpoints=["0"],
+                    breakpoints=["first"],
                 )
             await wait_until(
                 lambda: _session_status(
@@ -405,14 +431,14 @@ class TestGatePausesAndResumes:
 
     async def test_a_paused_gate_broadcasts_debug_session_status(self, env):
         """R6: the REAL ConnectionManager, so an arity bug is a real failure."""
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
         await wait_until(
             lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -421,7 +447,7 @@ class TestGatePausesAndResumes:
         assert frames, "the pause must be visible on the WS channel"
         waiting = [f for f in frames if f["status"] == DebugState.WAITING_AT_BP.value]
         assert waiting
-        assert waiting[-1]["current_step"]["key"] == "0"
+        assert waiting[-1]["current_step"]["key"] == "first"
         assert waiting[-1]["attach_available"] is True
 
         async with env.factory() as db:
@@ -430,14 +456,14 @@ class TestGatePausesAndResumes:
 
     async def test_the_paused_step_says_so_in_its_own_logs(self, env):
         """C11: one writer, and the plain log view still explains the pause."""
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
 
         async def notice_landed():
@@ -455,6 +481,232 @@ class TestGatePausesAndResumes:
         async with env.factory() as db:
             await debug_session_service.resume(db, session.id)
         await env.executor.wait_for_run(run.id)
+
+
+# -----------------------------------------------------------------------------
+# 12.8: the key IS the graph step id
+# -----------------------------------------------------------------------------
+
+
+class TestABreakpointOnAGraphStepIdFires:
+    """The retirement's load-bearing debug property.
+
+    "The run completed" is not evidence: it passes by NOT stopping, which is
+    exactly the failure a mis-keyed breakpoint produces. Every test here
+    asserts on the step that was HELD - which step ran, which did not, and
+    what the paused row names.
+    """
+
+    #: Ids deliberately unlike both the step NAMES and the step POSITIONS, so
+    #: a key resolved from either would miss.
+    GRAPH = {
+        "version": 2,
+        "entry_points": ["alpha"],
+        "steps": {
+            "alpha": {
+                "name": "Step One",
+                "type": "script",
+                "config": {"command": "echo a"},
+            },
+            "omega": {
+                "name": "Step Two",
+                "type": "script",
+                "config": {"command": "echo o"},
+            },
+        },
+        "edges": [
+            {
+                "id": "edge_0_success",
+                "from_step": "alpha",
+                "to_step": "omega",
+                "condition": "success",
+            }
+        ],
+    }
+
+    async def test_the_named_step_is_held_and_its_upstream_is_not(self, env):
+        repo, pipeline, original = await seed(env.factory, graph=self.GRAPH)
+        async with env.factory() as db:
+            session, run = await debug_session_service.create(
+                db,
+                original_run=original,
+                pipeline=pipeline,
+                repo=repo,
+                breakpoints=["omega"],
+            )
+        await wait_until(
+            lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
+        )
+
+        async with env.factory() as db:
+            rows = {
+                row.step_id: row
+                for row in (
+                    await db.execute(
+                        select(StepRun).where(StepRun.pipeline_run_id == run.id)
+                    )
+                ).scalars().all()
+            }
+        assert rows["alpha"].status == RunStatus.PASSED.value, (
+            "the upstream step must really have run - a gate that paused the "
+            "wrong step would leave this one untouched"
+        )
+        assert rows["omega"].status == RunStatus.RUNNING.value
+        assert len(env.local.ran) == 1, (
+            "the breakpointed step must NOT have executed"
+        )
+
+        row = await read_session(env.factory, session.id)
+        assert row.current_step_key == "omega"
+        # The NAME comes from a different field than the key does, so this
+        # pins that the key is the id and not the display name.
+        assert row.current_step_name == "Step Two"
+        assert row.current_step_index == 1
+        assert json.loads(row.hit_breakpoints) == ["omega"]
+
+        async with env.factory() as db:
+            await debug_session_service.resume(db, session.id)
+        await env.executor.wait_for_run(run.id)
+        assert len(env.local.ran) == 2, "resume must let the held step run"
+        async with env.factory() as db:
+            assert (await db.get(PipelineRun, run.id)).status == RunStatus.PASSED.value
+
+    async def test_a_position_style_key_is_refused_naming_the_real_ones(self, env):
+        """v1 addressed steps by index, so `"1"` is what a stale stored
+        breakpoint - or a habit - looks like. It must be a refusal that names
+        the keys that DO exist, never an accepted breakpoint that quietly
+        never fires (contract C2, and the migration's stale-key risk)."""
+        repo, pipeline, original = await seed(env.factory, graph=self.GRAPH)
+        async with env.factory() as db:
+            with pytest.raises(DebugSessionError) as exc:
+                await debug_session_service.create(
+                    db,
+                    original_run=original,
+                    pipeline=pipeline,
+                    repo=repo,
+                    breakpoints=["1"],
+                )
+        message = str(exc.value)
+        assert "1" in message
+        assert "alpha" in message and "omega" in message
+
+        async with env.factory() as db:
+            started = (
+                await db.execute(
+                    select(PipelineRun).where(
+                        PipelineRun.trigger_type == "debug_rerun"
+                    )
+                )
+            ).scalars().all()
+        assert started == [], "a refused create must not have started a run"
+
+    async def test_a_row_with_no_step_id_cannot_answer_a_breakpoint(self, env):
+        """The marker's identity rule, at the real gate.
+
+        `_spawn_fix_card`'s `trigger:` marker carries a REAL step's
+        `step_index` and no `step_id`. This graph's entry step is legally
+        named `"0"`, so an index-keyed fallback would make the marker answer
+        to that step's breakpoint - the gate would hold a row that is not a
+        step and is already terminal.
+        """
+        graph = {
+            "version": 2,
+            "entry_points": ["0"],
+            "steps": {
+                "0": {"name": "zero", "type": "script", "config": {"command": "e"}},
+                "next": {"name": "next", "type": "script", "config": {"command": "e"}},
+            },
+            "edges": [],
+        }
+        repo, pipeline, _original = await seed(env.factory, graph=graph)
+        async with env.factory() as db:
+            run = PipelineRun(
+                id=str(uuid4()),
+                pipeline_id=pipeline.id,
+                status=RunStatus.RUNNING.value,
+                trigger_type="debug_rerun",
+                current_step=0,
+                steps_completed=0,
+                steps_total=2,
+            )
+            db.add(run)
+            await db.commit()
+            marker = StepRun(
+                id=str(uuid4()),
+                pipeline_run_id=run.id,
+                step_index=0,          # the breakpointed step's own index
+                step_id=None,          # ... and deliberately no id
+                step_name="[Fix] repair it",
+                status=RunStatus.RUNNING.value,
+                executor="local",
+            )
+            real = StepRun(
+                id=str(uuid4()),
+                pipeline_run_id=run.id,
+                step_index=0,
+                step_id="0",
+                step_name="zero",
+                status=RunStatus.RUNNING.value,
+                executor="local",
+            )
+            db.add(marker)
+            db.add(real)
+            db.add(
+                DebugSession(
+                    id=str(uuid4()),
+                    pipeline_run_id=run.id,
+                    status=DebugState.PENDING.value,
+                    breakpoints=json.dumps(["0"]),
+                    hit_breakpoints=json.dumps([]),
+                    timeout_seconds=3600,
+                    max_timeout_seconds=14400,
+                )
+            )
+            await db.commit()
+
+        result = await asyncio.wait_for(
+            debug_session_service.gate(
+                env.factory, run.id, marker.id, SimpleNamespace(value="local")
+            ),
+            timeout=5.0,
+        )
+        assert result.outcome is DebugGateOutcome.RESUME
+        assert result.paused is False, (
+            "a row with no step_id is not a step; the gate must not hold it"
+        )
+        assert env.workspace.op_names() == [], (
+            "and it must not have pinned a workspace for it either"
+        )
+
+        # The step whose index it borrowed still pauses - the breakpoint is
+        # live, so the RESUME above was about identity and not about a
+        # breakpoint that never worked.
+        gate_task = asyncio.create_task(
+            debug_session_service.gate(
+                env.factory, run.id, real.id, SimpleNamespace(value="local")
+            )
+        )
+        try:
+            async with env.factory() as db:
+                session_id = (
+                    await db.execute(
+                        select(DebugSession).where(
+                            DebugSession.pipeline_run_id == run.id
+                        )
+                    )
+                ).scalar_one().id
+            await wait_until(
+                lambda: _session_status(
+                    env.factory, session_id, DebugState.WAITING_AT_BP
+                )
+            )
+            row = await read_session(env.factory, session_id)
+            assert row.current_step_key == "0"
+            assert row.current_step_name == "zero"
+        finally:
+            async with env.factory() as db:
+                await debug_session_service.resume(db, session_id)
+            await asyncio.wait_for(gate_task, timeout=5.0)
 
 
 # -----------------------------------------------------------------------------
@@ -526,14 +778,14 @@ class TestGatePlacementDoesNotHoldTheRunLock:
     async def test_the_database_is_writable_while_a_step_is_paused(self, env):
         """Contract C4: the gate holds no session across the pause. A pinned
         connection or an aging transaction snapshot would show up here."""
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
         await wait_until(
             lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -561,14 +813,14 @@ class TestPausedStepIsNotReapable:
         """Contract C3, the structural half. No row means no `timeout_at`,
         no `last_heartbeat`, and nothing for the orphan recovery to find -
         heartbeat suspension by PLACEMENT, with no suspension flag."""
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
         await wait_until(
             lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -598,14 +850,14 @@ class TestPausedStepIsNotReapable:
         against a paused run and assert it returns nothing."""
         from app.services.execution.recovery import recover_orphaned_executions
 
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
         await wait_until(
             lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -637,14 +889,14 @@ class TestRowIsTheTruth:
         """Contract C6. Nothing pokes the event here: the row is edited from
         an unrelated session, and the gate's next poll must notice. A design
         that trusted the in-memory event would hang forever."""
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
         await wait_until(
             lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -678,14 +930,14 @@ class TestRowIsTheTruth:
         """Contract C7 + the reuse property: a timed-out gate finishes the
         step through `_finish_local_step`, so there is no second terminal
         path for debug runs to drift from."""
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
         await wait_until(
             lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -731,14 +983,14 @@ class TestWorkspacePin:
     async def test_the_volume_is_pinned_while_paused_and_released_after(self, env):
         """Contract C8. Without the pin, a breakpoint on step 0 would attach a
         sidecar to a volume that does not exist yet."""
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             session, run = await debug_session_service.create(
                 db,
                 original_run=original,
                 pipeline=pipeline,
                 repo=repo,
-                breakpoints=["0"],
+                breakpoints=["first"],
             )
         await wait_until(
             lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
@@ -758,7 +1010,7 @@ class TestWorkspacePin:
     async def test_a_remote_step_is_paused_without_a_local_pin(self, env):
         """C16/§5: a remote step's volume lives on the runner host, so the
         backend must not create one - the pause is still real."""
-        repo, pipeline, original = await seed(env.factory, steps=SCRIPT_STEPS)
+        repo, pipeline, original = await seed(env.factory)
         async with env.factory() as db:
             run = PipelineRun(
                 id=str(uuid4()),
@@ -775,6 +1027,7 @@ class TestWorkspacePin:
                 id=str(uuid4()),
                 pipeline_run_id=run.id,
                 step_index=0,
+                step_id="first",
                 step_name="first",
                 status=RunStatus.RUNNING.value,
                 executor="remote",
@@ -784,7 +1037,7 @@ class TestWorkspacePin:
                 id=str(uuid4()),
                 pipeline_run_id=run.id,
                 status=DebugState.PENDING.value,
-                breakpoints=json.dumps(["0"]),
+                breakpoints=json.dumps(["first"]),
                 hit_breakpoints=json.dumps([]),
                 timeout_seconds=3600,
                 max_timeout_seconds=14400,

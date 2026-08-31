@@ -35,7 +35,7 @@ from app.models.spec import (  # noqa: E402
     PromptTemplate,
     UserStory,
 )
-from app.schemas._patch import _reject_null, not_null  # noqa: E402
+from app.schemas._patch import not_null  # noqa: E402
 from app.schemas.agent_file import AgentFileUpdate  # noqa: E402
 from app.schemas.card import CardUpdate  # noqa: E402
 from app.schemas.experiment import ExperimentUpdate  # noqa: E402
@@ -74,17 +74,38 @@ CLEARABLE_IDS = [entry[0] for entry in CLEARABLE]
 
 
 def _guarded_fields(schema) -> set:
-    """The fields `schema` refuses an explicit null on."""
+    """The fields `schema` refuses an explicit null on — measured, not read.
+
+    Was a scan for validators whose function *is* ``_reject_null``. That
+    measured the MECHANISM, and 12.8 P3 gave the mechanism a second
+    legitimate spelling: ``PipelineUpdate.steps`` left ``not_null(...)``
+    because that helper's premise is "this field maps to a NOT NULL column",
+    and ``steps`` stopped being written to ``pipelines.steps`` at all — the
+    boundary converts it into ``steps_graph``, and P6 drops the column. It
+    kept its own ``_steps_is_never_null`` validator, so the wire behaviour is
+    identical and only the reason changed.
+
+    Probing the behaviour instead keeps every assertion below true, keeps
+    ``steps`` inside the ratchet rather than exempted from it, and means a
+    future field guarded some third way is still counted. R4: this is the
+    strictly stronger test, not the accommodating one.
+    """
     guarded = set()
-    for decorator in schema.__pydantic_decorators__.field_validators.values():
-        function = getattr(decorator.func, "__func__", decorator.func)
-        if function is _reject_null:
-            guarded.update(decorator.info.fields)
+    for field in schema.model_fields:
+        try:
+            schema(**{field: None})
+        except ValidationError as caught:
+            if any(error["loc"] == (field,) for error in caught.errors()):
+                guarded.add(field)
     return guarded
 
 
 def _not_null_columns(model) -> set:
     return {column.name for column in model.__table__.columns if not column.nullable}
+
+
+def _column_names(model) -> set:
+    return {column.name for column in model.__table__.columns}
 
 
 class TestExplicitNullIsRefused:
@@ -147,8 +168,18 @@ class TestGuardsMatchTheColumns:
         self, label, schema, model, nullable_field
     ):
         """Guarding a nullable column would remove the only way to clear it —
-        a silent feature loss dressed up as a fix."""
-        over = _guarded_fields(schema) - _not_null_columns(model)
+        a silent feature loss dressed up as a fix.
+
+        Scoped to fields that ARE columns. A field with no column of its name
+        is neither NOT NULL nor nullable, so the rationale above simply does
+        not reach it: ``PipelineUpdate.steps`` is an authoring dialect the
+        boundary converts into ``steps_graph``, and there is nothing to clear
+        because the array is not stored. Before this scoping the test read
+        "not a NOT NULL column" as "a nullable column", which would have gone
+        red at 12.8 P6 — when ``pipelines.steps`` is dropped — on a schema
+        that was behaving correctly.
+        """
+        over = (_guarded_fields(schema) & _column_names(model)) - _not_null_columns(model)
         assert not over, (
             f"{label}: {sorted(over)} are nullable columns; refusing null on "
             f"them takes away the client's way to clear the value"

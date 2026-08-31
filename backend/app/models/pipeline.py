@@ -42,6 +42,22 @@ class Pipeline(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     steps: Mapped[str] = mapped_column(Text, nullable=False, default="[]")  # JSON array of PipelineStep (legacy v1)
     steps_graph: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON PipelineGraphModel (v2 graph-based)
+    # Why this pipeline's definition could not be materialized, or NULL when
+    # it could (12.8 §1.7). `sync_repo_pipelines` swallows every parse
+    # exception into a logger.warning and keeps the STALE definition on
+    # purpose ("a broken CI file must not break the push"), so a conversion
+    # REFUSAL landing there would be dark by construction. This is the channel
+    # it surfaces on: set by `upsert_materialized_pipeline` when conversion
+    # refuses, cleared on a successful sync, served on `PipelineRead`, and
+    # read by BOTH run guards - a pipeline carrying one refuses to start
+    # rather than silently running the definition it had before.
+    #
+    # The column is added by migration 0014, which also backfills every
+    # array-only row's `steps_graph`. The two ship together on purpose: this
+    # attribute is what `PipelineRead.definition_error` reads through
+    # `from_attributes`, and a model declaring a column no revision has added
+    # is a backend whose every pipeline query 503s.
+    definition_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     triggers: Mapped[str] = mapped_column(Text, nullable=False, default="[]")  # JSON array of TriggerConfig
     is_template: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

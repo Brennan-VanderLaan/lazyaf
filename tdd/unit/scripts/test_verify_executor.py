@@ -16,6 +16,26 @@ LANE is now derived from its pipeline DEFINITION (`requires:` -> remote,
 otherwise local) rather than being the constant "local", so the fixtures
 carry pipeline configs and the fake backend serves GET /api/runners.
 
+12.8 changed the shape of the DEFINITION itself, and with it every fixture in
+this module. `PipelineRead.steps` - the v1 array - has left the wire; a
+pipeline now serves `steps_graph`, a MAPPING KEYED BY STEP ID, and the gate
+correlates it with the run through `StepRun.step_id` rather than through an
+array position that no longer exists. Every assertion below survives that
+re-keying unchanged; what moved is the KEY, not the claim. Three things are
+new, and each one is a hole the retirement could otherwise have opened in
+silence:
+
+  * an EMPTY or MISSING definition FAILS the gate. Every per-step lookup
+    carries a fallback ('script', 'local'), so over an empty mapping the gate
+    would report "all local, all script" and pass over any run at all - and
+    "the field stopped arriving" is exactly what deleting a wire field looks
+    like from in here.
+  * a StepRun's `step_index` must equal its step's POSITION in the graph's
+    steps mapping (assertion 19). Nothing in the tree asserted this, and the
+    execution key, LAZYAF_STEP_INDEX, the websocket frames and the state
+    machine all depend on it.
+  * the gate identifies ITSELF by LAZYAF_STEP_ID, not LAZYAF_STEP_INDEX.
+
 Every assertion has a NEGATIVE test: a gate assertion nobody has watched
 fail is a gate assertion that does not exist. For 12.6 that means, one test
 each - a pinned step that ran local, a non-pinned step that ran remote, a
@@ -61,15 +81,23 @@ LOOPBACK_RUNNER_ID = "dogfood-loopback"
 
 
 def step_run(
-    index,
+    step_id,
     executor,
     name=None,
     status="passed",
     logs="a log line\n",
     step_run_id=None,
     runner_id=None,
+    index=None,
 ):
     """One StepRun as GET /api/pipeline-runs/{id} projects it.
+
+    Addressed by `step_id` - the GRAPH NODE ID - because that is the key the
+    gate correlates on from 12.8. `step_index` is still on the projection and
+    still means what it always meant (the step's position, which the
+    execution key and the websocket frames address it by); `make_run` stamps
+    it from list position so the fixtures satisfy assertion 19 by
+    construction, and the tests that are ABOUT assertion 19 override it.
 
     `runner_id` is the StepExecution's assignment (12.6 assertion 10). It is
     always emitted, null on the local lane, so a gate reading it cannot
@@ -77,9 +105,10 @@ def step_run(
     runner".
     """
     return {
-        "id": step_run_id or f"sr-{index}",
+        "id": step_run_id or f"sr-{step_id}",
         "step_index": index,
-        "step_name": name or f"step-{index}",
+        "step_id": step_id,
+        "step_name": name or step_id,
         "executor": executor,
         "status": status,
         "logs": logs,
@@ -87,31 +116,109 @@ def step_run(
     }
 
 
+def marker_step_run(name="pipeline fix", index=0, **kwargs):
+    """A StepRun that names NO graph node.
+
+    `_trigger_card` writes one deliberately (step_id=None, so a fix-card
+    marker can never be mistaken for the step that spawned it) and so does
+    `_verify_graph_coverage`. It spawned no container, so it has no lane, no
+    step type and no usage row - and the gate must skip it rather than
+    lane-check it against a fallback.
+    """
+    row = step_run("placeholder", "local", name=name, index=index, **kwargs)
+    row["step_id"] = None
+    row["id"] = f"sr-marker-{index}"
+    return row
+
+
 def make_run(step_runs, run_id="run-1", pipeline_id="pipe-1"):
+    """A pipeline run, with `step_index` stamped from list position.
+
+    Assertion 19 says a StepRun's index is its step's position in the graph,
+    and every fixture here lists its step runs in graph order - so stamping
+    by enumeration is the SAME number the executor derives from
+    `list(steps_dict.keys()).index(step_id)`. A test that wants them to
+    disagree says so by passing `index=` explicitly.
+    """
+    for i, sr in enumerate(step_runs):
+        if sr.get("step_index") is None:
+            sr["step_index"] = i
     return {"id": run_id, "pipeline_id": pipeline_id, "step_runs": step_runs}
 
 
-def make_pipeline(step_types, pipeline_id="pipe-1", requires=None, configs=None):
-    """A pipeline DEFINITION.
+def graph_step(step_id, step_type="script", name=None, config=None):
+    """One node of a v2 graph, in the shape PipelineStepV2 serializes to."""
+    return {
+        "id": step_id,
+        "name": name or step_id,
+        "type": step_type,
+        "config": dict(config or {}),
+        "position": {"x": 100, "y": 0},
+        "timeout": 300,
+        "continue_in_context": False,
+        "actions": {"success": [], "failure": [], "always": []},
+    }
 
-    `requires` maps a step index to a requirements dict. Its mere PRESENCE
-    is what routes a step to the remote lane (12.6), so the gate re-derives
-    the expected executor from exactly this - never from what happened.
 
-    `configs` maps a step index to extra step-config keys (14.x: `agent`,
+def _append_graph_step(pipeline, step):
+    """Add a node to the end of a LINEAR graph, wiring the success edge.
+
+    Returns the node's POSITION, which is the step_index the executor will
+    stamp on its StepRun.
+    """
+    graph = pipeline["steps_graph"]
+    steps = graph["steps"]
+    if steps:
+        graph["edges"].append({
+            "id": f"edge_{len(graph['edges'])}_success",
+            "from_step": list(steps)[-1],
+            "to_step": step["id"],
+            "condition": "success",
+        })
+    else:
+        graph["entry_points"] = [step["id"]]
+    step["position"] = {"x": 100, "y": len(steps) * 150}
+    steps[step["id"]] = step
+    return len(steps) - 1
+
+
+def make_pipeline(specs, pipeline_id="pipe-1", requires=None, configs=None):
+    """A pipeline DEFINITION as GET /api/pipelines/{id} serves it from 12.8.
+
+    `specs` is a list of `(step_id, type)` pairs IN GRAPH ORDER - the order
+    is load-bearing, because a node's position in the mapping is the
+    `step_index` its StepRun carries (assertion 19).
+
+    `requires` maps a STEP ID to a requirements dict. Its mere PRESENCE is
+    what routes a step to the remote lane (12.6), so the gate re-derives the
+    expected executor from exactly this - never from what happened.
+
+    `configs` maps a STEP ID to extra step-config keys (14.x: `agent`,
     `endpoint`, `harness`), for the same reason: the harness lane is derived
     from the DEFINITION, never from the outcome.
+
+    The edges are what `array_to_graph` produces for a linear v1 array - one
+    SUCCESS edge per consecutive pair, step 0 the sole entry point - because
+    that is exactly what the boundary converter now hands the executor for
+    `.lazyaf/pipelines/test-suite.yaml`.
     """
     requires = requires or {}
     configs = configs or {}
-    steps = []
-    for i, t in enumerate(step_types):
-        step = {"type": t, "config": dict(configs.get(i) or {})}
-        if i in requires:
-            step["config"]["requires"] = requires[i]
-        step["name"] = f"step-{i}"
-        steps.append(step)
-    return {"id": pipeline_id, "steps": steps}
+    pipeline = {
+        "id": pipeline_id,
+        "steps_graph": {"steps": {}, "edges": [], "entry_points": [], "version": 2},
+    }
+    for step_id, step_type in specs:
+        config = dict(configs.get(step_id) or {})
+        if step_id in requires:
+            config["requires"] = requires[step_id]
+        _append_graph_step(pipeline, graph_step(step_id, step_type, config=config))
+    return pipeline
+
+
+def graph_steps(pipeline):
+    """The definition's step mapping - the thing the gate actually reads."""
+    return pipeline["steps_graph"]["steps"]
 
 
 def runner_row(runner_id=LOOPBACK_RUNNER_ID, status="idle", connection="websocket"):
@@ -143,7 +250,13 @@ def usage_row(
     cost_usd="0.000000",
     raw=None,
 ):
-    """One rollup row for a StepRun (and, with `raw`, the per-step detail)."""
+    """One rollup row for a StepRun (and, with `raw`, the per-step detail).
+
+    Deliberately carries NO `step_id`: `RunUsageStep` does not have one, and
+    the gate correlates the rollup to the run through `step_run_id` alone. A
+    fixture that invented the field would let the gate start reading it
+    without anyone noticing the API does not serve it.
+    """
     row = {
         "usage_id": f"u-{sr['id']}",
         "step_execution_id": f"se-{sr['id']}",
@@ -173,6 +286,10 @@ def usage_row(
 HARNESS_TURNS = 6
 TOOLS_ENDPOINT = "dogfood-mock"
 TEXT_ENDPOINT = "dogfood-mock-notools"
+
+#: The two 14.x dogfood harness steps, by graph node id.
+HARNESS_TOOLS_STEP = "harness-probe"
+HARNESS_TEXT_STEP = "harness-probe-notools"
 
 
 def summed_tokens(turns=HARNESS_TURNS):
@@ -273,19 +390,24 @@ def append_harness(run, pipeline, *, statuses=("passed", "passed"), configs=None
     (vacuous pass = fail, R4), so every fixture that drives verify_run end to
     end has to carry them. A test about a 12.x assertion should not have to
     describe the 14.x lane, so it gets appended in one line instead.
+
+    The node is appended to the GRAPH and its position is read back as the
+    StepRun's `step_index`, so the pair satisfies assertion 19 the same way
+    the executor makes it true.
     """
     if configs is None:
         configs = [
-            harness_config(TOOLS_ENDPOINT),
-            harness_config(TEXT_ENDPOINT, mode="text"),
+            (HARNESS_TOOLS_STEP, harness_config(TOOLS_ENDPOINT)),
+            (HARNESS_TEXT_STEP, harness_config(TEXT_ENDPOINT, mode="text")),
         ]
-    base = len(pipeline["steps"])
-    for offset, config in enumerate(configs):
-        index = base + offset
-        name = f"harness-{offset}"
-        pipeline["steps"].append({"type": "agent", "name": name, "config": config})
+    for offset, (step_id, config) in enumerate(configs):
+        position = _append_graph_step(
+            pipeline, graph_step(step_id, "agent", config=config)
+        )
         run["step_runs"].append(
-            step_run(index, "local", name=name, status=statuses[offset])
+            step_run(
+                step_id, "local", status=statuses[offset], index=position
+            )
         )
     return run, pipeline
 
@@ -293,36 +415,40 @@ def append_harness(run, pipeline, *, statuses=("passed", "passed"), configs=None
 def derive_rollup(run, pipeline, *, exclude=(), missing=(), tokenless=()):
     """A rollup covering every PASSED step of the run.
 
-    `exclude` drops steps by index legitimately (the gate's own stdout-mode
+    `exclude` drops steps by STEP ID legitimately (the gate's own stdout-mode
     step); `missing` drops them ILLEGITIMATELY (the dark-channel case);
     `tokenless` keeps the row but nulls its token counts.
     """
-    step_types = {i: s.get("type", "script") for i, s in enumerate(pipeline["steps"])}
+    steps = graph_steps(pipeline)
+    step_types = {sid: s.get("type", "script") for sid, s in steps.items()}
     harness_modes = {
-        i: verify_executor.step_harness_mode(s)
-        for i, s in enumerate(pipeline["steps"])
+        sid: verify_executor.step_harness_mode(s)
+        for sid, s in steps.items()
         if (s.get("config") or {}).get("agent") == "openai-harness"
     }
     rows = []
     for sr in run["step_runs"]:
-        if sr["step_index"] in exclude or sr["step_index"] in missing:
+        step_id = sr.get("step_id")
+        if step_id is None:
+            # Marker rows spawned no container and can post no usage.
+            continue
+        if step_id in exclude or step_id in missing:
             continue
         if sr.get("status") != "passed":
             continue
-        index = sr["step_index"]
-        if index in harness_modes:
+        if step_id in harness_modes:
             rows.append(
                 harness_usage_row(
                     sr,
-                    mode="text" if harness_modes[index] == "text" else "tools",
+                    mode="text" if harness_modes[step_id] == "text" else "tools",
                 )
             )
             continue
-        is_agent = step_types.get(index) == "agent"
+        is_agent = step_types.get(step_id) == "agent"
         rows.append(
             usage_row(
                 sr,
-                tokens=is_agent and index not in tokenless,
+                tokens=is_agent and step_id not in tokenless,
                 cost_source="cli-reported" if is_agent else "unknown",
             )
         )
@@ -402,12 +528,15 @@ def script_and_agent(
 ):
     """The 12.6 + 14.x dogfood shape in miniature.
 
-    Five steps, two lanes, three agents:
-      0 tier1                 script, NO `requires:` -> local  (assertion 11)
-      1 remote-probe          script, `requires:`    -> remote (assertion 8)
-      2 mock-agent            agent,  `requires:`    -> remote (assertion 12)
-      3 harness-probe         agent (openai-harness, tools)    (13-15, 17, 18)
-      4 harness-probe-notools agent (openai-harness, text)     (16)
+    Five steps, two lanes, three agents - named by the graph node ids the
+    real `.lazyaf/pipelines/test-suite.yaml` carries, because from 12.8 the
+    id is the correlation key and the handle a failure message leads with:
+
+      tier1                 script, NO `requires:` -> local  (assertion 11)
+      remote-probe          script, `requires:`    -> remote (assertion 8)
+      mock-agent            agent,  `requires:`    -> remote (assertion 12)
+      harness-probe         agent (openai-harness, tools)    (13-15, 17, 18)
+      harness-probe-notools agent (openai-harness, text)     (16)
 
     The two harness steps route LOCAL: they carry no `requires:`, and a
     `direct` endpoint must not flip a step to the remote lane on its own
@@ -416,35 +545,34 @@ def script_and_agent(
     """
     if harness_configs is None:
         harness_configs = {
-            3: harness_config(TOOLS_ENDPOINT),
-            4: harness_config(TEXT_ENDPOINT, mode="text"),
+            HARNESS_TOOLS_STEP: harness_config(TOOLS_ENDPOINT),
+            HARNESS_TEXT_STEP: harness_config(TEXT_ENDPOINT, mode="text"),
         }
     run = make_run(
         [
-            step_run(0, "local", name="tier1"),
-            step_run(1, probe_executor, name="remote-probe", runner_id=probe_runner_id),
+            step_run("tier1", "local"),
+            step_run("remote-probe", probe_executor, runner_id=probe_runner_id),
             step_run(
-                2,
+                "mock-agent",
                 agent_executor,
-                name="mock-agent",
                 status=agent_status,
                 runner_id=agent_runner_id,
             ),
-            step_run(3, "local", name="harness-probe", status=harness_statuses[0]),
-            step_run(
-                4, "local", name="harness-probe-notools", status=harness_statuses[1]
-            ),
+            step_run(HARNESS_TOOLS_STEP, "local", status=harness_statuses[0]),
+            step_run(HARNESS_TEXT_STEP, "local", status=harness_statuses[1]),
         ]
     )
     pipeline = make_pipeline(
-        ["script", "script", "agent", "agent", "agent"],
-        requires={1: REMOTE_PIN, 2: REMOTE_PIN},
+        [
+            ("tier1", "script"),
+            ("remote-probe", "script"),
+            ("mock-agent", "agent"),
+            (HARNESS_TOOLS_STEP, "agent"),
+            (HARNESS_TEXT_STEP, "agent"),
+        ],
+        requires={"remote-probe": REMOTE_PIN, "mock-agent": REMOTE_PIN},
         configs=harness_configs,
     )
-    # The DEFINITION carries the same names the run does, because the gate
-    # reports a failing step by the name its definition gives it.
-    for step, sr in zip(pipeline["steps"], run["step_runs"]):
-        step["name"] = sr["step_name"]
     return run, pipeline
 
 
@@ -465,13 +593,14 @@ class TestVerifyRun:
     def test_an_off_lane_executor_fails(self, monkeypatch):
         run = make_run(
             [
-                step_run(0, "local"),
-                step_run(1, "legacy", name="tier2"),
-                step_run(2, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("tier1", "local"),
+                step_run("tier2", "legacy"),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
             ]
         )
         pipeline = make_pipeline(
-            ["script", "script", "agent"], requires={2: REMOTE_PIN}
+            [("tier1", "script"), ("tier2", "script"), ("mock-agent", "agent")],
+            requires={"mock-agent": REMOTE_PIN},
         )
         stub_backend(monkeypatch, run, pipeline)
 
@@ -482,18 +611,25 @@ class TestVerifyRun:
         assert "legacy" in str(exc.value)
 
     def test_vacuous_pass_is_failure(self, monkeypatch):
-        """No script/docker step runs at all -> fail loudly (R4)."""
+        """No script/docker step runs at all -> fail loudly (R4).
+
+        The DEFINITION is present and non-empty here on purpose: an absent
+        definition is its own (new) failure with its own test, and this one
+        has to keep exercising the "the run executed nothing" guard rather
+        than being shadowed by it.
+        """
         run = make_run([])
-        pipeline = make_pipeline([])
+        pipeline = make_pipeline([("tier1", "script")])
         stub_backend(monkeypatch, run, pipeline)
 
         with pytest.raises(SystemExit) as exc:
             verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "no script/docker step runs found" in str(exc.value)
         assert "vacuous pass = fail" in str(exc.value)
 
     def test_only_agent_steps_is_vacuous_failure(self, monkeypatch):
-        run = make_run([step_run(0, "local")])
-        pipeline = make_pipeline(["agent"])
+        run = make_run([step_run("mock-agent", "local")])
+        pipeline = make_pipeline([("mock-agent", "agent")])
         stub_backend(monkeypatch, run, pipeline)
 
         with pytest.raises(SystemExit) as exc:
@@ -503,13 +639,14 @@ class TestVerifyRun:
     def test_docker_steps_are_checked_alongside_script(self, monkeypatch):
         run = make_run(
             [
-                step_run(0, "local"),
-                step_run(1, "remote", runner_id=LOOPBACK_RUNNER_ID),
-                step_run(2, "local", name="mock-agent"),
+                step_run("tier1", "local"),
+                step_run("tier2", "remote", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("mock-agent", "local"),
             ]
         )
         pipeline = make_pipeline(
-            ["script", "docker", "agent"], requires={1: REMOTE_PIN}
+            [("tier1", "script"), ("tier2", "docker"), ("mock-agent", "agent")],
+            requires={"tier2": REMOTE_PIN},
         )
         append_harness(run, pipeline)
         stub_backend(monkeypatch, run, pipeline)
@@ -518,8 +655,11 @@ class TestVerifyRun:
         assert "OK: 2 script step run(s) and 3 agent step run(s)" in msg
 
     def test_missing_step_type_defaults_to_script(self, monkeypatch):
-        run = make_run([step_run(0, "legacy")])
-        pipeline = {"id": "pipe-1", "steps": [{}]}  # no "type" key, no config
+        run = make_run([step_run("nameless", "legacy")])
+        pipeline = make_pipeline([("nameless", "script")])
+        # No "type" key, no config - the shape an older definition has.
+        del graph_steps(pipeline)["nameless"]["type"]
+        del graph_steps(pipeline)["nameless"]["config"]
         stub_backend(monkeypatch, run, pipeline)
 
         with pytest.raises(SystemExit) as exc:
@@ -534,17 +674,208 @@ class TestVerifyRun:
         """
         run = make_run(
             [
-                step_run(0, "local"),
-                step_run(1, "remote", name="probe", runner_id=LOOPBACK_RUNNER_ID),
-                step_run(2, "local", name="mock-agent"),
+                step_run("tier1", "local"),
+                step_run("probe", "remote", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("mock-agent", "local"),
             ]
         )
-        pipeline = make_pipeline(["script", "script", "agent"], requires={1: REMOTE_PIN})
+        pipeline = make_pipeline(
+            [("tier1", "script"), ("probe", "script"), ("mock-agent", "agent")],
+            requires={"probe": REMOTE_PIN},
+        )
         append_harness(run, pipeline)
-        del pipeline["steps"][0]["config"]
+        del graph_steps(pipeline)["tier1"]["config"]
         stub_backend(monkeypatch, run, pipeline)
 
         assert "OK:" in verify_executor.verify_run("http://backend:8000", "run-1")
+
+
+# -----------------------------------------------------------------------------
+# 12.8: the definition the gate reads is the GRAPH
+# -----------------------------------------------------------------------------
+
+
+class TestGraphDefinitionGate:
+    """The retirement's own trapdoor, held shut.
+
+    `PipelineRead.steps` left the wire in 12.8. From in here that looks like
+    a key that simply stopped arriving - and every per-step lookup in this
+    gate carries a fallback, so an empty definition would make it report
+    "every step is local, every step is script" and print OK over any run at
+    all. Assertions 8 and 11 would stop being able to fail on the very run
+    meant to prove the retirement. There is no version of this that surfaces
+    on its own, so it is checked once, first, and fatally.
+    """
+
+    def _healthy_then_broken(self, monkeypatch, break_definition):
+        """A run that would otherwise gate CLEAN, with only the DEFINITION
+        broken.
+
+        The rollup is derived BEFORE the break, so the fixture is a backend
+        in which every other fact is in order - which is the whole point: the
+        only thing wrong is that the definition stopped arriving, and the
+        gate must still refuse.
+        """
+        run, pipeline = script_and_agent()
+        rollup = derive_rollup(run, pipeline)
+        break_definition(pipeline)
+        stub_backend(monkeypatch, run, pipeline, rollup=rollup)
+        return run, pipeline
+
+    def test_an_empty_steps_mapping_fails_the_gate(self, monkeypatch):
+        def empty(pipeline):
+            pipeline["steps_graph"]["steps"] = {}
+
+        self._healthy_then_broken(monkeypatch, empty)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "NO graph step definitions" in str(exc.value)
+        assert "vacuous pass = fail" in str(exc.value)
+
+    def test_a_missing_steps_graph_key_fails_the_gate(self, monkeypatch):
+        """The literal shape of a deleted wire field."""
+        self._healthy_then_broken(
+            monkeypatch, lambda pipeline: pipeline.pop("steps_graph")
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "NO graph step definitions" in str(exc.value)
+
+    def test_a_null_steps_graph_fails_the_gate(self, monkeypatch):
+        """A pipeline whose definition never materialized carries null."""
+
+        def nulled(pipeline):
+            pipeline["steps_graph"] = None
+
+        self._healthy_then_broken(monkeypatch, nulled)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "NO graph step definitions" in str(exc.value)
+        assert "definition_error" in str(exc.value)
+
+    def test_an_array_arriving_under_the_graph_key_fails_the_gate(self, monkeypatch):
+        """A LIST is not a mapping keyed by step id.
+
+        This is the shape a half-finished retirement produces - the v1 array
+        moved under the new key without being converted. Iterating it would
+        yield step dicts with no ids to correlate on, so the gate refuses
+        rather than silently correlating nothing.
+        """
+
+        def flattened(pipeline):
+            pipeline["steps_graph"]["steps"] = list(graph_steps(pipeline).values())
+
+        self._healthy_then_broken(monkeypatch, flattened)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "NO graph step definitions" in str(exc.value)
+
+    def test_the_harness_lane_refuses_an_empty_definition_too(self, monkeypatch):
+        """Asserted directly, because verify_run's guard shadows it.
+
+        `verify_harness_lane` derives its own view of the definition, so it
+        needs its own refusal - otherwise a future caller that skipped
+        verify_run would get "no harness step in this pipeline" (a claim
+        about the pipeline) for what is really "no pipeline definition at
+        all".
+        """
+        run, pipeline = script_and_agent()
+        rollup = derive_rollup(run, pipeline)
+        pipeline["steps_graph"]["steps"] = {}
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_harness_lane(
+                "http://backend:8000", run, pipeline, rollup
+            )
+        assert "NO graph step definitions" in str(exc.value)
+
+
+class TestStepIndexMatchesGraphPosition:
+    """Assertion 19 (12.8).
+
+    `step_index` is not an array concept and it survives the retirement: it
+    is the ADDRESS of a step. The execution key
+    (`{run_id}:{step_index}:{step_run_id}`), LAZYAF_STEP_INDEX, the
+    step_update / step_log websocket frames the UI renders, and the state
+    machine's completion bookkeeping all key on it - while the executor
+    DERIVES it from `list(steps_dict.keys()).index(step_id)`. Nothing else in
+    the tree asserts the two agree, and a disagreement is silent in both
+    directions: log lines land on a different step in the UI, and an
+    idempotency key collides with a different step's.
+    """
+
+    def test_indices_matching_graph_positions_pass(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        assert [sr["step_index"] for sr in run["step_runs"]] == [0, 1, 2, 3, 4]
+        assert list(graph_steps(pipeline)) == [
+            sr["step_id"] for sr in run["step_runs"]
+        ]
+        stub_backend(monkeypatch, run, pipeline)
+
+        msg = verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "each at its graph position" in msg
+
+    def test_a_step_index_that_does_not_match_its_position_fails(self, monkeypatch):
+        """Two steps swapped their indices: every log line and every
+        idempotency key for those two now addresses the other one."""
+        run, pipeline = script_and_agent()
+        run["step_runs"][0]["step_index"] = 1
+        run["step_runs"][1]["step_index"] = 0
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "does not match its step's POSITION" in str(exc.value)
+        assert "tier1" in str(exc.value)
+        assert "remote-probe" in str(exc.value)
+
+    def test_an_index_past_the_end_of_the_graph_fails(self, monkeypatch):
+        run, pipeline = script_and_agent()
+        run["step_runs"][2]["step_index"] = 99
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "does not match its step's POSITION" in str(exc.value)
+        assert "mock-agent" in str(exc.value)
+
+    def test_a_step_run_naming_a_step_the_definition_lacks_fails(self, monkeypatch):
+        """Definition drift: the run executed something the current graph
+        does not contain (a second push re-materialized the pipeline
+        mid-run, or a step id was renamed). Every expectation below is a
+        lookup into that definition, so there is nothing left to check the
+        step against - and checking it against a fallback is exactly the
+        vacuous pass this phase removes."""
+        run, pipeline = script_and_agent()
+        run["step_runs"][0]["step_id"] = "tier1-renamed"
+        stub_backend(monkeypatch, run, pipeline)
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "CURRENT graph definition does not contain" in str(exc.value)
+        assert "tier1-renamed" in str(exc.value)
+
+    def test_a_marker_step_run_is_skipped_not_lane_checked(self, monkeypatch):
+        """`_trigger_card`'s marker row carries step_id=None deliberately.
+
+        It spawned no container, so it has no lane, no step type and no
+        usage row. Under the old index correlation it was looked up with
+        `.get(index, "script")` and lane-checked against a fallback; keyed by
+        id it is simply not a step, and the gate says how many it skipped
+        rather than passing over them in silence.
+        """
+        run, pipeline = script_and_agent()
+        run["step_runs"].append(
+            marker_step_run(name="[Pipeline Fix] flaky test", index=2, logs="")
+        )
+        stub_backend(monkeypatch, run, pipeline)
+
+        msg = verify_executor.verify_run("http://backend:8000", "run-1")
+        assert "1 marker step run(s) skipped" in msg
 
 
 # -----------------------------------------------------------------------------
@@ -556,14 +887,17 @@ class TestControlPathLogProbe:
     """12.3: a PASSED script step with empty logs = the control-layer
     reporting path (POST /api/steps/{id}/logs) silently failed."""
 
-    def _run(self, logs, name="tier1", status="passed"):
+    def _run(self, logs, step_id="tier1", status="passed"):
         run = make_run(
             [
-                step_run(0, "local", name=name, status=status, logs=logs),
-                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
+                step_run(step_id, "local", status=status, logs=logs),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
             ]
         )
-        pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        pipeline = make_pipeline(
+            [(step_id, "script"), ("mock-agent", "agent")],
+            requires={"mock-agent": REMOTE_PIN},
+        )
         return append_harness(run, pipeline)
 
     def test_passed_step_with_empty_logs_fails(self, monkeypatch):
@@ -604,24 +938,33 @@ class TestControlPathLogProbe:
 
     def test_own_step_is_exempt_from_log_check(self, monkeypatch):
         """The verify step's own logs are still streaming - never
-        self-fail on an empty own row."""
+        self-fail on an empty own row. Exempted by GRAPH NODE ID from
+        12.8, which is what LAZYAF_STEP_ID carries."""
         run = make_run(
             [
-                step_run(0, "local"),
-                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
-                step_run(2, "local", name="verify-executor", logs=""),
+                step_run("tier1", "local"),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("verify-executor", "local", logs=""),
             ]
         )
         pipeline = make_pipeline(
-            ["script", "agent", "script"], requires={1: REMOTE_PIN}
+            [
+                ("tier1", "script"),
+                ("mock-agent", "agent"),
+                ("verify-executor", "script"),
+            ],
+            requires={"mock-agent": REMOTE_PIN},
         )
         append_harness(run, pipeline)
         stub_backend(
-            monkeypatch, run, pipeline, rollup=derive_rollup(run, pipeline, exclude=(2,))
+            monkeypatch,
+            run,
+            pipeline,
+            rollup=derive_rollup(run, pipeline, exclude=("verify-executor",)),
         )
 
         msg = verify_executor.verify_run(
-            "http://backend:8000", "run-1", self_index=2
+            "http://backend:8000", "run-1", self_id="verify-executor"
         )
         assert "OK: 2 script step run(s) and 3 agent step run(s)" in msg
 
@@ -676,8 +1019,8 @@ class TestAgentStepRouting:
         Deleting the mock-agent step from test-suite.yaml would otherwise
         leave a green gate that no longer covers the agent path at all.
         """
-        run = make_run([step_run(0, "local"), step_run(1, "local")])
-        pipeline = make_pipeline(["script", "script"])
+        run = make_run([step_run("tier1", "local"), step_run("tier2", "local")])
+        pipeline = make_pipeline([("tier1", "script"), ("tier2", "script")])
         stub_backend(monkeypatch, run, pipeline)
 
         with pytest.raises(SystemExit) as exc:
@@ -702,7 +1045,7 @@ class TestUsageChannelGate:
             monkeypatch,
             run,
             pipeline,
-            rollup=derive_rollup(run, pipeline, missing=(0,)),
+            rollup=derive_rollup(run, pipeline, missing=("tier1",)),
         )
 
         with pytest.raises(SystemExit) as exc:
@@ -719,7 +1062,7 @@ class TestUsageChannelGate:
             monkeypatch,
             run,
             pipeline,
-            rollup=derive_rollup(run, pipeline, missing=(2,)),
+            rollup=derive_rollup(run, pipeline, missing=("mock-agent",)),
         )
 
         with pytest.raises(SystemExit) as exc:
@@ -734,7 +1077,7 @@ class TestUsageChannelGate:
             monkeypatch,
             run,
             pipeline,
-            rollup=derive_rollup(run, pipeline, tokenless=(2,)),
+            rollup=derive_rollup(run, pipeline, tokenless=("mock-agent",)),
         )
 
         with pytest.raises(SystemExit) as exc:
@@ -759,13 +1102,14 @@ class TestUsageChannelGate:
     def test_running_steps_are_not_required_to_have_usage_yet(self, monkeypatch):
         run = make_run(
             [
-                step_run(0, "local", name="tier1"),
-                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
-                step_run(2, "local", name="tier3", status="running", logs=""),
+                step_run("tier1", "local"),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("tier3", "local", status="running", logs=""),
             ]
         )
         pipeline = make_pipeline(
-            ["script", "agent", "script"], requires={1: REMOTE_PIN}
+            [("tier1", "script"), ("mock-agent", "agent"), ("tier3", "script")],
+            requires={"mock-agent": REMOTE_PIN},
         )
         append_harness(run, pipeline)
         stub_backend(monkeypatch, run, pipeline)
@@ -782,11 +1126,16 @@ class TestMain:
         main() skip a step the fixture data does not have, and the tests
         passed on the host while failing in CI. Start from a clean
         contract and let each test declare exactly what it needs.
+
+        LAZYAF_STEP_ID joins the list at 12.8: it is what the gate now
+        exempts itself by, so an inherited one would silently exempt a
+        fixture step and re-open the exact hole this fixture closed.
         """
         for name in (
             "LAZYAF_BACKEND_URL",
             "LAZYAF_PIPELINE_RUN_ID",
             "LAZYAF_STEP_INDEX",
+            "LAZYAF_STEP_ID",
             "LAZYAF_STEP_RUN_ID",
             "LAZYAF_EXECUTION_KEY",
         ):
@@ -804,12 +1153,15 @@ class TestMain:
         base = "http://backend-e2e:8000"
         run = make_run(
             [
-                step_run(0, "local"),
-                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("tier1", "local"),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
             ],
             run_id="abc123",
         )
-        pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        pipeline = make_pipeline(
+            [("tier1", "script"), ("mock-agent", "agent")],
+            requires={"mock-agent": REMOTE_PIN},
+        )
         append_harness(run, pipeline)
         calls = stub_backend(monkeypatch, run, pipeline, base=base)
 
@@ -834,39 +1186,97 @@ class TestMain:
         assert f"{base}/api/runners" in calls
         assert calls[-1] == f"{base}/api/model-endpoints"
 
-    def test_main_passes_own_index_from_env(self, monkeypatch, capsys):
+    def test_main_passes_own_step_id_from_env(self, monkeypatch, capsys):
+        """LAZYAF_STEP_ID, not LAZYAF_STEP_INDEX (12.8, section 4.9).
+
+        Keying the gate's own identity on a graph's key insertion order was
+        the single most fragile thing in the ratchet: reorder the mapping
+        and the gate starts exempting a different step, silently. The node
+        id is what the author wrote.
+        """
         run = make_run(
             [
-                step_run(0, "local"),
-                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
-                step_run(2, "local", name="me", logs=""),
+                step_run("tier1", "local"),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("verify-executor", "local", logs=""),
             ],
             run_id="r42",
         )
         pipeline = make_pipeline(
-            ["script", "agent", "script"], requires={1: REMOTE_PIN}
+            [
+                ("tier1", "script"),
+                ("mock-agent", "agent"),
+                ("verify-executor", "script"),
+            ],
+            requires={"mock-agent": REMOTE_PIN},
         )
         append_harness(run, pipeline)
         stub_backend(
-            monkeypatch, run, pipeline, rollup=derive_rollup(run, pipeline, exclude=(2,))
+            monkeypatch,
+            run,
+            pipeline,
+            rollup=derive_rollup(run, pipeline, exclude=("verify-executor",)),
         )
 
         monkeypatch.setenv("LAZYAF_PIPELINE_RUN_ID", "r42")
-        monkeypatch.setenv("LAZYAF_STEP_INDEX", "2")
+        monkeypatch.setenv("LAZYAF_STEP_ID", "verify-executor")
         monkeypatch.delenv("LAZYAF_BACKEND_URL", raising=False)
 
         verify_executor.main()
         assert "OK: 2 script step run(s)" in capsys.readouterr().out
 
+    def test_a_stale_step_index_no_longer_exempts_anything(self, monkeypatch):
+        """The re-key, stated as a refusal.
+
+        LAZYAF_STEP_INDEX is still injected into every step container. If
+        the gate still read it, this fixture would pass - and it must not:
+        the exemption is by node id now, and a gate that quietly kept the
+        old key would be exempting a step chosen by mapping order.
+        """
+        run = make_run(
+            [
+                step_run("tier1", "local"),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("verify-executor", "local", logs=""),
+            ],
+            run_id="r43",
+        )
+        pipeline = make_pipeline(
+            [
+                ("tier1", "script"),
+                ("mock-agent", "agent"),
+                ("verify-executor", "script"),
+            ],
+            requires={"mock-agent": REMOTE_PIN},
+        )
+        append_harness(run, pipeline)
+        stub_backend(
+            monkeypatch,
+            run,
+            pipeline,
+            rollup=derive_rollup(run, pipeline, exclude=("verify-executor",)),
+        )
+
+        monkeypatch.setenv("LAZYAF_PIPELINE_RUN_ID", "r43")
+        monkeypatch.setenv("LAZYAF_STEP_INDEX", "2")
+
+        with pytest.raises(SystemExit) as exc:
+            verify_executor.main()
+        assert "delivered no logs" in str(exc.value)
+        assert "verify-executor" in str(exc.value)
+
     def test_default_backend_url(self, monkeypatch, capsys):
         run = make_run(
             [
-                step_run(0, "local"),
-                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("tier1", "local"),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
             ],
             run_id="r9",
         )
-        pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        pipeline = make_pipeline(
+            [("tier1", "script"), ("mock-agent", "agent")],
+            requires={"mock-agent": REMOTE_PIN},
+        )
         append_harness(run, pipeline)
         calls = stub_backend(monkeypatch, run, pipeline)
 
@@ -886,7 +1296,7 @@ class TestManifestDeliveryGate:
         run = make_run(
             [
                 step_run(
-                    0,
+                    "tier1",
                     "local",
                     name="T1",
                     logs=(
@@ -895,10 +1305,13 @@ class TestManifestDeliveryGate:
                         "reach backend after 3 attempts\n"
                     ),
                 ),
-                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
             ]
         )
-        pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        pipeline = make_pipeline(
+            [("tier1", "script"), ("mock-agent", "agent")],
+            requires={"mock-agent": REMOTE_PIN},
+        )
         stub_backend(monkeypatch, run, pipeline)
 
         with pytest.raises(SystemExit) as exc:
@@ -908,11 +1321,19 @@ class TestManifestDeliveryGate:
     def test_clean_run_passes_the_gate(self, monkeypatch):
         run = make_run(
             [
-                step_run(0, "local", name="T1", logs="real log line\n[lazyaf] exit code: 0\n"),
-                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
+                step_run(
+                    "tier1",
+                    "local",
+                    name="T1",
+                    logs="real log line\n[lazyaf] exit code: 0\n",
+                ),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
             ]
         )
-        pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        pipeline = make_pipeline(
+            [("tier1", "script"), ("mock-agent", "agent")],
+            requires={"mock-agent": REMOTE_PIN},
+        )
         append_harness(run, pipeline)
         stub_backend(monkeypatch, run, pipeline)
 
@@ -961,11 +1382,10 @@ class TestUsageScrapeFailureGate:
         stream, so a run whose usage POST never landed is still caught."""
         run = make_run(
             [
-                step_run(0, "local", name="tier1"),
+                step_run("tier1", "local"),
                 step_run(
-                    1,
+                    "mock-agent",
                     "remote",
-                    name="mock-agent",
                     runner_id=LOOPBACK_RUNNER_ID,
                     logs=(
                         "[agent] agent=claude-code model=x\n"
@@ -975,7 +1395,10 @@ class TestUsageScrapeFailureGate:
                 ),
             ]
         )
-        pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        pipeline = make_pipeline(
+            [("tier1", "script"), ("mock-agent", "agent")],
+            requires={"mock-agent": REMOTE_PIN},
+        )
         stub_backend(monkeypatch, run, pipeline)
 
         with pytest.raises(SystemExit) as exc:
@@ -1057,11 +1480,11 @@ class TestRemoteLaneRouting:
         """
         run = make_run(
             [
-                step_run(0, "local", name="tier1"),
-                step_run(1, "local", name="mock-agent"),
+                step_run("tier1", "local"),
+                step_run("mock-agent", "local"),
             ]
         )
-        pipeline = make_pipeline(["script", "agent"])
+        pipeline = make_pipeline([("tier1", "script"), ("mock-agent", "agent")])
         stub_backend(monkeypatch, run, pipeline)
 
         with pytest.raises(SystemExit) as exc:
@@ -1412,7 +1835,7 @@ class TestHarnessScrapeMarker:
     def test_the_scrape_marker_on_a_harness_step_fails(self, monkeypatch):
         run, pipeline = script_and_agent()
         for sr in run["step_runs"]:
-            if sr["step_name"] == "harness-probe":
+            if sr["step_id"] == HARNESS_TOOLS_STEP:
                 sr["logs"] = (
                     "[agent] turn 1/8\n"
                     + verify_executor.SCRAPE_FAILED_LOG_MARKER
@@ -1439,7 +1862,7 @@ class TestHarnessFallbackLane:
         run, pipeline = script_and_agent()
         rollup = derive_rollup(run, pipeline)
         for row in rollup["steps"]:
-            if row["step_name"] == "harness-probe-notools":
+            if row["step_name"] == HARNESS_TEXT_STEP:
                 row["raw"] = harness_raw(mode="tools")
         stub_backend(monkeypatch, run, pipeline, rollup=rollup)
 
@@ -1453,7 +1876,7 @@ class TestHarnessFallbackLane:
         run, pipeline = script_and_agent()
         rollup = derive_rollup(run, pipeline)
         for row in rollup["steps"]:
-            if row["step_name"] == "harness-probe-notools":
+            if row["step_name"] == HARNESS_TEXT_STEP:
                 raw = harness_raw(mode="text")
                 del raw["harness"]["malformed_responses"]
                 row["raw"] = raw
@@ -1466,8 +1889,8 @@ class TestHarnessFallbackLane:
     def test_a_pipeline_with_no_forced_text_step_fails(self, monkeypatch):
         run, pipeline = script_and_agent(
             harness_configs={
-                3: harness_config(TOOLS_ENDPOINT),
-                4: harness_config(TOOLS_ENDPOINT, mode="tools"),
+                HARNESS_TOOLS_STEP: harness_config(TOOLS_ENDPOINT),
+                HARNESS_TEXT_STEP: harness_config(TOOLS_ENDPOINT, mode="tools"),
             }
         )
         stub_backend(monkeypatch, run, pipeline)
@@ -1544,8 +1967,8 @@ class TestHarnessEndpointRegistry:
         resolver does - no second parser."""
         run, pipeline = script_and_agent(
             harness_configs={
-                3: harness_config(model=f"endpoint:{TOOLS_ENDPOINT}"),
-                4: harness_config(TEXT_ENDPOINT, mode="text"),
+                HARNESS_TOOLS_STEP: harness_config(model=f"endpoint:{TOOLS_ENDPOINT}"),
+                HARNESS_TEXT_STEP: harness_config(TEXT_ENDPOINT, mode="text"),
             }
         )
         stub_backend(monkeypatch, run, pipeline)
@@ -1591,11 +2014,14 @@ class TestHarnessLaneVacuousPass:
     def test_a_pipeline_with_no_harness_step_fails(self, monkeypatch):
         run = make_run(
             [
-                step_run(0, "local", name="tier1"),
-                step_run(1, "remote", name="mock-agent", runner_id=LOOPBACK_RUNNER_ID),
+                step_run("tier1", "local"),
+                step_run("mock-agent", "remote", runner_id=LOOPBACK_RUNNER_ID),
             ]
         )
-        pipeline = make_pipeline(["script", "agent"], requires={1: REMOTE_PIN})
+        pipeline = make_pipeline(
+            [("tier1", "script"), ("mock-agent", "agent")],
+            requires={"mock-agent": REMOTE_PIN},
+        )
         stub_backend(monkeypatch, run, pipeline)
 
         with pytest.raises(SystemExit) as exc:
@@ -1614,7 +2040,7 @@ class TestHarnessLaneVacuousPass:
         run, pipeline = script_and_agent()
         rollup = derive_rollup(run, pipeline)
         rollup["steps"] = [
-            r for r in rollup["steps"] if r["step_name"] != "harness-probe"
+            r for r in rollup["steps"] if r["step_name"] != HARNESS_TOOLS_STEP
         ]
         stub_backend(monkeypatch, run, pipeline, rollup=rollup)
 
@@ -1661,3 +2087,52 @@ class TestMockTokenConstantsDoNotDrift:
         from tdd.shared.mock_openai import ACTION_SCRIPT_LENGTH
 
         assert ACTION_SCRIPT_LENGTH >= verify_executor.MIN_HARNESS_TURNS
+
+
+# -----------------------------------------------------------------------------
+# The LIVE dogfood definition (section 5.3): the gate keys on what the
+# boundary converter actually produces from .lazyaf/pipelines/test-suite.yaml
+# -----------------------------------------------------------------------------
+
+
+class TestTheRealDogfoodDefinition:
+    """The fixtures above are miniatures. This one is the real file.
+
+    `.lazyaf/pipelines/test-suite.yaml` runs on every push to this repo and
+    is the acceptance run for the whole retirement (section 5.3), so the
+    properties the gate depends on are asserted against the file itself
+    rather than against a hand-written stand-in: every step declares an `id`
+    (section 1.6b - without one the converter renames them `step_0..step_N`
+    and the gate's own self-exemption, the context directories and the
+    breakpoint keys all change), and the gate step is named `verify-executor`.
+    """
+
+    def _yaml_steps(self):
+        yaml = pytest.importorskip("yaml")
+        path = REPO_ROOT / ".lazyaf" / "pipelines" / "test-suite.yaml"
+        return yaml.safe_load(path.read_text(encoding="utf-8"))["steps"]
+
+    def test_every_dogfood_step_declares_an_id(self):
+        steps = self._yaml_steps()
+        assert steps, "the dogfood pipeline must not be stepless"
+        missing = [
+            s.get("name") for s in steps if not (s.get("id") or "").strip()
+        ]
+        assert not missing, (
+            "these dogfood steps declare no `id`, so `array_to_graph` would "
+            f"name them step_0..step_N: {missing}"
+        )
+
+    def test_dogfood_step_ids_are_unique(self):
+        ids = [s["id"] for s in self._yaml_steps()]
+        assert len(ids) == len(set(ids))
+
+    def test_the_gate_step_is_the_one_the_self_exemption_names(self):
+        """The gate exempts itself by LAZYAF_STEP_ID, which is this id."""
+        steps = {s["id"]: s for s in self._yaml_steps()}
+        assert "verify-executor" in steps
+        gate = steps["verify-executor"]
+        assert "verify_executor.py" in gate["config"]["command"]
+        # `control: false` is the gate-independence escape hatch, and it is
+        # the reason the gate's own step has no usage row to find.
+        assert gate["config"]["control"] is False

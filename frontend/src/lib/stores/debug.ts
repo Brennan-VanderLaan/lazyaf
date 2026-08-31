@@ -9,6 +9,7 @@ import type {
   StepRunV2,
 } from '../api/types';
 import { debug as debugApi } from '../api/client';
+import { graphStepOrder } from '../components/graph/order';
 import { parseTimestamp } from '../utils/time';
 
 /**
@@ -79,6 +80,13 @@ export function debugStateLabel(status: DebugState): string {
  *
  * Exported so the panel can match a live `StepRun` against the session's
  * breakpoint lists without re-deriving the rule inline.
+ *
+ * THE INDEX FALLBACK SURVIVES 12.8 and is not dead code: every step the
+ * executor dispatches now carries `step_id`, but `pipeline_executor` still
+ * writes one StepRun with `step_id = null` - the graph-defect row
+ * (`step_name = "pipeline graph"`) it creates when a definition cannot be
+ * executed at all. That row has no step to be identified by, so its key is
+ * its index, and dropping the fallback would key it `"null"`.
  */
 export function debugStepKey(stepRun: Pick<StepRunV2, 'step_id' | 'step_index'>): string {
   return stepRun.step_id || String(stepRun.step_index);
@@ -87,78 +95,35 @@ export function debugStepKey(stepRun: Pick<StepRunV2, 'step_id' | 'step_index'>)
 /**
  * The selectable breakpoints of a pipeline, in display order.
  *
- * GRAPH (v2) pipelines: the key is the graph step id, which is exactly what
- * the executor stamps onto `StepRun.step_id`.
+ * The key is the graph step id, which is exactly what the executor stamps
+ * onto `StepRun.step_id`. There is no second keying rule: 12.8 retired the
+ * v1 array, and with it the index-keyed branch this function used to carry
+ * for it. That branch existed because a v1 `PipelineStepConfig.id` is a
+ * context-directory reference the executor never wrote to `StepRun.step_id`,
+ * so a v1 pipeline had to be keyed positionally.
  *
- * LEGACY (v1) pipelines: the key is the step INDEX as a string. It is NOT
- * `step.id` - a v1 `PipelineStepConfig.id` is an optional context-directory
- * reference that the executor never writes to `StepRun.step_id`, so keying
- * off it would produce a breakpoint that silently never fires. This is the
- * exact trap the "one resolver" rule exists to close.
+ * An empty list means the pipeline has no step to break on - NOT a
+ * fallback. There is deliberately nothing to fall back TO: a pipeline whose
+ * `steps_graph` is missing or empty has no executable definition, and
+ * inventing index keys for it would hand the backend breakpoints that no
+ * gate can ever match - a breakpoint that never fires, with no error
+ * anywhere. That is the exact trap the "one resolver" rule exists to close.
  *
- * `index` is the backend step index for v1; for v2 it is display position
- * only (a graph step has no stable index) and the KEY is the identity.
+ * `index` is display position only; the KEY is the identity.
  */
 export function debugBreakpointOptions(pipeline: Pipeline | PipelineV2): DebugBreakpointOption[] {
   const graph = (pipeline as PipelineV2).steps_graph as PipelineGraphModel | null | undefined;
+  if (!graph || !graph.steps) return [];
 
-  if (graph && graph.steps && Object.keys(graph.steps).length > 0) {
-    return graphStepOrder(graph).map((stepId, position) => {
-      const step = graph.steps[stepId];
-      return {
-        key: stepId,
-        name: step?.name ?? stepId,
-        type: step?.type ?? 'script',
-        index: position,
-      };
-    });
-  }
-
-  return (pipeline.steps ?? []).map((step, index) => ({
-    key: String(index),
-    name: step.name,
-    type: step.type,
-    index,
-  }));
-}
-
-/**
- * A stable, readable order for graph steps: entry points first, then each
- * step reachable from them (breadth-first over the edges), then anything
- * orphaned. A checkbox list that reshuffles between renders - or that lists a
- * pipeline's last step first because of object key order - is unusable, and
- * "whatever order the Record happens to have" is not a contract.
- */
-function graphStepOrder(graph: PipelineGraphModel): string[] {
-  const all = Object.keys(graph.steps);
-  const adjacency = new Map<string, string[]>();
-  for (const edge of graph.edges ?? []) {
-    if (!edge.from_step || !edge.to_step) continue;
-    const list = adjacency.get(edge.from_step) ?? [];
-    if (!list.includes(edge.to_step)) list.push(edge.to_step);
-    adjacency.set(edge.from_step, list);
-  }
-
-  const ordered: string[] = [];
-  const seen = new Set<string>();
-  const queue = [...(graph.entry_points ?? [])].filter((id) => id in graph.steps);
-
-  while (queue.length > 0) {
-    const id = queue.shift() as string;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    ordered.push(id);
-    for (const next of adjacency.get(id) ?? []) {
-      if (!seen.has(next) && next in graph.steps) queue.push(next);
-    }
-  }
-
-  // Orphans (no path from any entry point) still get a checkbox: a step the
-  // UI refuses to show is a step the user cannot break on.
-  for (const id of all) {
-    if (!seen.has(id)) ordered.push(id);
-  }
-  return ordered;
+  return graphStepOrder(graph).map((stepId, position) => {
+    const step = graph.steps[stepId];
+    return {
+      key: stepId,
+      name: step?.name ?? stepId,
+      type: step?.type ?? 'script',
+      index: position,
+    };
+  });
 }
 
 // -----------------------------------------------------------------------------

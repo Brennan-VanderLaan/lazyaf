@@ -1298,6 +1298,67 @@ export type EndpointProbeStatus = 'unprobed' | 'ok' | 'degraded' | 'unreachable'
 export type EndpointHealth = 'healthy' | 'stale' | 'degraded' | 'unhealthy' | 'unprobed';
 
 /**
+ * The input modalities LazyAF has a NAME for. Mirrors the backend's
+ * `WIRE_MODALITIES + UNREPRESENTABLE_MODALITIES`.
+ *
+ * `video` is in the list and is NOT a wire modality: the OpenAI
+ * chat-completions content-part vocabulary is `text`, `image_url`,
+ * `input_audio`, `file` — there is no `video_url` and no `input_video`.
+ * vLLM's `video_url` is a documented OpenAI-INCOMPATIBLE extension, and
+ * sampling a video into N `image_url` parts is IMAGES wearing a hat. Video is
+ * carried here precisely so the UI can SAY that, rather than leave a chip
+ * that is grey forever for an unstated reason.
+ */
+export type ModalityName = 'text' | 'images' | 'audio' | 'video';
+
+/**
+ * SIX states, and no two of them collapse. This is `supports_tools`'s
+ * three-state doctrine widened by the three facts a modality can produce that
+ * a tool-call probe cannot:
+ *
+ *   supported       probed, and the endpoint accepted the content part
+ *   unsupported     probed, and the endpoint REFUSED it (a quotable 4xx)
+ *   unprobed        nobody asked. `null` in the column. Press Probe.
+ *   probe_failed    somebody asked and the ASKING broke (timeout, 5xx,
+ *                   deadline). Also `null` in the column — same refusal at
+ *                   dispatch, DIFFERENT next action: read the reason first.
+ *   undetectable    asked, got a 200, and the answer does not decide it. The
+ *                   dangerous one: the request SUCCEEDS and the input vanishes.
+ *   unrepresentable the wire format has no way to say it. Not an observation
+ *                   about this server — a property of the protocol.
+ */
+export type ModalityState =
+  | 'supported'
+  | 'supported_unverified'
+  | 'unsupported'
+  | 'unprobed'
+  | 'undetectable'
+  | 'probe_failed'
+  | 'unrepresentable';
+
+/**
+ * One modality's answer WITH its provenance. Mirrors the backend's
+ * `Modality` model, which is DERIVED in `capabilities_of` beside `health` —
+ * so this side renders it and never recomputes it from the booleans.
+ */
+export interface Modality {
+  modality: ModalityName;
+  state: ModalityState;
+  /**
+   * `ollama_capabilities` (free, from /api/show) | `wire_probe` (a real
+   * request against the model) | `wire_format` (a constant, not an
+   * observation) | null.
+   */
+  source: string | null;
+  /** Machine reason token, e.g. `http_400`, `no_usage_delta`, `timeout`. */
+  reason: string | null;
+  /** Scrubbed snippet of the upstream refusal, when there was one. */
+  evidence: string | null;
+  /** e.g. `no_usage_no_control` — the claim is narrower than it looks. */
+  caveat: string | null;
+}
+
+/**
  * What the last probe observed. A SNAPSHOT, not a live reference.
  *
  * `supports_tools` is deliberately THREE-state: `true` (probed, works),
@@ -1305,11 +1366,38 @@ export type EndpointHealth = 'healthy' | 'stale' | 'degraded' | 'unhealthy' | 'u
  * and `null` (NEVER PROBED — we have not asked). `null` is not "assume no":
  * dispatch REFUSES on it, and the UI must render it as visibly different
  * from `false` or every new endpoint silently reads as "no tool support".
+ *
+ * `supports_images` / `supports_audio` inherit that doctrine verbatim, and
+ * inheriting it is the point: EVERY endpoint registered before the modality
+ * probe shipped reads `null` here until it is re-probed, so "not probed" is
+ * the COMMON case on first load, not an edge case.
+ *
+ * `modalities` is DERIVED backend-side (`capabilities_of`, beside `health`)
+ * and always carries one entry per `MODALITY_NAMES`, video included. The UI
+ * renders that list and never recomputes it from the booleans: a second
+ * derivation here would be a second writer that drifts from the first.
+ *
+ * An EMPTY or absent list is not "no modalities" and not "unprobed" — it is a
+ * backend that cannot answer, and `stores/endpoints` renders it as exactly
+ * that rather than as a blank, because a blank where a modality should be is
+ * the one rendering that reads as "no".
  */
 export interface EndpointCapabilities {
   supports_tools: boolean | null;
   supports_streaming: boolean | null;
   reports_usage: boolean | null;
+  /** THREE-state, like `supports_tools`. Not read by the UI — see `modalities`. */
+  supports_images: boolean | null;
+  /** THREE-state, like `supports_tools`. Not read by the UI — see `modalities`. */
+  supports_audio: boolean | null;
+  /**
+   * The ONE thing the capability display reads. It is derived backend-side
+   * from the columns plus `probe_detail`, because six states with a reason
+   * each cannot be recovered from a boolean on this side, and a second
+   * derivation in TypeScript would be a second writer that drifts from the
+   * first.
+   */
+  modalities: Modality[];
   /** EFFECTIVE window: operator override, else what the probe found, else null. */
   context_window: number | null;
   max_output_tokens: number | null;

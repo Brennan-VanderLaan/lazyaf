@@ -59,6 +59,29 @@ from app.services.websocket import manager
 # Fixtures
 # -----------------------------------------------------------------------------
 
+def cell_graph(pipeline) -> dict:
+    """The cell pipeline's v2 graph definition (12.8).
+
+    A cell's ephemeral pipeline is written as a GRAPH, so its steps are a
+    MAPPING keyed by node id (`agent`, and `verify` when the experiment
+    declares one) rather than a positional array. Read through this helper
+    rather than `json.loads(pipeline.steps)` so a definition that stops being
+    written is an assertion failure here and not a silent `[]`.
+    """
+    assert pipeline.steps_graph, (
+        f"cell pipeline {pipeline.name!r} has no steps_graph - an ad-hoc "
+        f"pipeline with no definition cannot dispatch a single step"
+    )
+    return json.loads(pipeline.steps_graph)
+
+
+def cell_step(pipeline, step_id: str = "agent") -> dict:
+    """One node of a cell pipeline's graph, by id."""
+    steps = cell_graph(pipeline)["steps"]
+    assert step_id in steps, f"no {step_id!r} node in {sorted(steps)}"
+    return steps[step_id]
+
+
 @pytest.fixture(autouse=True)
 def _register_router():
     """Include the experiments router on the app under test.
@@ -504,10 +527,10 @@ class TestLaunch:
         for cell in cells:
             run = await db_session.get(PipelineRun, cell.pipeline_run_id)
             pipeline = await db_session.get(Pipeline, run.pipeline_id)
-            steps = json.loads(pipeline.steps)
-            assert steps[0]["type"] == "agent"
-            assert steps[0]["config"]["model"] == cell.model
-            assert steps[0]["config"]["agent"] == cell.agent
+            step = cell_step(pipeline)
+            assert step["type"] == "agent"
+            assert step["config"]["model"] == cell.model
+            assert step["config"]["agent"] == cell.agent
 
     async def test_cell_pipelines_are_hidden_ad_hoc_pipelines(
         self, client, card, db_session
@@ -546,7 +569,7 @@ class TestLaunch:
         for cell in cells:
             run = await db_session.get(PipelineRun, cell.pipeline_run_id)
             pipeline = await db_session.get(Pipeline, run.pipeline_id)
-            branches.add(json.loads(pipeline.steps)[0]["config"]["branch"])
+            branches.add(cell_step(pipeline)["config"]["branch"])
         assert len(branches) == 2
         assert all(b.startswith("lazyaf/exp/") for b in branches)
 
@@ -562,7 +585,7 @@ class TestLaunch:
         ).scalars().first()
         run = await db_session.get(PipelineRun, cell.pipeline_run_id)
         pipeline = await db_session.get(Pipeline, run.pipeline_id)
-        commit = json.loads(pipeline.steps)[0]["config"]["commit"]
+        commit = cell_step(pipeline)["config"]["commit"]
         assert commit == {"enabled": True, "push": False}
 
     async def test_verify_appends_a_script_step(self, client, card, db_session):
@@ -579,12 +602,22 @@ class TestLaunch:
         ).scalars().first()
         run = await db_session.get(PipelineRun, cell.pipeline_run_id)
         pipeline = await db_session.get(Pipeline, run.pipeline_id)
-        steps = json.loads(pipeline.steps)
-        assert [s["type"] for s in steps] == ["agent", "script"]
-        assert steps[1]["config"]["command"] == "pytest -q"
-        assert steps[1]["timeout"] == 120
+        graph = cell_graph(pipeline)
+        assert [s["type"] for s in graph["steps"].values()] == ["agent", "script"]
+        assert graph["entry_points"] == ["agent"]
+        assert cell_step(pipeline, "verify")["config"]["command"] == "pytest -q"
+        assert cell_step(pipeline, "verify")["timeout"] == 120
+
         # A crashed agent must not run verify and paper a 0% over an error.
-        assert steps[0]["on_failure"] == "stop"
+        # Under v1 that was the agent step's `on_failure: "stop"`; on the
+        # graph it is the ABSENCE of a failure edge out of `agent`, which is
+        # the same rule with nowhere left to hide it. Asserted as "the only
+        # edge is agent -> verify on SUCCESS" rather than "no failure edge",
+        # so an edge added under `always` fails this too.
+        assert [
+            (e["from_step"], e["to_step"], e["condition"])
+            for e in graph["edges"]
+        ] == [("agent", "verify", "success")]
 
     async def test_launch_twice_is_a_409(self, client, card):
         body = await create(client, card)
@@ -643,7 +676,7 @@ class TestLaunch:
         ).scalars().first()
         run = await db_session.get(PipelineRun, cell.pipeline_run_id)
         pipeline = await db_session.get(Pipeline, run.pipeline_id)
-        config = json.loads(pipeline.steps)[0]["config"]
+        config = cell_step(pipeline)["config"]
         assert config["prompt_template"] == "FROZEN PROMPT BODY"
         assert cell.prompt_version == 1
 

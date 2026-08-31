@@ -22,44 +22,53 @@ async function waitForGraphEditor(page: Page) {
   await expect(page.locator('.svelte-flow')).toBeVisible({ timeout: 3000 });
 }
 
-// Helper: Reliable drag between SvelteFlow handles
-// Uses pointer events which SvelteFlow responds to
-async function dragHandle(page: Page, sourceHandle: any, targetHandle: any) {
-  // Get bounding boxes
-  const sourceBox = await sourceHandle.boundingBox();
-  const targetBox = await targetHandle.boundingBox();
+/**
+ * Connect two nodes through the editor's Connect panel.
+ *
+ * NOT a drag. SvelteFlow's connection drag does not respond to Playwright's
+ * synthetic pointer events - the `dragHandle` helper that used to live here
+ * moved the mouse in eight steps with waits between them and still never
+ * produced an edge, which is why nine specs in this file stood skipped with a
+ * "the functionality works manually" note. The editor now ships a real
+ * keyboard/menu affordance for the same job (ConnectPanel), so these specs
+ * drive the product the way a keyboard user does rather than the way the
+ * library wants a mouse to.
+ *
+ * `condition` omitted means "take whatever default the editor offers", which
+ * is what the smart-default specs assert.
+ */
+async function connectSteps(
+  page: Page,
+  from: string,
+  to: string,
+  condition?: 'success' | 'failure' | 'always',
+) {
+  const badgesBefore = await page.locator('.condition-badge').count();
 
-  if (!sourceBox || !targetBox) {
-    throw new Error('Could not get handle bounding boxes');
+  await page.click('[data-testid="toolbar-connect"]');
+  await expect(page.locator('[data-testid="connect-panel"]')).toBeVisible({ timeout: 2000 });
+  await page.selectOption('[data-testid="connect-from"]', { label: from });
+  await page.selectOption('[data-testid="connect-to"]', { label: to });
+  if (condition) {
+    await page.selectOption('[data-testid="connect-condition"]', condition);
   }
+  await page.click('[data-testid="connect-confirm"]');
 
-  // Calculate centers
-  const sourceX = sourceBox.x + sourceBox.width / 2;
-  const sourceY = sourceBox.y + sourceBox.height / 2;
-  const targetX = targetBox.x + targetBox.width / 2;
-  const targetY = targetBox.y + targetBox.height / 2;
+  // The panel closes itself only on success, so its disappearance IS the
+  // assertion that the connection was accepted rather than refused.
+  await expect(page.locator('[data-testid="connect-panel"]')).toHaveCount(0, { timeout: 2000 });
+  await expect(page.locator('.condition-badge')).toHaveCount(badgesBefore + 1, { timeout: 2000 });
+}
 
-  // Hover over source to activate it
-  await page.mouse.move(sourceX, sourceY);
-  await page.waitForTimeout(50);
-
-  // Start drag
-  await page.mouse.down();
-  await page.waitForTimeout(30);
-
-  // Move to target in steps
-  const steps = 8;
-  for (let i = 1; i <= steps; i++) {
-    const x = sourceX + (targetX - sourceX) * (i / steps);
-    const y = sourceY + (targetY - sourceY) * (i / steps);
-    await page.mouse.move(x, y);
-    await page.waitForTimeout(15);
-  }
-
-  // Release on target
-  await page.waitForTimeout(30);
-  await page.mouse.up();
-  await page.waitForTimeout(150);
+/** The condition the panel OFFERS for `from`, without accepting it. */
+async function offeredCondition(page: Page, from: string): Promise<string> {
+  await page.click('[data-testid="toolbar-connect"]');
+  await expect(page.locator('[data-testid="connect-panel"]')).toBeVisible({ timeout: 2000 });
+  await page.selectOption('[data-testid="connect-from"]', { label: from });
+  const value = await page.locator('[data-testid="connect-condition"]').inputValue();
+  await page.click('[data-testid="connect-cancel"]');
+  await expect(page.locator('[data-testid="connect-panel"]')).toHaveCount(0);
+  return value;
 }
 
 // Helper: Add a script step via toolbar (includes modal waits)
@@ -80,22 +89,10 @@ async function addScriptStep(page: Page, name: string, command: string) {
   await page.waitForTimeout(300);
 }
 
-// Helper: Stabilize the graph view before interactions
-async function stabilizeGraph(page: Page) {
-  // Click fit view to ensure consistent positioning
-  const fitViewButton = page.locator('.svelte-flow__controls-fitview');
-  if (await fitViewButton.count() > 0) {
-    await fitViewButton.click();
-  }
-  // Wait for any animations/re-renders to complete
-  await page.waitForTimeout(300);
-}
-
-// Helper: Get the graph canvas bounds
-async function getCanvasBounds(page: Page) {
-  const canvas = page.locator('.svelte-flow');
-  return await canvas.boundingBox();
-}
+// `stabilizeGraph` and `getCanvasBounds` were deleted with `dragHandle`.
+// Both existed only to make handle-dragging land: one clicked "fit view" and
+// waited 300ms before every drag, the other measured the canvas so a drag
+// could be aimed at it. Nothing connects by pixel coordinates any more.
 
 // =============================================================================
 // Test Suite: Adding Nodes via Toolbar
@@ -402,9 +399,19 @@ test.describe('Graph Pipeline Editor - Node Configuration', () => {
 // Test Suite: Edge Connections and Conditions
 // =============================================================================
 
-// NOTE: SvelteFlow's connection mechanism doesn't respond to Playwright's mouse events.
-// These tests are skipped but the functionality works manually.
-// TODO: Investigate SvelteFlow-specific Playwright testing approaches or use component tests.
+// =============================================================================
+// Test Suite: Edge Connections
+//
+// These five specs stood SKIPPED from the day they were written, under a note
+// saying SvelteFlow's connection mechanism does not respond to Playwright's
+// mouse events and "the functionality works manually". That was true, and it
+// was also five permanently-dark specs on the only pipeline-authoring surface
+// the product has - which is how the editor came to be PUTting to a route that
+// does not exist without anything noticing. They are driven now through the
+// editor's Connect panel, which is a real affordance (it is also the only way
+// to draw an edge from a keyboard) rather than a test hook.
+// =============================================================================
+
 test.describe('Graph Pipeline Editor - Edge Connections', () => {
   let repo: { id: string; name: string };
 
@@ -412,134 +419,108 @@ test.describe('Graph Pipeline Editor - Edge Connections', () => {
     repo = await createTestRepo(page, 'e2e-graph');
   });
 
-  test.skip('can connect two nodes by dragging', async ({ page }) => {
+  test('can connect two nodes', async ({ page }) => {
     await goToPipelinesPage(page, repo.name);
     await page.click('button:has-text("New Pipeline")');
     await waitForGraphEditor(page);
 
-    // Add two nodes
     await addScriptStep(page, 'Step A', 'echo a');
     await addScriptStep(page, 'Step B', 'echo b');
 
-    // Stabilize graph after all nodes added
-    await stabilizeGraph(page);
+    await connectSteps(page, 'Step A', 'Step B');
 
-    // Get node handles - each step node has 2 handles (left target, right source)
-    const nodes = page.locator('.step-node');
-    const sourceHandle = nodes.first().locator('.svelte-flow__handle').last();  // right handle
-    const targetHandle = nodes.nth(1).locator('.svelte-flow__handle').first();  // left handle
-
-    // Drag from source to target
-    await dragHandle(page, sourceHandle, targetHandle);
-
-    // Edge should appear (check for condition badge as SVG edges have visibility issues)
+    // SVG edge paths are awkward to assert on; the condition badge is the
+    // edge's visible identity and is what the picker specs below click.
     await expect(page.locator('.condition-badge')).toBeVisible({ timeout: 2000 });
   });
 
-  test.skip('new edge defaults to success condition', async ({ page }) => {
+  test('new edge defaults to success condition', async ({ page }) => {
     await goToPipelinesPage(page, repo.name);
     await page.click('button:has-text("New Pipeline")');
     await waitForGraphEditor(page);
 
-    // Add two nodes
     await addScriptStep(page, 'Step 1', 'echo 1');
     await addScriptStep(page, 'Step 2', 'echo 2');
-    await stabilizeGraph(page);
 
-    // Connect them - each step node has 2 handles (left target, right source)
-    const nodes = page.locator('.step-node');
-    const sourceHandle = nodes.first().locator('.svelte-flow__handle').last();  // right
-    const targetHandle = nodes.nth(1).locator('.svelte-flow__handle').first();  // left
-    await dragHandle(page, sourceHandle, targetHandle);
+    // The panel OFFERS success before anything is confirmed - i.e. the
+    // default is the editor's, not something this spec typed in.
+    expect(await offeredCondition(page, 'Step 1')).toBe('success');
 
-    // Edge label should show "ok" (success)
+    await connectSteps(page, 'Step 1', 'Step 2');
     await expect(page.locator('.condition-badge')).toContainText('ok');
   });
 
-  test.skip('clicking edge badge shows condition picker', async ({ page }) => {
+  test('clicking edge badge shows condition picker', async ({ page }) => {
     await goToPipelinesPage(page, repo.name);
     await page.click('button:has-text("New Pipeline")');
     await waitForGraphEditor(page);
 
-    // Setup two connected nodes
     await addScriptStep(page, 'A', 'echo a');
     await addScriptStep(page, 'B', 'echo b');
-    await stabilizeGraph(page);
+    await connectSteps(page, 'A', 'B');
 
-    const nodes = page.locator('.step-node');
-    const sourceHandle = nodes.first().locator('.svelte-flow__handle').last();  // right
-    const targetHandle = nodes.nth(1).locator('.svelte-flow__handle').first();  // left
-    await dragHandle(page, sourceHandle, targetHandle);
-
-    // Wait for edge to be created
-    await expect(page.locator('.condition-badge')).toBeVisible({ timeout: 2000 });
-
-    // Click the condition badge
     await page.locator('.condition-badge').click();
 
-    // Picker should appear
     await expect(page.locator('.condition-picker')).toBeVisible();
     await expect(page.locator('.condition-picker')).toContainText('On Success');
     await expect(page.locator('.condition-picker')).toContainText('On Failure');
     await expect(page.locator('.condition-picker')).toContainText('Always');
   });
 
-  test.skip('can change edge condition to failure', async ({ page }) => {
+  test('can change edge condition to failure', async ({ page }) => {
     await goToPipelinesPage(page, repo.name);
     await page.click('button:has-text("New Pipeline")');
     await waitForGraphEditor(page);
 
-    // Setup connected nodes
     await addScriptStep(page, 'Main', 'npm test');
     await addScriptStep(page, 'Error Handler', 'echo failed');
-    await stabilizeGraph(page);
+    await connectSteps(page, 'Main', 'Error Handler');
 
-    const nodes = page.locator('.step-node');
-    const sourceHandle = nodes.first().locator('.svelte-flow__handle').last();  // right
-    const targetHandle = nodes.nth(1).locator('.svelte-flow__handle').first();  // left
-    await dragHandle(page, sourceHandle, targetHandle);
-
-    // Wait for edge to be created
-    await expect(page.locator('.condition-badge')).toBeVisible({ timeout: 2000 });
-
-    // Change to failure condition (use force due to potential minimap overlap)
+    // force: the minimap can overlap the picker's lower options.
     await page.locator('.condition-badge').click();
     await page.locator('.picker-option.failure').click({ force: true });
 
-    // Badge should update to "err"
     await expect(page.locator('.condition-badge')).toContainText('err');
   });
 
-  test.skip('smart defaults: second edge from same source defaults to failure', async ({ page }) => {
+  test('smart defaults: second edge from same source defaults to failure', async ({ page }) => {
     await goToPipelinesPage(page, repo.name);
     await page.click('button:has-text("New Pipeline")');
     await waitForGraphEditor(page);
 
-    // Add three nodes
     await addScriptStep(page, 'Source', 'npm test');
     await addScriptStep(page, 'On Pass', 'echo pass');
     await addScriptStep(page, 'On Fail', 'echo fail');
-    await stabilizeGraph(page);
 
-    const nodes = page.locator('.step-node');
-
-    // Connect source to first target (should be success)
-    const sourceHandle = nodes.first().locator('.svelte-flow__handle').last();  // right
-    const target1Handle = nodes.nth(1).locator('.svelte-flow__handle').first();  // left
-    await dragHandle(page, sourceHandle, target1Handle);
-
+    await connectSteps(page, 'Source', 'On Pass');
     await expect(page.locator('.condition-badge').first()).toContainText('ok');
 
-    // Stabilize again after first edge
-    await stabilizeGraph(page);
+    // The rule under test: a source that already has a success edge offers
+    // FAILURE next. `defaultConditionFor` is shared with the drag path, so
+    // pinning it here pins it for both.
+    expect(await offeredCondition(page, 'Source')).toBe('failure');
 
-    // Connect source to second target (should default to failure)
-    const target2Handle = nodes.nth(2).locator('.svelte-flow__handle').first();  // left
-    await dragHandle(page, sourceHandle, target2Handle);
+    await connectSteps(page, 'Source', 'On Fail');
+    await expect(page.locator('.condition-badge').nth(1)).toContainText('err');
+  });
 
-    // Second edge should be failure
-    const badges = page.locator('.condition-badge');
-    await expect(badges.nth(1)).toContainText('err');
+  test('refuses to connect a step to itself, naming it', async ({ page }) => {
+    await goToPipelinesPage(page, repo.name);
+    await page.click('button:has-text("New Pipeline")');
+    await waitForGraphEditor(page);
+
+    await addScriptStep(page, 'Solo', 'echo solo');
+
+    await page.click('[data-testid="toolbar-connect"]');
+    await page.selectOption('[data-testid="connect-from"]', { label: 'Solo' });
+    await page.selectOption('[data-testid="connect-to"]', { label: 'Solo' });
+    await page.click('[data-testid="connect-confirm"]');
+
+    // Refused, said why, and stayed open so the author can fix it (R1),
+    // rather than writing a self-edge that fails the run later.
+    await expect(page.locator('[data-testid="connect-problem"]')).toContainText('Solo');
+    await expect(page.locator('[data-testid="connect-panel"]')).toBeVisible();
+    await expect(page.locator('.condition-badge')).toHaveCount(0);
   });
 });
 
@@ -564,63 +545,51 @@ test.describe('Graph Pipeline Editor - Entry Points', () => {
     await expect(page.locator('.start-node')).toContainText('Start');
   });
 
-  test.skip('connecting Start node to step sets it as entry point', async ({ page }) => {
+  test('connecting Start node to step sets it as entry point', async ({ page }) => {
     await goToPipelinesPage(page, repo.name);
     await page.click('button:has-text("New Pipeline")');
     await waitForGraphEditor(page);
 
-    // Add a step
     await addScriptStep(page, 'First Step', 'echo first');
-    await stabilizeGraph(page);
 
-    // Connect Start node to the step - Start has one output handle, step has input on left
-    const startHandle = page.locator('.start-node .svelte-flow__handle');
-    const stepHandle = page.locator('.step-node .svelte-flow__handle').first();  // left
-    await dragHandle(page, startHandle, stepHandle);
+    // Start has no outcome to branch on, so its edge is unconditional.
+    expect(await offeredCondition(page, 'Start')).toBe('always');
 
-    // Edge should appear from Start to step (uses 'always' condition)
-    await expect(page.locator('.condition-badge')).toBeVisible({ timeout: 2000 });
+    await connectSteps(page, 'Start', 'First Step');
+    await expect(page.locator('.condition-badge')).toContainText('->');
   });
 
-  test.skip('Start node can connect to multiple steps for parallel execution', async ({ page }) => {
+  test('Start node can connect to multiple steps for parallel execution', async ({ page }) => {
     await goToPipelinesPage(page, repo.name);
     await page.click('button:has-text("New Pipeline")');
     await waitForGraphEditor(page);
 
-    // Add two steps
     await addScriptStep(page, 'Parallel A', 'echo A');
     await addScriptStep(page, 'Parallel B', 'echo B');
-    await stabilizeGraph(page);
 
-    // Connect Start to both steps
-    const startHandle = page.locator('.start-node .svelte-flow__handle');
-    const firstStepHandle = page.locator('.step-node').first().locator('.svelte-flow__handle').first();  // left
-    const secondStepHandle = page.locator('.step-node').nth(1).locator('.svelte-flow__handle').first();  // left
+    await connectSteps(page, 'Start', 'Parallel A');
+    await connectSteps(page, 'Start', 'Parallel B');
 
-    await dragHandle(page, startHandle, firstStepHandle);
-    await expect(page.locator('.condition-badge').first()).toBeVisible({ timeout: 2000 });
-
-    await stabilizeGraph(page);
-    await dragHandle(page, startHandle, secondStepHandle);
-
-    // Both edges should exist (2 condition badges)
     await expect(page.locator('.condition-badge')).toHaveCount(2, { timeout: 2000 });
   });
 });
 
 // =============================================================================
-// Test Suite: Execution Visualization
+// DELETED, NOT SKIPPED: "Graph Pipeline Editor - Execution Visualization".
+//
+// It was a `test.describe` holding `test.skip(true, 'Requires backend pipeline
+// run support')` and a comment listing four things it "would verify" - and
+// ZERO tests. It could never run, never fail, and nothing could ever un-skip
+// it, so it measured nothing while looking, in a skip count, exactly like
+// coverage that was temporarily parked (R4).
+//
+// The behaviour it named is not uncovered: node status colours, active-step
+// pulsing and edge animation are driven from `stepStatuses` / `activeStepIds`
+// / `completedStepIds`, and a real run through them is exercised by
+// tdd/e2e/test_graph_pipeline.py and by the dogfood pipeline. A UI-level spec
+// for it needs a live run to watch, which is `dogfood-live.spec.ts`'s
+// territory, not a placeholder here.
 // =============================================================================
-
-test.describe('Graph Pipeline Editor - Execution Visualization', () => {
-  test.skip(true, 'Requires backend pipeline run support');
-
-  // These tests would verify:
-  // - Nodes pulse when active
-  // - Edges animate when data flows
-  // - Nodes change color based on status
-  // - MiniMap reflects execution state
-});
 
 // =============================================================================
 // Test Suite: Saving and Loading
@@ -633,31 +602,66 @@ test.describe('Graph Pipeline Editor - Save and Load', () => {
     repo = await createTestRepo(page, 'e2e-graph');
   });
 
-  // Skipped: Requires edge connection to Start node to create entry point
-  test.skip('can save pipeline with graph structure', async ({ page }) => {
+  test('saves a NEW pipeline and then UPDATES it, through the editor', async ({ page }) => {
     await goToPipelinesPage(page, repo.name);
     await page.click('button:has-text("New Pipeline")');
     await waitForGraphEditor(page);
 
-    // Fill pipeline name
     await page.fill('input[placeholder*="Pipeline name"]', 'My Graph Pipeline');
-
-    // Add a node
     await addScriptStep(page, 'Build', 'npm build');
-    await stabilizeGraph(page);
 
-    // Save the pipeline
-    await page.click('button:has-text("Save Pipeline")');
+    // An entry point is what makes a pipeline runnable and the ONLY way to
+    // declare one is an edge from Start. Until the Connect panel existed
+    // this spec could not get past this line, which is why it was skipped.
+    await connectSteps(page, 'Start', 'Build');
 
-    // Wait for save to complete - look for success indicator or button state change
-    await page.waitForTimeout(500);
+    await page.click('[data-testid="save-pipeline"]');
+    await expect(page.locator('[data-testid="pipelines-page"]')).toBeVisible({ timeout: 5000 });
 
-    // Verify pipeline was saved by checking API
-    const response = await page.request.get(`${BACKEND_URL}/api/repos/${repo.id}/pipelines`);
-    expect(response.ok()).toBeTruthy();
-    const pipelines = await response.json();
-    expect(pipelines.length).toBeGreaterThan(0);
-    expect(pipelines.some((p: any) => p.name === 'My Graph Pipeline')).toBeTruthy();
+    const listed = await page.request.get(`${BACKEND_URL}/api/repos/${repo.id}/pipelines`);
+    expect(listed.ok()).toBeTruthy();
+    const pipelines = await listed.json();
+    const created = pipelines.find((p: any) => p.name === 'My Graph Pipeline');
+    expect(created, 'the pipeline the editor just saved').toBeTruthy();
+
+    // THE POINT OF THE SPEC: what was persisted, read back from the API.
+    const graph = created.steps_graph;
+    expect(graph, 'steps_graph').toBeTruthy();
+    const buildId = Object.keys(graph.steps).find((id: string) => graph.steps[id].name === 'Build');
+    expect(buildId).toBeTruthy();
+    expect(graph.entry_points).toEqual([buildId]);
+    expect(graph.steps[buildId!].config.command).toBe('npm build');
+
+    // ---- and now UPDATE it. This is the half nothing has ever covered: the
+    // editor PUT to a route that does not exist, so saving an EXISTING
+    // pipeline 405'd every time and no test looked. ----
+    await page.locator('.pipeline-card:has-text("My Graph Pipeline") button:has-text("Edit")').click();
+    await waitForGraphEditor(page);
+    await expect(page.locator('.step-node')).toContainText('Build');
+
+    await addScriptStep(page, 'Test', 'npm test');
+    await connectSteps(page, 'Build', 'Test');
+    await page.click('[data-testid="save-pipeline"]');
+    await expect(page.locator('[data-testid="pipelines-page"]')).toBeVisible({ timeout: 5000 });
+
+    const reread = await page.request.get(`${BACKEND_URL}/api/pipelines/${created.id}`);
+    expect(reread.ok(), 'GET the pipeline the editor just updated').toBeTruthy();
+    const updated = await reread.json();
+    const updatedGraph = updated.steps_graph;
+
+    const ids = Object.keys(updatedGraph.steps);
+    const byName: Record<string, string> = {};
+    for (const id of ids) byName[updatedGraph.steps[id].name] = id;
+    expect(Object.keys(byName).sort()).toEqual(['Build', 'Test']);
+
+    expect(updatedGraph.entry_points).toEqual([byName['Build']]);
+    expect(updatedGraph.edges).toContainEqual(
+      expect.objectContaining({
+        from_step: byName['Build'],
+        to_step: byName['Test'],
+        condition: 'success',
+      }),
+    );
   });
 
   test('saved pipeline loads with graph structure intact', async ({ page }) => {

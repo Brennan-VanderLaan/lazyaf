@@ -106,12 +106,24 @@ class TestPipelineWorkflowDemo:
         assert pipeline_response.status_code == 201
         pipeline = pipeline_response.json()
 
+        # 12.8: the array above is the AUTHORING dialect and the API door
+        # converts it once, here. What comes back - and what the executor
+        # runs - is the graph. There is no `steps` on the wire any more, so a
+        # demo that printed one would be documenting a field that is gone.
+        graph = pipeline['steps_graph']
+        assert graph is not None, "an authored pipeline must come back with a graph"
+        nodes = graph['steps']
+        assert len(nodes) == 3
+        assert graph['entry_points'] == ['step_0']
+
         print(f"    Pipeline created: {pipeline['name']}")
         print(f"    Pipeline ID: {pipeline['id'][:8]}...")
-        print(f"    Steps: {len(pipeline['steps'])}")
-        for i, step in enumerate(pipeline['steps']):
-            print(f"      [{i}] {step['name']} ({step['type']})")
-            print(f"          on_success: {step['on_success']}, on_failure: {step['on_failure']}")
+        print(f"    Steps: {len(nodes)}")
+        for step_id, step in nodes.items():
+            print(f"      [{step_id}] {step['name']} ({step['type']})")
+        print(f"    Edges: {len(graph['edges'])}")
+        for edge in graph['edges']:
+            print(f"      {edge['from_step']} --{edge['condition']}--> {edge['to_step']}")
 
         # ---------------------------------------------------------------------
         # Step 2: List Pipelines for the Repository
@@ -203,7 +215,20 @@ class TestPipelineWorkflowDemo:
         # ---------------------------------------------------------------------
         print("\n[8] Updating pipeline to add deployment step...")
 
-        updated_steps = steps + [
+        # NOTE the change to "Run Tests". It said `on_success: stop` when it
+        # was the LAST step; appending after it without reopening it leaves
+        # the new step unreachable, and 12.8 refuses that at the boundary
+        # (422) instead of writing a pipeline with a dead tail. Before the
+        # retirement this wrote fine and the deploy step simply never ran.
+        updated_steps = steps[:-1] + [
+            pipeline_step_payload(
+                name="Run Tests",
+                step_type="script",
+                config={"command": "npm test"},
+                on_success="next",
+                on_failure="stop",
+                timeout=600,
+            ),
             pipeline_step_payload(
                 name="Deploy to Staging",
                 step_type="docker",
@@ -221,7 +246,8 @@ class TestPipelineWorkflowDemo:
         updated = update_response.json()
 
         print(f"    Pipeline updated: {updated['name']}")
-        print(f"    New step count: {len(updated['steps'])}")
+        print(f"    New step count: {len(updated['steps_graph']['steps'])}")
+        assert len(updated['steps_graph']['steps']) == 4
 
         # ---------------------------------------------------------------------
         # Step 9: Cleanup - Delete Pipeline
@@ -314,11 +340,33 @@ class TestPipelineWithBranchingDemo:
         pipeline = pipeline_response.json()
 
         print(f"\nPipeline: {pipeline['name']}")
-        print("\nBranching logic:")
-        for step in pipeline['steps']:
-            print(f"  {step['name']}:")
-            print(f"    on_success -> {step['on_success']}")
-            print(f"    on_failure -> {step['on_failure']}")
+        graph = pipeline['steps_graph']
+        nodes = graph['steps']
+
+        print("\nBranching logic, as the graph holds it:")
+        print("  FLOW lives on edges -")
+        for edge in graph['edges']:
+            print(f"    {edge['from_step']} --{edge['condition']}--> {edge['to_step']}")
+        print("  EFFECTS live on the node -")
+        for step_id, step in nodes.items():
+            actions = step.get('actions') or {}
+            if any(actions.get(c) for c in ('success', 'failure', 'always')):
+                print(f"    {step_id} ({step['name']}): {actions}")
+
+        # 12.8 §1.2: `next`/`stop` were FLOW and are now edges; `merge:` was
+        # an EFFECT and is now a node action. The demo asserts the split it
+        # is describing, so this documentation cannot drift from the wire.
+        by_condition = {(e['from_step'], e['condition']) for e in graph['edges']}
+        # Lint continues on BOTH outcomes (on_failure: next).
+        assert ('step_0', 'success') in by_condition
+        assert ('step_0', 'failure') in by_condition
+        # Unit tests stop on failure: a success edge and no failure edge.
+        assert ('step_1', 'success') in by_condition
+        assert ('step_1', 'failure') not in by_condition
+        # Integration tests auto-merge. The merge is an ACTION, and this is
+        # the last node, so it carries no edge at all.
+        assert nodes['step_2']['actions']['success'] == ['merge:main']
+        assert not [e for e in graph['edges'] if e['from_step'] == 'step_2']
 
         print("\nExpected behavior:")
         print("  1. Lint runs, continues regardless of result")
@@ -388,7 +436,8 @@ class TestPipelineTemplatesDemo:
 
         print(f"\nTemplate created: {template['name']}")
         print(f"  is_template: {template['is_template']}")
-        print(f"  steps: {len(template['steps'])}")
+        print(f"  steps: {len(template['steps_graph']['steps'])}")
+        assert len(template['steps_graph']['steps']) == 3
 
         # List to show template is marked differently
         list_response = await client.get(f"/api/repos/{demo_repo['id']}/pipelines")

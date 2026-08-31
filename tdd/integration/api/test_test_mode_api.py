@@ -340,6 +340,64 @@ class TestSeed:
         # Internal git repo actually exists on disk
         assert clean_git_repos.repo_exists(body["repo"]["id"])
 
+    async def test_the_seeded_pipeline_is_one_the_executor_can_dispatch(
+        self, test_client, db_session, clean_git_repos
+    ):
+        """A fixture the executor cannot run is worse than no fixture.
+
+        The seeded pipeline is a v2 GRAPH since 12.8, and a graph has more
+        ways to be undispatchable than an array did - no entry point, an edge
+        to a step that is not declared, a node nothing reaches. So this asks
+        the executor's own definition-time authority
+        (`graph_definition_errors`) rather than eyeballing the JSON: a seed
+        that stops being runnable fails HERE, in test mode's own suite,
+        instead of somewhere in the middle of a demo.
+
+        The node id is pinned too. It is the debug breakpoint key and the
+        context-directory name for anyone poking at the seeded board by hand,
+        so a rename is a break for them and not an implementation detail.
+        """
+        import json
+
+        from app.models import Pipeline
+        from app.routers.test_api import SEED_STEP_COMMAND, SEED_STEP_ID
+        from app.services.pipeline_executor import graph_definition_errors
+
+        body = (await test_client.post("/api/test/seed")).json()
+        pipeline = await db_session.get(Pipeline, body["pipeline"]["id"])
+
+        assert pipeline.steps_graph, "the seeded pipeline has no definition"
+        graph = json.loads(pipeline.steps_graph)
+        assert graph_definition_errors(graph) == []
+        assert list(graph["steps"]) == [SEED_STEP_ID]
+        assert graph["entry_points"] == [SEED_STEP_ID]
+        assert graph["steps"][SEED_STEP_ID]["type"] == "script"
+        assert graph["steps"][SEED_STEP_ID]["config"]["command"] == SEED_STEP_COMMAND
+
+    async def test_seeding_twice_leaves_one_runnable_definition_per_pipeline(
+        self, test_client, db_session, clean_git_repos
+    ):
+        """Idempotence is about the STATE a second /seed leaves behind.
+
+        The existing sibling test pins that a second call returns 200; this
+        pins that what it left is still usable. Both seeded pipeline rows must
+        carry a dispatchable definition - a second seed that wrote a half-built
+        or empty one would still answer 200 and only fail later, at the first
+        run, which is the shape of failure test mode exists to prevent.
+        """
+        import json
+
+        from app.models import Pipeline
+        from app.services.pipeline_executor import graph_definition_errors
+
+        first = (await test_client.post("/api/test/seed")).json()
+        second = (await test_client.post("/api/test/seed")).json()
+
+        for body in (first, second):
+            pipeline = await db_session.get(Pipeline, body["pipeline"]["id"])
+            assert pipeline is not None
+            assert graph_definition_errors(json.loads(pipeline.steps_graph)) == []
+
     async def test_seed_git_commit_is_deterministic(
         self, test_client, clean_git_repos
     ):

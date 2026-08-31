@@ -14,11 +14,14 @@ from sse_starlette.sse import EventSourceResponse
 from app.database import get_db
 from app.models import Repo, AgentFile
 from app.schemas.playground import (
+    PlaygroundCapabilities,
     PlaygroundTestRequest,
     PlaygroundTestResponse,
     PlaygroundStatus,
     PlaygroundResult,
     PlaygroundSessionSummary,
+    attachment_refusal,
+    playground_capabilities,
 )
 from app.services.playground_service import PlaygroundCancelError, playground_service
 from app.services.agent_resolver import agent_resolver
@@ -51,6 +54,18 @@ async def start_test(
 
     if not repo.is_ingested:
         raise HTTPException(status_code=400, detail="Repository not ingested")
+
+    # Attachments, BEFORE anything that costs money.
+    #
+    # The UI already greys the attach control and names the reason, but the
+    # button is not the contract - this is, exactly as it is for the blank
+    # prompt above. A refusal here is a 422 with the whole story in it, never
+    # a 200 that quietly drops the files: a run that SUCCEEDS having lost half
+    # its input is the worst failure shape on this page, because nothing looks
+    # wrong. See the Attachments section of schemas/playground.py.
+    refusal = attachment_refusal(request.attachments)
+    if refusal:
+        raise HTTPException(status_code=422, detail=refusal)
 
     # Resolve agent configuration
     prompt_template = None
@@ -149,6 +164,28 @@ async def list_sessions(
 
 
 # Session endpoints
+
+
+@session_router.get("/capabilities", response_model=PlaygroundCapabilities)
+async def get_capabilities():
+    """What the playground itself can carry, and the caps it enforces.
+
+    Declared BEFORE the `/{session_id}/...` routes so a literal path can never
+    be shadowed by the parameterised ones (it would not be, at two segments
+    against one, but ordering is cheaper than remembering why).
+
+    This exists so the UI RENDERS the limits instead of re-spelling them. A
+    "max 5 MiB" written into a Svelte template beside a `5 * 1024 * 1024` in a
+    validator is two sources of truth for one contract (R3), and the half that
+    drifts is always the sentence a human reads. It also carries the reason
+    each modality is or is not attachable, so a greyed control on that page is
+    never greyed for a reason nobody wrote down.
+
+    Static, cheap and unauthenticated-by-the-same-rules-as-the-rest: it names
+    no session, reads no database and reveals nothing but this build's own
+    limits.
+    """
+    return playground_capabilities()
 
 
 @session_router.get("/{session_id}/stream")

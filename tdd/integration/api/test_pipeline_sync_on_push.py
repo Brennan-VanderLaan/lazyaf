@@ -193,7 +193,12 @@ class TestSyncOnPushCreatesPipeline:
         pipeline = await _get_materialized_pipeline(client, repo["id"])
         assert pipeline is not None
         assert pipeline["description"] == "Repo CI pipeline"
-        assert len(pipeline["steps"]) == 1
+        # The yaml stays an ARRAY (that is the authoring format); the row it
+        # materializes into is a GRAPH, converted once at this boundary.
+        assert pipeline["definition_error"] is None
+        graph = pipeline["steps_graph"]
+        assert [node["name"] for node in graph["steps"].values()] == ["Test"]
+        assert graph["entry_points"] == list(graph["steps"])
         assert pipeline["triggers"] == [
             {
                 "type": "push",
@@ -250,7 +255,7 @@ class TestSyncOnPushRefreshesPipeline:
             json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
         )
         pipeline_v1 = await _get_materialized_pipeline(client, repo["id"])
-        assert len(pipeline_v1["steps"]) == 1
+        assert len(pipeline_v1["steps_graph"]["steps"]) == 1
 
         # Modify the yaml and push
         yaml_path = repo_path / ".lazyaf" / "pipelines" / "repo-ci.yaml"
@@ -267,7 +272,11 @@ class TestSyncOnPushRefreshesPipeline:
         pipeline_v2 = await _get_materialized_pipeline(client, repo["id"])
         assert pipeline_v2["id"] == pipeline_v1["id"]
         assert pipeline_v2["description"] == "Repo CI pipeline v2"
-        assert [s["name"] for s in pipeline_v2["steps"]] == ["Lint", "Test"]
+        graph_v2 = pipeline_v2["steps_graph"]
+        assert [n["name"] for n in graph_v2["steps"].values()] == ["Lint", "Test"]
+        assert [
+            (e["from_step"], e["to_step"], e["condition"]) for e in graph_v2["edges"]
+        ] == [("step_0", "step_1", "success")]
 
         # The run started by that same push uses the NEW two-step definition
         run_response = await client.get(
@@ -312,7 +321,7 @@ class TestSyncOnPushClearsRemovedYaml:
         assert pipeline_after is not None
         assert pipeline_after["id"] == pipeline["id"]
         assert pipeline_after["triggers"] == []
-        assert pipeline_after["steps"] == pipeline["steps"]
+        assert pipeline_after["steps_graph"] == pipeline["steps_graph"]
 
         # And it stays in the DB
         db_result = await db_session.execute(
@@ -379,7 +388,7 @@ class TestBrokenYamlKeepsTriggers:
 
         pipeline_after = await _get_materialized_pipeline(client, repo["id"])
         assert pipeline_after["triggers"] == pipeline["triggers"]
-        assert pipeline_after["steps"] == pipeline["steps"]
+        assert pipeline_after["steps_graph"] == pipeline["steps_graph"]
         # The still-armed trigger fired for this very push
         assert result["triggered_runs"] == 1
 
@@ -399,7 +408,7 @@ class TestBrokenYamlKeepsTriggers:
 
         pipeline_after = await _get_materialized_pipeline(client, repo["id"])
         assert pipeline_after["triggers"] == pipeline["triggers"]
-        assert pipeline_after["steps"] == pipeline["steps"]
+        assert pipeline_after["steps_graph"] == pipeline["steps_graph"]
         assert result["triggered_runs"] == 1
 
 
@@ -444,7 +453,7 @@ class TestSyncShortCircuit:
         assert calls == []
         assert result["triggered_runs"] == 1
         after = await _get_materialized_pipeline(client, repo["id"])
-        for field in ("id", "description", "steps", "triggers"):
+        for field in ("id", "description", "steps_graph", "triggers"):
             assert after[field] == before[field]
 
 
@@ -627,7 +636,7 @@ class TestManualRunBranchScoping:
         assert branch in detail
 
         after = await _get_materialized_pipeline(client, repo["id"])
-        for field in ("id", "description", "steps", "triggers"):
+        for field in ("id", "description", "steps_graph", "triggers"):
             assert after[field] == before[field]
 
     async def test_explicit_default_branch_still_runs(
@@ -641,3 +650,102 @@ class TestManualRunBranchScoping:
         )
         assert_status_code(response, 200)
         assert response.json()["status"] == "running"
+
+
+class TestUnconvertibleYamlSurfacesAsADefinitionError:
+    """A file that PARSES but cannot become a graph (12.8 §1.7, the Y5 channel).
+
+    This is a different failure class from "unparseable yaml", which keeps
+    today's keep-stale + warning behaviour (TestBrokenYamlKeepsTriggers
+    above). A file whose STEPS cannot be expressed as a graph has to be
+    visible: the row keeps its last-good graph, so without a channel the next
+    push would quietly re-run the previous definition under the new file's
+    name and report green.
+    """
+
+    BANANA_YAML = """name: repo-ci
+description: Repo CI pipeline
+triggers:
+  - type: push
+    config:
+      branches: ["{branch}"]
+steps:
+  - name: Nonsense
+    type: banana
+    config:
+      command: echo "never runs"
+"""
+
+    async def _materialize_v1(self, client, repo, repo_path, branch):
+        head_sha = _git(repo_path, "rev-parse", "HEAD")
+        response = await client.post(
+            f"/git/{repo['id']}.git/_internal/push-event",
+            json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
+        )
+        assert_status_code(response, 200)
+        pipeline = await _get_materialized_pipeline(client, repo["id"])
+        assert pipeline["definition_error"] is None
+        return pipeline
+
+    async def test_refusal_lands_on_the_row_and_the_run_endpoint_says_no(
+        self, client, clean_git_repos, pushed_ci_repo
+    ):
+        repo, repo_path, branch = pushed_ci_repo
+        good = await self._materialize_v1(client, repo, repo_path, branch)
+
+        yaml_path = repo_path / ".lazyaf" / "pipelines" / "repo-ci.yaml"
+        yaml_path.write_text(self.BANANA_YAML.format(branch=branch))
+        _git(repo_path, "add", ".")
+        _git(repo_path, "commit", "-m", "break the CI definition")
+        await _push_and_fire_event(client, clean_git_repos, repo, repo_path, branch)
+
+        after = await _get_materialized_pipeline(client, repo["id"])
+        assert after["definition_error"], "the refusal is invisible"
+        assert "banana" in after["definition_error"]
+        # The last-good graph is still there to be read - and refused.
+        assert after["steps_graph"] == good["steps_graph"]
+
+        response = await client.post(
+            f"/api/pipelines/{after['id']}/run", json={"trigger_type": "manual"}
+        )
+        assert_status_code(response, 400)
+        assert "banana" in response.json()["detail"]
+
+    async def test_one_unconvertible_file_does_not_discard_the_others(
+        self, client, clean_git_repos, pushed_ci_repo
+    ):
+        """The upsert runs OUTSIDE sync's per-file swallow-and-continue.
+
+        It is called inside `except Exception: rollback; raise`, so a refusal
+        that RAISED would roll the whole sync back and every other pipeline
+        the push touched would silently keep its old definition. The refusal
+        is recorded and the sync carries on.
+        """
+        repo, repo_path, branch = pushed_ci_repo
+        await self._materialize_v1(client, repo, repo_path, branch)
+
+        pipelines_dir = repo_path / ".lazyaf" / "pipelines"
+        (pipelines_dir / "banana.yaml").write_text(
+            self.BANANA_YAML.format(branch=branch).replace(
+                "name: repo-ci", "name: banana-ci"
+            )
+        )
+        (pipelines_dir / "repo-ci.yaml").write_text(
+            PIPELINE_YAML_V2.format(branch=branch)
+        )
+        _git(repo_path, "add", ".")
+        _git(repo_path, "commit", "-m", "add an unconvertible file next to a good one")
+        await _push_and_fire_event(client, clean_git_repos, repo, repo_path, branch)
+
+        good = await _get_materialized_pipeline(client, repo["id"])
+        assert good["definition_error"] is None
+        assert [
+            node["name"] for node in good["steps_graph"]["steps"].values()
+        ] == ["Lint", "Test"], "the good file's sync was discarded by the bad one"
+
+        broken = await _get_materialized_pipeline(
+            client, repo["id"], name="[repo] banana-ci"
+        )
+        assert broken is not None, "the unconvertible file left no row to look at"
+        assert broken["definition_error"]
+        assert broken["steps_graph"] is None

@@ -28,10 +28,27 @@ from app.services.execution import debug_session_service as service_module
 from app.services.execution.debug_session_service import debug_session_service
 
 
-STEPS = [
-    {"name": "first", "type": "script", "config": {"command": "echo one"}},
-    {"name": "second", "type": "script", "config": {"command": "echo two"}},
-]
+#: A two-step LINEAR GRAPH. 12.8 retires the v1 array, so the wire vocabulary
+#: for `breakpoints` is graph step IDS - these tests used index keys and every
+#: one of them is now a 400 naming the keys that do exist.
+STEPS_GRAPH = {
+    "version": 2,
+    "entry_points": ["first"],
+    "steps": {
+        "first": {"name": "first", "type": "script", "config": {"command": "echo one"}},
+        "second": {"name": "second", "type": "script", "config": {"command": "echo two"}},
+    },
+    "edges": [
+        {
+            "id": "edge_0_success",
+            "from_step": "first",
+            "to_step": "second",
+            "condition": "success",
+        }
+    ],
+}
+
+STEP_IDS = list(STEPS_GRAPH["steps"])
 
 
 @pytest.fixture(autouse=True)
@@ -54,7 +71,7 @@ async def failed_run(db_session):
         id=str(uuid4()),
         repo_id=repo.id,
         name="dbg-pipeline",
-        steps=json.dumps(STEPS),
+        steps_graph=json.dumps(STEPS_GRAPH),
     )
     db_session.add(pipeline)
     await db_session.commit()
@@ -66,7 +83,7 @@ async def failed_run(db_session):
         trigger_context=json.dumps({"branch": "main", "commit_sha": "abc1234"}),
         current_step=0,
         steps_completed=0,
-        steps_total=len(STEPS),
+        steps_total=len(STEP_IDS),
     )
     db_session.add(run)
     await db_session.commit()
@@ -104,7 +121,7 @@ class TestCreateDebugRerun:
         the UI polls."""
         response = await client.post(
             f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-            json={"breakpoints": ["0"]},
+            json={"breakpoints": ["first"]},
         )
         assert response.status_code == 200, response.text
         body = response.json()
@@ -123,7 +140,7 @@ class TestCreateDebugRerun:
         silently never fires."""
         response = await client.post(
             f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-            json={"breakpoints": ["0", "build"]},
+            json={"breakpoints": ["first", "build"]},
         )
         assert response.status_code == 400
         assert "build" in response.json()["detail"]
@@ -133,6 +150,63 @@ class TestCreateDebugRerun:
             )
         ).scalars().all()
         assert rows == [], "a refused create must not have started a run"
+
+    async def test_an_index_style_breakpoint_is_a_400_naming_the_real_keys(
+        self, client, failed_run
+    ):
+        """v1 addressed a step by its POSITION, so `"0"` is what a stored
+        breakpoint or a habit looks like after 12.8. It is a key this
+        pipeline does not define: the API refuses it and names the keys that
+        exist, rather than accepting a breakpoint that can never fire."""
+        response = await client.post(
+            f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
+            json={"breakpoints": ["0"]},
+        )
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert "0" in detail
+        for step_id in STEP_IDS:
+            assert step_id in detail
+
+    async def test_a_pipeline_with_no_graph_is_a_400_not_a_silent_session(
+        self, client, db_session
+    ):
+        """R1: the graph is the only execution definition. Debugging a
+        pipeline that has none is refused by name - note the EMPTY
+        breakpoints, which the unknown-key check could never have caught."""
+        repo = Repo(id=str(uuid4()), name="dbg2", default_branch="main", is_ingested=True)
+        db_session.add(repo)
+        await db_session.commit()
+        graphless = Pipeline(
+            id=str(uuid4()), repo_id=repo.id, name="graphless-pipeline"
+        )
+        db_session.add(graphless)
+        await db_session.commit()
+        run = PipelineRun(
+            id=str(uuid4()),
+            pipeline_id=graphless.id,
+            status=RunStatus.FAILED.value,
+            trigger_type="manual",
+            trigger_context=json.dumps({"branch": "main", "commit_sha": "abc1234"}),
+            current_step=0,
+            steps_completed=0,
+            steps_total=0,
+        )
+        db_session.add(run)
+        await db_session.commit()
+
+        response = await client.post(
+            f"/api/pipeline-runs/{run.id}/debug-rerun", json={"breakpoints": []}
+        )
+        assert response.status_code == 400
+        assert "graphless-pipeline" in response.json()["detail"]
+        assert "no graph definition" in response.json()["detail"]
+        started = (
+            await db_session.execute(
+                select(PipelineRun).where(PipelineRun.trigger_type == "debug_rerun")
+            )
+        ).scalars().all()
+        assert started == []
 
     async def test_unknown_run_is_404(self, client):
         response = await client.post(
@@ -145,7 +219,7 @@ class TestCreateDebugRerun:
     ):
         response = await client.post(
             f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-            json={"breakpoints": ["0"]},
+            json={"breakpoints": ["first"]},
         )
         body = response.json()
         await wait_for_status(client, body["debug_session_id"], "waiting_at_bp")
@@ -165,18 +239,18 @@ class TestGetSession:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0", "1"]},
+                json={"breakpoints": ["first", "second"]},
             )
         ).json()
         body = await wait_for_status(
             client, created["debug_session_id"], "waiting_at_bp"
         )
         assert "token" not in body
-        assert body["current_step"]["key"] == "0"
+        assert body["current_step"]["key"] == "first"
         assert body["current_step"]["name"] == "first"
-        assert body["breakpoints"] == ["0", "1"]
-        assert body["breakpoints_hit"] == ["0"]
-        assert body["breakpoints_pending"] == ["1"]
+        assert body["breakpoints"] == ["first", "second"]
+        assert body["breakpoints_hit"] == ["first"]
+        assert body["breakpoints_pending"] == ["second"]
         assert body["attach_available"] is True
         assert body["attach_unavailable_reason"] is None
         assert body["commit"]["sha"] == "abc1234"
@@ -190,7 +264,7 @@ class TestGetSession:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0"]},
+                json={"breakpoints": ["first"]},
             )
         ).json()
         await wait_for_status(client, created["debug_session_id"], "waiting_at_bp")
@@ -208,7 +282,7 @@ class TestJoinToken:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0"]},
+                json={"breakpoints": ["first"]},
             )
         ).json()
         session_id = created["debug_session_id"]
@@ -235,7 +309,7 @@ class TestJoinToken:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0"]},
+                json={"breakpoints": ["first"]},
             )
         ).json()
         session_id = created["debug_session_id"]
@@ -257,7 +331,7 @@ class TestResumeAbortExtend:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0", "1"]},
+                json={"breakpoints": ["first", "second"]},
             )
         ).json()
         session_id = created["debug_session_id"]
@@ -266,10 +340,10 @@ class TestResumeAbortExtend:
             f"/api/debug/{session_id}/resume", json={"clear_remaining": False}
         )
         assert response.status_code == 200
-        assert response.json() == {"status": "pending", "next_breakpoint": "1"}
+        assert response.json() == {"status": "pending", "next_breakpoint": "second"}
 
         second = await wait_for_status(client, session_id, "waiting_at_bp")
-        assert second["current_step"]["key"] == "1"
+        assert second["current_step"]["key"] == "second"
         await drain(client, session_id)
 
     async def test_resume_when_not_paused_is_409(self, client, failed_run):
@@ -289,7 +363,7 @@ class TestResumeAbortExtend:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0"]},
+                json={"breakpoints": ["first"]},
             )
         ).json()
         session_id = created["debug_session_id"]
@@ -306,7 +380,7 @@ class TestResumeAbortExtend:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0"]},
+                json={"breakpoints": ["first"]},
             )
         ).json()
         session_id = created["debug_session_id"]
@@ -323,7 +397,7 @@ class TestResumeAbortExtend:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0"]},
+                json={"breakpoints": ["first"]},
             )
         ).json()
         session_id = created["debug_session_id"]
@@ -350,7 +424,7 @@ class TestSessionRowIsTheOnlyDebugState:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0"]},
+                json={"breakpoints": ["first"]},
             )
         ).json()
         await wait_for_status(client, created["debug_session_id"], "waiting_at_bp")
@@ -380,7 +454,7 @@ class TestSessionRowIsTheOnlyDebugState:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0"]},
+                json={"breakpoints": ["first"]},
             )
         ).json()
         await wait_for_status(client, created["debug_session_id"], "waiting_at_bp")
@@ -505,7 +579,7 @@ class TestTerminalUpgradeRefusals:
         created = (
             await client.post(
                 f"/api/pipeline-runs/{failed_run.id}/debug-rerun",
-                json={"breakpoints": ["0"]},
+                json={"breakpoints": ["first"]},
             )
         ).json()
         session_id = created["debug_session_id"]
@@ -534,11 +608,11 @@ class TestTerminalUpgradeRefusals:
             id=str(uuid4()),
             pipeline_run_id=failed_run.id,
             status="waiting_at_bp",
-            breakpoints=json.dumps(["0"]),
-            hit_breakpoints=json.dumps(["0"]),
+            breakpoints=json.dumps(["first"]),
+            hit_breakpoints=json.dumps(["first"]),
             timeout_seconds=3600,
             max_timeout_seconds=14400,
-            current_step_key="0",
+            current_step_key="first",
             current_step_executor="remote",
         )
         db_session.add(session)

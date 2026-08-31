@@ -94,6 +94,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.schemas._datetime import utc_isoformat
+from app.schemas.pipeline import (
+    EdgeCondition,
+    PipelineEdge,
+    PipelineGraphModel,
+    PipelineNodePosition,
+    PipelineStepV2,
+)
 from app.models import (
     Card,
     Job,
@@ -253,6 +260,100 @@ def is_adhoc_pipeline_name(name: str | None) -> bool:
     return bool(name) and name.startswith(ADHOC_PREFIX)
 
 
+def adhoc_steps_graph(steps: list[dict[str, Any]]) -> str:
+    """The v2 graph JSON for an ad-hoc pipeline's LINEAR chain of steps.
+
+    The single writer of the ad-hoc pipeline DEFINITION (R3). Every ad-hoc
+    pipeline the product creates - card work, a playground session, an
+    endpoint probe, an experiment cell - is a chain of one or two steps that
+    runs in order and stops on the first failure, so this takes the step
+    dicts those callers already build and returns the graph the executor
+    runs.
+
+    A graph and not the v1 array, because 12.8 retires the array and these
+    callers are AUTHORS, not an authoring EDGE: nobody hand-writes an
+    ephemeral pipeline, so there is no v1 text left to keep accepting here.
+    Nothing is lost in the move. The two v1 flow keys these sites carried
+    said exactly what the edges below say and nothing more:
+
+      * ``on_success: "next"`` IS the SUCCESS edge to the following step -
+        and on the LAST step it was already a no-op, because
+        ``_execute_step`` guarded its continuation with
+        ``current_step + 1 < len(steps)``.
+      * ``on_failure: "stop"`` IS the absence of a failure edge.
+
+    And no ad-hoc writer has ever emitted an EFFECT (``merge:`` /
+    ``trigger:``), so no node built here carries an ``actions`` entry. Worth
+    saying explicitly because it is the thing a reader will fear was
+    dropped: a card's auto-merge does NOT ride on a step action. It is the
+    human ``POST /api/cards/{id}/approve`` calling
+    ``git_repo_manager.merge_branch`` directly, plus the run-level
+    ``TriggerConfig.on_pass`` action that ``_complete_pipeline`` reads off
+    ``PipelineRun.trigger_context`` - and an ad-hoc run writes no ``on_pass``
+    into that context and ``triggers="[]"`` onto the row. Neither path has
+    ever looked at a step's ``on_success``.
+
+    Built THROUGH ``PipelineGraphModel`` rather than as a hand-rolled dict so
+    a definition this module writes clears the same validator a hand-authored
+    graph clears at the API boundary (R6): a bad step type or a dangling edge
+    raises here, at the writer, instead of becoming a run that cannot
+    dispatch.
+
+    Args:
+        steps: step dicts carrying ``id``, ``name``, ``type``, ``config`` and
+            ``timeout``, in execution order. The first is the entry point.
+
+    Returns:
+        JSON for ``Pipeline.steps_graph``.
+
+    Raises:
+        ValueError: on an empty list or duplicate step ids. Duplicates
+            matter because the graph is keyed BY id - two steps sharing one
+            would silently collapse into a pipeline with a step missing.
+    """
+    if not steps:
+        raise ValueError(
+            "an ad-hoc pipeline needs at least one step: a graph must have an "
+            "entry point, so there is no such thing as an empty definition"
+        )
+
+    ids = [step["id"] for step in steps]
+    if len(set(ids)) != len(ids):
+        raise ValueError(
+            f"ad-hoc pipeline step ids must be unique (the graph is keyed by "
+            f"id, so a duplicate silently drops a step), got {ids}"
+        )
+
+    graph = PipelineGraphModel(
+        steps={
+            step["id"]: PipelineStepV2(
+                id=step["id"],
+                name=step["name"],
+                type=step["type"],
+                config=step.get("config") or {},
+                # Same vertical layout `array_to_graph` gives a converted
+                # array, so an ad-hoc run opened in the graph view reads the
+                # way every other converted pipeline does.
+                position=PipelineNodePosition(x=100, y=i * 150),
+                timeout=step.get("timeout", 300),
+            )
+            for i, step in enumerate(steps)
+        },
+        edges=[
+            PipelineEdge(
+                id=f"edge_{i}_success",
+                from_step=ids[i],
+                to_step=ids[i + 1],
+                condition=EdgeCondition.SUCCESS,
+            )
+            for i in range(len(steps) - 1)
+        ],
+        entry_points=[ids[0]],
+        version=2,
+    )
+    return graph.model_dump_json()
+
+
 def build_agent_step_config(
     *,
     agent: str,
@@ -382,8 +483,6 @@ async def start_adhoc_agent_run(
         "type": "agent",
         "config": step_config,
         "timeout": timeout,
-        "on_success": "next",
-        "on_failure": "stop",
     }
 
     pipeline = Pipeline(
@@ -395,8 +494,7 @@ async def start_adhoc_agent_run(
             f"work ({trigger_type}). Hidden from GET /api/pipelines; its RUN "
             "is visible. Cascade-deletes with its runs."
         ),
-        steps=json.dumps([step]),
-        steps_graph=None,
+        steps_graph=adhoc_steps_graph([step]),
         triggers="[]",
         is_template=False,
     )
@@ -516,8 +614,6 @@ async def start_endpoint_probe_run(db: AsyncSession, endpoint) -> PipelineRun:
         "type": "script",
         "config": step_config,
         "timeout": ENDPOINT_PROBE_TIMEOUT,
-        "on_success": "next",
-        "on_failure": "stop",
     }
 
     pipeline = Pipeline(
@@ -529,8 +625,7 @@ async def start_endpoint_probe_run(db: AsyncSession, endpoint) -> PipelineRun:
             "endpoint from the box that hosts it. Hidden from "
             "GET /api/pipelines; its RUN is visible."
         ),
-        steps=json.dumps([step]),
-        steps_graph=None,
+        steps_graph=adhoc_steps_graph([step]),
         triggers="[]",
         is_template=False,
     )
@@ -788,14 +883,37 @@ async def _run_error(db: AsyncSession, run_id: str) -> str | None:
     return None
 
 
-def _run_agent_name(pipeline_run: PipelineRun, steps_json: str | None) -> str | None:
-    """The agent that ran, read back off the ephemeral pipeline definition."""
-    try:
-        steps = json.loads(steps_json or "[]")
-    except (json.JSONDecodeError, TypeError):
+def _run_agent_name(
+    pipeline_run: PipelineRun, steps_graph_json: str | None
+) -> str | None:
+    """The agent that ran, read back off the ephemeral pipeline definition.
+
+    Reads the v2 GRAPH (12.8): the definition is a `steps` MAPPING keyed by
+    step id, not an array. Failing over to None here is not cosmetic - the
+    caller writes it to `card.completed_runner_type` and `job.runner_type`,
+    so a None from a shape this could not read is dark data loss on every
+    card with no error anywhere. Hence the WARNING below: the two ways this
+    returns None are "the run had no agent step" (a script-only ad-hoc run -
+    normal, silent) and "the definition would not read", which is a defect
+    and says so.
+    """
+    graph = None
+    if steps_graph_json:
+        try:
+            graph = json.loads(steps_graph_json)
+        except (json.JSONDecodeError, TypeError):
+            graph = None
+    steps = (graph or {}).get("steps")
+    if not isinstance(steps, dict):
+        logger.warning(
+            "Run %s: could not read a v2 graph off its pipeline definition, so "
+            "the agent that ran is unknown - the card and job will record no "
+            "runner type",
+            pipeline_run.id[:8],
+        )
         return None
-    for step in steps:
-        if step.get("type") == "agent":
+    for step in steps.values():
+        if isinstance(step, dict) and step.get("type") == "agent":
             return (step.get("config") or {}).get("agent")
     return None
 
@@ -1167,7 +1285,7 @@ async def _complete_card_work(
         error = None
 
     pipeline = await db.get(Pipeline, pipeline_run.pipeline_id)
-    agent = _run_agent_name(pipeline_run, pipeline.steps if pipeline else None)
+    agent = _run_agent_name(pipeline_run, pipeline.steps_graph if pipeline else None)
 
     card.status = target
     if verified:

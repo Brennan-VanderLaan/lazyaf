@@ -17,13 +17,21 @@ same lie one layer down.
 
 Three seams, three altitudes:
 
-- `graph_definition_errors` / `unreached_graph_steps` / `describe_step_action`
-  are pure functions over plain dicts - no db, no container, no run.
+- `graph_definition_errors` and `unreached_graph_steps` are pure functions
+  over plain dicts - no db, no container, no run.
 - `_verify_graph_coverage` is exercised against a REAL session with REAL rows
   (R6): it writes StepRuns and drives `_complete_pipeline`, and a mock would
   prove nothing about either.
-- The legacy `on_success` typo is covered next door in
-  `test_pipeline_executor.py::test_an_undispatchable_action_fails_the_run`.
+- THE TYPO row is the one that changed shape. `describe_step_action` and its
+  `TestStepActionVocabulary` class lived here until 12.8 P5 deleted the v1
+  array path they guarded. The claim survives in two halves, both stronger:
+  a node ACTION is validated by `schemas.pipeline.describe_terminal_action`
+  at the API boundary and again at `_run_terminal_action`
+  (`test_graph_pipeline_schemas.py::TestDescribeTerminalActionVocabulary`,
+  `test_pipeline_executor.py::TestAnActionThatCannotBePerformedFailsTheRun`),
+  and FLOW - the half `nextt` was a typo of - is an EDGE, which cannot be
+  misspelled into silence: an edge naming a step the graph does not define is
+  a `graph_definition_errors` defect, asserted right here.
 
 The live-stack reproductions are `tdd/qa/test_graph_execution_qa4.py` (QA
 sandbox, :8790). These are the fast tier's version of the same assertions.
@@ -42,9 +50,7 @@ if str(backend_path) not in sys.path:
 
 from app.models import Pipeline, PipelineRun, Repo, RunStatus, StepRun  # noqa: E402
 from app.services.pipeline_executor import (  # noqa: E402
-    STEP_ACTIONS,
     PipelineExecutor,
-    describe_step_action,
     graph_definition_errors,
     unreached_graph_steps,
 )
@@ -328,39 +334,6 @@ class TestUnreachedGraphSteps:
 
 
 # ---------------------------------------------------------------------------
-# describe_step_action - the CLOSED legacy vocabulary
-# ---------------------------------------------------------------------------
-
-class TestStepActionVocabulary:
-    @pytest.mark.parametrize(
-        "action",
-        ["next", "stop", "trigger:card-1", "trigger:pipeline:p-1", "merge:main"],
-    )
-    def test_the_vocabulary_is_accepted(self, action):
-        assert describe_step_action(action) is None
-
-    @pytest.mark.parametrize(
-        "action", ["nextt", "Next", "next ", "b", "[b, c]", "", "merge", None, 7]
-    )
-    def test_everything_else_is_refused(self, action):
-        problem = describe_step_action(action)
-        assert problem is not None
-        assert "'next', 'stop'" in problem
-
-    @pytest.mark.parametrize("action", ["trigger:", "merge:", "trigger:pipeline:"])
-    def test_a_prefix_with_no_target_is_refused(self, action):
-        problem = describe_step_action(action)
-        assert problem is not None
-        assert "empty target" in problem
-
-    def test_the_message_names_the_offender(self):
-        assert "'nextt'" in describe_step_action("nextt")
-
-    def test_bare_actions_are_exactly_next_and_stop(self):
-        assert STEP_ACTIONS == ("next", "stop")
-
-
-# ---------------------------------------------------------------------------
 # _verify_graph_coverage - against a REAL session and REAL rows (R6)
 # ---------------------------------------------------------------------------
 
@@ -550,8 +523,8 @@ class TestVerifyGraphCoverage:
 #
 # This is the shape that made the completion invariant dangerous to add. A
 # routing failure (the realistic `executor: legacy` stale-config mistake)
-# finishes a step SYNCHRONOUSLY inside `_execute_graph_step`, which re-enters
-# `_handle_graph_step_complete` in the caller's own frame - so a fan-out
+# finishes a step SYNCHRONOUSLY inside `_execute_step`, which re-enters
+# `_handle_step_complete` in the caller's own frame - so a fan-out
 # sibling that has not been dispatched yet looks, from the inner frame, exactly
 # like a step that will never run.
 #
@@ -587,10 +560,10 @@ async def _make_graph_run(db, graph_dict):
 
 
 def _synchronously_failing_dispatch(db, executor, run, pipeline, repo, graph_dict, ran):
-    """A stand-in for `_execute_graph_step` on the routing-failure path.
+    """A stand-in for `_execute_step` on the routing-failure path.
 
     Writes the FAILED StepRun the real dispatch writes, then re-enters
-    `_handle_graph_step_complete` in the caller's stack - which is precisely
+    `_handle_step_complete` in the caller's stack - which is precisely
     what `_dispatch_step_run` -> `_fail_step_run` -> the `route_error` branch
     does today.
     """
@@ -609,7 +582,7 @@ def _synchronously_failing_dispatch(db, executor, run, pipeline, repo, graph_dic
             )
         )
         await db.commit()
-        await executor._handle_graph_step_complete(
+        await executor._handle_step_complete(
             db, run, pipeline, repo, graph_dict, step_id, False, None
         )
 
@@ -629,14 +602,14 @@ class TestSynchronousDispatchDoesNotStrandSiblings:
         ran = []
         with patch.object(
             executor,
-            "_execute_graph_step",
+            "_execute_step",
             new=_synchronously_failing_dispatch(
                 db_session, executor, run, pipeline, repo, DIAMOND, ran
             ),
         ):
             executor._reserve_active_steps(run, ["a"])
             await db_session.commit()
-            await executor._execute_graph_step(
+            await executor._execute_step(
                 db_session, run, pipeline, repo, DIAMOND, "a"
             )
 
@@ -673,7 +646,7 @@ class TestSynchronousDispatchDoesNotStrandSiblings:
         ran = []
         with patch.object(
             executor,
-            "_execute_graph_step",
+            "_execute_step",
             new=_synchronously_failing_dispatch(
                 db_session, executor, run, pipeline, repo, two_entries, ran
             ),
@@ -681,7 +654,7 @@ class TestSynchronousDispatchDoesNotStrandSiblings:
             executor._reserve_active_steps(run, ["a", "b"])
             await db_session.commit()
             for entry in ("a", "b"):
-                await executor._execute_graph_step(
+                await executor._execute_step(
                     db_session, run, pipeline, repo, two_entries, entry
                 )
 
@@ -709,14 +682,14 @@ class TestSynchronousDispatchDoesNotStrandSiblings:
 
         with patch.object(
             executor,
-            "_execute_graph_step",
+            "_execute_step",
             new=_synchronously_failing_dispatch(
                 db_session, executor, run, pipeline, repo, DIAMOND, ran
             ),
         ), patch.object(executor, "_complete_pipeline", new=counting_complete):
             executor._reserve_active_steps(run, ["a"])
             await db_session.commit()
-            await executor._execute_graph_step(
+            await executor._execute_step(
                 db_session, run, pipeline, repo, DIAMOND, "a"
             )
 

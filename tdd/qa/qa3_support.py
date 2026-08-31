@@ -156,7 +156,10 @@ def graph_pipeline(repo_id: str, configs: list[dict], name_prefix: str = "qa3") 
     payload = {
         "name": f"{name_prefix}-{uuid.uuid4().hex[:8]}",
         "description": "QA-3 race probe",
-        "steps": [],
+        # No `steps` key. 12.8 §4.4 makes a body carrying BOTH definitions a
+        # 422 - an empty array squeaks through only because it is falsy, and
+        # a create that says it authors an array when it authors a graph is
+        # the ambiguity the rule exists to remove.
         "steps_graph": {
             "steps": steps,
             "edges": [],

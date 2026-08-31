@@ -1,11 +1,15 @@
 import { writable, derived } from 'svelte/store';
-import type { Pipeline, PipelineCreate, PipelineUpdate, PipelineRun, PipelineRunCreate, RunStatus, StepRun } from '../api/types';
+import type { PipelineV2, PipelineRun, PipelineRunCreate, RunStatus, StepRun } from '../api/types';
+import type { PipelineGraphCreate, PipelineGraphUpdate } from '../api/client';
 import { pipelines as pipelinesApi, pipelineRuns as runsApi } from '../api/client';
 import { timestampOrder } from '../utils/time';
 
 // Pipelines store
 function createPipelinesStore() {
-  const { subscribe, set, update } = writable<Pipeline[]>([]);
+  // 12.8 P3: the store holds the GRAPH-shaped read model. `PipelineRead` no
+  // longer carries a `steps` array, so every consumer that used to count it
+  // reads `steps_graph` instead.
+  const { subscribe, set, update } = writable<PipelineV2[]>([]);
   const loading = writable(false);
   const error = writable<string | null>(null);
 
@@ -27,7 +31,7 @@ function createPipelinesStore() {
       }
     },
 
-    async create(repoId: string, data: PipelineCreate) {
+    async create(repoId: string, data: PipelineGraphCreate) {
       error.set(null);
       try {
         const pipeline = await pipelinesApi.create(repoId, data);
@@ -39,7 +43,7 @@ function createPipelinesStore() {
       }
     },
 
-    async update(id: string, data: PipelineUpdate) {
+    async update(id: string, data: PipelineGraphUpdate) {
       error.set(null);
       try {
         const pipeline = await pipelinesApi.update(id, data);
@@ -75,7 +79,7 @@ function createPipelinesStore() {
       }
     },
 
-    updateLocal(pipeline: Pipeline) {
+    updateLocal(pipeline: PipelineV2) {
       update(pipelines => {
         // Only update existing pipelines, never add new ones
         // Adding is handled by create() to avoid race conditions with WebSocket

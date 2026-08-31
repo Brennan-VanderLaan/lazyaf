@@ -39,7 +39,7 @@ from app.database import ALEMBIC_BASELINE_REVISION, Base, _alembic_config, _run_
 
 # Tip of the migration chain. Every startup path (fresh upgrade, legacy
 # adoption stamp-then-upgrade) must end here.
-ALEMBIC_HEAD_REVISION = "0012"
+ALEMBIC_HEAD_REVISION = "0014"
 
 EXPECTED_TABLES = {
     "repos",
@@ -81,6 +81,8 @@ EXPECTED_TABLES = {
     "model_endpoints",
     # 0012 (M13-1) reshapes workspaces' uniqueness (a run owns one workspace
     # PER LANE) - one column plus an index swap, no tables.
+    # 0013 (M14.6) adds model_endpoints.supports_images / supports_audio -
+    # two nullable columns, no tables, and DELIBERATELY no backfill.
 }
 
 SPEC_TABLES = {"features", "user_stories", "acceptance_criteria", "prompt_templates"}
@@ -992,6 +994,217 @@ class TestModelEndpointsMigration:
                         "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
                     )
                 )
+
+
+def _endpoint_row_sql(endpoint_id: str, name: str) -> str:
+    """INSERT for one model_endpoints row using ONLY the 0011 column set.
+
+    Deliberately names no modality column: this is what a row inserted before
+    0013 existed actually looks like, which is the whole subject of
+    TestEndpointModalitiesMigration.
+    """
+    return (
+        "INSERT INTO model_endpoints (id, name, base_url, model, server_kind, "
+        "auth_style, reach, gpu_node_id, max_concurrency, "
+        "request_timeout_seconds, supports_tools, supports_streaming, "
+        "reports_usage, probe_status, probe_detail, consecutive_failures, "
+        "enabled, created_at, updated_at) VALUES "
+        f"('{endpoint_id}', '{name}', 'http://192.168.1.50:11434/v1', "
+        "'qwen2.5-coder:32b', 'ollama', 'none', 'direct', "
+        f"'endpoint:{name}', 1, 300, 1, 1, 1, 'ok', '{{}}', 0, 1, "
+        "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+    )
+
+
+class TestEndpointModalitiesMigration:
+    """0013 (M14.6): `supports_images` and `supports_audio`.
+
+    Two nullable columns, and the thing worth testing is what the revision
+    REFUSES to do. `NULL` means "we have not asked"; `False` means "we asked
+    and it said no". A backfill to false would take every endpoint registered
+    before this revision - including endpoints that genuinely see - and record
+    a positive claim that they are blind, which the UI would then show to an
+    operator as fact. That is the silent downgrade this whole doctrine exists
+    to prevent, and it is exactly what a well-meaning "sensible default"
+    backfill looks like from the inside.
+    """
+
+    async def test_both_columns_exist_and_are_nullable(self, engine_factory):
+        """THREE-STATE at the DDL level, same as `supports_tools`. A NOT NULL
+        column would force a default, and the default would be a lie."""
+        engine = engine_factory("modalities_schema.db")
+        await _migrate(engine)
+
+        columns = (await _snapshot(engine))["model_endpoints"]["columns"]
+        for name in ("supports_images", "supports_audio"):
+            assert name in columns, name
+            assert columns[name][1] is True, f"{name} must be nullable"
+
+    async def test_there_is_no_supports_video_column(self, engine_factory):
+        """The OpenAI chat-completions wire format has no video content part,
+        so a `supports_video` column would be NULL on every row forever -
+        schema rot with extra steps. Video is a constant of the protocol,
+        projected to the UI, never stored."""
+        engine = engine_factory("modalities_no_video.db")
+        await _migrate(engine)
+
+        columns = (await _snapshot(engine))["model_endpoints"]["columns"]
+        assert "supports_video" not in columns
+
+    async def test_existing_rows_get_null_and_never_false(self, engine_factory):
+        """THE assertion this revision exists for.
+
+        A row inserted at 0012 - i.e. an endpoint someone registered and
+        probed before LazyAF knew how to ask about images - must read NULL
+        after the upgrade. A `0` here would be the migration inventing a
+        capability observation that no probe ever made.
+        """
+        engine = engine_factory("modalities_backfill.db")
+        await _upgrade_to(engine, "0012")
+
+        async with engine.begin() as conn:
+            await conn.execute(text(_endpoint_row_sql("e-legacy", "legacy-4090")))
+
+        await _upgrade_to(engine, "0013")
+
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT supports_tools, supports_images, supports_audio "
+                        "FROM model_endpoints WHERE id = 'e-legacy'"
+                    )
+                )
+            ).one()
+
+        supports_tools, supports_images, supports_audio = row
+        # What WAS observed survives untouched...
+        assert supports_tools == 1
+        # ...and what was never asked is NULL, not 0. `is None` and not a
+        # falsy check: `0` would pass a truthiness assertion and is precisely
+        # the wrong answer.
+        assert supports_images is None, "a backfill to false would be a lie"
+        assert supports_audio is None, "a backfill to false would be a lie"
+
+    async def test_a_row_inserted_after_0013_still_defaults_to_null(
+        self, engine_factory
+    ):
+        """No `server_default`, deliberately: a default of '0' would be the
+        same backfill wearing a different hat, applied forever to every
+        client that does not name the column."""
+        engine = engine_factory("modalities_default.db")
+        await _migrate(engine)
+
+        async with engine.begin() as conn:
+            await conn.execute(text(_endpoint_row_sql("e-new", "fresh-4090")))
+
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT supports_images, supports_audio FROM "
+                        "model_endpoints WHERE id = 'e-new'"
+                    )
+                )
+            ).one()
+        assert row == (None, None)
+
+    async def test_the_columns_can_hold_all_three_states(self, engine_factory):
+        engine = engine_factory("modalities_three_state.db")
+        await _migrate(engine)
+
+        async with engine.begin() as conn:
+            await conn.execute(text(_endpoint_row_sql("e1", "sees")))
+            await conn.execute(text(_endpoint_row_sql("e2", "blind")))
+            await conn.execute(text(_endpoint_row_sql("e3", "unasked")))
+            await conn.execute(
+                text("UPDATE model_endpoints SET supports_images = 1 WHERE id = 'e1'")
+            )
+            await conn.execute(
+                text("UPDATE model_endpoints SET supports_images = 0 WHERE id = 'e2'")
+            )
+
+        async with engine.connect() as conn:
+            rows = dict(
+                (
+                    await conn.execute(
+                        text("SELECT id, supports_images FROM model_endpoints")
+                    )
+                ).all()
+            )
+        assert rows == {"e1": 1, "e2": 0, "e3": None}
+
+    async def test_this_revision_adds_no_index(self, engine_factory):
+        """Neither column is a lookup predicate - the UI reads them off rows
+        it already has - so an index would be objects to maintain for no
+        query."""
+        engine = engine_factory("modalities_indexes.db")
+        reference = engine_factory("modalities_indexes_ref.db")
+        await _migrate(engine)
+        await _upgrade_to(reference, "0012")
+
+        assert (await _snapshot(engine))["model_endpoints"]["indexes"] == (
+            await _snapshot(reference)
+        )["model_endpoints"]["indexes"]
+
+    async def test_downgrade_to_0012_removes_this_revision_only(self, engine_factory):
+        engine = engine_factory("modalities_down.db")
+        reference = engine_factory("modalities_down_ref.db")
+        await _migrate(engine)
+        await _upgrade_to(reference, "0012")
+
+        await _downgrade_to(engine, "0012")
+
+        assert (await _snapshot(engine))["model_endpoints"] == (
+            await _snapshot(reference)
+        )["model_endpoints"]
+        assert await _alembic_versions(engine) == ["0012"]
+
+    async def test_downgrade_keeps_every_row(self, engine_factory):
+        """Unlike 0012's downgrade, nothing here has to be deleted: the two
+        columns are re-derivable by pressing Probe."""
+        engine = engine_factory("modalities_down_rows.db")
+        await _migrate(engine)
+        async with engine.begin() as conn:
+            await conn.execute(text(_endpoint_row_sql("e-keep", "keep-me")))
+
+        await _downgrade_to(engine, "0012")
+
+        async with engine.connect() as conn:
+            names = [
+                row[0]
+                for row in (
+                    await conn.execute(text("SELECT name FROM model_endpoints"))
+                ).all()
+            ]
+        assert names == ["keep-me"]
+
+    async def test_0013_roundtrip_restores_head(self, engine_factory):
+        engine = engine_factory("modalities_rt.db")
+        await _migrate(engine)
+        head = await _snapshot(engine)
+
+        await _downgrade_to(engine, "0012")
+        await _upgrade_to(engine, "head")
+
+        assert await _snapshot(engine) == head
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
+
+    async def test_upgrade_is_idempotent_over_a_healed_schema(self, engine_factory):
+        """The adopt path: create_all builds the CURRENT model schema - both
+        modality columns included - the DB is stamped behind head, and 0013
+        then runs over columns that already exist. Every add is guarded, so
+        this must not raise."""
+        engine = engine_factory("modalities_idem.db")
+        await _create_all(engine)
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda c: command.stamp(_alembic_config(c), "0012"))
+
+        await _upgrade_to(engine, "0013")
+
+        assert await _alembic_versions(engine) == ["0013"]
+        columns = (await _snapshot(engine))["model_endpoints"]["columns"]
+        assert "supports_images" in columns
 
 
 def _workspace_row_sql(

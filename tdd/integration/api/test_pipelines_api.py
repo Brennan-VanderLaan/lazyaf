@@ -126,8 +126,27 @@ class TestCreatePipeline:
         )
         result = assert_created_response(response, {"name": "Minimal Pipeline"})
         assert result["repo_id"] == repo["id"]
-        assert result["steps"] == []
+        # Create-then-author (12.8 §4.4): an EMPTY `steps` is not a
+        # definition, so the row is created with none and is simply not
+        # runnable until one arrives. It is not a 422 - the editor creates the
+        # pipeline first and authors the graph in a follow-up PATCH.
+        assert result["steps_graph"] is None
+        assert result["definition_error"] is None
         assert result["is_template"] is False
+
+    async def test_create_pipeline_without_steps_cannot_run(
+        self, client, ingested_repo
+    ):
+        """...and the run endpoint says so, rather than passing vacuously."""
+        created = await client.post(
+            f"/api/repos/{ingested_repo['id']}/pipelines",
+            json=pipeline_create_payload(name="Unauthored Pipeline"),
+        )
+        response = await client.post(
+            f"/api/pipelines/{created.json()['id']}/run", json={}
+        )
+        assert_status_code(response, 400)
+        assert "no steps" in response.json()["detail"].lower()
 
     async def test_create_pipeline_with_steps(self, client, repo):
         """Creates pipeline with step definitions."""
@@ -151,9 +170,17 @@ class TestCreatePipeline:
         )
         result = response.json()
         assert result["name"] == "CI Pipeline"
-        assert len(result["steps"]) == 2
-        assert result["steps"][0]["name"] == "Lint"
-        assert result["steps"][1]["name"] == "Test"
+
+        # The array is converted at the boundary; the row holds a GRAPH, and
+        # that graph is the only definition the executor will ever read.
+        graph = result["steps_graph"]
+        assert graph is not None, result
+        assert [node["name"] for node in graph["steps"].values()] == ["Lint", "Test"]
+        assert list(graph["steps"]) == ["step_0", "step_1"]
+        assert graph["entry_points"] == ["step_0"]
+        assert [
+            (e["from_step"], e["to_step"], e["condition"]) for e in graph["edges"]
+        ] == [("step_0", "step_1", "success")]
 
     async def test_create_pipeline_with_docker_step(self, client, repo):
         """Creates pipeline with docker step type."""
@@ -170,9 +197,9 @@ class TestCreatePipeline:
             f"/api/repos/{repo['id']}/pipelines",
             json=payload,
         )
-        result = response.json()
-        assert result["steps"][0]["type"] == "docker"
-        assert result["steps"][0]["config"]["image"] == "node:20"
+        node = response.json()["steps_graph"]["steps"]["step_0"]
+        assert node["type"] == "docker"
+        assert node["config"]["image"] == "node:20"
 
     async def test_create_pipeline_with_agent_step(self, client, repo):
         """Creates pipeline with agent step type."""
@@ -193,12 +220,19 @@ class TestCreatePipeline:
             f"/api/repos/{repo['id']}/pipelines",
             json=payload,
         )
-        result = response.json()
-        assert result["steps"][0]["type"] == "agent"
-        assert result["steps"][0]["config"]["runner_type"] == "claude-code"
+        node = response.json()["steps_graph"]["steps"]["step_0"]
+        assert node["type"] == "agent"
+        assert node["config"]["runner_type"] == "claude-code"
 
     async def test_create_pipeline_with_branching(self, client, repo):
-        """Creates pipeline with custom on_success/on_failure actions."""
+        """on_success/on_failure EFFECTS survive as node actions.
+
+        v1 carried flow and effect in one string. The graph splits them:
+        `merge:` / `trigger:` are effects and land in `actions`, keyed by the
+        same condition vocabulary the edges use. Until 12.8 this conversion
+        dropped both on the floor - a `merge:` on the final step (the common
+        "merge when this passes" shape) was not even examined.
+        """
         steps = [
             pipeline_step_payload(
                 name="Test",
@@ -214,9 +248,14 @@ class TestCreatePipeline:
             f"/api/repos/{repo['id']}/pipelines",
             json=payload,
         )
-        result = response.json()
-        assert result["steps"][0]["on_success"] == "merge:main"
-        assert result["steps"][0]["on_failure"] == "trigger:fix-card-123"
+        graph = response.json()["steps_graph"]
+        assert graph["steps"]["step_0"]["actions"] == {
+            "success": ["merge:main"],
+            "failure": ["trigger:fix-card-123"],
+            "always": [],
+        }
+        # Sole step: the effects fire, and there is nothing to continue to.
+        assert graph["edges"] == []
 
     async def test_create_pipeline_as_template(self, client, repo):
         """Creates pipeline as a template."""
@@ -269,7 +308,13 @@ class TestGetPipeline:
         assert "repo_id" in result
         assert "name" in result
         assert "description" in result
-        assert "steps" in result
+        assert "steps_graph" in result
+        assert "definition_error" in result
+        # The v1 array left the wire at 12.8 P3. Pinned so nobody restores it
+        # "for compatibility": its `= []` default made an unparseable row, a
+        # graph pipeline and a pipeline with no definition at all look
+        # identical on screen.
+        assert "steps" not in result
         assert "is_template" in result
         assert "created_at" in result
         assert "updated_at" in result
@@ -296,7 +341,12 @@ class TestUpdatePipeline:
         assert response.json()["description"] == "Updated description"
 
     async def test_update_pipeline_steps(self, client, pipeline):
-        """Updates pipeline steps."""
+        """A PATCH carrying the array replaces the GRAPH.
+
+        Before 12.8 this wrote `pipelines.steps`, a column the executor never
+        reads on a graph pipeline - so the edit landed in the database and
+        changed nothing about what ran.
+        """
         new_steps = [
             pipeline_step_payload(name="New Step", step_type="script", config={"command": "echo hello"}),
         ]
@@ -304,9 +354,13 @@ class TestUpdatePipeline:
             f"/api/pipelines/{pipeline['id']}",
             json={"steps": new_steps},
         )
-        result = response.json()
-        assert len(result["steps"]) == 1
-        assert result["steps"][0]["name"] == "New Step"
+        graph = response.json()["steps_graph"]
+        assert [node["name"] for node in graph["steps"].values()] == ["New Step"]
+        assert graph["entry_points"] == ["step_0"]
+
+        # ...and the row the next run reads agrees.
+        reread = await client.get(f"/api/pipelines/{pipeline['id']}")
+        assert reread.json()["steps_graph"] == graph
 
     async def test_update_pipeline_is_template(self, client, pipeline):
         """Updates pipeline is_template flag."""
@@ -357,13 +411,21 @@ class TestPipelineStepsValidation:
             f"/api/repos/{repo['id']}/pipelines",
             json=payload,
         )
-        result = response.json()
-        assert result["steps"][0]["timeout"] == 600
+        node = response.json()["steps_graph"]["steps"]["step_0"]
+        assert node["timeout"] == 600
 
     async def test_step_defaults_are_applied(self, client, repo):
-        """Steps without explicit values get defaults."""
+        """The v1 defaults (`next` / `stop`) survive the conversion.
+
+        On a two-step array they are the whole point: `on_success: next`
+        becomes the SUCCESS edge to the following step, and `on_failure: stop`
+        becomes the absence of a FAILURE edge. Asserting them on the graph is
+        what proves the default was carried rather than lost - the array field
+        is gone from the wire.
+        """
         steps = [
             {"name": "Basic Step", "type": "script", "config": {"command": "echo test"}},
+            {"name": "Second Step", "type": "script", "config": {"command": "echo two"}},
         ]
         payload = pipeline_create_payload(name="Defaults Pipeline", steps=steps)
 
@@ -371,11 +433,14 @@ class TestPipelineStepsValidation:
             f"/api/repos/{repo['id']}/pipelines",
             json=payload,
         )
-        result = response.json()
-        step = result["steps"][0]
-        assert step["on_success"] == "next"
-        assert step["on_failure"] == "stop"
-        assert step["timeout"] == 300
+        graph = response.json()["steps_graph"]
+        assert [
+            (e["from_step"], e["to_step"], e["condition"]) for e in graph["edges"]
+        ] == [("step_0", "step_1", "success")], "on_success: next must be a SUCCESS edge"
+        assert graph["steps"]["step_0"]["timeout"] == 300
+        assert graph["steps"]["step_0"]["actions"] == {
+            "success": [], "failure": [], "always": [],
+        }, "next/stop are FLOW, and flow lives on edges - never in actions"
 
 
 class TestPipelineIsolation:
@@ -511,3 +576,344 @@ class TestExportContentDisposition:
             'filename="My_Nice_Pipeline.yaml"'
             in response.headers["content-disposition"]
         )
+
+
+# =============================================================================
+# 12.8 — the API door: one definition dialect, converted at the boundary
+# =============================================================================
+
+def _linear_graph_payload(*, entry: str = "a") -> dict:
+    """A two-node linear graph, hand-authored the way the editor sends one."""
+    return {
+        "steps": {
+            "a": {
+                "id": "a", "name": "Alpha", "type": "script",
+                "config": {"command": "echo a"}, "timeout": 777,
+                "continue_in_context": True,
+            },
+            "b": {
+                "id": "b", "name": "Beta", "type": "script",
+                "config": {"command": "echo b"},
+            },
+        },
+        "edges": [
+            {"id": "e1", "from_step": "a", "to_step": "b", "condition": "success"}
+        ],
+        "entry_points": [entry],
+        "version": 2,
+    }
+
+
+class TestDefinitionDialectBoundary:
+    """`steps` is the authoring array; `steps_graph` is the definition.
+
+    §4.4: exactly one of them reaches the column, and it is always the graph.
+    Before 12.8 the router setattr'd both independently, so a PATCH carrying
+    `steps` against a graph pipeline wrote a field the executor never reads -
+    the user's edit landed in the database and changed nothing about the run.
+    """
+
+    async def test_both_dialects_on_create_is_refused(self, client, repo):
+        response = await client.post(
+            f"/api/repos/{repo['id']}/pipelines",
+            json={
+                "name": "Two Dialects",
+                "steps": [pipeline_step_payload(name="S", step_type="script")],
+                "steps_graph": _linear_graph_payload(),
+            },
+        )
+        assert_status_code(response, 422)
+        assert "not both" in response.text
+
+    async def test_both_dialects_on_update_is_refused(self, client, pipeline):
+        response = await client.patch(
+            f"/api/pipelines/{pipeline['id']}",
+            json={
+                "steps": [pipeline_step_payload(name="S", step_type="script")],
+                "steps_graph": _linear_graph_payload(),
+            },
+        )
+        assert_status_code(response, 422)
+        assert "not both" in response.text
+
+    async def test_empty_steps_beside_a_graph_is_not_a_conflict(self, client, repo):
+        """`{"steps": [], "steps_graph": {...}}` is what real callers send.
+
+        `steps` was a NOT NULL column, so the editor and
+        `tdd/qa/qa3_support.graph_pipeline` both name it even when the graph
+        is the definition. An empty array is not a second definition.
+        """
+        response = await client.post(
+            f"/api/repos/{repo['id']}/pipelines",
+            json={
+                "name": "Graph With Empty Array",
+                "steps": [],
+                "steps_graph": _linear_graph_payload(),
+            },
+        )
+        assert_status_code(response, 201)
+        assert set(response.json()["steps_graph"]["steps"]) == {"a", "b"}
+
+    async def test_authored_step_ids_survive_the_conversion(self, client, repo):
+        """An `id:` the author wrote is the graph's node key (§1.6b).
+
+        Node ids are the context-directory names and the debug breakpoint
+        keys, so renaming them to `step_0..step_N` changes behaviour far from
+        the cause. Nothing tested this before 12.8.
+        """
+        steps = [
+            {"id": "tier1", "name": "T1", "type": "script", "config": {"command": "a"}},
+            {"id": "tier2", "name": "T2", "type": "script", "config": {"command": "b"}},
+        ]
+        response = await client.post(
+            f"/api/repos/{repo['id']}/pipelines",
+            json=pipeline_create_payload(name="Authored Ids", steps=steps),
+        )
+        assert_status_code(response, 201)
+        graph = response.json()["steps_graph"]
+        assert list(graph["steps"]) == ["tier1", "tier2"]
+        assert graph["entry_points"] == ["tier1"]
+        assert graph["edges"][0]["from_step"] == "tier1"
+        assert graph["edges"][0]["to_step"] == "tier2"
+
+    async def test_mid_array_stop_that_orphans_the_tail_is_refused(self, client, repo):
+        """A step that continues on neither outcome makes the rest dead.
+
+        v1 let this through: it simply stopped, and the steps after it never
+        ran. As a graph they are unreachable, `_verify_graph_coverage` FAILS
+        the run, and a pipeline that was green becomes red for the wrong
+        reason. Refuse at the door and name the step responsible.
+        """
+        steps = [
+            pipeline_step_payload(name="First", on_success="stop", on_failure="stop"),
+            pipeline_step_payload(name="Orphan"),
+        ]
+        response = await client.post(
+            f"/api/repos/{repo['id']}/pipelines",
+            json=pipeline_create_payload(name="Orphaned Tail", steps=steps),
+        )
+        assert_status_code(response, 422)
+        detail = response.text
+        assert "step_0" in detail and "unreachable" in detail, detail
+
+    async def test_stop_on_the_final_step_is_fine(self, client, repo):
+        """The same word on the LAST step orphans nothing."""
+        steps = [
+            pipeline_step_payload(name="Only", on_success="stop", on_failure="stop"),
+        ]
+        response = await client.post(
+            f"/api/repos/{repo['id']}/pipelines",
+            json=pipeline_create_payload(name="Terminal Stop", steps=steps),
+        )
+        assert_status_code(response, 201)
+        assert response.json()["steps_graph"]["edges"] == []
+
+    async def test_retired_trigger_pipeline_action_is_refused_by_name(
+        self, client, repo
+    ):
+        """`trigger:pipeline:` names its replacement rather than vanishing."""
+        steps = [
+            pipeline_step_payload(name="Chain", on_success="trigger:pipeline:abc123"),
+        ]
+        response = await client.post(
+            f"/api/repos/{repo['id']}/pipelines",
+            json=pipeline_create_payload(name="Retired Action", steps=steps),
+        )
+        assert_status_code(response, 422)
+        detail = response.text
+        assert "retired" in detail, detail
+        assert "card_complete" in detail, detail
+
+    async def test_unknown_action_is_refused_naming_the_step(self, client, repo):
+        steps = [pipeline_step_payload(name="Typo", on_success="nextt")]
+        response = await client.post(
+            f"/api/repos/{repo['id']}/pipelines",
+            json=pipeline_create_payload(name="Typo Pipeline", steps=steps),
+        )
+        assert_status_code(response, 422)
+        assert "'nextt'" in response.text, response.text
+
+
+class TestRunRefusesADefinitionError:
+    """A row carrying `definition_error` must not run (§1.7, the Y5 channel).
+
+    The row KEEPS the graph it had before a refused sync, so without this
+    guard a broken CI file re-runs yesterday's definition under today's name
+    and reports green.
+    """
+
+    async def test_run_is_refused_and_names_the_reason(
+        self, client, db_session, pipeline
+    ):
+        from app.models import Pipeline
+
+        row = await db_session.get(Pipeline, pipeline["id"])
+        row.definition_error = "step 'step_0' declares on_success='banana'"
+        await db_session.commit()
+
+        response = await client.post(
+            f"/api/pipelines/{pipeline['id']}/run", json={}
+        )
+        assert_status_code(response, 400)
+        assert "banana" in response.json()["detail"]
+
+        runs = await client.get(f"/api/pipelines/{pipeline['id']}/runs")
+        assert runs.json() == [], "a refused pipeline must not have started"
+
+    async def test_the_reason_is_visible_on_the_row(
+        self, client, db_session, pipeline
+    ):
+        """The badge channel: a refusal a user can see without reading logs."""
+        from app.models import Pipeline
+
+        row = await db_session.get(Pipeline, pipeline["id"])
+        row.definition_error = "two steps declare the id 'tier1'"
+        await db_session.commit()
+
+        response = await client.get(f"/api/pipelines/{pipeline['id']}")
+        assert response.json()["definition_error"] == "two steps declare the id 'tier1'"
+
+
+class TestExportEmitsTheAuthoringDialect:
+    """Export writes the array `.lazyaf/pipelines/*.yaml` shape (§4.10).
+
+    It used to emit a THIRD dialect - `steps` as a mapping keyed by step id,
+    with edge TARGETS written into `on_success` - which `PipelineYaml` cannot
+    validate, so LazyAF could not import its own export.
+    """
+
+    async def _graph_pipeline(self, client, repo, name, graph):
+        response = await client.post(
+            f"/api/repos/{repo['id']}/pipelines",
+            json={"name": name, "steps_graph": graph},
+        )
+        assert response.status_code == 201, response.text
+        return response.json()["id"]
+
+    async def test_linear_graph_round_trips_through_the_importer(
+        self, client, repo
+    ):
+        """Export -> PipelineYaml -> array_to_graph reproduces the graph."""
+        import yaml as yaml_module
+
+        from app.schemas.lazyaf_yaml import PipelineYaml, pipeline_yaml_to_graph
+
+        pipeline_id = await self._graph_pipeline(
+            client, repo, "Round Trip", _linear_graph_payload()
+        )
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        assert_status_code(response, 200)
+
+        document = yaml_module.safe_load(response.text)
+        assert isinstance(document["steps"], list), document
+
+        reimported = pipeline_yaml_to_graph(PipelineYaml(**document))
+        assert list(reimported.steps) == ["a", "b"]
+        assert reimported.entry_points == ["a"]
+        assert [(e.from_step, e.to_step, e.condition.value) for e in reimported.edges] == [
+            ("a", "b", "success")
+        ]
+
+    async def test_export_preserves_id_timeout_and_continuation(
+        self, client, repo
+    ):
+        """Pinned field set (§4.10): dropping any of these is silent damage.
+
+        Without `id` every node is renamed on re-import; without `timeout`
+        every step silently resets to 300s; without `continue_in_context` the
+        workspace continuation is lost.
+        """
+        import yaml as yaml_module
+
+        pipeline_id = await self._graph_pipeline(
+            client, repo, "Preserve Fields", _linear_graph_payload()
+        )
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        first = yaml_module.safe_load(response.text)["steps"][0]
+
+        assert first["id"] == "a"
+        assert first["timeout"] == 777
+        assert first["continue_in_context"] is True
+        assert first["on_success"] == "next"
+        assert first["on_failure"] == "stop"
+
+    async def test_export_writes_actions_as_the_v1_word(self, client, repo):
+        """`actions.success == ['merge:main']` comes back as `on_success`."""
+        import yaml as yaml_module
+
+        graph = {
+            "steps": {
+                "only": {
+                    "id": "only", "name": "Only", "type": "script",
+                    "config": {"command": "echo x"},
+                    "actions": {"success": ["merge:main"], "failure": [], "always": []},
+                }
+            },
+            "edges": [],
+            "entry_points": ["only"],
+            "version": 2,
+        }
+        pipeline_id = await self._graph_pipeline(client, repo, "Merge Export", graph)
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        assert_status_code(response, 200)
+        assert yaml_module.safe_load(response.text)["steps"][0]["on_success"] == "merge:main"
+
+    async def test_fan_out_export_is_refused_naming_the_construct(
+        self, client, repo
+    ):
+        graph = {
+            "steps": {
+                "start": {"id": "start", "name": "Start", "type": "script", "config": {}},
+                "a": {"id": "a", "name": "A", "type": "script", "config": {}},
+                "b": {"id": "b", "name": "B", "type": "script", "config": {}},
+            },
+            "edges": [
+                {"id": "e1", "from_step": "start", "to_step": "a", "condition": "success"},
+                {"id": "e2", "from_step": "start", "to_step": "b", "condition": "success"},
+            ],
+            "entry_points": ["start"],
+            "version": 2,
+        }
+        pipeline_id = await self._graph_pipeline(client, repo, "Fan Out", graph)
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        assert_status_code(response, 409)
+        detail = response.json()["detail"]
+        assert "fan-out" in detail, detail
+        assert "'start'" in detail, detail
+
+    async def test_always_edge_export_is_refused_naming_the_construct(
+        self, client, repo
+    ):
+        graph = _linear_graph_payload()
+        graph["edges"][0]["condition"] = "always"
+        pipeline_id = await self._graph_pipeline(client, repo, "Always Edge", graph)
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        assert_status_code(response, 409)
+        assert "'always' edge" in response.json()["detail"]
+
+    async def test_multiple_entry_points_export_is_refused(self, client, repo):
+        graph = _linear_graph_payload()
+        graph["entry_points"] = ["a", "b"]
+        pipeline_id = await self._graph_pipeline(client, repo, "Two Entries", graph)
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        assert_status_code(response, 409)
+        assert "entry points" in response.json()["detail"]
+
+    async def test_fan_in_export_is_refused_naming_the_construct(self, client, repo):
+        graph = {
+            "steps": {
+                "a": {"id": "a", "name": "A", "type": "script", "config": {}},
+                "b": {"id": "b", "name": "B", "type": "script", "config": {}},
+                "join": {"id": "join", "name": "Join", "type": "script", "config": {}},
+            },
+            "edges": [
+                {"id": "e1", "from_step": "a", "to_step": "join", "condition": "success"},
+                {"id": "e2", "from_step": "b", "to_step": "join", "condition": "success"},
+            ],
+            "entry_points": ["a"],
+            "version": 2,
+        }
+        pipeline_id = await self._graph_pipeline(client, repo, "Fan In", graph)
+        response = await client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
+        assert_status_code(response, 409)
+        assert "fan-in" in response.json()["detail"]

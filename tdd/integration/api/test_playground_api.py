@@ -27,6 +27,7 @@ Everything below drives the REAL router and the REAL service against the real
 (in-memory) database. The only double is the container.
 """
 import asyncio
+import base64
 import sys
 import time
 from pathlib import Path
@@ -40,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "backend"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "tdd"))
 
 from app.models import PipelineRun, StepRun
+from app.schemas import playground as playground_schemas
 from app.services import agent_run
 from app.services.playground_service import (
     playground_service,
@@ -473,3 +475,325 @@ class TestRunStatusTranslation:
         """A state nobody taught the table about is not a completed run."""
         assert session_status_for_run("something-new") == "failed"
         assert session_status_for_run(None) == "failed"
+# -----------------------------------------------------------------------------
+# Attachments and the playground's own capability read (14.5)
+# -----------------------------------------------------------------------------
+#
+# THE THING THESE TESTS ARE ACTUALLY DEFENDING is the one failure mode that
+# does not look like a failure: a file accepted with a 200 that never reaches
+# the model, producing a right-looking answer from a prompt that silently lost
+# half its input. Every assertion below is either "this is refused loudly" or
+# "this refusal names something a human can act on".
+
+
+#: The design's 32x32 probe PNG - 96 bytes. Deliberately NOT a 1x1: Qwen2-VL's
+#: image processor raises below its 28px patch factor, so a 1x1 would be a
+#: false negative produced by our own payload.
+PNG_32 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/"
+    "tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC"
+)
+PNG_32_B64 = base64.b64encode(PNG_32).decode()
+
+
+def image_attachment(**overrides) -> dict:
+    payload = {
+        "kind": "image",
+        "media_type": "image/png",
+        "filename": "screenshot.png",
+        "data_base64": PNG_32_B64,
+    }
+    payload.update(overrides)
+    return payload
+
+
+async def post_playground(client, repo, **overrides):
+    """Start-endpoint POST that does NOT assert success. The refusals need it."""
+    payload = {"runner_type": "mock", "branch": repo["default_branch"]}
+    payload.update(overrides)
+    return await client.post(
+        f"/api/repos/{repo['id']}/playground/test", json=payload
+    )
+
+
+class TestPlaygroundCapabilities:
+    """The read the UI renders instead of re-spelling the limits (R3)."""
+
+    async def test_capabilities_states_every_limit(self, client):
+        response = await client.get("/api/playground/capabilities")
+        assert response.status_code == 200, response.text
+        limits = response.json()["attachment_limits"]
+        assert limits["max_files"] == playground_schemas.MAX_ATTACHMENTS
+        assert limits["max_bytes_per_file"] == playground_schemas.MAX_ATTACHMENT_BYTES
+        assert (
+            limits["max_bytes_total"]
+            == playground_schemas.MAX_ATTACHMENTS_TOTAL_BYTES
+        )
+        assert limits["media_types"] == list(
+            playground_schemas.ALLOWED_IMAGE_MEDIA_TYPES
+        )
+
+    async def test_the_literal_path_is_not_shadowed_by_the_session_routes(
+        self, client
+    ):
+        """`/capabilities` must not be parsed as a session id.
+
+        It is one segment against the session routes' two, so it cannot be -
+        but a future `/{session_id}` route would silently turn this 200 into a
+        404 about a session nobody asked for, and that regression is invisible
+        without an assertion.
+        """
+        response = await client.get("/api/playground/capabilities")
+        assert response.status_code == 200
+        assert "attachment_limits" in response.json()
+
+    async def test_every_modality_carries_a_reason_in_both_states(self, client):
+        """A control greyed for a reason nobody wrote down is the bug."""
+        body = (await client.get("/api/playground/capabilities")).json()
+        seen = {m["modality"]: m for m in body["modalities"]}
+        assert set(seen) == {"images", "audio", "video"}
+        for modality, entry in seen.items():
+            assert entry["reason"].strip(), f"{modality} has no reason"
+            assert isinstance(entry["attachable"], bool)
+
+    async def test_video_says_the_wire_format_cannot_carry_it(self, client):
+        """Not "no model supports it" - the PROTOCOL has no content part.
+
+        This is the sentence that stops video from being a chip that is grey
+        forever for an unstated reason.
+        """
+        body = (await client.get("/api/playground/capabilities")).json()
+        video = next(m for m in body["modalities"] if m["modality"] == "video")
+        assert video["attachable"] is False
+        assert "content part" in video["reason"]
+
+    async def test_the_declared_and_the_enforced_limits_are_the_same_object(self):
+        """R3, asserted rather than trusted.
+
+        The projection the UI renders is built from the same module constants
+        the validator raises on. If someone edits one, this fails.
+        """
+        limits = playground_schemas.playground_capabilities().attachment_limits
+        assert limits.max_files == playground_schemas.MAX_ATTACHMENTS
+        assert limits.max_bytes_per_file == playground_schemas.MAX_ATTACHMENT_BYTES
+
+
+class TestAttachmentValidation:
+    """Edge validation. Every one of these is refused BEFORE a container."""
+
+    async def test_a_request_with_no_attachments_is_untouched(
+        self, client, ingested_repo, control_executor
+    ):
+        """The asymmetry that keeps this from being a self-inflicted outage.
+
+        Almost every playground run attaches nothing. Refusing those because
+        the platform cannot carry an image would take the whole page offline
+        for a capability they do not use - which is exactly why the modality
+        refusal is conditional on the request actually attaching something.
+        """
+        response = await post_playground(
+            client, ingested_repo, task_override="say hello"
+        )
+        assert response.status_code == 200, response.text
+        forget_session(response.json()["session_id"])
+
+    async def test_an_attachment_is_refused_naming_the_missing_plumbing(
+        self, client, ingested_repo, control_executor
+    ):
+        """The refusal has to be actionable, not "unsupported".
+
+        A human told "no" learns nothing; a human told WHICH four modules have
+        to land can go and look at them, and so can the next agent to pick
+        this up.
+        """
+        response = await post_playground(
+            client,
+            ingested_repo,
+            task_override="what is in this screenshot?",
+            attachments=[image_attachment()],
+        )
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert "transcript" in detail
+        assert "runner_common.harness.transcript" in detail
+
+    async def test_the_refusal_matches_the_capability_read(self, client, ingested_repo):
+        """One fact, one place.
+
+        The sentence the UI greys the button with and the sentence the API
+        refuses with are the SAME string. Two hand-written near-copies is how
+        a UI ends up telling someone to do something the backend does not
+        actually want.
+        """
+        caps = (await client.get("/api/playground/capabilities")).json()
+        images = next(m for m in caps["modalities"] if m["modality"] == "images")
+        response = await post_playground(
+            client,
+            ingested_repo,
+            task_override="look at this",
+            attachments=[image_attachment()],
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"] == images["reason"]
+
+    async def test_bytes_that_are_not_an_image_are_refused(
+        self, client, ingested_repo
+    ):
+        """Sniffed, not trusted.
+
+        A media type and a filename are both things a client asserts. The
+        first bytes of the file are what a vision encoder has to decode.
+        """
+        response = await post_playground(
+            client,
+            ingested_repo,
+            task_override="look",
+            attachments=[
+                image_attachment(
+                    data_base64=base64.b64encode(b"this is just prose").decode()
+                )
+            ],
+        )
+        assert response.status_code == 422, response.text
+        assert "PNG, JPEG, WebP or GIF" in response.text
+
+    async def test_a_mislabelled_image_is_refused_rather_than_corrected(
+        self, client, ingested_repo
+    ):
+        """R1: quietly rewriting media_type would be a silent fix.
+
+        The client is confused about its own data; saying so beats papering
+        over it, because the same confusion will produce something we cannot
+        repair next time.
+        """
+        response = await post_playground(
+            client,
+            ingested_repo,
+            task_override="look",
+            attachments=[image_attachment(media_type="image/jpeg")],
+        )
+        assert response.status_code == 422, response.text
+        assert "declares image/jpeg" in response.text
+        assert "image/png" in response.text
+
+    async def test_an_unsupported_media_type_names_what_is_supported(
+        self, client, ingested_repo
+    ):
+        response = await post_playground(
+            client,
+            ingested_repo,
+            task_override="look",
+            attachments=[image_attachment(media_type="application/pdf")],
+        )
+        assert response.status_code == 422, response.text
+        for allowed in playground_schemas.ALLOWED_IMAGE_MEDIA_TYPES:
+            assert allowed in response.text
+
+    async def test_too_many_attachments_states_the_count(
+        self, client, ingested_repo
+    ):
+        over = playground_schemas.MAX_ATTACHMENTS + 1
+        response = await post_playground(
+            client,
+            ingested_repo,
+            task_override="look",
+            attachments=[image_attachment() for _ in range(over)],
+        )
+        assert response.status_code == 422, response.text
+        assert str(playground_schemas.MAX_ATTACHMENTS) in response.text
+
+    async def test_an_oversized_attachment_is_refused_without_decoding_it(
+        self, client, ingested_repo
+    ):
+        """The encoded length is checked FIRST.
+
+        The point is not to materialise a hostile payload in memory to find
+        out it is too big. This posts a string past the per-file cap and
+        expects the encoded-length refusal, whose message names the limit.
+        """
+        oversized = "A" * (playground_schemas._MAX_ENCODED_CHARS + 4)
+        response = await post_playground(
+            client,
+            ingested_repo,
+            task_override="look",
+            attachments=[image_attachment(data_base64=oversized)],
+        )
+        assert response.status_code == 422, response.text
+        assert "per-file limit" in response.text
+
+    async def test_invalid_base64_is_refused(self, client, ingested_repo):
+        response = await post_playground(
+            client,
+            ingested_repo,
+            task_override="look",
+            attachments=[image_attachment(data_base64="!!! not base64 !!!")],
+        )
+        assert response.status_code == 422, response.text
+        assert "base64" in response.text
+
+    async def test_an_empty_attachment_is_refused(self, client, ingested_repo):
+        response = await post_playground(
+            client,
+            ingested_repo,
+            task_override="look",
+            attachments=[image_attachment(data_base64="")],
+        )
+        assert response.status_code == 422, response.text
+
+    async def test_the_field_exists_so_it_cannot_be_silently_dropped(self):
+        """WHY the field is declared at all while everything is refused.
+
+        pydantic IGNORES unknown keys. Without `attachments` on the request
+        model, a client that posted images would get a 200 and have them
+        dropped on the floor - the invisible downgrade R1 forbids. The loud
+        422 is only possible because the field is declared.
+        """
+        assert "attachments" in playground_schemas.PlaygroundTestRequest.model_fields
+
+
+class TestAttachmentSniffing:
+    """The format sniffer, on its own. Pure, so it is tested directly."""
+
+    async def test_it_recognises_the_four_formats_it_claims(self):
+        assert playground_schemas.sniff_image_media_type(PNG_32) == "image/png"
+        assert (
+            playground_schemas.sniff_image_media_type(b"\xff\xd8\xff\xe0rest")
+            == "image/jpeg"
+        )
+        assert (
+            playground_schemas.sniff_image_media_type(b"GIF89a" + b"\x00" * 8)
+            == "image/gif"
+        )
+        assert (
+            playground_schemas.sniff_image_media_type(
+                b"RIFF" + b"\x00\x00\x00\x00" + b"WEBPVP8 "
+            )
+            == "image/webp"
+        )
+
+    async def test_every_format_it_recognises_is_one_the_schema_accepts(self):
+        """No third vocabulary. The sniffer and the allowlist agree by test."""
+        for payload in (
+            PNG_32,
+            b"\xff\xd8\xff\xe0",
+            b"GIF87a" + b"\x00" * 8,
+            b"RIFF\x00\x00\x00\x00WEBP",
+        ):
+            sniffed = playground_schemas.sniff_image_media_type(payload)
+            assert sniffed in playground_schemas.ALLOWED_IMAGE_MEDIA_TYPES
+
+    async def test_a_truncated_riff_header_is_not_a_webp(self):
+        """`data[8:12]` on a short buffer slices to b"" rather than raising.
+
+        Without this the sniffer would answer "webp" for any four bytes
+        spelling RIFF - a WAV file, for one.
+        """
+        assert playground_schemas.sniff_image_media_type(b"RIFF") is None
+        assert (
+            playground_schemas.sniff_image_media_type(b"RIFF\x00\x00\x00\x00WAVEfmt ")
+            is None
+        )
+
+    async def test_it_answers_none_rather_than_guessing(self):
+        assert playground_schemas.sniff_image_media_type(b"") is None
+        assert playground_schemas.sniff_image_media_type(b"<html>") is None

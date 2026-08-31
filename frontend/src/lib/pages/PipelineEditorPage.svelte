@@ -2,6 +2,8 @@
   import { onMount } from 'svelte';
   import { push } from 'svelte-spa-router';
   import { PipelineGraphEditor } from '../components/graph';
+  import { pipelines as pipelinesApi } from '../api/client';
+  import { describeError } from '../utils/errors';
   import type { PipelineV2, PipelineGraphModel } from '../api/types';
 
   interface Props {
@@ -18,6 +20,12 @@
   let saving = $state(false);
   let error = $state<string | null>(null);
   let hasUnsavedChanges = $state(false);
+  // A load failure the editor must not paper over. `graph` starts EMPTY, and
+  // an empty graph is a valid thing to save - so rendering the canvas over a
+  // pipeline whose definition failed to load offers the user a Save button
+  // that would replace their real definition with nothing (R1). When this is
+  // set the canvas is not rendered at all.
+  let unloadable = $state(false);
 
   // Graph state
   let graph = $state<PipelineGraphModel>({
@@ -45,66 +53,42 @@
     }
 
     try {
-      // Load the pipeline
-      const response = await fetch(`/api/pipelines/${params.id}`);
-      if (!response.ok) {
-        throw new Error('Failed to load pipeline');
-      }
-
-      const data: PipelineV2 = await response.json();
+      // One client, one route, one verb - see `pipelines.update` in
+      // api/client.ts for why this page no longer hand-rolls `fetch`.
+      const data = await pipelinesApi.get(params.id);
       pipeline = data;
       pipelineName = data.name;
       pipelineDescription = data.description || '';
 
-      // Load graph or convert from legacy
+      // The GRAPH IS THE DEFINITION (12.8 P3). There is no v1 array to
+      // convert from any more: `convertLegacyToGraph` lived here, invented
+      // `step_0..step_N` ids and dropped every `merge:` / `trigger:` action
+      // the array carried, which meant editing a v1 pipeline and pressing
+      // Save silently rewrote it into a different pipeline. The conversion
+      // now happens once, at the YAML boundary, with refusals
+      // (`array_to_graph`), and this page only ever sees a graph.
       if (data.steps_graph) {
         graph = data.steps_graph;
-      } else if (data.steps && data.steps.length > 0) {
-        // Convert legacy steps to graph
-        graph = convertLegacyToGraph(data.steps);
+      } else {
+        // `definition_error` is on the wire (`PipelineRead`) but not yet in
+        // `api/types.ts`, which another lane owns - hence the cast rather
+        // than a silent `any`. See the handoff note in this wave's report.
+        const definitionError = (data as PipelineV2 & { definition_error?: string | null }).definition_error;
+        unloadable = true;
+        error =
+          `Pipeline "${data.name}" has no graph definition (steps_graph is empty), ` +
+          `so there is nothing to edit. ` +
+          (definitionError
+            ? `Its definition failed to materialize: ${definitionError}`
+            : `Re-sync it from .lazyaf/pipelines/, or delete it.`);
       }
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to load pipeline';
+      unloadable = true;
+      error = describeError(e, 'Failed to load pipeline');
     } finally {
       loading = false;
     }
   });
-
-  // Convert legacy array-based steps to graph model
-  function convertLegacyToGraph(steps: any[]): PipelineGraphModel {
-    const graphSteps: Record<string, any> = {};
-    const edges: any[] = [];
-
-    steps.forEach((step, i) => {
-      const stepId = `step_${i}`;
-      graphSteps[stepId] = {
-        id: stepId,
-        name: step.name,
-        type: step.type,
-        config: step.config || {},
-        position: { x: 100, y: i * 150 },
-        timeout: step.timeout || 300,
-        continue_in_context: step.continue_in_context || false,
-      };
-
-      // Create edges based on on_success/on_failure
-      if (i < steps.length - 1 && step.on_success === 'next') {
-        edges.push({
-          id: `edge_${i}_success`,
-          from_step: stepId,
-          to_step: `step_${i + 1}`,
-          condition: 'success',
-        });
-      }
-    });
-
-    return {
-      steps: graphSteps,
-      edges,
-      entry_points: steps.length > 0 ? ['step_0'] : [],
-      version: 2,
-    };
-  }
 
   // Handle graph changes
   function onGraphChange(newGraph: PipelineGraphModel) {
@@ -133,14 +117,16 @@
     error = null;
 
     try {
+      // `steps: []` is GONE from this payload. It was here only because
+      // `pipelines.steps` used to be a NOT NULL column every writer had to
+      // name; the boundary now refuses a body that carries both dialects,
+      // and sending an empty array alongside a graph is asking the API to
+      // ignore half of what you sent.
       const payload = {
         name: pipelineName,
         description: pipelineDescription || null,
         steps_graph: graph,
-        steps: [], // Empty legacy steps since we're using graph
       };
-
-      let response: Response;
 
       if (isNew) {
         // Get repo_id from URL query (supports hash-based routing)
@@ -157,22 +143,12 @@
           return;
         }
 
-        response = await fetch(`/api/repos/${repoId}/pipelines`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
+        await pipelinesApi.create(repoId, payload);
       } else {
-        response = await fetch(`/api/pipelines/${params.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-      }
-
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.detail || 'Failed to save pipeline');
+        // PATCH. This was `PUT` against a route that does not exist, so
+        // saving an EXISTING pipeline 405'd every single time - and no test
+        // caught it because the only spec that saved a pipeline was skipped.
+        await pipelinesApi.update(params.id!, payload);
       }
 
       hasUnsavedChanges = false;
@@ -180,7 +156,7 @@
       // Navigate back to pipelines list
       push('/pipelines');
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to save pipeline';
+      error = describeError(e, 'Failed to save pipeline');
     } finally {
       saving = false;
     }
@@ -242,7 +218,12 @@
       <button class="btn secondary" onclick={cancel} disabled={saving}>
         Cancel
       </button>
-      <button class="btn primary" onclick={savePipeline} disabled={saving || loading}>
+      <button
+        class="btn primary"
+        data-testid="save-pipeline"
+        onclick={savePipeline}
+        disabled={saving || loading || unloadable}
+      >
         {#if saving}
           Saving...
         {:else}
@@ -254,9 +235,11 @@
 
   <!-- Error message -->
   {#if error}
-    <div class="error-banner">
+    <div class="error-banner" data-testid="editor-error">
       <span>{error}</span>
-      <button onclick={() => error = null}>&times;</button>
+      {#if !unloadable}
+        <button onclick={() => error = null}>&times;</button>
+      {/if}
     </div>
   {/if}
 
@@ -265,6 +248,11 @@
     {#if loading}
       <div class="loading">
         <span>Loading pipeline...</span>
+      </div>
+    {:else if unloadable}
+      <!-- Deliberately NO canvas: see `unloadable`. -->
+      <div class="loading" data-testid="editor-unloadable">
+        <span>This pipeline cannot be edited.</span>
       </div>
     {:else}
       <PipelineGraphEditor

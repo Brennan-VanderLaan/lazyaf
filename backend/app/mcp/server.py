@@ -43,6 +43,9 @@ Pipeline Features:
 - Chain multiple steps (script, docker, agent) into reusable workflows
 - Conditional branching: on_success and on_failure actions
 - Actions: "next" (continue), "stop" (end), "trigger:{card_id}" (spawn AI fix), "merge:{branch}"
+- The step array you send is converted to the execution graph at the API
+  boundary. Anything the graph cannot hold faithfully is refused with 422
+  naming the step - it is never silently dropped.
 - Automatic triggers: card_complete (when card reaches status), push (on git push)
 - Trigger actions: on_pass (merge card), on_fail (mark failed or reject)
 
@@ -431,6 +434,10 @@ def create_pipeline(
             - on_success: "next" | "stop" | "merge:{branch}" (default: "next")
             - on_failure: "next" | "stop" | "trigger:{card_id}" (default: "stop")
             - timeout: Seconds (default: 300)
+            The array is converted to the execution graph on the way in, so
+            "stop" on a step that is not the last one is a 422 (it would make
+            every step after it unreachable), and "trigger:pipeline:{id}" is
+            retired - chain pipelines with a card_complete or push trigger.
         description: Optional description
         triggers: Optional list of automatic triggers. Each trigger has:
             - type: "card_complete" or "push"
@@ -611,7 +618,8 @@ def run_pipeline(pipeline_id: str) -> dict:
     Trigger a pipeline run.
 
     The repo must be ingested and have at least one step defined.
-    Runs execute steps sequentially, following on_success/on_failure branching.
+    Runs execute the pipeline's graph, following its success/failure edges;
+    independent branches run in parallel.
 
     Args:
         pipeline_id: Pipeline to run

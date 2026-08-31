@@ -236,18 +236,63 @@ def test_empty_pipeline_file_is_not_reported_as_missing(hostile_repo):
     assert status != 404, f"the file exists, but the API says: {body}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA4-11: PipelineStepYaml.type is a plain `str` with no "
-        "enum, so `type: banana` materializes happily and only explodes when "
-        "the ExecutionRouter is asked to route it. The graph API 422s the "
-        "identical value - two definition paths, two answers."
-    ),
-)
 def test_unknown_step_type_is_refused_by_the_yaml_path(hostile_repo):
+    """QA4-11 FIXED (12.8 §4.2/§4.3), and the fix has a deliberate shape.
+
+    `PipelineStepYaml.type` is still a plain `str`, because this endpoint
+    serves the AUTHORING FILE as written - which is exactly what a user needs
+    to see in order to fix it. The refusal moved to where it decides
+    something: materialization, where `PipelineStepConfig.type` IS the enum.
+    So `type: banana` no longer "materializes happily and only explodes when
+    the ExecutionRouter is asked to route it" - it never becomes a runnable
+    definition at all, and the row says why.
+
+    Two definition paths, ONE answer. That is the finding closed.
+    """
     status, body = api("GET", f"/api/repos/{hostile_repo}/lazyaf/pipelines/bananatype")
-    assert status in (400, 422), f"'type: banana' was accepted with {status}: {str(body)[:200]}"
+    assert status == 200, f"the authoring file must stay readable: {status}"
+    assert body["steps"][0]["type"] == "banana"
+
+    status, run = api(
+        "POST", f"/api/repos/{hostile_repo}/lazyaf/pipelines/bananatype/run",
+        timeout=180,
+    )
+    if status == 404:
+        pytest.skip("QA sandbox was reset mid-test")
+    assert status == 400, f"'type: banana' was accepted for a run with {status}: {str(run)[:200]}"
+    detail = run["detail"] if isinstance(run, dict) else str(run)
+    assert "banana" in detail, f"the refusal does not name the offender: {detail}"
+
+
+@pytest.mark.parametrize(
+    "yaml_name,platform_name",
+    [
+        ("bananatype", "[repo] QA4 Banana Type"),
+        ("weirdactions", "[repo] QA4 Weird Actions"),
+        ("nosteps", "[repo] QA4 No Steps"),
+    ],
+)
+def test_unconvertible_yaml_is_recorded_on_the_row(hostile_repo, yaml_name, platform_name):
+    """The Y5 channel (12.8 §1.7): a refused conversion is VISIBLE.
+
+    `sync_repo_pipelines` deliberately swallows parse failures so a broken CI
+    file cannot break a push. A conversion refusal landing in that same
+    silence would make the whole "refuse loudly" strategy dark, so it is
+    recorded on `Pipeline.definition_error` instead - which is what both run
+    guards read.
+    """
+    status, listed = api("GET", f"/api/repos/{hostile_repo}/pipelines", timeout=180)
+    if status != 200 or not isinstance(listed, list):
+        pytest.skip(f"platform pipeline listing unavailable: {status}")
+
+    rows = {row["name"]: row for row in listed}
+    if platform_name not in rows:
+        pytest.skip(f"{platform_name} not materialized; sandbox may have been reset")
+
+    assert rows[platform_name]["definition_error"], (
+        f"{yaml_name}.yaml cannot become a graph, but the row says nothing - "
+        "the user has no way to tell it from a pipeline that works"
+    )
 
 
 @pytest.mark.xfail(
@@ -271,24 +316,21 @@ def test_two_files_with_the_same_name_do_not_collapse(hostile_repo):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA4-08: run_repo_pipeline calls "
-        "pipeline_executor.start_pipeline directly and therefore SKIPS the "
-        "'Pipeline has no steps defined' gate that "
-        "POST /api/pipelines/{id}/run enforces (pipelines.py:305). A yaml "
-        "file with no steps: key runs, does nothing, and reports PASSED - a "
-        "green tick for a pipeline that never existed."
-    ),
-)
 def test_stepless_yaml_pipeline_does_not_report_a_green_pass(hostile_repo):
+    """QA4-08 FIXED (12.8): the run-by-name door has the gate too.
+
+    `run_repo_pipeline` calls `pipeline_executor.start_pipeline` DIRECTLY and
+    so skipped the "Pipeline has no steps defined" gate that
+    `POST /api/pipelines/{id}/run` enforces. A yaml with no `steps:` key ran,
+    did nothing, and reported PASSED - a green tick for a pipeline that never
+    existed. Both doors refuse now, and the refusal names the file.
+    """
     status, body = api("POST", f"/api/repos/{hostile_repo}/lazyaf/pipelines/nosteps/run", timeout=180)
     if status == 404:
         pytest.skip("QA sandbox was reset mid-test")
-    assert status != 200 or body.get("status") != "passed", (
-        f"a pipeline with zero steps reported {body.get('status')!r}"
-    )
+    assert status == 400, f"a pipeline with zero steps was started: {status} {str(body)[:200]}"
+    detail = body["detail"] if isinstance(body, dict) else str(body)
+    assert "nosteps.yaml" in detail, f"the refusal does not name the file: {detail}"
 
 
 @pytest.mark.xfail(

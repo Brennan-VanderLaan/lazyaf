@@ -26,23 +26,29 @@
     }
   }
 
-  // Handle escape key
-  function handleKeydown(event: KeyboardEvent) {
-    if (event.key === 'Escape') {
-      onClose();
-    }
-  }
-
+  // ESCAPE IS DELIBERATELY NOT HANDLED HERE. It used to be, on this same
+  // deferred `document` listener - and it did not work: the `setTimeout` is a
+  // macrotask, opening the menu queues a SvelteFlow re-render ahead of it, and
+  // in the gap between "the menu is visible" and "the listener exists" an
+  // Escape lands on nothing. Measured, not guessed: Escape pressed straight
+  // after the menu appeared left it open every time; Escape after a 500ms
+  // pause closed it. A key binding whose behaviour depends on how fast you
+  // press the key is the shape of a bug that gets fixed and reappears.
+  //
+  // `PipelineGraphEditor` owns dismissal now, from a `svelte:window` handler
+  // bound when the EDITOR mounts - long before any overlay can open, so there
+  // is no window to lose. The footer's "ESC to close" hint is still true.
+  //
+  // Click-outside stays here, because the deferral is LOAD-BEARING for it:
+  // without it the very click that opens the menu closes it again.
   onMount(() => {
-    // Add listeners after a tick to avoid immediate close
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       document.addEventListener('click', handleClickOutside);
-      document.addEventListener('keydown', handleKeydown);
     }, 0);
 
     return () => {
+      clearTimeout(timer);
       document.removeEventListener('click', handleClickOutside);
-      document.removeEventListener('keydown', handleKeydown);
     };
   });
 

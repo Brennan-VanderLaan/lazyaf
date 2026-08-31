@@ -230,6 +230,43 @@ class PipelineBase(BaseModel):
     description: str | None = None
 
 
+#: Refusal text for a body that carries BOTH dialects (12.8 §4.4). One
+#: definition per request: `steps` is the v1 ARRAY authoring dialect, which
+#: the boundary converts with `array_to_graph`; `steps_graph` is the
+#: execution definition itself. Before 12.8 the router setattr'd them
+#: independently, so `{"steps": [...], "steps_graph": {...}}` persisted an
+#: array the executor never read while the graph decided the run - the user's
+#: edit silently did nothing (R1). Refusing is the honest answer, and it is
+#: the same answer on POST and on PATCH so a client has one rule to learn.
+#:
+#: WORDED IDENTICALLY to `routers/pipelines.graph_from_request`'s refusal, on
+#: purpose and only for as long as both exist. The two are the SAME RULE in
+#: two places (R3) and one of them has to go - see the handoff note. Until
+#: someone collapses them, this validator runs during body parsing and
+#: therefore always wins, so the router's branch is unreachable; keeping the
+#: sentence identical means a caller and a test see one claim either way.
+_BOTH_DIALECTS = (
+    "send either `steps` (the v1 array, converted to a graph at this "
+    "boundary) or `steps_graph` (the graph itself), not both: only one of "
+    "them can be the definition, and writing both means the one the executor "
+    "does not read is silently discarded. Omit `steps` to keep the graph you "
+    "sent, or omit `steps_graph` to have the array converted."
+)
+
+
+def _refuse_both_dialects(steps, steps_graph) -> None:
+    """Raise when a body carries BOTH a real array and a real graph.
+
+    "Carries" means CARRIES A DEFINITION, not "the key is present": the
+    pipeline editor and `tdd/qa/qa3_support.graph_pipeline` both post
+    `{"steps": [], "steps_graph": {...}}` because `steps` used to be a NOT
+    NULL column that every writer had to name. An empty array is not a
+    second definition, so it is not a conflict.
+    """
+    if steps and steps_graph is not None:
+        raise ValueError(_BOTH_DIALECTS)
+
+
 class PipelineCreate(PipelineBase):
     name: Name
     description: Body | None = None
@@ -240,12 +277,13 @@ class PipelineCreate(PipelineBase):
 
     @model_validator(mode="after")
     def validate_steps_definition(self):
-        """Ensure either steps or steps_graph is provided, not both with conflicting data."""
-        has_steps = bool(self.steps)
-        has_graph = self.steps_graph is not None
+        """One definition dialect per request (12.8 §4.4).
 
-        # Allow both to be empty for initial creation
-        # If graph is provided, it takes precedence
+        Was an explicit no-op that computed two booleans and returned. The
+        comment said "if graph is provided, it takes precedence", but nothing
+        implemented that and `create_pipeline` wrote both columns.
+        """
+        _refuse_both_dialects(self.steps, self.steps_graph)
         return self
 
 
@@ -259,13 +297,70 @@ class PipelineUpdate(BaseModel):
 
     # pipelines.description and .steps_graph are nullable; the rest are
     # NOT NULL and an explicit null used to reach the column as a 500.
-    _reject_nulls = not_null("name", "steps", "triggers", "is_template")
+    #
+    # `steps` LEFT this list at 12.8 P3 and gained `_steps_is_never_null`
+    # below instead. It is no longer a column-backed field: the boundary
+    # converts it into `steps_graph` and never writes `pipelines.steps`, so
+    # `not_null`'s premise ("this maps to a NOT NULL column") stopped being
+    # true here - and stays untrue after P6 drops the column, at which point
+    # keeping it in this list would read as guarding a column that no longer
+    # exists. The WIRE BEHAVIOUR is deliberately unchanged: an explicit
+    # `null` was a 422 before and is a 422 now.
+    _reject_nulls = not_null("name", "triggers", "is_template")
+
+    @field_validator("steps", mode="before")
+    @classmethod
+    def _steps_is_never_null(cls, v):
+        """`{"steps": null}` is refused, naming `steps` (12.8 P3).
+
+        Not folded into the `_refuse_both_dialects` model validator: a
+        cross-field rule reports at the model's `loc`, and a client that sent
+        one bad field deserves to be told WHICH one. `mode="before"` keeps
+        the refusal ahead of type coercion, exactly as `not_null` does.
+
+        Null is not a way to clear a definition. There is no such thing as a
+        pipeline with no definition - `array_to_graph` refuses an empty array
+        and `PipelineGraphModel` refuses empty entry points - so the only
+        honest reading of `null` here is "I meant to leave this alone", and
+        that is spelled by omitting the field.
+        """
+        if v is None:
+            raise ValueError(
+                "'steps' cannot be null; omit the field to leave the "
+                "definition unchanged, or send a non-empty array (or "
+                "`steps_graph`) to replace it"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def validate_steps_definition(self):
+        """One definition dialect per request (12.8 §4.4). Same rule as POST."""
+        _refuse_both_dialects(self.steps, self.steps_graph)
+        return self
 
 
 class PipelineRead(PipelineBase):
+    """What a pipeline looks like on the wire. GRAPH ONLY, since 12.8 P3.
+
+    `steps` is DELETED, not made optional (§4.3). Its `= []` default was the
+    R1 hazard of the whole retirement concentrated in one line: a graph
+    pipeline, an unparseable row and a row with no definition at all all
+    serialized as `steps: []`, so every failure looked exactly like an empty
+    pipeline. Deleting the field is what makes `PipelinesPage`'s live "0
+    steps for every graph pipeline" bug surface and what makes
+    `verify_executor`'s vacuous-pass hole impossible to leave unfixed.
+
+    A derived array projection was considered and rejected: it can only exist
+    for a linear graph, so a fan-out would force it to lie or to refuse, and
+    a wire field that conditionally refuses is worse than no field.
+
+    The ARRAY authoring dialect is still readable - from
+    `GET /api/repos/{id}/lazyaf/pipelines`, which serves the authoring FILE.
+    That is the R3-clean split: array = authoring, graph = execution,
+    different endpoints.
+    """
     id: str
     repo_id: str
-    steps: list[PipelineStepConfig] = []
     steps_graph: Optional[PipelineGraphModel] = None  # Graph-based definition (v2)
     # Why a definition failed to materialize, or None when it did (12.8,
     # §1.7). `sync_repo_pipelines` swallows every parse exception into a
@@ -285,17 +380,6 @@ class PipelineRead(PipelineBase):
     is_template: bool
     created_at: UTCDateTime
     updated_at: UTCDateTime
-
-    @field_validator("steps", mode="before")
-    @classmethod
-    def parse_steps(cls, v):
-        """Parse steps from JSON string if needed."""
-        if isinstance(v, str):
-            try:
-                return json.loads(v)
-            except (json.JSONDecodeError, TypeError):
-                return []
-        return v
 
     @field_validator("steps_graph", mode="before")
     @classmethod

@@ -251,7 +251,7 @@ class TestRunRepoPipeline:
         platform_pipeline = platform_pipeline_response.json()
         assert platform_pipeline["name"] == "[repo] test-ci"
         assert platform_pipeline["repo_id"] == repo_id
-        assert len(platform_pipeline["steps"]) == 2
+        assert len(platform_pipeline["steps_graph"]["steps"]) == 2
 
         # Verify pipeline run was created
         run_response = await client.get(f"/api/pipeline-runs/{result['run_id']}")
@@ -352,7 +352,108 @@ class TestRepoPipelineAndPlatformPipelineDrift:
         platform_pipeline = platform_response.json()
 
         # Verify it has 2 steps from the original definition
-        assert len(platform_pipeline["steps"]) == 2
+        assert len(platform_pipeline["steps_graph"]["steps"]) == 2
 
         # In a real scenario, the repo definition would change and running again
         # would update the platform pipeline. This test verifies the update mechanism works.
+
+
+# =============================================================================
+# 12.8 — the manual run-by-name door refuses what it cannot run (QA4-08)
+# =============================================================================
+
+@pytest_asyncio.fixture
+async def repo_with_unrunnable_definitions(client, clean_git_repos):
+    """A repo carrying the two files this endpoint used to run vacuously.
+
+    `nosteps.yaml` parses fine and declares no steps; `banana.yaml` parses
+    fine and declares a step type nothing can execute. Both used to
+    materialize happily.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_path = Path(tmpdir) / "unrunnable-repo"
+        repo_path.mkdir()
+
+        subprocess.run(["git", "init"], cwd=repo_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_path, check=True, capture_output=True)
+        (repo_path / "README.md").write_text("# Unrunnable")
+
+        pipelines_dir = repo_path / ".lazyaf" / "pipelines"
+        pipelines_dir.mkdir(parents=True)
+        (pipelines_dir / "nosteps.yaml").write_text(
+            'name: nosteps\ndescription: "does nothing at all"\n'
+        )
+        (pipelines_dir / "banana.yaml").write_text(
+            'name: banana\nsteps:\n'
+            '  - name: S\n    type: banana\n    config: {command: "echo x"}\n'
+        )
+
+        subprocess.run(["git", "add", "."], cwd=repo_path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "unrunnable definitions"], cwd=repo_path, check=True, capture_output=True)
+
+        response = await client.post(
+            "/api/repos/ingest",
+            json={"path": str(repo_path), "name": "repo-unrunnable"},
+        )
+        assert response.status_code == 201, f"Failed to ingest repo: {response.text}"
+        repo_response = await client.get(f"/api/repos/{response.json()['id']}")
+        return repo_response.json()
+
+
+class TestRunRepoPipelineRefusesAnUnrunnableDefinition:
+    """QA4-08: this endpoint calls `start_pipeline` DIRECTLY.
+
+    It therefore skipped every gate `POST /api/pipelines/{id}/run` enforces,
+    so a `.lazyaf/pipelines/*.yaml` with no `steps:` key ran, did nothing and
+    reported PASSED - a green tick for a pipeline that never existed.
+    """
+
+    async def test_stepless_yaml_does_not_report_a_green_pass(
+        self, client, repo_with_unrunnable_definitions, clean_runner_registry
+    ):
+        repo_id = repo_with_unrunnable_definitions["id"]
+        response = await client.post(
+            f"/api/repos/{repo_id}/lazyaf/pipelines/nosteps/run"
+        )
+        assert_status_code(response, 400)
+        assert "nosteps.yaml" in response.json()["detail"]
+
+        # ...and no run was created to report anything at all.
+        listing = await client.get(f"/api/repos/{repo_id}/pipelines")
+        for pipeline in listing.json():
+            runs = await client.get(f"/api/pipelines/{pipeline['id']}/runs")
+            assert runs.json() == [], f"{pipeline['name']} started a run anyway"
+
+    async def test_unconvertible_yaml_is_refused_and_recorded_on_the_row(
+        self, client, repo_with_unrunnable_definitions, clean_runner_registry
+    ):
+        repo_id = repo_with_unrunnable_definitions["id"]
+        response = await client.post(
+            f"/api/repos/{repo_id}/lazyaf/pipelines/banana/run"
+        )
+        assert_status_code(response, 400)
+        assert "banana" in response.json()["detail"]
+
+        # The row exists and says why, so the refusal is inspectable rather
+        # than only being a message the caller may have thrown away.
+        listing = await client.get(f"/api/repos/{repo_id}/pipelines")
+        rows = {p["name"]: p for p in listing.json()}
+        assert "[repo] banana" in rows, rows
+        assert rows["[repo] banana"]["definition_error"]
+
+    async def test_the_authoring_file_is_still_readable(
+        self, client, repo_with_unrunnable_definitions
+    ):
+        """Refusing to RUN it does not make the file unreadable (§4.3).
+
+        `GET /api/repos/{id}/lazyaf/pipelines/{name}` serves the authoring
+        FILE - the array, as written - which is exactly what a user needs to
+        see in order to fix it.
+        """
+        repo_id = repo_with_unrunnable_definitions["id"]
+        response = await client.get(
+            f"/api/repos/{repo_id}/lazyaf/pipelines/banana"
+        )
+        assert_status_code(response, 200)
+        assert response.json()["steps"][0]["type"] == "banana"

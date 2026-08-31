@@ -25,6 +25,7 @@ from app.schemas.pipeline import (
     PipelineRunRead,
     PipelineRunCreate,
     StepRunRead,
+    array_to_graph,
 )
 from app.models.card import StepType
 from app.models.pipeline import RunStatus
@@ -206,49 +207,107 @@ class TestPipelineUpdateSchema:
         assert len(update.steps) == 1
         assert update.name is None
 
+    def test_explicit_null_steps_is_still_refused_naming_the_field(self):
+        """12.8 P3 moved this guard; it did not remove it.
+
+        `steps` left `not_null(...)` because that helper's premise is "this
+        field maps to a NOT NULL column", and `steps` stopped being written
+        to `pipelines.steps` at all - the boundary converts it into
+        `steps_graph`. The WIRE BEHAVIOUR is unchanged on purpose: `null` was
+        a 422 before and is a 422 now, still reported against `steps` so the
+        client is told which field was wrong.
+        """
+        with pytest.raises(ValidationError) as caught:
+            PipelineUpdate(steps=None)
+        errors = caught.value.errors()
+        assert [error["loc"] for error in errors] == [("steps",)]
+        assert "steps" in errors[0]["msg"]
+
+    def test_the_refusal_says_how_to_leave_the_definition_alone(self):
+        with pytest.raises(ValidationError) as caught:
+            PipelineUpdate(steps=None)
+        assert "omit the field" in caught.value.errors()[0]["msg"]
+
+
+#: A minimal linear graph as the ORM stores it: a JSON string in
+#: `pipelines.steps_graph`. Used by the parse tests below, which are the
+#: `parse_steps` tests of the v1 era CONVERTED onto the surviving surface -
+#: `steps_graph` had no parse coverage at all before 12.8 P3.
+_GRAPH_JSON = json.dumps({
+    "steps": {
+        "tier1": {
+            "id": "tier1", "name": "Test", "type": "script",
+            "config": {"command": "pytest -q"}, "timeout": 300,
+        },
+    },
+    "edges": [],
+    "entry_points": ["tier1"],
+    "version": 2,
+})
+
 
 class TestPipelineReadSchema:
     """Tests for PipelineRead schema."""
 
-    def test_parse_steps_from_json_string(self):
-        """Should parse steps from JSON string."""
-        pipeline = PipelineRead(
-            id="pipeline-123",
-            repo_id="repo-456",
-            name="Test",
-            steps='[{"name": "Test", "type": "script", "config": {}, "on_success": "next", "on_failure": "stop", "timeout": 300}]',
-            is_template=False,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-        )
-        assert len(pipeline.steps) == 1
-        assert pipeline.steps[0].name == "Test"
+    def test_parse_steps_graph_from_json_string(self):
+        """Should parse steps_graph from JSON string.
 
-    def test_parse_steps_from_list(self):
-        """Should accept steps as list directly."""
+        `pipelines.steps_graph` is a Text column, so every real
+        `PipelineRead.model_validate(row)` hands this validator a string.
+        The v1 twin of this test read `steps`; that field is gone at 12.8 P3
+        and the graph is now the only definition on the wire, so the claim
+        moves here rather than being deleted (R4).
+        """
         pipeline = PipelineRead(
             id="pipeline-123",
             repo_id="repo-456",
             name="Test",
-            steps=[{"name": "Test", "type": "script"}],
+            steps_graph=_GRAPH_JSON,
             is_template=False,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
         )
-        assert len(pipeline.steps) == 1
+        assert list(pipeline.steps_graph.steps) == ["tier1"]
+        assert pipeline.steps_graph.steps["tier1"].name == "Test"
+        assert pipeline.steps_graph.entry_points == ["tier1"]
 
-    def test_parse_invalid_json_returns_empty(self):
-        """Invalid JSON should result in empty steps list."""
+    def test_parse_steps_graph_from_dict(self):
+        """Should accept steps_graph as a dict directly."""
         pipeline = PipelineRead(
             id="pipeline-123",
             repo_id="repo-456",
             name="Test",
-            steps="invalid json",
+            steps_graph=json.loads(_GRAPH_JSON),
             is_template=False,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
         )
-        assert pipeline.steps == []
+        assert list(pipeline.steps_graph.steps) == ["tier1"]
+
+    def test_parse_invalid_json_returns_none(self):
+        """Invalid JSON in the column yields no graph rather than a 500.
+
+        This PINS A KNOWN DARK CHANNEL, deliberately and with its owner
+        named. `parse_steps_graph` swallows a JSONDecodeError to None
+        exactly as `parse_steps` used to swallow to `[]`, so an unparseable
+        definition is indistinguishable here from a pipeline that has none.
+        Plan §4.7 records that nothing in the system has ever looked, and
+        assigns the looking to migration 0014, which refuses to convert a row
+        whose `steps` will not parse and names the pipeline id.
+
+        The test exists so the swallow is a recorded behaviour with a
+        pointer, not an accident someone discovers from a blank page.
+        """
+        pipeline = PipelineRead(
+            id="pipeline-123",
+            repo_id="repo-456",
+            name="Test",
+            steps_graph="invalid json",
+            is_template=False,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        assert pipeline.steps_graph is None
 
     def test_has_all_required_fields(self):
         """PipelineRead should have all required fields."""
@@ -256,7 +315,6 @@ class TestPipelineReadSchema:
             id="pipeline-123",
             repo_id="repo-456",
             name="Test Pipeline",
-            steps=[],
             is_template=False,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
@@ -265,6 +323,149 @@ class TestPipelineReadSchema:
         assert pipeline.repo_id == "repo-456"
         assert pipeline.name == "Test Pipeline"
         assert pipeline.is_template is False
+
+
+class TestPipelineReadHasNoStepsArray:
+    """§4.3: `steps` is DELETED from the wire, not made optional (12.8 P3).
+
+    The `= []` default was the R1 hazard of the whole retirement in one line.
+    A graph pipeline, a row whose JSON would not parse, and a row with no
+    definition at all ALL serialized as `steps: []` - so every failure looked
+    exactly like an empty pipeline, and two live bugs (`PipelinesPage`
+    rendering "0 steps" for every graph pipeline; `verify_executor` passing
+    vacuously on an empty definition) were invisible because the field always
+    had something plausible to say.
+
+    These tests are the tombstone. If `steps` ever comes back as a defaulted
+    read field, they fail here rather than three lanes downstream.
+    """
+
+    def _read(self, **overrides):
+        kwargs = dict(
+            id="p1",
+            repo_id="r1",
+            name="P",
+            is_template=False,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        kwargs.update(overrides)
+        return PipelineRead(**kwargs)
+
+    def test_steps_is_not_a_field(self):
+        assert "steps" not in PipelineRead.model_fields
+
+    def test_steps_is_not_on_the_wire(self):
+        assert "steps" not in self._read().model_dump()
+
+    def test_the_parse_steps_validator_is_gone(self):
+        """Absence of the FIELD is not proof the validator went with it - a
+        stray `field_validator("steps")` on a model with no `steps` field is
+        how a half-removal survives review."""
+        assert not hasattr(PipelineRead, "parse_steps")
+        validators = PipelineRead.__pydantic_decorators__.field_validators
+        guarded = {field for v in validators.values() for field in v.info.fields}
+        assert "steps" not in guarded
+
+    def test_an_orm_row_still_carrying_the_column_does_not_leak_it(self):
+        """`Pipeline.steps` stays on the ORM model until P6 (the column is
+        NOT NULL with no server_default, so a model that stopped declaring it
+        could not INSERT). The column outliving the wire field is the whole
+        point of the phase split - it must not travel."""
+        from app.models.pipeline import Pipeline
+
+        row = Pipeline(
+            id="p1",
+            repo_id="r1",
+            name="P",
+            steps='[{"name": "Legacy", "type": "script"}]',
+            triggers="[]",
+            is_template=False,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+
+        dumped = PipelineRead.model_validate(row).model_dump()
+
+        assert "steps" not in dumped
+        assert "Legacy" not in json.dumps(dumped, default=str)
+
+    def test_an_unset_definition_is_none_not_an_empty_collection(self):
+        """The distinction the deletion buys: "this pipeline has no graph" is
+        now sayable, and is not spelled the same way as "this pipeline has an
+        empty definition" (which is unrepresentable - `array_to_graph`
+        refuses an empty array and `PipelineGraphModel` refuses empty entry
+        points)."""
+        assert self._read().steps_graph is None
+
+
+class TestOneDefinitionDialectPerRequest:
+    """§4.4 pinned contract: POST/PATCH carrying BOTH dialects is a 422.
+
+    `PipelineCreate.validate_steps_definition` used to be an explicit no-op -
+    it computed `has_steps` and `has_graph`, used neither, and returned self
+    under a comment claiming "if graph is provided, it takes precedence".
+    Nothing implemented that: `create_pipeline` wrote both columns and
+    `update_pipeline` setattr'd them independently, so `PATCH {"steps": [...]}`
+    on a graph pipeline persisted an array the executor never read and the
+    user's edit silently did nothing. `trigger_service` force-NULLed
+    `steps_graph` specifically to dodge this.
+
+    Refusing is the R1 answer, and the refusal is identical on both verbs so
+    a client has one rule rather than two.
+    """
+
+    ARRAY = [{"name": "Test", "type": "script", "config": {"command": "x"}}]
+    GRAPH = json.loads(_GRAPH_JSON)
+
+    def test_create_with_both_is_refused(self):
+        with pytest.raises(ValidationError) as caught:
+            PipelineCreate(name="P", steps=self.ARRAY, steps_graph=self.GRAPH)
+        assert "not both" in str(caught.value)
+
+    def test_update_with_both_is_refused(self):
+        with pytest.raises(ValidationError) as caught:
+            PipelineUpdate(steps=self.ARRAY, steps_graph=self.GRAPH)
+        assert "not both" in str(caught.value)
+
+    def test_the_message_names_both_fields_and_the_way_out(self):
+        """A 422 that does not say which two things collided, or what to send
+        instead, costs the caller a round trip through the source."""
+        with pytest.raises(ValidationError) as caught:
+            PipelineCreate(name="P", steps=self.ARRAY, steps_graph=self.GRAPH)
+        message = str(caught.value)
+        assert "steps" in message and "steps_graph" in message
+        assert "Omit" in message
+
+    def test_array_alone_is_accepted(self):
+        assert PipelineCreate(name="P", steps=self.ARRAY).steps_graph is None
+        assert PipelineUpdate(steps=self.ARRAY).steps_graph is None
+
+    def test_graph_alone_is_accepted(self):
+        assert PipelineCreate(name="P", steps_graph=self.GRAPH).steps == []
+        assert PipelineUpdate(steps_graph=self.GRAPH).steps is None
+
+    def test_neither_is_accepted(self):
+        """Creating a named, empty pipeline and filling it in from the editor
+        is the normal first move; it must not become a 422."""
+        assert PipelineCreate(name="P").steps_graph is None
+        assert PipelineUpdate(name="Renamed").steps is None
+
+    def test_an_empty_array_beside_a_graph_is_NOT_a_conflict(self):
+        """The pipeline editor posts `{"steps_graph": graph, "steps": []}`
+        and `tdd/qa/qa3_support.graph_pipeline` posts the same shape, because
+        `steps` used to be a NOT NULL column every writer had to name. An
+        empty array carries no definition, so there is nothing for the graph
+        to conflict with - refusing it would break the only authoring surface
+        the product has, to enforce a rule about a value that says nothing.
+        """
+        created = PipelineCreate(name="P", steps=[], steps_graph=self.GRAPH)
+        assert created.steps == []
+        assert created.steps_graph is not None
+
+        updated = PipelineUpdate(steps=[], steps_graph=self.GRAPH)
+        assert updated.steps == []
+        assert updated.steps_graph is not None
 
 
 class TestPipelineReadDefinitionError:
@@ -282,7 +483,6 @@ class TestPipelineReadDefinitionError:
             id="pipeline-123",
             repo_id="repo-456",
             name="Test Pipeline",
-            steps=[],
             is_template=False,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
@@ -340,6 +540,38 @@ class TestPipelineReadDefinitionError:
         read = PipelineRead.model_validate(RowWithoutTheColumn())
         assert read.definition_error is None
         assert read.id == "pipeline-123"
+
+    def test_the_default_is_what_does_the_work_not_luck(self):
+        """The negative control for the test above.
+
+        `from_attributes` reads each field with getattr and treats an
+        AttributeError as "not supplied" - which is only survivable because
+        the field HAS a default. Declared without one, the same absent
+        attribute is a `missing` error against that field. Pinned so nobody
+        "tightens" `definition_error` to a required field during the window
+        before the column lands and turns every pipeline response into a 500.
+        """
+        from pydantic import BaseModel, ConfigDict
+
+        class RowWithoutTheColumn:
+            id = "pipeline-123"
+
+        class Defaulted(BaseModel):
+            model_config = ConfigDict(from_attributes=True)
+            id: str
+            definition_error: str | None = None
+
+        class Required(BaseModel):
+            model_config = ConfigDict(from_attributes=True)
+            id: str
+            definition_error: str | None
+
+        assert Defaulted.model_validate(RowWithoutTheColumn()).definition_error is None
+
+        with pytest.raises(ValidationError) as caught:
+            Required.model_validate(RowWithoutTheColumn())
+        assert caught.value.errors()[0]["type"] == "missing"
+        assert caught.value.errors()[0]["loc"] == ("definition_error",)
 
     def test_a_real_orm_row_serializes(self):
         """The same claim against the actual model, and it stays true after
@@ -575,22 +807,35 @@ class TestPipelineStepConfigId:
         with pytest.raises(ValidationError):
             PipelineStepConfig(name="T", type=StepType.SCRIPT, id=3)
 
-    def test_an_id_survives_a_pipeline_read_round_trip(self):
-        """`PipelineRead.steps` is `list[PipelineStepConfig]`, so the id has
-        to survive the JSON-string parse the ORM row goes through."""
+    def test_an_id_survives_all_the_way_to_the_wire(self):
+        """The end-to-end claim, re-aimed at the surviving surface (12.8 P3).
+
+        This used to read the ids back off `PipelineRead.steps`. That field
+        is deleted, so the same claim - "an authored id is what a client
+        sees, not `step_{index}`" - now has to be made through the graph,
+        which is where the id actually matters: node ids are the
+        context-directory names, the debug breakpoint keys and the
+        correlation key `verify_executor` reads off each StepRun.
+
+        Stronger than the v1 version, which only proved the id survived a
+        JSON parse; this one proves it survives the CONVERSION too.
+        """
+        graph = array_to_graph([
+            PipelineStepConfig(id="tier1", name="T1", type=StepType.SCRIPT),
+            PipelineStepConfig(name="T2", type=StepType.SCRIPT, on_failure="next"),
+        ])
+
         pipeline = PipelineRead.model_validate({
             "id": "p1",
             "repo_id": "r1",
             "name": "P",
-            "steps": json.dumps([
-                {"id": "tier1", "name": "T1", "type": "script"},
-                {"name": "T2", "type": "script"},
-            ]),
-            "steps_graph": None,
+            "steps_graph": graph.model_dump_json(),
             "triggers": "[]",
             "is_template": False,
             "created_at": datetime(2026, 8, 30, 12, 0, 0),
             "updated_at": datetime(2026, 8, 30, 12, 0, 0),
         })
 
-        assert [s.id for s in pipeline.steps] == ["tier1", None]
+        assert list(pipeline.steps_graph.steps) == ["tier1", "step_1"]
+        assert pipeline.steps_graph.entry_points == ["tier1"]
+        assert pipeline.model_dump()["steps_graph"]["steps"]["tier1"]["id"] == "tier1"

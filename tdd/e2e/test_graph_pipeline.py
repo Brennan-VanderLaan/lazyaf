@@ -579,11 +579,18 @@ class TestGraphPipelineYAMLExport:
         pipeline_id = create_response.json()["id"]
 
         export_response = await api_client.get(f"/api/pipelines/{pipeline_id}/export/yaml")
-        yaml_content = export_response.text
 
-        # Should show start has two success targets
-        assert "Branch A" in yaml_content
-        assert "Branch B" in yaml_content
+        # 12.8 P3 (§4.10): export REFUSES a fan-out instead of lying about it.
+        # The YAML authoring format is an array, and an array step continues to
+        # exactly ONE successor - so there is no faithful rendering of
+        # start -> {branch_a, branch_b}. This test used to assert both branch
+        # names appeared in the body, which passed only because the exporter
+        # silently flattened the graph into something that could never be
+        # re-imported. A refusal that names the construct is the honest answer.
+        assert export_response.status_code == 409, export_response.text
+        detail = export_response.json()["detail"]
+        assert "fan-out" in detail, detail
+        assert "branch_a" in detail and "branch_b" in detail, detail
 
 
 # =============================================================================

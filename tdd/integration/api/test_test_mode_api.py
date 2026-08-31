@@ -419,6 +419,72 @@ class TestSeed:
 
         assert second == first
 
+    async def test_seeding_twice_without_a_reset_still_succeeds(
+        self, test_client, clean_git_repos
+    ):
+        """/seed is idempotent, not one-shot.
+
+        Every other seeded row is keyed by uuid4(), but ModelEndpoint carries a
+        UNIQUE index on name - so a second /seed used to write the repo, the
+        pipeline and both cards successfully and then explode on that one
+        table. Worse, the rescue that exists so endpoint seeding 'never fails
+        a seed' called rollback(), which EXPIRED the rows already committed
+        above, so building the response lazy-loaded repo.id outside a greenlet
+        and raised MissingGreenlet. The handler whose job was to swallow the
+        failure was the thing returning 500.
+        """
+        first = await test_client.post("/api/test/seed")
+        assert_status_code(first, 200)
+
+        second = await test_client.post("/api/test/seed")
+        assert_status_code(second, 200)
+        assert second.json()["success"] is True
+        # The response is built from values read BEFORE endpoint seeding, so it
+        # survives even if that half rolls back.
+        assert second.json()["repo"]["id"]
+
+    async def test_seeding_twice_does_not_duplicate_model_endpoints(
+        self, test_client, db_session, clean_git_repos
+    ):
+        from sqlalchemy import func, select as sa_select
+
+        from app.models.model_endpoint import ModelEndpoint
+
+        await test_client.post("/api/test/seed")
+        after_one = await db_session.scalar(
+            sa_select(func.count()).select_from(ModelEndpoint)
+        )
+        await test_client.post("/api/test/seed")
+        after_two = await db_session.scalar(
+            sa_select(func.count()).select_from(ModelEndpoint)
+        )
+
+        assert after_one > 0, "seed created no model endpoints at all"
+        assert after_two == after_one
+
+    async def test_seeded_cards_use_a_step_type_that_can_actually_run(
+        self, test_client, clean_git_repos
+    ):
+        """A seeded card whose only outcome is a red toast is not a fixture.
+
+        12.4 removed docker and script execution from the runners, and
+        create_card refuses those types - but these rows are written through
+        the ORM, which bypasses that refusal. So the seed has to hold the rule
+        itself or it hands a demo a broken button.
+        """
+        from app.routers.cards import DEPRECATED_CARD_STEP_TYPES
+        from app.models import Card
+
+        body = (await test_client.post("/api/test/seed")).json()
+        for seeded in body["cards"]:
+            card = await test_client.get(f"/api/cards/{seeded['id']}")
+            if card.status_code != 200:
+                continue
+            assert card.json()["step_type"] not in DEPRECATED_CARD_STEP_TYPES, (
+                f"seeded card {seeded['title']!r} uses step type "
+                f"{card.json()['step_type']!r}, which Start refuses"
+            )
+
     async def test_reset_seed_cycle_is_repeatable(
         self, test_client, db_session, clean_git_repos
     ):

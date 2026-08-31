@@ -314,13 +314,11 @@ def test_nonfinite_literal_error_body_is_json(api):
 # QA-API-06  MAJOR - pipeline name lands raw in Content-Disposition
 # =============================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA-API-06: backend/app/routers/pipelines.py:569 "
-           "interpolates the pipeline name into Content-Disposition; starlette "
-           "latin-1 encodes headers, so any codepoint > U+00FF raises "
-           "UnicodeEncodeError -> 500",
-)
+# QA-API-06 FIXED: the name no longer reaches the header raw. `_content_disposition`
+# (backend/app/routers/pipelines.py:537) builds an RFC 6266 value - an ASCII
+# `filename=` fallback for old clients plus the real name in
+# `filename*=UTF-8''<percent-encoded>` - so a codepoint > U+00FF is percent-escaped
+# instead of blowing up starlette's latin-1 header encoding.
 @pytest.mark.parametrize(
     "name",
     ["中文-pipeline", "ship-it-\U0001F680", "Проверка"],
@@ -331,12 +329,10 @@ def test_export_yaml_survives_a_non_latin1_pipeline_name(api, plain_repo, name):
     assert r.status_code == 200, f"name={name!r} -> {r.status_code} {r.text[:200]}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA-API-06b: a pipeline name containing CR/LF/NUL makes "
-           "h11 refuse to serialise the Content-Disposition header; uvicorn "
-           "drops the connection with no response at all",
-)
+# QA-API-06b FIXED: the same `_content_disposition` drops every non-printable
+# character before the name reaches the header, so CR/LF/NUL can no longer make
+# h11 refuse to serialise the response, and the injected `X-Injected:` text ends
+# up inside the filename rather than as a header of its own.
 @pytest.mark.parametrize("name", ["evil\r\nX-Injected: yes", "line1\nline2", "nul\x00name"])
 def test_export_yaml_never_drops_the_connection(api, plain_repo, name):
     pid = api.post(f"/api/repos/{plain_repo}/pipelines", json={"name": name}).json()["id"]
@@ -555,30 +551,50 @@ def test_reparenting_a_story_either_works_or_fails_loudly(api):
 # QA-API-13  MINOR - no length/whitespace validation on any name or title
 # =============================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA-API-13: no name/title field on any entity has a "
-           "min_length, a strip, or a max_length, so empty strings, "
-           "whitespace-only names, NUL bytes and 1 MB blobs are all stored",
+# QA-API-13 PARTLY FIXED: `AgentFileCreate.name` is now the `Name` alias
+# (backend/app/schemas/_strings.py) - strip_whitespace, then min_length=1 - so
+# "", "   " and "\t\n " are a 422 on `body.name` instead of a stored row.
+#
+# The NUL param keeps its marker: that alias deliberately does NOT filter
+# control characters ("A NUL byte in a name is a separate finding with its own
+# round-trip test asserting today's behaviour"), so the NUL half of this finding
+# is still open. Split rather than deleted, per the measured result.
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "",
+        "   ",
+        "\t\n ",
+        pytest.param(
+            "nul\x00name",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="QA finding QA-API-13 (NUL half, still open): `Name` "
+                       "bounds length and blankness but does not reject control "
+                       "characters, so a NUL-bearing name is still accepted and "
+                       "stored verbatim - see "
+                       "test_nul_byte_in_a_name_round_trips_verbatim below",
+            ),
+        ),
+    ],
 )
-@pytest.mark.parametrize("bad_name", ["", "   ", "\t\n ", "nul\x00name"])
 def test_blank_and_control_char_names_are_rejected(api, bad_name):
     r = api.post("/api/agent-files", json={"name": bad_name, "content": "x"})
     assert r.status_code == 422, f"name={bad_name!r} accepted with {r.status_code}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA-API-13b: a 1 MB name is stored verbatim and then "
-           "rendered by every list view",
-)
+# QA-API-13b FIXED: `Name` caps every *Create/*Update name at NAME_MAX = 200
+# characters, so the 1 MB blob is refused at the edge with a 422 naming
+# `body.name` instead of being stored and then rendered by every list view.
 def test_absurdly_long_name_is_rejected(api):
     r = api.post("/api/agent-files", json={"name": "A" * 1_000_000, "content": "x"})
     assert r.status_code == 422, f"1 MB name accepted with {r.status_code}"
 
 
 def test_nul_byte_in_a_name_round_trips_verbatim(api):
-    """Documents the current storage behaviour that QA-API-13 will change."""
+    """Documents the current storage behaviour that QA-API-13's NUL half will
+    change. The length/blankness half of that finding is already closed - see
+    the two tests above."""
     name = f"nul\x00{uuid.uuid4().hex[:6]}"
     r = api.post("/api/agent-files", json={"name": name, "content": "c\x00d"})
     assert r.status_code == 201

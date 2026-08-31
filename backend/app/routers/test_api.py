@@ -211,6 +211,30 @@ SEED_MODEL_ENDPOINTS = [
 ]
 
 
+def _apply_seed_endpoint_spec(endpoint, spec, mock_url, default_gpu_node_id) -> None:
+    """Stamp a seed spec onto an endpoint row, new or existing.
+
+    One definition of what a seeded endpoint IS, so an update and an insert
+    cannot drift apart (R3).
+    """
+    from decimal import Decimal
+
+    endpoint.description = spec["description"]
+    endpoint.base_url = f"{mock_url}/{spec['scenario']}/v1"
+    endpoint.model = spec["model"]
+    endpoint.server_kind = "vllm"
+    endpoint.auth_style = "none"
+    endpoint.reach = "direct"
+    endpoint.rate_usd_hour = Decimal("0.010000")
+    endpoint.gpu_node_id = default_gpu_node_id(spec["name"])
+    endpoint.max_concurrency = 1
+    endpoint.request_timeout_seconds = 60
+    endpoint.probe_status = "unprobed"
+    endpoint.probe_detail = "{}"
+    endpoint.consecutive_failures = 0
+    endpoint.enabled = True
+
+
 async def _seed_model_endpoints(db: AsyncSession) -> list[SeededEndpoint]:
     """Register (and best-effort probe) the two mock endpoints."""
     import os
@@ -223,26 +247,28 @@ async def _seed_model_endpoints(db: AsyncSession) -> list[SeededEndpoint]:
         "LAZYAF_MOCK_ENDPOINT_URL", DEFAULT_MOCK_ENDPOINT_URL
     ).rstrip("/")
 
+    # Idempotent by name. ModelEndpoint carries a UNIQUE index on `name`, and
+    # every other row this seeder writes is keyed by uuid4() - so a second
+    # /seed used to succeed for the repo, the pipeline and both cards and then
+    # explode on this one table. "Produce this known state" is a naturally
+    # idempotent job; matches upsert_materialized_pipeline's shape elsewhere.
+    existing = {
+        row.name: row
+        for row in (
+            await db.execute(
+                select(ModelEndpoint).where(
+                    ModelEndpoint.name.in_([e["name"] for e in SEED_MODEL_ENDPOINTS])
+                )
+            )
+        ).scalars()
+    }
+
     rows = []
     for spec in SEED_MODEL_ENDPOINTS:
-        endpoint = ModelEndpoint(
-            name=spec["name"],
-            description=spec["description"],
-            base_url=f"{mock_url}/{spec['scenario']}/v1",
-            model=spec["model"],
-            server_kind="vllm",
-            auth_style="none",
-            reach="direct",
-            rate_usd_hour=Decimal("0.010000"),
-            gpu_node_id=default_gpu_node_id(spec["name"]),
-            max_concurrency=1,
-            request_timeout_seconds=60,
-            probe_status="unprobed",
-            probe_detail="{}",
-            consecutive_failures=0,
-            enabled=True,
-        )
-        db.add(endpoint)
+        endpoint = existing.get(spec["name"]) or ModelEndpoint(name=spec["name"])
+        _apply_seed_endpoint_spec(endpoint, spec, mock_url, default_gpu_node_id)
+        if endpoint.name not in existing:
+            db.add(endpoint)
         rows.append(endpoint)
     await db.commit()
 
@@ -434,8 +460,14 @@ async def seed_state(db: AsyncSession = Depends(get_db)):
         title="Seed card (todo)",
         description="Deterministic seed card ready to start",
         status=CardStatus.TODO.value,
-        step_type=StepType.SCRIPT.value,
-        step_config=json.dumps({"command": "echo seed-card-ran"}),
+        # AGENT, not SCRIPT. 12.4 removed docker/script execution from the
+        # runners, so a seeded script card was a card whose only possible
+        # outcome was a red toast on Start - the seed handed a demo a broken
+        # button. Seeded through the ORM, this row bypasses create_card's
+        # refusal, so the seed has to hold the rule itself.
+        step_type=StepType.AGENT.value,
+        runner_type="mock",
+        step_config=json.dumps({"task": "Write a short greeting to README.md"}),
     )
     card_review = Card(
         id=str(uuid4()),
@@ -443,8 +475,11 @@ async def seed_state(db: AsyncSession = Depends(get_db)):
         title="Seed card (in review)",
         description="Deterministic seed card awaiting review",
         status=CardStatus.IN_REVIEW.value,
-        step_type=StepType.SCRIPT.value,
-        step_config=json.dumps({"command": "echo seed-card-ran"}),
+        # AGENT for the same reason as the todo card above: Retry is offered
+        # from in_review, and a deprecated step type would refuse there too.
+        step_type=StepType.AGENT.value,
+        runner_type="mock",
+        step_config=json.dumps({"task": "Write a short greeting to README.md"}),
         branch_name=SEED_REVIEW_BRANCH,
     )
     db.add(card_todo)
@@ -456,6 +491,25 @@ async def seed_state(db: AsyncSession = Depends(get_db)):
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Seeding failed: {e}")
 
+    # Read every value the response needs BEFORE touching model endpoints.
+    #
+    # The rescue below exists so endpoint seeding can never fail a seed, and it
+    # was doing the opposite: `rollback()` EXPIRES the ORM rows committed above,
+    # so building the response then lazy-loaded `repo.id` outside a greenlet and
+    # raised MissingGreenlet - a 500 from the handler whose whole job was to
+    # swallow the failure. Plain values cannot be expired.
+    seeded_repo = SeededRepo(
+        id=repo.id,
+        name=repo.name,
+        default_branch=repo.default_branch,
+        git_initialized=git_initialized,
+    )
+    seeded_pipeline = SeededPipeline(id=pipeline.id, name=pipeline.name)
+    seeded_cards = [
+        SeededCard(id=card_todo.id, title=card_todo.title, status=card_todo.status),
+        SeededCard(id=card_review.id, title=card_review.title, status=card_review.status),
+    ]
+
     try:
         model_endpoints = await _seed_model_endpoints(db)
     except Exception as e:  # noqa: BLE001 - endpoint seeding never fails a seed
@@ -466,15 +520,7 @@ async def seed_state(db: AsyncSession = Depends(get_db)):
     return SeedResponse(
         success=True,
         model_endpoints=model_endpoints,
-        repo=SeededRepo(
-            id=repo.id,
-            name=repo.name,
-            default_branch=repo.default_branch,
-            git_initialized=git_initialized,
-        ),
-        pipeline=SeededPipeline(id=pipeline.id, name=pipeline.name),
-        cards=[
-            SeededCard(id=card_todo.id, title=card_todo.title, status=card_todo.status),
-            SeededCard(id=card_review.id, title=card_review.title, status=card_review.status),
-        ],
+        repo=seeded_repo,
+        pipeline=seeded_pipeline,
+        cards=seeded_cards,
     )

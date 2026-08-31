@@ -114,20 +114,20 @@ def test_timestamp_is_the_right_instant_not_just_a_relabelled_one():
 
 # ---------------------------------------------------------------------------
 # FINDING 3 (MAJOR) — no length bound on user-supplied names.
+# FINDING 6 (MAJOR) — blank / whitespace-only names accepted.
+#
+# BOTH FIXED at the schema (``backend/app/schemas/_strings.py``): the ``Name``
+# alias — ``strip_whitespace=True, min_length=1, max_length=200`` — is applied
+# to the ``*Create``/``*Update`` INPUT schemas of repos, pipelines and the rest,
+# so a blank, whitespace-only or 5000-character name is a 422 naming
+# ``body.name`` instead of a row that later wrecks a card header or renders as
+# an invisible sidebar entry. The ``*Read`` schemas keep a bare ``str`` on
+# purpose, so rows written before the bound still serialize.
+#
+# The xfail(strict) markers below are gone; these three are regression guards.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding 3: `RepoBase.name` / `PipelineBase.name` are bare `str` "
-        "with no max_length, so a 5000-character name is stored and then "
-        "rendered into `.card-header h3`, which declares no overflow rule. "
-        "Measured: card scrollWidth 66642px inside a 436px card, so the Edit "
-        "and Run buttons are pushed outside the clipped card and cannot be "
-        "clicked. Fix: bound the field (e.g. max_length=200)."
-    ),
-)
 def test_pipeline_name_is_length_bounded(repo):
     resp = requests.post(
         f"{BASE_URL}/api/repos/{repo['id']}/pipelines",
@@ -143,14 +143,6 @@ def test_pipeline_name_is_length_bounded(repo):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding 6: `POST /api/repos {'name': ''}` is accepted with 201 and "
-        "the sidebar renders the name verbatim, producing an unlabelled, "
-        "invisible click target. Fix: min_length=1 plus a strip() check."
-    ),
-)
 def test_repo_name_cannot_be_empty():
     resp = requests.post(f"{BASE_URL}/api/repos", json={"name": ""}, timeout=TIMEOUT)
     assert resp.status_code == 422, (
@@ -158,13 +150,6 @@ def test_repo_name_cannot_be_empty():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding 6 (variant): a whitespace-only repo name is also accepted "
-        "and renders as a blank sidebar row."
-    ),
-)
 def test_repo_name_cannot_be_whitespace_only():
     resp = requests.post(
         f"{BASE_URL}/api/repos", json={"name": "   \t  "}, timeout=TIMEOUT

@@ -172,10 +172,10 @@ def test_step_key_and_declared_id_must_agree(create_pipeline):
     assert status == 422, f"key/id mismatch should be refused, got {status}: {body}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="QA finding QA4-19: an empty pipeline name is accepted.",
-)
+# QA4-19 FIXED, but NOT in validate_graph_integrity: the pipeline create/update
+# schemas now type `name` as the `Name` alias from backend/app/schemas/_strings.py
+# (strip_whitespace, min_length=1, max_length=200), so "" is refused by pydantic
+# with a 422 on `body.name` before any graph validation runs.
 def test_empty_pipeline_name_is_rejected(create_pipeline):
     status, body = create_pipeline({
         "name": "",

@@ -268,16 +268,12 @@ def test_resolve_conflicts_refuses_when_there_is_no_conflict(repo):
 # QA2-07  deleting a pipeline mid-run destroys the run and leaks its container
 # ===========================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-07: DELETE /api/pipelines/{id} has no in-flight-run "
-        "check (backend/app/routers/pipelines.py delete_pipeline). It "
-        "cascade-deletes a RUNNING PipelineRun, so the run 404s instantly, "
-        "/cancel can no longer reach it, and the step container is left "
-        "behind exited instead of being removed."
-    ),
-)
+# QA2-07 FIXED (12.7): delete_pipeline (backend/app/routers/pipelines.py)
+# now selects the pipeline's runs whose status is in IN_FLIGHT_RUN_STATUSES
+# ('pending', 'running') BEFORE the delete, and refuses with 409
+# live_run_refusal(...) - which names the live run and the
+# POST /api/pipeline-runs/{id}/cancel to make first - instead of
+# cascade-deleting the run row out from under the executor.
 def test_deleting_a_pipeline_with_a_live_run_is_refused(repo):
     pipeline_id = make_pipeline(repo, "delete-mid-run", "echo start; sleep 30; echo end")
     status, run = api("POST", f"/api/pipelines/{pipeline_id}/run", {})
@@ -296,16 +292,12 @@ def test_deleting_a_pipeline_with_a_live_run_is_refused(repo):
 # QA2-08  deleting a repo mid-run strands its Job at 'running' forever
 # ===========================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "QA finding QA2-08: DELETE /api/repos/{id} has no in-flight-run "
-        "check (backend/app/routers/repos.py delete_repo). It deletes the "
-        "git storage and cascade-deletes the Card while its agent run is "
-        "executing; the Job row survives, still 'running', pointing at a "
-        "card that no longer exists, and nothing cancels the run."
-    ),
-)
+# QA2-08 FIXED (12.7): delete_repo (backend/app/routers/repos.py) now runs
+# the same in-flight check twice before deleting anything - once for the
+# repo's PipelineRuns in IN_FLIGHT_RUN_STATUSES and once for its Cards' Jobs
+# in IN_FLIGHT_JOB_STATUSES ('queued', 'running') - and refuses with 409
+# naming the live work and the cancel call. Verified against the stack: the
+# DELETE answers 409, the repo is still there, and the run lands its Job.
 def test_deleting_a_repo_with_a_live_run_does_not_strand_a_job():
     repo_id, _ = seed_repo()
     card_id = make_card(repo_id, "repo-delete-mid-run", seconds=25)
@@ -328,10 +320,66 @@ def test_deleting_a_repo_with_a_live_run_does_not_strand_a_job():
 # Regression locks: behaviour that is CORRECT today and must stay correct
 # ===========================================================================
 
+# Putting a card in a status is ITSELF a product operation, and PATCH is not
+# the way to reach most of them: `_require_manual_transition`
+# (backend/app/routers/cards.py) restricts a PATCHed status to
+# MANUAL_STATUSES - 'todo', 'in_review', 'failed' - in BOTH directions,
+# because 'in_progress' stands for a live agent run and 'done' for a merged
+# branch, and a field write neither starts nor merges anything.
+#
+# The two guard tests below used to stage with a bare
+# `api("PATCH", f"/api/cards/{id}", {"status": bad})` whose result was never
+# looked at. The moment that guard landed, the PATCH was refused, the card
+# silently stayed 'todo', and the tests went on to assert the refusal of a
+# transition they had never set up - start-from-todo (which is ALLOWED, so
+# the agent actually ran) instead of start-from-in_progress.
+#
+# So `stage_card` reaches each status the way the product does, and ends by
+# ASSERTING the card really got there. That assertion is the point: its
+# absence is exactly why this scaffolding rotted silently.
+
+def stage_card(repo, label, status):
+    """A fresh card genuinely in ``status``, put there through the product."""
+    if status == "in_progress":
+        # START_FROM = ('todo',): only /start opens a run, and only a run
+        # means in_progress. The mock streams for 25s, so the card is still
+        # in_progress while the refusal below is asserted.
+        card_id = make_card(repo, label, seconds=25)
+        start_card(card_id)
+    elif status == "done":
+        # APPROVE_FROM = ('in_review',) AND a branch: 'done' means MERGED, so
+        # the card needs a real run that pushed real work to merge.
+        card_id = make_card(repo, label, files={f"{label}.txt": "staged by QA-2"})
+        start_card(card_id)
+        card = wait_for_card(card_id, ("in_review", "failed"))
+        assert card["status"] == "in_review", f"the agent run did not land in review: {card}"
+        approve_status, body = api("POST", f"/api/cards/{card_id}/approve", {})
+        assert approve_status == 200, f"approve failed: {approve_status} {body}"
+        assert body["merge_result"]["success"], (
+            f"approve did not merge the branch: {body['merge_result']}"
+        )
+    else:
+        # 'todo' is where a card is born; 'in_review' and 'failed' are in
+        # MANUAL_STATUSES, so PATCH is the product's OWN way to reach them.
+        card_id = make_card(repo, label)
+        if status != "todo":
+            patch_status, body = api("PATCH", f"/api/cards/{card_id}", {"status": status})
+            assert patch_status == 200, (
+                f"PATCH to {status!r} was refused: {patch_status} {body}"
+            )
+
+    actual = card_status(card_id)
+    assert actual == status, (
+        f"staging failed: this test needs a card in {status!r} and the card is "
+        f"{actual!r}, so the refusal asserted next would be the refusal of some "
+        "OTHER transition."
+    )
+    return card_id
+
+
 @pytest.mark.parametrize("bad", ["in_progress", "in_review", "done", "failed"])
 def test_start_is_refused_from_every_non_todo_status(repo, bad):
-    card_id = make_card(repo, f"start-guard-{bad}")
-    api("PATCH", f"/api/cards/{card_id}", {"status": bad})
+    card_id = stage_card(repo, f"start-guard-{bad}", bad)
     status, body = api("POST", f"/api/cards/{card_id}/start")
     assert status == 400
     assert "todo" in body["detail"]
@@ -339,8 +387,7 @@ def test_start_is_refused_from_every_non_todo_status(repo, bad):
 
 @pytest.mark.parametrize("bad", ["todo", "in_progress", "done"])
 def test_retry_is_refused_from_every_non_retryable_status(repo, bad):
-    card_id = make_card(repo, f"retry-guard-{bad}")
-    api("PATCH", f"/api/cards/{card_id}", {"status": bad})
+    card_id = stage_card(repo, f"retry-guard-{bad}", bad)
     status, body = api("POST", f"/api/cards/{card_id}/retry")
     assert status == 400
     assert bad in body["detail"]

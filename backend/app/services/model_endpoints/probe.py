@@ -1,16 +1,44 @@
-"""The capability probe (M14, wave8 section 2).
+"""The capability probe (M14 wave8 section 2; modalities M14.6).
 
-Four requests, no side effects, never raises. The probe answers the only four
-questions the platform actually needs before it dares spend GPU time on a
-model it has never driven:
+Up to eight requests, no side effects, never raises. The probe answers the
+questions the platform needs before it dares spend GPU time on a model it has
+never driven:
 
     1. is it there, and does it have the model?   GET  {base}/models
     2. can it TOOL CALL?                          POST {base}/chat/completions
     3. can it STREAM?                             POST {base}/chat/completions
-    4. how big is its context window?             POST {root}/api/show (ollama)
+    4. how big is its context window,             POST {root}/api/show (ollama)
+       and can it SEE?                            ...same request, M14.6
+    5. can it take an IMAGE content part?         POST {base}/chat/completions
+    6. ...and did the image actually arrive?      POST {base}/chat/completions
+    7. can it take an AUDIO content part?         POST {base}/chat/completions
+    8. ...and did the audio actually arrive?      POST {base}/chat/completions
 
 ...plus `reports_usage`, harvested from 2 and 3, because the whole cost story
 depends on whether the server returns a `usage` block at all.
+
+WHAT THE MODALITY HALF COSTS (M14.6), because a probe spends real money:
+
+    ollama `capabilities` read   0 requests, 0 tokens (rides request 4)
+    image/audio REFUSED          1 request,  0 tokens - the server rejects the
+                                 shape before inference, so the common case is
+                                 free
+    image ACCEPTED               2 requests, ~14 text + 6..576 image tokens
+    audio ACCEPTED               2 requests, ~14 text + up to ~1500 - a
+                                 Whisper-class encoder pads to a fixed 30s mel
+                                 window, so 1ms of silence is billed as one
+    Worst case added: 4 requests, ~1700 prompt tokens, 16 completion tokens.
+    A modern ollama: 1 request (the audio 400), 0 tokens.
+
+VIDEO IS ABSENT FROM THAT LIST AND ALWAYS WILL BE. The OpenAI
+chat-completions user-content-part vocabulary is `text` / `image_url` /
+`input_audio` / `file`. There is no `video_url` and no `input_video`, so there
+is no cross-server way to ASK the question and no cross-server way to SEND
+video even if the answer were yes. vLLM's `video_url` is a documented
+OpenAI-incompatible extension; frame-sampling a video into N `image_url` parts
+is images. See `UNREPRESENTABLE_MODALITIES` in `models/model_endpoint.py`: it
+is declared as a property of the wire format, not probed, and surfaced as a
+permanently-explained state.
 
 THE DECISION THAT MAKES THIS PROBE WORTH RUNNING: `supports_tools` is judged on
 the **RESPONSE SHAPE**, not on the server accepting the `tools` parameter, and
@@ -19,6 +47,18 @@ accept `required` and then emit prose anyway; a probe that trusts the parameter
 is testing the server's ADVERTISING. This one checks
 `choices[0].message.tool_calls[0].function.name == "probe"` and that its
 arguments parse as a JSON object - the only thing the harness can rely on.
+
+THE SAME DECISION, MADE TWICE MORE, FOR MODALITIES: a modality is judged on
+the HTTP status and the TOKEN LEDGER, never on what the model says. Asking a
+7B model to describe a 32x32 square tests its competence, not its wiring. And
+because a server can accept an image content part, return a clean 200, and
+silently DISCARD the image (llama.cpp-class shims have flattened content parts
+by concatenating their text for years), acceptance alone is not evidence. The
+probe therefore sends a MATCHED CONTROL - the same request minus the image -
+and requires `prompt_tokens` to have gone UP. A success with no token delta is
+recorded as `undetectable`, which is a worse state than "unsupported" and is
+the one R1 most needs surfaced: the request succeeds while half its input
+vanishes.
 
 AN UNREACHABLE PROBE IS A SUCCESSFUL OBSERVATION. `probe_status` becomes
 `unreachable`, `consecutive_failures` is bumped, `last_error` is set - and the
@@ -48,8 +88,16 @@ logger = logging.getLogger(__name__)
 
 #: Per request.
 PROBE_TIMEOUT_SECONDS = 20
-#: All four requests together. The operator is watching a spinner.
-PROBE_TOTAL_TIMEOUT_SECONDS = 60
+#: Every request together. The operator is watching a spinner.
+#:
+#: Raised 60 -> 90 by M14.6. Four requests at 20s each already exceeded 60,
+#: and the modality probes add up to four more; leaving it at 60 would starve
+#: them BY CONSTRUCTION, and a capability that is structurally guaranteed to
+#: record `deadline_exhausted` is not a capability, it is a decoration. 90s is
+#: the stated trade against the spinner, and the modality probes run LAST
+#: precisely so that when this budget does run out, the thing that gets
+#: starved is the one dispatch does not depend on.
+PROBE_TOTAL_TIMEOUT_SECONDS = 90
 #: 24h. After this the capability record is STALE - which still WORKS: dispatch
 #: runs, warns, and schedules a background re-probe.
 PROBE_TTL_SECONDS = 86_400
@@ -64,6 +112,13 @@ PROBE_DETAIL_MAX_BYTES = 4096
 LAST_ERROR_MAX_CHARS = 512
 #: Upstream bodies are quoted into `probe_detail` this far and no further.
 BODY_SNIPPET_CHARS = 512
+#: Modality refusal bodies are quoted HALF as far, and the reason is
+#: arithmetic, not taste: `set_probe_detail` does not TRIM an oversized
+#: detail dict, it REPLACES THE WHOLE THING with a `{"truncated": true}` stub.
+#: Two more 512-char snippets on a bad day push the dict toward the 4 KiB cap
+#: and would take `tools_reason` down with them as collateral. The real
+#: refusals are short ("this model does not support image input").
+MODALITY_BODY_SNIPPET_CHARS = 256
 
 #: The tool the probe asks for, and the value it asks for.
 PROBE_TOOL_NAME = "probe"
@@ -80,6 +135,62 @@ TOOLS_REASONS = (
     "bad_response_shape",
     "timeout",
 )
+
+#: `probe_detail["<modality>_reason"]`. Grouped by the VERDICT each one
+#: produces, because that grouping is the contract - not the strings.
+MODALITY_REASONS = (
+    # -> False. A positive refusal, and the only modality answer an operator
+    #    can act on directly. Costs zero tokens: the server rejects the
+    #    request shape before inference.
+    "http_400",
+    "http_415",
+    "http_422",
+    "not_in_capabilities",
+    # -> None, "we could not tell". Every one of these is UNKNOWN, never
+    #    False (constraint 4: a failed probe is not a negative observation).
+    "http_4xx",
+    "http_5xx",
+    "bad_response_shape",
+    "timeout",
+    "transport_error",
+    "deadline_exhausted",
+    "api_show_unavailable",
+    "api_show_has_no_capabilities_field",
+    # -> None, and the WORST case: 200 OK, and the attachment measurably
+    #    never entered the prompt. The request succeeds and the input
+    #    vanishes.
+    "no_prompt_token_delta",
+)
+
+#: The subset that means "we asked, it answered 200, and the answer does not
+#: decide it". Read by the wire projection to pick `undetectable` over
+#: `probe_failed`; both are NULL columns and both refuse at dispatch, but they
+#: tell an operator to do completely different things.
+UNDETECTABLE_MODALITY_REASONS: tuple[str, ...] = ("no_prompt_token_delta",)
+
+#: The subset that means "the ASKING broke". Re-probing may help; reading the
+#: reason first is usually the better move.
+MODALITY_FAILURE_REASONS: tuple[str, ...] = (
+    "http_4xx",
+    "http_5xx",
+    "bad_response_shape",
+    "timeout",
+    "transport_error",
+    "deadline_exhausted",
+    "api_show_unavailable",
+)
+
+#: Statuses that are a POSITIVE REFUSAL of the content-part shape, i.e. the
+#: only ones that make a modality `False`. vLLM raises on multimodal parts
+#: when the model config carries no multimodal processor; ollama answers
+#: "model does not support images"; a shim that has never heard of
+#: `image_url` answers "invalid content type". Everything else 4xx (401 auth,
+#: 404 routing, 413 our payload, 429 rate limit) says nothing about the
+#: modality and must stay UNKNOWN.
+MODALITY_REFUSAL_STATUSES: tuple[int, ...] = (400, 415, 422)
+
+#: Recorded beside a `True` that could not be corroborated by a control.
+MODALITY_CAVEATS: tuple[str, ...] = ("no_usage_no_control", "control_unavailable")
 
 
 class ProbeTransportError(Exception):
@@ -139,6 +250,13 @@ class ProbeResult:
     supports_tools: bool | None = None
     supports_streaming: bool | None = None
     reports_usage: bool | None = None
+    #: THREE-STATE, like `supports_tools`. `None` here is "we could not tell"
+    #: and is produced by four different situations the detail keys keep
+    #: apart: never asked, the asking broke, the deadline ran out, and - the
+    #: dangerous one - a 200 whose token ledger proves the attachment never
+    #: entered the prompt.
+    supports_images: bool | None = None
+    supports_audio: bool | None = None
     context_window: int | None = None
     context_window_source: str | None = None
     detail: dict = field(default_factory=dict)
@@ -153,6 +271,8 @@ class ProbeResult:
             "supports_tools": self.supports_tools,
             "supports_streaming": self.supports_streaming,
             "reports_usage": self.reports_usage,
+            "supports_images": self.supports_images,
+            "supports_audio": self.supports_audio,
             "context_window": self.context_window,
             "context_window_source": self.context_window_source,
             "detail": self.detail,
@@ -283,6 +403,109 @@ def stream_probe_body(model: str) -> dict:
         # Servers that honor this put `usage` on the final frame; servers that
         # ignore it produce a turn with no usage, which the harness COUNTS.
         "stream_options": {"include_usage": True},
+    }
+
+
+# -- the modality payloads (M14.6) --------------------------------------------
+#
+# BUILT, NOT REMEMBERED. Both blobs below were generated by a script and their
+# byte counts verified; neither is a string recalled from somewhere.
+
+#: A 32x32 all-black RGB PNG: 82 bytes, 112 base64 chars, 134-char data URL.
+#:
+#: 32x32 AND NOT 1x1, and this is the single most likely way a hasty
+#: implementation ships a false negative. Qwen2-VL's image processor raises
+#: `height:1 must be larger than factor:28` on any dimension below its patch
+#: factor, so a 1x1 probe would collect a 400 and record
+#: `supports_images = False` AGAINST A MODEL THAT GENUINELY SEES. A false
+#: negative manufactured by our own payload is worse than no probe at all.
+#: 32 clears every patch factor in common use (14, 16, 28) with room over.
+#:
+#: It is also deliberately not a recognisable test image: a shim that flattens
+#: content parts by concatenating their text will charge us for the base64 as
+#: prose, and 112 characters is a cheap way to be wrong.
+PROBE_IMAGE_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAGUlEQVR42u3BMQEAAADCoPVP"
+    "7WENoAAAAG4MIAABITLN7AAAAABJRU5ErkJggg=="
+)
+
+#: 8 kHz mono 8-bit PCM WAV, 8 silent samples = 1 millisecond. 52 bytes, 72
+#: base64 chars - the smallest thing that is unambiguously a WAV file.
+#:
+#: ⚠ ITS SIZE DOES NOT BOUND ITS COST. Whisper-family audio encoders pad every
+#: input to a fixed 30-second mel window, so this 1ms of silence can be billed
+#: as ~1500 prompt tokens. That is the largest single cost in the whole probe
+#: and it is charged only when a server ACCEPTS audio, which is rare.
+PROBE_AUDIO_B64 = (
+    "UklGRiwAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQgAAACAgICAgICAgA=="
+)
+PROBE_AUDIO_FORMAT = "wav"
+
+#: The text part. Identical in the attachment request and in its control, so
+#: the only difference between the two is the attachment itself.
+MODALITY_PROBE_TEXT = "Reply with the single word: ok"
+#: Four. The reply is never read - the judgements are the HTTP status and the
+#: token ledger - so anything larger is money spent on prose nobody parses.
+MODALITY_MAX_TOKENS = 4
+
+#: The content-part `type` each modality is spelled as on this wire format.
+#: Note what is NOT here: there is no video spelling to put in it.
+MODALITY_PART_TYPES: dict[str, str] = {
+    "images": "image_url",
+    "audio": "input_audio",
+}
+
+
+def modality_probe_body(model: str, modality: str, *, attach: bool = True) -> dict:
+    """One modality request, or its MATCHED CONTROL when `attach=False`.
+
+    The pair is the whole design. `attach=True` and `attach=False` differ by
+    exactly one content part, so subtracting the control's `prompt_tokens`
+    from the attachment request's isolates the attachment - and a positive
+    delta is the only model-independent, competence-independent evidence that
+    the server actually ENCODED it rather than silently dropping it.
+
+    Note what this deliberately does NOT do: it does not ask the model to
+    describe the image. Asking a 7B model to name the colour of a 32x32 square
+    tests its COMPETENCE, and a wrong answer would record `False` against a
+    model that sees perfectly well.
+    """
+    if modality not in MODALITY_PART_TYPES:
+        raise ValueError(
+            f"unknown modality {modality!r}; this wire format can carry "
+            f"{', '.join(sorted(MODALITY_PART_TYPES))} and nothing else"
+        )
+
+    parts: list[dict] = [{"type": "text", "text": MODALITY_PROBE_TEXT}]
+    if attach:
+        if modality == "images":
+            parts.append(
+                {
+                    "type": "image_url",
+                    # `detail: low` caps the vision encoder's tiling on servers
+                    # that honour it (85 tokens on OpenAI's class of model
+                    # instead of up to 1445). Ignored elsewhere, harmless.
+                    "image_url": {"url": PROBE_IMAGE_DATA_URL, "detail": "low"},
+                }
+            )
+        else:
+            parts.append(
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": PROBE_AUDIO_B64,
+                        "format": PROBE_AUDIO_FORMAT,
+                    },
+                }
+            )
+
+    return {
+        "model": model,
+        "messages": [{"role": "user", "content": parts}],
+        "max_tokens": MODALITY_MAX_TOKENS,
+        "temperature": 0,
+        "stream": False,
     }
 
 
@@ -443,6 +666,168 @@ def judge_ollama_context(response: ProbeHTTP | None) -> int | None:
     return max(candidates) if candidates else None
 
 
+def ollama_capabilities(response: ProbeHTTP | None) -> list | None:
+    """The raw `capabilities` array `/api/show` returned, or None if absent.
+
+    Returned verbatim so `probe_detail` can record the WHOLE evidence for a
+    free `True`. An operator asking "why does this say it sees images" wants
+    the array ollama actually sent, not our reading of it. ~60 bytes.
+    """
+    if response is None or not response.ok or not isinstance(response.payload, dict):
+        return None
+    capabilities = response.payload.get("capabilities")
+    return capabilities if isinstance(capabilities, list) else None
+
+
+def judge_ollama_vision(response: ProbeHTTP | None) -> tuple[bool | None, str | None]:
+    """The FREE image answer, from `/api/show`. Zero extra requests, zero tokens.
+
+    ollama >= 0.6 computes `capabilities` from the loaded model's projector and
+    architecture - not from its name - so this is real evidence, not a
+    heuristic. It piggybacks the `/api/show` request the probe already makes
+    for the context window, which is why a modern ollama learns about images
+    for nothing.
+
+    **THIS JUDGE ANSWERS IMAGES ONLY.** ollama's vocabulary
+    (`types/model/capability.go`) is completion / tools / insert / vision /
+    embedding / thinking: there is no `audio` member and no `video` member. A
+    `capabilities` array that omits `audio` says NOTHING about audio, so audio
+    always falls through to the paid wire probe.
+
+    **AN ABSENT `capabilities` KEY IS None, NEVER False.** It means "this
+    ollama predates the field", not "this model cannot see". Recording False
+    there would make every pre-0.6 ollama claim it is blind - the exact shape
+    of lie the three states exist to forbid - and it would do it silently,
+    because the wire probe that could have corrected it would never run.
+    """
+    capabilities = ollama_capabilities(response)
+    if capabilities is None:
+        if response is None or not response.ok:
+            return None, "api_show_unavailable"
+        return None, "api_show_has_no_capabilities_field"
+    if "vision" in capabilities:
+        return True, None
+    return False, "not_in_capabilities"
+
+
+def judge_modality(
+    response: ProbeHTTP | None, error: str | None = None
+) -> tuple[bool | None, str | None]:
+    """Did the endpoint ACCEPT this content-part shape? THREE-STATE.
+
+    Judged on the transport and nothing else - never on what the model said.
+    A `True` here means "the request shape was accepted"; whether the
+    attachment reached the prompt is a separate question the matched control
+    answers.
+
+    **Two deliberate divergences from `judge_tools`, both of them the same
+    principle**: that function returns `False` on a 5xx and on a malformed
+    envelope, which is defensible for tools (a corroborating response-shape
+    signal exists, and "asking for tools broke it" is operationally the same
+    as no tools). For a modality neither is defensible. A 500 is genuinely
+    ambiguous between "no vision, and it crashed" and "vision, and the server
+    is broken right now", and a mangled envelope is not evidence about vision
+    at all. Constraint 4 governs: a failed probe is UNKNOWN, not FALSE.
+    """
+    if error is not None:
+        return None, error
+    if response is None:
+        return None, "timeout"
+    if response.status in MODALITY_REFUSAL_STATUSES:
+        return False, f"http_{response.status}"
+    if response.status >= 500:
+        return None, "http_5xx"
+    if not response.ok:
+        # 401 auth, 404 routing, 413 our own payload, 429 rate limit. None of
+        # them is an answer about the modality.
+        return None, "http_4xx"
+
+    payload = response.payload
+    if not isinstance(payload, dict):
+        return None, "bad_response_shape"
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None, "bad_response_shape"
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        return None, "bad_response_shape"
+    return True, None
+
+
+def modality_state(
+    value: bool | None, reason: str | None, caveat: str | None = None
+) -> str:
+    """One probed modality's six-state answer. THE only place this is decided.
+
+    Lives here, beside the reason vocabularies it reads, so that the wire
+    projection (`schemas.model_endpoint.modalities_of`) and the dispatch
+    refusal (`services.model_endpoints.resolve`) are reading ONE function
+    rather than two implementations of the same table (R3). A UI that showed
+    `undetectable` while dispatch treated the row as `unprobed` would be the
+    drift this prevents.
+
+    The null column splits three ways and the split lives entirely in
+    `reason`: a delta that never appeared is `undetectable`, a probe that
+    broke is `probe_failed`, and no reason at all means nobody ever asked.
+    Returns a `models.model_endpoint.MODALITY_STATES` member.
+    """
+    if value is True:
+        # A caveat means the acceptance was never corroborated - see
+        # MODALITY_CAVEATS. `supported` is reserved for a capability the probe
+        # actually demonstrated; this is "the server took it and nothing
+        # contradicted that", which is a weaker and different claim.
+        return "supported_unverified" if caveat else "supported"
+    if value is False:
+        return "unsupported"
+    if reason in UNDETECTABLE_MODALITY_REASONS:
+        return "undetectable"
+    if reason in MODALITY_FAILURE_REASONS:
+        return "probe_failed"
+    return "unprobed"
+
+
+def prompt_tokens_of(payload: Any) -> int | None:
+    """`usage.prompt_tokens`, or None. The matched control's only reading."""
+    usage = _usage_from(payload)
+    if usage is None:
+        return None
+    value = usage.get("prompt_tokens")
+    return value if isinstance(value, int) else None
+
+
+def judge_modality_delta(
+    attached_tokens: int | None, control_tokens: int | None
+) -> tuple[bool | None, str | None]:
+    """(B) "it saw it" vs (C) "the server silently dropped it".
+
+    This is the case that actually bites. llama.cpp-class shims have
+    historically flattened content parts by concatenating their `text` and
+    discarding the rest, then returned a perfectly good 200. Acceptance alone
+    cannot tell that apart from real support, and the difference matters
+    enormously: in one case an attached image is read, in the other the step
+    SUCCEEDS while half its input silently vanished.
+
+    The discriminator is arithmetic and needs nothing from the model:
+
+        delta = prompt_tokens(with attachment) - prompt_tokens(control)
+
+    A positive delta means the attachment was encoded into the prompt. A
+    delta of zero or less means the request succeeded and the attachment went
+    nowhere - `None`, reason `no_prompt_token_delta`, which the UI renders as
+    `undetectable` and dispatch refuses. Recording `True` on a zero delta
+    would be claiming a capability that was demonstrably not exercised.
+
+    Returns `(None, None)` when the comparison is not available at all; the
+    caller keeps its acceptance verdict and records a CAVEAT saying the claim
+    is "it accepted the shape" and nothing more.
+    """
+    if attached_tokens is None or control_tokens is None:
+        return None, None
+    if attached_tokens > control_tokens:
+        return True, None
+    return None, "no_prompt_token_delta"
+
+
 def pick_context_window(
     override: int | None,
     ollama_context: int | None,
@@ -506,6 +891,18 @@ async def run_probe(spec: ProbeSpec, transport=None) -> ProbeResult:
 
     def remaining() -> float:
         return max(1.0, min(float(spec.timeout_seconds), deadline - time.monotonic()))
+
+    def spent() -> bool:
+        """Is the shared budget gone?
+
+        `remaining()` floors at 1.0s and therefore never says "stop" - which
+        is right for the four dispatch-critical requests (a 1s attempt beats
+        no attempt) and wrong for the modality probes, which would otherwise
+        fire doomed 1s requests at a server that is already too slow. Asked
+        BEFORE each modality request so starvation is recorded honestly as
+        `deadline_exhausted` rather than mislabelled as a timeout.
+        """
+        return time.monotonic() >= deadline
 
     def clean(text: Any, limit: int = BODY_SNIPPET_CHARS) -> str:
         return scrub_secrets(text, spec.secret_values)[:limit]
@@ -619,8 +1016,17 @@ async def run_probe(spec: ProbeSpec, transport=None) -> ProbeResult:
     if usage_reason:
         detail["usage_reason"] = usage_reason
 
-    # -- request 4: ollama context window --------------------------------------
+    # -- request 4: ollama context window AND the free vision answer -----------
+    #
+    # One request, two answers. `/api/show` was already being made for the
+    # context window; M14.6 reads `capabilities` off the SAME payload, so a
+    # modern ollama learns whether it can see for zero extra requests and zero
+    # tokens. That is why this stays request 4 and the modality probes come
+    # after it: the free answer, when it exists, makes the paid one
+    # unnecessary.
     ollama_context = None
+    ollama_vision: bool | None = None
+    ollama_vision_reason: str | None = None
     if spec.server_kind == "ollama":
         try:
             show_response = await transport.request(
@@ -632,10 +1038,136 @@ async def run_probe(spec: ProbeSpec, transport=None) -> ProbeResult:
             ollama_context = judge_ollama_context(show_response)
             if ollama_context is None:
                 detail["context_reason"] = f"api_show_http_{show_response.status}"
+            ollama_vision, ollama_vision_reason = judge_ollama_vision(show_response)
+            capabilities = ollama_capabilities(show_response)
+            if capabilities is not None:
+                # Verbatim: this array IS the evidence for a free True, and
+                # an operator asking "why" wants what ollama actually said.
+                detail["ollama_capabilities"] = capabilities
         except ProbeTransportError as exc:
             detail["context_reason"] = clean(f"api_show_unreachable: {exc}")
+            ollama_vision_reason = "api_show_unavailable"
         except Exception as exc:
             detail["context_reason"] = clean(f"api_show_error: {type(exc).__name__}")
+            ollama_vision_reason = "api_show_unavailable"
+
+    # -- requests 5-8: modalities (LAST, and often zero of them) ---------------
+    #
+    # Last on purpose. Tools is dispatch-critical - every harness step has to
+    # pick a protocol - and images is not; if the shared deadline runs out,
+    # these are the right things to starve, and starvation records
+    # `deadline_exhausted`, which is honest.
+    #
+    # Sequential, not gathered. Firing concurrent inference at a
+    # `max_concurrency: 1` box is rude, gains nothing on the single-slot
+    # hardware M14 targets, and would make the shared-deadline arithmetic
+    # untestable.
+
+    async def probe_wire_modality(modality: str) -> bool | None:
+        """One modality over the wire: attach, judge, and corroborate.
+
+        Up to two requests, and frequently zero tokens - a server that refuses
+        the shape rejects it BEFORE inference.
+        """
+        if spent():
+            # NO source recorded: nothing was sent, and claiming `wire_probe`
+            # would imply a request that never left the building.
+            detail[f"{modality}_reason"] = "deadline_exhausted"
+            return None
+
+        detail[f"{modality}_source"] = "wire_probe"
+        response: ProbeHTTP | None = None
+        error: str | None = None
+        try:
+            response = await transport.request(
+                "POST",
+                f"{base}/chat/completions",
+                json_body=modality_probe_body(spec.model, modality, attach=True),
+                timeout=remaining(),
+            )
+        except ProbeTransportError as exc:
+            error = "transport_error"
+            detail[f"{modality}_transport_error"] = clean(
+                str(exc), MODALITY_BODY_SNIPPET_CHARS
+            )
+        except Exception as exc:
+            error = "transport_error"
+            detail[f"{modality}_transport_error"] = clean(
+                f"{type(exc).__name__}: {exc}", MODALITY_BODY_SNIPPET_CHARS
+            )
+
+        supported, reason = judge_modality(response, error)
+        if response is not None:
+            detail[f"{modality}_status"] = response.status
+            if not response.ok:
+                detail[f"{modality}_body"] = clean(
+                    response.text, MODALITY_BODY_SNIPPET_CHARS
+                )
+        if reason:
+            detail[f"{modality}_reason"] = reason
+        if supported is not True:
+            return supported
+
+        # Accepted. Now: did the attachment actually GET there?
+        attached_tokens = prompt_tokens_of(response.payload if response else None)
+        if reports_usage is not True or attached_tokens is None:
+            # No token ledger, so no control worth spending. The claim
+            # narrows to "it accepted the shape", and the caveat says so.
+            detail[f"{modality}_caveat"] = "no_usage_no_control"
+            return True
+
+        detail[f"{modality}_prompt_tokens"] = attached_tokens
+        if spent():
+            detail[f"{modality}_caveat"] = "control_unavailable"
+            return True
+
+        control: ProbeHTTP | None = None
+        try:
+            control = await transport.request(
+                "POST",
+                f"{base}/chat/completions",
+                json_body=modality_probe_body(spec.model, modality, attach=False),
+                timeout=remaining(),
+            )
+        except Exception:
+            control = None
+
+        control_tokens = (
+            prompt_tokens_of(control.payload)
+            if control is not None and control.ok
+            else None
+        )
+        if control_tokens is None:
+            detail[f"{modality}_caveat"] = "control_unavailable"
+            return True
+
+        detail[f"{modality}_control_tokens"] = control_tokens
+        verdict, delta_reason = judge_modality_delta(attached_tokens, control_tokens)
+        if delta_reason:
+            detail[f"{modality}_reason"] = delta_reason
+        return verdict
+
+    if ollama_vision is not None:
+        # The free path answered. The wire probe is NOT sent - that is the
+        # whole value of `/api/show`, and it is worth an assertion.
+        supports_images: bool | None = ollama_vision
+        detail["images_source"] = "ollama_capabilities"
+        if ollama_vision_reason:
+            detail["images_reason"] = ollama_vision_reason
+    else:
+        if ollama_vision_reason:
+            # Why the free path could not answer. Kept even though the wire
+            # probe is about to overwrite `images_reason`, because "ollama is
+            # too old to say" is the actionable half of a paid probe.
+            detail["images_free_path_reason"] = ollama_vision_reason
+        supports_images = await probe_wire_modality("images")
+
+    # Audio is ALWAYS the wire probe: ollama's capability vocabulary has no
+    # `audio` member, so there is no free answer to inherit - not for ollama
+    # and not for anything else. Against ollama specifically this reliably
+    # 400s (its OpenAI layer knows `text` and `image_url` only), and that is a
+    # TRUE `False` for this endpoint, recorded at zero tokens.
+    supports_audio = await probe_wire_modality("audio")
 
     # The override is applied by the CALLER (the column is the override), so
     # the probe reports only what it DISCOVERED.
@@ -646,6 +1178,11 @@ async def run_probe(spec: ProbeSpec, transport=None) -> ProbeResult:
         detail["context_window"] = context_window
         detail["context_window_source"] = context_source
 
+    # NOTE the modalities are NOT arguments here, and must not become them. A
+    # model with no vision is not a degraded endpoint - it is a text model,
+    # which is what almost every endpoint on this platform is. Folding a
+    # missing modality into `probe_status` would paint most of the registry
+    # amber for a capability nothing in the pipeline uses.
     probe_status = compute_probe_status(
         True, supports_tools, supports_streaming, reports_usage, model_listed
     )
@@ -658,6 +1195,8 @@ async def run_probe(spec: ProbeSpec, transport=None) -> ProbeResult:
         supports_tools=supports_tools,
         supports_streaming=supports_streaming,
         reports_usage=reports_usage,
+        supports_images=supports_images,
+        supports_audio=supports_audio,
         context_window=context_window,
         context_window_source=context_source,
         detail=detail,
@@ -748,6 +1287,13 @@ def apply_probe_result(
     endpoint.supports_tools = result.supports_tools
     endpoint.supports_streaming = result.supports_streaming
     endpoint.reports_usage = result.reports_usage
+    # M14.6. Written straight through INCLUDING None: a probe that reached the
+    # server but could not settle the image question must clear a previous
+    # answer, not leave a stale one standing behind a fresh `probed_at`
+    # timestamp. (The unreachable branch above returns before this and keeps
+    # everything, which is the opposite case and the opposite rule.)
+    endpoint.supports_images = result.supports_images
+    endpoint.supports_audio = result.supports_audio
     endpoint.consecutive_failures = 0
     endpoint.last_success_at = now
     endpoint.last_error = None

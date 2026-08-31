@@ -42,6 +42,21 @@ Reach = Literal["direct", "runner-local", "proxy"]
 ProbeStatus = Literal["unprobed", "ok", "degraded", "unreachable"]
 Health = Literal["healthy", "stale", "degraded", "unhealthy", "unprobed"]
 
+#: M14.6. Mirrors `models.model_endpoint.MODALITY_NAMES` / `MODALITY_STATES` /
+#: `MODALITY_SOURCES` - the same Literal-mirrors-tuple idiom the four
+#: vocabularies above use.
+ModalityName = Literal["text", "images", "audio", "video"]
+ModalityState = Literal[
+    "supported",
+    "supported_unverified",
+    "unsupported",
+    "unprobed",
+    "undetectable",
+    "probe_failed",
+    "unrepresentable",
+]
+ModalitySource = Literal["ollama_capabilities", "wire_probe", "wire_format"]
+
 #: `^[a-z0-9][a-z0-9-]{0,38}$` - capped so `endpoint:<name>` fits
 #: `step_usages.gpu_node_id`'s String(64).
 NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{0,38}$"
@@ -98,18 +113,67 @@ def validate_auth_fields(
 # Capability snapshot
 # -----------------------------------------------------------------------------
 
+class Modality(BaseModel):
+    """One modality's answer WITH its provenance (M14.6).
+
+    This exists because `bool | None` cannot carry the six distinctions a
+    human needs, and deriving them in the frontend would be a SECOND
+    derivation of a backend fact - exactly what `ModelEndpoint.health` refuses
+    when it says a second stored health column would be a second writer that
+    drifts from the first. Computed once, here, beside `health`.
+
+    The two collapses that would be wrong, named so a reviewer can look for
+    them:
+
+    * `unprobed` vs `probe_failed`. Both are a null column and both refuse at
+      dispatch, but one says PRESS PROBE and the other says the probe ran and
+      broke - read the error before you press it again.
+    * `undetectable` vs `unsupported`. `unsupported` is a positive refusal you
+      can quote back ("HTTP 400: this model does not support image input").
+      `undetectable` is a request that SUCCEEDS WHILE DOING NOTHING, which is
+      the more dangerous of the two and the one R1 exists to surface.
+    """
+
+    modality: ModalityName
+    state: ModalityState
+    #: `ollama_capabilities` - free, from `/api/show` (images only).
+    #: `wire_probe`          - one or two real requests against the model.
+    #: `wire_format`         - a CONSTANT of the protocol, not an observation:
+    #:                         text always works, video never can.
+    source: ModalitySource | None = None
+    #: The `MODALITY_REASONS` entry behind `state`, or null when there is
+    #: nothing to explain (a plain `supported`).
+    reason: str | None = None
+    #: The upstream refusal, scrubbed and capped at 256 chars. This is what
+    #: makes `unsupported` actionable instead of merely red.
+    evidence: str | None = None
+    #: Narrows a `supported`: `no_usage_no_control` / `control_unavailable`
+    #: mean the endpoint ACCEPTED the shape but no token ledger was available
+    #: to prove the attachment actually entered the prompt.
+    caveat: str | None = None
+
+
 class EndpointCapabilities(BaseModel):
     """What the last probe observed. A SNAPSHOT, never a live reference:
     a step must behave identically if someone re-probes mid-run, and M13
     needs to attribute a result to the capabilities that were in force.
 
     `supports_tools` is three-state on purpose. `null` is not "assume no": it
-    is "we have not asked", and dispatch REFUSES on it.
+    is "we have not asked", and dispatch REFUSES on it. `supports_images` and
+    `supports_audio` inherit that doctrine whole - and note that every
+    endpoint registered before M14.6 reads `null` for both until it is
+    re-probed, which the UI must render as NOT PROBED and never as "does not
+    support images".
     """
 
     supports_tools: bool | None = None
     supports_streaming: bool | None = None
     reports_usage: bool | None = None
+    #: M14.6, three-state. True means the endpoint ACCEPTED the content part
+    #: and (where a usage block made it measurable) the attachment entered the
+    #: prompt. It is NOT a claim that the model is any good at vision/audio.
+    supports_images: bool | None = None
+    supports_audio: bool | None = None
     #: EFFECTIVE window: operator override, else what the probe discovered,
     #: else null (and null means the harness assumes 8192 and says so).
     context_window: int | None = None
@@ -119,6 +183,12 @@ class EndpointCapabilities(BaseModel):
     probed_from: str | None = None
     probe_age_seconds: float | None = None
     stale: bool = False
+    #: DERIVED, one entry per `MODALITY_NAMES`, always all four and always in
+    #: that order - a modality the UI has to look up by name is a modality the
+    #: UI can silently fail to render. Includes `video`, which is permanently
+    #: `unrepresentable` and is here precisely so the human sees the row and
+    #: reads WHY rather than wondering where video went.
+    modalities: list[Modality] = Field(default_factory=list)
 
 
 class EndpointPricing(BaseModel):
@@ -151,6 +221,13 @@ class ProbeResult(BaseModel):
     supports_tools: bool | None = None
     supports_streaming: bool | None = None
     reports_usage: bool | None = None
+    #: M14.6. Optional with a `None` default so a runner-local probe running
+    #: an OLDER runner image - which does not know how to ask these questions
+    #: yet - reports "we did not ask" rather than failing validation or, far
+    #: worse, defaulting to False and recording a capability claim no probe
+    #: ever made.
+    supports_images: bool | None = None
+    supports_audio: bool | None = None
     context_window: int | None = None
     context_window_source: str | None = None
     detail: dict = Field(default_factory=dict)
@@ -365,6 +442,79 @@ class EndpointUsageRollup(BaseModel):
 # Projection (ONE place a row becomes a payload)
 # -----------------------------------------------------------------------------
 
+#: The reason `video` carries, forever, on every endpoint.
+VIDEO_REASON = "wire_format_has_no_video_content_part"
+#: The reason `text` carries. Also a property of the protocol, not a probe.
+TEXT_REASON = "wire_format_base_content_type"
+
+
+def modalities_of(endpoint) -> list[Modality]:
+    """All four modalities, always, in `MODALITY_NAMES` order (M14.6).
+
+    Always all four, and never filtered: "consistently broken out" means the
+    human sees the same four rows on every endpoint and reads a different
+    STATE, rather than inferring meaning from which chips are missing.
+
+    `text` and `video` are answered from the wire format itself and cost
+    nothing. Neither is an observation about this server: text is the base
+    content type of every chat-completions request, and video has no content
+    part to send at all. Whether the server WORKS is `health`; these two rows
+    are about what the protocol can express.
+    """
+    from app.models.model_endpoint import MODALITY_NAMES
+    from app.services.model_endpoints.probe import modality_state
+
+    detail = endpoint.get_probe_detail()
+    columns = {
+        "images": endpoint.supports_images,
+        "audio": endpoint.supports_audio,
+    }
+
+    out: list[Modality] = []
+    for name in MODALITY_NAMES:
+        if name == "text":
+            out.append(
+                Modality(
+                    modality="text",
+                    state="supported",
+                    source="wire_format",
+                    reason=TEXT_REASON,
+                )
+            )
+            continue
+        if name == "video":
+            out.append(
+                Modality(
+                    modality="video",
+                    state="unrepresentable",
+                    source="wire_format",
+                    reason=VIDEO_REASON,
+                )
+            )
+            continue
+
+        value = columns[name]
+        reason = detail.get(f"{name}_reason")
+        reason = reason if isinstance(reason, str) else None
+        source = detail.get(f"{name}_source")
+        evidence = detail.get(f"{name}_body")
+        caveat = detail.get(f"{name}_caveat")
+        state = modality_state(value, reason, caveat if isinstance(caveat, str) else None)
+        out.append(
+            Modality(
+                modality=name,
+                state=state,
+                # No source when nobody asked - an `unprobed` row that named a
+                # source would be claiming a probe happened.
+                source=source if source in ("ollama_capabilities", "wire_probe") else None,
+                reason=reason,
+                evidence=evidence if isinstance(evidence, str) else None,
+                caveat=caveat if isinstance(caveat, str) else None,
+            )
+        )
+    return out
+
+
 def capabilities_of(endpoint) -> EndpointCapabilities:
     """The capability snapshot, computed in exactly one place so the API, the
     WS frame and the agent-config block cannot disagree."""
@@ -372,6 +522,9 @@ def capabilities_of(endpoint) -> EndpointCapabilities:
         supports_tools=endpoint.supports_tools,
         supports_streaming=endpoint.supports_streaming,
         reports_usage=endpoint.reports_usage,
+        supports_images=endpoint.supports_images,
+        supports_audio=endpoint.supports_audio,
+        modalities=modalities_of(endpoint),
         context_window=endpoint.effective_context_window,
         max_output_tokens=endpoint.max_output_tokens,
         probe_status=endpoint.probe_status,

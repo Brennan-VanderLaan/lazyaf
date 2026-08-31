@@ -50,6 +50,10 @@ const {
   hasEndpoints,
   triState,
   capabilityCells,
+  modalityCells,
+  modalitiesReported,
+  modalityPresentation,
+  unansweredCells,
   contextWindowLabel,
   rateLabel,
   costIsShared,
@@ -60,6 +64,9 @@ const {
   ENDPOINT_MODEL_PREFIX,
   HEALTH_PRESENTATION,
   HEALTH_STATES,
+  MODALITY_PRESENTATION,
+  MODALITY_ORDER,
+  MODALITIES_UNREPORTED,
 } = await import('./endpoints');
 
 function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
@@ -67,6 +74,8 @@ function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
     supports_tools: true,
     supports_streaming: true,
     reports_usage: true,
+    supports_images: null,
+    supports_audio: null,
     context_window: 32768,
     max_output_tokens: 4096,
     probe_status: 'ok' as const,
@@ -74,6 +83,12 @@ function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
     probed_from: 'backend',
     probe_age_seconds: 120,
     stale: false,
+    // Deliberately EMPTY by default, and the `withModalities` helper below is
+    // what fills it. The default fixture is a row registered before modality
+    // detection: booleans null, list empty. That is the shape the first load
+    // after this milestone actually has, so it is the shape most of this file
+    // exercises.
+    modalities: [] as ModelEndpoint['capabilities']['modalities'],
     ...(overrides.capabilities ?? {}),
   };
   return {
@@ -510,6 +525,320 @@ describe('capability presentation: three states, never two', () => {
   });
 });
 
+// -----------------------------------------------------------------------------
+// Modalities: SIX states, and the two collapses that would each be a lie.
+// -----------------------------------------------------------------------------
+
+/** A capability snapshot carrying a modality list, in the wire's own shape. */
+function withModalities(
+  entries: Array<{
+    modality: string;
+    state: string;
+    source?: string | null;
+    reason?: string | null;
+    evidence?: string | null;
+    caveat?: string | null;
+  }>,
+  extra: Record<string, unknown> = {},
+): ModelEndpoint {
+  return makeEndpoint({
+    capabilities: {
+      modalities: entries.map((e) => ({
+        source: null,
+        reason: null,
+        evidence: null,
+        caveat: null,
+        ...e,
+      })),
+      ...extra,
+    } as never,
+  });
+}
+
+/** The realistic first-load row: probed before modality detection existed. */
+const LEGACY_ROW = [
+  { modality: 'text', state: 'supported', source: 'wire_format' },
+  { modality: 'images', state: 'unprobed' },
+  { modality: 'audio', state: 'unprobed' },
+  {
+    modality: 'video',
+    state: 'unrepresentable',
+    source: 'wire_format',
+    reason: 'wire_format_has_no_video_content_part',
+  },
+];
+
+describe('modality presentation: no two states collapse into one', () => {
+  it('every state has a DISTINCT glyph, outline and sentence', () => {
+    const states = Object.keys(MODALITY_PRESENTATION);
+    // Counted from the map, not written as a literal. A hardcoded number here
+    // fails on the day a state is ADDED, which is exactly when the real
+    // property - that no two states look alike - matters most. The sibling
+    // test below pins the map against the backend vocabulary, so nothing is
+    // lost by not restating the size.
+    const n = states.length;
+    expect(n).toBeGreaterThanOrEqual(6);
+
+    const glyphs = states.map((k) => modalityPresentation(k).glyph);
+    expect(new Set(glyphs).size, `two states share a glyph: ${glyphs.join(' ')}`).toBe(n);
+
+    const meanings = states.map((k) => modalityPresentation(k).meaning);
+    expect(new Set(meanings).size, 'two states share a meaning sentence').toBe(n);
+
+    const labels = states.map((k) => modalityPresentation(k).label);
+    expect(new Set(labels).size, 'two states share a label').toBe(n);
+  });
+
+  it('an unverified acceptance never looks like a proven one', () => {
+    const proven = MODALITY_PRESENTATION.supported;
+    const unverified = MODALITY_PRESENTATION.supported_unverified;
+
+    // FP-1: a shim that flattens content parts into the prompt as prose moves
+    // the token ledger exactly like a real encoder, so the probe's control
+    // votes yes for a model that never saw the image. Both remain USABLE -
+    // the difference has to be visible, not enforced by a refusal.
+    expect(unverified.glyph).not.toBe(proven.glyph);
+    expect(unverified.tone).not.toBe(proven.tone);
+    expect(unverified.label).not.toBe(proven.label);
+    expect(unverified.actionable).toBe(true);
+    expect(unverified.next).not.toBeNull();
+  });
+
+  it('THE BUG THIS LANE EXISTS FOR: not-probed never renders as not-supported', () => {
+    const unprobed = MODALITY_PRESENTATION.unprobed;
+    const unsupported = MODALITY_PRESENTATION.unsupported;
+
+    expect(unprobed.glyph).not.toBe(unsupported.glyph);
+    expect(unprobed.outline).not.toBe(unsupported.outline);
+    expect(unprobed.tone).not.toBe(unsupported.tone);
+    expect(unprobed.label).not.toBe(unsupported.label);
+    // ...and only one of the two is something a probe can fix.
+    expect(unprobed.actionable).toBe(true);
+    expect(unsupported.actionable).toBe(false);
+    expect(unprobed.next).toMatch(/probe/i);
+    expect(unsupported.next).toBeNull();
+  });
+
+  it('unprobed and probe_failed are both null-in-the-column but are NOT one cell', () => {
+    const unprobed = MODALITY_PRESENTATION.unprobed;
+    const failed = MODALITY_PRESENTATION.probe_failed;
+
+    expect(unprobed.glyph).not.toBe(failed.glyph);
+    expect(unprobed.tone).not.toBe(failed.tone);
+    // Both need a human, and they need DIFFERENT things from them: one says
+    // press Probe, the other says read the error before pressing it again.
+    expect(unprobed.next).not.toBe(failed.next);
+    expect(failed.next).toMatch(/reason/i);
+    expect(failed.meaning).toMatch(/never "no"/i);
+  });
+
+  it('undetectable is not unsupported: one succeeds while doing nothing', () => {
+    const undetectable = MODALITY_PRESENTATION.undetectable;
+    const unsupported = MODALITY_PRESENTATION.unsupported;
+
+    expect(undetectable.glyph).not.toBe(unsupported.glyph);
+    expect(undetectable.outline).not.toBe(unsupported.outline);
+    // The dangerous half has to say the dangerous thing out loud.
+    expect(undetectable.meaning).toMatch(/200/);
+    expect(undetectable.meaning).toMatch(/discard|vanish/i);
+    expect(unsupported.meaning).toMatch(/refus/i);
+  });
+
+  it('unrepresentable says the WIRE FORMAT cannot carry it, and offers no probe', () => {
+    const cell = MODALITY_PRESENTATION.unrepresentable;
+    expect(cell.actionable).toBe(false);
+    expect(cell.next).toBeNull();
+    expect(cell.struck).toBe(true);
+    expect(cell.meaning).toMatch(/wire format/i);
+    // It must not read as an observation about this particular server.
+    expect(cell.meaning).toMatch(/ANY endpoint/);
+  });
+
+  it('colour is never the only channel: tone and outline vary independently', () => {
+    // unprobed vs undetectable are the SAME grey on purpose; the border shape
+    // is what separates them, so a monochrome screenshot still distinguishes.
+    expect(MODALITY_PRESENTATION.unprobed.tone).toBe(MODALITY_PRESENTATION.undetectable.tone);
+    expect(MODALITY_PRESENTATION.unprobed.outline).not.toBe(
+      MODALITY_PRESENTATION.undetectable.outline,
+    );
+  });
+
+  it('an unknown state from a newer backend is UNKNOWN, never assumed false', () => {
+    const presentation = modalityPresentation('holographic');
+    expect(presentation.label).toBe('holographic');
+    expect(presentation.tone).toBe('unknown');
+    expect(presentation.meaning).toMatch(/refuses rather than assumes/i);
+  });
+});
+
+describe('modalityCells is a projection of the wire, not a second derivation', () => {
+  it('renders the backend list in presentation order', () => {
+    const cells = modalityCells(
+      withModalities([
+        { modality: 'video', state: 'unrepresentable', source: 'wire_format' },
+        { modality: 'images', state: 'supported', source: 'wire_probe' },
+        { modality: 'text', state: 'supported', source: 'wire_format' },
+        { modality: 'audio', state: 'unsupported', source: 'wire_probe' },
+      ]),
+    );
+    expect(cells.map((c) => c.key)).toEqual([...MODALITY_ORDER]);
+  });
+
+  it('NEVER reads supports_images: the modality list is the one source', () => {
+    // A payload whose boolean and whose list disagree must render the LIST.
+    // Reading both would be two derivations of one backend answer.
+    const row = makeEndpoint({
+      capabilities: {
+        supports_images: true,
+        modalities: [
+          {
+            modality: 'images',
+            state: 'unprobed',
+            source: null,
+            reason: null,
+            evidence: null,
+            caveat: null,
+          },
+        ],
+      } as never,
+    });
+    expect(modalityCells(row)[0].state).toBe('unprobed');
+  });
+
+  it('carries the backend provenance VERBATIM into the tooltip', () => {
+    const cell = modalityCells(
+      withModalities([
+        {
+          modality: 'images',
+          state: 'unsupported',
+          source: 'wire_probe',
+          reason: 'http_400',
+          evidence: 'this model does not support image input',
+        },
+      ]),
+    )[0];
+
+    expect(cell.source).toBe('wire_probe');
+    expect(cell.reason).toBe('http_400');
+    expect(cell.detail).toContain('this model does not support image input');
+    expect(cell.detail).toContain('http_400');
+    // Provenance is appended to the MEANING, not substituted for it.
+    expect(cell.detail).toContain(MODALITY_PRESENTATION.unsupported.meaning);
+  });
+
+  it('a caveat narrows the claim on screen instead of being dropped', () => {
+    const cell = modalityCells(
+      withModalities([
+        {
+          modality: 'images',
+          state: 'supported',
+          source: 'wire_probe',
+          caveat: 'no_usage_no_control',
+        },
+      ]),
+    )[0];
+    expect(cell.caveat).toBe('no_usage_no_control');
+    expect(cell.detail).toContain('no_usage_no_control');
+  });
+
+  it('a wire_format answer says it was never probed and never will be', () => {
+    const cell = modalityCells(
+      withModalities([{ modality: 'video', state: 'unrepresentable', source: 'wire_format' }]),
+    )[0];
+    expect(cell.detail).toMatch(/fact about the protocol/i);
+    // ...and it must NOT be stamped with a probe time, which would imply the
+    // constant was observed against this server.
+    expect(cell.detail).not.toContain('Observed');
+  });
+
+  it('a probed answer is stamped with WHEN and from WHERE', () => {
+    const cell = modalityCells(
+      withModalities([{ modality: 'images', state: 'supported', source: 'wire_probe' }]),
+    )[0];
+    expect(cell.detail).toContain('2026-08-30T09:14:22Z');
+    expect(cell.detail).toContain('backend');
+  });
+});
+
+describe('an unanswered capability is ACTIONABLE where it is read', () => {
+  it('the legacy first-load row offers a probe for images and audio', () => {
+    const keys = unansweredCells(withModalities(LEGACY_ROW)).map((c) => c.key);
+
+    expect(keys).toContain('images');
+    expect(keys).toContain('audio');
+    // Video is unanswerable, not unanswered — offering Probe for it would
+    // send an operator round a loop that can never terminate.
+    expect(keys).not.toContain('video');
+    expect(keys).not.toContain('text');
+  });
+
+  it('probe_failed and undetectable are actionable; supported and refused are not', () => {
+    const keys = unansweredCells(
+      withModalities([
+        { modality: 'text', state: 'supported', source: 'wire_format' },
+        { modality: 'images', state: 'probe_failed', source: 'wire_probe', reason: 'timeout' },
+        { modality: 'audio', state: 'undetectable', source: 'wire_probe' },
+        { modality: 'video', state: 'unrepresentable', source: 'wire_format' },
+      ]),
+    ).map((c) => c.key);
+    expect(keys.sort()).toEqual(['audio', 'images']);
+  });
+
+  it('a fully answered endpoint offers nothing — the button disappears', () => {
+    expect(
+      unansweredCells(
+        withModalities([
+          { modality: 'text', state: 'supported', source: 'wire_format' },
+          { modality: 'images', state: 'supported', source: 'wire_probe' },
+          { modality: 'audio', state: 'unsupported', source: 'wire_probe' },
+          { modality: 'video', state: 'unrepresentable', source: 'wire_format' },
+        ]),
+      ),
+    ).toEqual([]);
+  });
+
+  it('an unprobed PROTOCOL capability is unanswered too, not just modalities', () => {
+    const keys = unansweredCells(withModalities(LEGACY_ROW, { supports_tools: null })).map(
+      (c) => c.key,
+    );
+    expect(keys).toContain('tools');
+  });
+});
+
+describe('a backend that cannot answer is a FOURTH fact, not "unprobed"', () => {
+  it('an ABSENT modalities key renders no cells and reports as unreported', () => {
+    const row = makeEndpoint({ capabilities: { modalities: undefined } as never });
+    expect(modalitiesReported(row)).toBe(false);
+    expect(modalityCells(row)).toEqual([]);
+    // ...and nothing about it is actionable: pressing Probe cannot add a
+    // field to an older backend's projection.
+    expect(unansweredCells(row).map((c) => c.key)).not.toContain('images');
+  });
+
+  it('an EMPTY list renders no cells either — same consequence, so same note', () => {
+    // The current backend projects one entry per MODALITY_NAMES, so an empty
+    // list means something went wrong upstream. It must not fall through to a
+    // blank: a blank where a modality should be reads as "no".
+    const row = makeEndpoint();
+    expect(row.capabilities.modalities).toEqual([]);
+    expect(modalityCells(row)).toEqual([]);
+    expect(unansweredCells(row).map((c) => c.key)).not.toContain('images');
+  });
+
+  it('modalitiesReported still tells the two causes apart for anyone who asks', () => {
+    expect(modalitiesReported(makeEndpoint())).toBe(true);
+    expect(
+      modalitiesReported(makeEndpoint({ capabilities: { modalities: undefined } as never })),
+    ).toBe(false);
+  });
+
+  it('the message says it is neither "no support" NOR "never probed"', () => {
+    expect(MODALITIES_UNREPORTED).toMatch(/not "no image support"/i);
+    expect(MODALITIES_UNREPORTED).toMatch(/never probed/i);
+    expect(MODALITIES_UNREPORTED).toMatch(/update the backend/i);
+  });
+});
+
 describe('cost basis: null and 0.00 are different facts and stay different', () => {
   it('unpriced reads "unpriced", never "$0.00"', () => {
     expect(rateLabel(makeEndpoint({ rate_usd_hour: null, priced: false }))).toBe('unpriced');
@@ -622,6 +951,73 @@ describe('health vocabulary is the BACKEND vocabulary (contract #1)', () => {
     const presentation = healthPresentation('quantum' as EndpointHealth);
     expect(presentation.label).toBe('quantum');
     expect(presentation.tone).toBe('unknown');
+  });
+});
+
+describe('the modality vocabulary is the BACKEND vocabulary (M14.6)', () => {
+  const source = backendSource('models/model_endpoint.py');
+
+  /** Members of a `NAME: tuple[str, ...] = (...)` declaration. */
+  function backendTuple(name: string): string[] {
+    const block = source.match(new RegExp(`${name}[^=]*=\\s*\\(([^)]*)\\)`));
+    expect(
+      block,
+      `${name} no longer parses out of models/model_endpoint.py — either it ` +
+        `moved (update this guard) or the regex rotted (fix the regex, do ` +
+        `not delete this test).`,
+    ).toBeTruthy();
+    return [...block![1].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+  }
+
+  it('extraction actually found the tuples (regex not rotted)', () => {
+    // A floor, not an equality: this test's job is to prove the REGEX still
+    // parses the backend tuple, not to restate how many members it has. An
+    // equality here turns "the backend gained a state" into a frontend test
+    // failure that says nothing about the regex - which is what it did when
+    // supported_unverified landed. The sibling test below is the one that
+    // fails, correctly and with a useful message, if a state has no
+    // presentation.
+    expect(backendTuple('MODALITY_STATES').length).toBeGreaterThanOrEqual(6);
+    expect(backendTuple('WIRE_MODALITIES').length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('FRONTEND DRIFTED if this fails: every backend state has a presentation', () => {
+    const backendStates = backendTuple('MODALITY_STATES');
+    for (const state of backendStates) {
+      expect(
+        Object.keys(MODALITY_PRESENTATION),
+        `The backend projects modality state '${state}' but ` +
+          `stores/endpoints.ts has no presentation for it, so the capability ` +
+          `display would render a bare string with no glyph, no outline and ` +
+          `no meaning. Add it to MODALITY_PRESENTATION.`,
+      ).toContain(state);
+    }
+    // ...and nothing here is invented on this side either.
+    for (const state of Object.keys(MODALITY_PRESENTATION)) {
+      expect(
+        backendStates,
+        `The UI renders modality state '${state}' that the backend never ` +
+          `projects.`,
+      ).toContain(state);
+    }
+  });
+
+  it('FRONTEND DRIFTED if this fails: every backend modality is ordered here', () => {
+    const backendNames = [
+      ...backendTuple('WIRE_MODALITIES'),
+      ...backendTuple('UNREPRESENTABLE_MODALITIES'),
+    ];
+    expect([...MODALITY_ORDER].sort()).toEqual([...backendNames].sort());
+  });
+
+  it('video is UNREPRESENTABLE on the backend, so it is never a probe target', () => {
+    // If video ever becomes a wire modality this fails, and it SHOULD: the
+    // UI's permanent "the wire format cannot carry this" copy would then be
+    // a lie, and every sentence about it needs rewriting rather than the
+    // chip quietly starting to render a probe button.
+    expect(backendTuple('UNREPRESENTABLE_MODALITIES')).toContain('video');
+    expect(backendTuple('WIRE_MODALITIES')).not.toContain('video');
+    expect(MODALITY_PRESENTATION.unrepresentable.actionable).toBe(false);
   });
 });
 

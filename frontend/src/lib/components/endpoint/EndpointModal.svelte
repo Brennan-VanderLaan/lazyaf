@@ -31,6 +31,7 @@
   } from '../../api/types';
   import { untrack } from 'svelte';
   import { describeError } from '../../utils/errors';
+  import CapabilityChecks from './CapabilityChecks.svelte';
 
   interface Props {
     /** null = register a new endpoint. */
@@ -470,11 +471,25 @@
         </label>
       </div>
 
+      {#if isEdit && initial}
+        <!-- What you are about to invalidate, shown BEFORE you invalidate it.
+             The same component the table and the Playground render — read
+             only here, because an observation is not an editable field. -->
+        <div class="cap-block" data-testid="endpoint-current-capabilities">
+          <h3>What the last probe observed</h3>
+          <CapabilityChecks endpoint={initial} variant="panel" />
+        </div>
+      {/if}
+
       {#if capabilityInvalidated}
         <div class="warn-block" data-testid="endpoint-capability-reset-warning">
-          Saving this change resets the capability record to <strong>never probed</strong>: a
-          capability observed against a different model, URL or credential is not evidence about
-          this one. Dispatch will refuse the endpoint until you probe it again.
+          Saving this change resets the <strong>whole</strong> capability record to
+          <strong>never probed</strong> — tool support, streaming, usage, context window
+          <strong>and every input modality (images, audio)</strong>: a capability observed against
+          a different model, URL or credential is not evidence about this one. Dispatch will
+          refuse the endpoint until you probe it again, and the modality chips will read
+          <em>not probed</em> rather than <em>not supported</em>, because those are different
+          facts.
         </div>
       {/if}
 
@@ -698,6 +713,22 @@
     padding: 0.6rem 0.75rem;
     border-radius: 4px;
     font-size: 0.85rem;
+  }
+
+  .cap-block {
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    margin-top: 0.5rem;
+    background: var(--surface-alt);
+  }
+
+  .cap-block h3 {
+    margin: 0 0 0.5rem;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
   }
 
   .warn-block {

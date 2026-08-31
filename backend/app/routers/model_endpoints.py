@@ -207,12 +207,24 @@ def _step_id_from_token(authorization: Optional[str]) -> Optional[str]:
 
 def _reset_capability_record(endpoint: ModelEndpoint) -> None:
     """A capability observed against a DIFFERENT model is not evidence about
-    this one. Nulls the three booleans and the discovered context window, and
-    returns the row to `unprobed` - which dispatch then refuses until the
-    operator re-probes."""
+    this one. Nulls EVERY observed capability and the discovered context
+    window, and returns the row to `unprobed` - which dispatch then refuses
+    until the operator re-probes.
+
+    Every capability boolean must be listed here, and
+    TestCapabilityResetCoversEveryCapability derives the expected set from the
+    model so that adding one later breaks a test rather than shipping a lie.
+    Missing one produces a row that says `probe_status="unprobed"` and
+    `supports_images=True` in the same breath, with no source backing it -
+    and the modality refusal passes on the stale True, so a swapped base_url
+    would send an image to a server that refuses them. That was measured, not
+    imagined.
+    """
     endpoint.supports_tools = None
     endpoint.supports_streaming = None
     endpoint.reports_usage = None
+    endpoint.supports_images = None
+    endpoint.supports_audio = None
     endpoint.probe_status = "unprobed"
     endpoint.probed_at = None
     endpoint.probed_from = None

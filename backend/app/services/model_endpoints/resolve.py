@@ -92,6 +92,204 @@ def endpoint_dispatch_refusal(endpoint: ModelEndpoint) -> str | None:
     return None
 
 
+#: THE one spelling of "this step's inputs are not just text". A step config
+#: carries `attachments: [...]`; each entry is either a bare modality string
+#: or an object carrying a `modality`, a `type`, or a `media_type`. The wire
+#: shape of an attachment ITSELF - where the bytes live, how they are
+#: versioned - is not settled here; this parser reads only what modality it
+#: is, which is all dispatch needs in order to know whether the endpoint can
+#: be asked for it.
+STEP_ATTACHMENTS_KEY = "attachments"
+
+#: Fields an attachment may declare its modality in, in precedence order.
+#: `media_type` is here because `schemas.playground.PlaygroundAttachment`
+#: carries a sniffed MIME type and NOT a modality tag - so once
+#: `ATTACHMENTS_REACH_THE_MODEL` flips and those objects start reaching a step
+#: config, a parser that only read `modality`/`type` would find nothing and
+#: wave the request through with no modality check at all.
+_MODALITY_TAG_FIELDS: tuple[str, ...] = ("modality", "type", "media_type")
+
+#: Spellings that mean the same modality. `image_url` / `input_audio` are the
+#: wire-format content-part names; `image` is what a human types.
+_MODALITY_ALIASES: dict[str, str] = {
+    "image": "images",
+    "images": "images",
+    "image_url": "images",
+    "audio": "audio",
+    "input_audio": "audio",
+    "video": "video",
+    "video_url": "video",
+    "text": "text",
+}
+
+#: What an attachment that declares NOTHING this parser understands becomes.
+#: Not a modality: a placeholder that `endpoint_modality_refusal` refuses by
+#: name. Deliberately not in `WIRE_MODALITIES`.
+UNTAGGED_ATTACHMENT = "untagged"
+
+
+def _modality_of(item) -> str:
+    """One attachment's modality, or `UNTAGGED_ATTACHMENT`."""
+    tag = None
+    if isinstance(item, str):
+        tag = item
+    elif isinstance(item, dict):
+        for field in _MODALITY_TAG_FIELDS:
+            candidate = item.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                tag = candidate
+                break
+    if not tag:
+        return UNTAGGED_ATTACHMENT
+
+    cleaned = tag.strip().lower()
+    if "/" in cleaned:
+        # A MIME type: `image/png` -> images, `audio/wav` -> audio.
+        family = cleaned.split("/", 1)[0]
+        return _MODALITY_ALIASES.get(family, family)
+    return _MODALITY_ALIASES.get(cleaned, cleaned)
+
+
+def step_modality_needs(step_config: dict | None) -> frozenset:
+    """Which modalities this step's inputs require. THE only parser.
+
+    Everything unrecognised SURVIVES rather than being dropped - an unknown
+    tag is kept verbatim, and an attachment declaring no tag at all becomes
+    `UNTAGGED_ATTACHMENT`. `endpoint_modality_refusal` then refuses on it by
+    name. This looks pedantic and is the whole point: silently ignoring an
+    attachment nobody taught this parser about would run the step with less
+    input than its author attached and report SUCCESS, which is the same class
+    of invisible downgrade as dropping an image - and harder to notice,
+    because nothing fails.
+    """
+    if not isinstance(step_config, dict):
+        return frozenset()
+    attachments = step_config.get(STEP_ATTACHMENTS_KEY)
+    if not isinstance(attachments, list):
+        return frozenset()
+
+    needs = {_modality_of(item) for item in attachments}
+    # Text is the base content type of every request; it is never a "need".
+    needs.discard("text")
+    return frozenset(needs)
+
+
+def endpoint_modality_refusal(endpoint: ModelEndpoint, *, needs: frozenset) -> str | None:
+    """Why this endpoint must not receive THIS step's ATTACHMENTS, or None.
+
+    Deliberately separate from `endpoint_dispatch_refusal`, and the asymmetry
+    is load-bearing. That function's `supports_tools is None` clause is
+    UNCONDITIONAL because every harness step has to pick a protocol - tools
+    mode or the fenced-block fallback - so a null there makes every step
+    incoherent. Modalities are not like that: almost every step attaches
+    nothing. An unconditional refusal on `supports_images is None` would take
+    EVERY endpoint registered before M14.6 offline the moment 0013 landed, for
+    a capability those steps never use. That is a self-inflicted outage
+    dressed up as rigour.
+
+    So the refusal is conditional on the step actually attaching something -
+    and once it does, `None` REFUSES. It does not fall back to text-only and
+    it does not strip the attachment. Dropping an image the author attached
+    and running anyway is worse than the tools case, not better: the step
+    would SUCCEED, and report an answer produced from a prompt that silently
+    lost half its input.
+    """
+    from app.models.model_endpoint import UNREPRESENTABLE_MODALITIES, WIRE_MODALITIES
+    from app.services.model_endpoints.probe import modality_state
+
+    # `text` is the base content type of every chat-completions request and
+    # has no column to consult. Dropped here as well as in
+    # `step_modality_needs` so that an explicit `needs` from the Playground
+    # cannot produce a nonsense "no text observation" refusal.
+    needs = frozenset(needs) - {"text"}
+    if not needs:
+        return None
+
+    # Order the refusals so the STRUCTURAL ones (no wire format can carry
+    # this; we cannot even classify it) come before the per-endpoint ones. A
+    # video attachment must not be reported as "re-probe the endpoint".
+    for name in sorted(needs):
+        if name in UNREPRESENTABLE_MODALITIES:
+            return (
+                f"step attaches {name}, and LazyAF cannot send {name} to ANY "
+                f"endpoint: the OpenAI chat-completions wire format has no "
+                f"{name} content part (it defines text, image_url, "
+                f"input_audio and file). This is a property of the protocol, "
+                f"not of endpoint '{endpoint.name}' - re-probing will not "
+                f"change it. Sample the {name} into frames and attach those "
+                f"as images if that is what you meant."
+            )
+        if name == UNTAGGED_ATTACHMENT:
+            return (
+                f"step attaches a file that declares no modality (no "
+                f"`modality`, `type` or `media_type`), so LazyAF cannot tell "
+                f"whether endpoint '{endpoint.name}' is able to receive it. "
+                f"Refused rather than passed through: an attachment this "
+                f"resolver cannot classify is one it cannot check, and a step "
+                f"that quietly dropped it would still report success"
+            )
+        if name not in WIRE_MODALITIES:
+            return (
+                f"step attaches an unrecognised modality '{name}'. LazyAF "
+                f"speaks {', '.join(WIRE_MODALITIES)} over this wire format "
+                f"and refuses rather than dropping an attachment it does not "
+                f"understand"
+            )
+
+    detail = endpoint.get_probe_detail()
+    for name in sorted(needs):
+        value = getattr(endpoint, f"supports_{name}", None)
+        reason = detail.get(f"{name}_reason")
+        caveat = detail.get(f"{name}_caveat")
+        state = modality_state(
+            value,
+            reason if isinstance(reason, str) else None,
+            caveat if isinstance(caveat, str) else None,
+        )
+        # An UNVERIFIED acceptance still dispatches. Refusing it would block a
+        # capability that probably works, on the strength of a control that
+        # merely failed to corroborate - and the honest place to surface the
+        # doubt is the UI, where a human is choosing, not a refusal that reads
+        # as "this endpoint cannot do images" when we do not know that.
+        if state in ("supported", "supported_unverified"):
+            continue
+
+        if state == "unsupported":
+            body = detail.get(f"{name}_body")
+            quoted = f" ({reason}: {body})" if body else f" ({reason})"
+            return (
+                f"endpoint '{endpoint.name}' was probed and REFUSED {name} "
+                f"content parts{quoted}. Remove the attachment, or pick an "
+                f"endpoint whose {name} capability is green"
+            )
+        if state == "undetectable":
+            return (
+                f"endpoint '{endpoint.name}' accepted an {name} content part "
+                f"at probe time but the attachment never reached the prompt "
+                f"(prompt_tokens did not move against the control request), "
+                f"so it was silently discarded. LazyAF refuses rather than "
+                f"letting this step SUCCEED on a prompt that quietly lost its "
+                f"{name}. Verify by hand, or pick another endpoint"
+            )
+        if state == "probe_failed":
+            return (
+                f"endpoint '{endpoint.name}' has no {name} observation: the "
+                f"probe itself failed ({reason}). This is NOT a 'no' - read "
+                f"the probe detail before re-probing. LazyAF will not send "
+                f"{name} to an endpoint that has not demonstrated it accepts "
+                f"it, and will not silently drop it"
+            )
+        return (
+            f"endpoint '{endpoint.name}' has no {name} observation "
+            f"(supports_{name} is null - it was registered before LazyAF knew "
+            f"how to ask); re-probe it with "
+            f"POST /api/model-endpoints/{endpoint.id}/probe. LazyAF will not "
+            f"send {name} to an endpoint that has not demonstrated it accepts "
+            f"one, and will not silently drop it"
+        )
+    return None
+
+
 def endpoint_dispatch_warning(endpoint: ModelEndpoint) -> str | None:
     """What dispatch must SAY OUT LOUD before running on this endpoint.
 
@@ -148,13 +346,21 @@ async def _enabled_names(db) -> list[str]:
 
 
 async def resolve_step_endpoint(
-    db, step_config: dict | None, step_name: str
+    db, step_config: dict | None, step_name: str, *, needs: frozenset | None = None
 ) -> ModelEndpoint:
     """The ONE resolver. Raises `ValueError` with an actionable message.
 
     Every refusal names the endpoints that DO exist, because "unknown
     endpoint 'local-4090'" without that list is one round trip short of
     useful when the actual problem is a typo.
+
+    `needs` DEFAULTS TO DERIVING ITSELF from `step_config`, and that default
+    is deliberate: `needs=frozenset()` would have meant every caller that
+    forgot to pass it silently skipped the modality check, which is a
+    no-check dressed as a default. Pass it explicitly only for the surfaces
+    whose attachments do not live in `step_config` (the Playground's ad-hoc
+    run) - and even then it is `step_modality_needs`'s vocabulary, so there
+    is still exactly one parser.
     """
     reference = parse_endpoint_reference(step_config)
     if not reference:
@@ -177,5 +383,12 @@ async def resolve_step_endpoint(
     refusal = endpoint_dispatch_refusal(endpoint)
     if refusal:
         raise ValueError(f"step '{step_name}': {refusal}")
+
+    modality_refusal = endpoint_modality_refusal(
+        endpoint,
+        needs=step_modality_needs(step_config) if needs is None else needs,
+    )
+    if modality_refusal:
+        raise ValueError(f"step '{step_name}': {modality_refusal}")
 
     return endpoint

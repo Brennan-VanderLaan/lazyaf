@@ -74,6 +74,76 @@ HEALTH_STATES: tuple[str, ...] = (
     "unprobed",
 )
 
+# -- modalities (M14.6) -------------------------------------------------------
+#
+# THE ONE THING TO UNDERSTAND HERE: two of these are OBSERVATIONS about a
+# server and two are FACTS ABOUT THE WIRE FORMAT, and conflating them is the
+# bug this split exists to prevent.
+
+#: Content-part types the OpenAI chat-completions wire format defines and
+#: LazyAF can therefore actually SEND (`text`, `image_url`, `input_audio`).
+#: These are the modalities a probe can ask about.
+WIRE_MODALITIES: tuple[str, ...] = ("text", "images", "audio")
+
+#: **VIDEO IS NOT EXPRESSIBLE OVER THIS WIRE FORMAT.** The chat-completions
+#: user-content-part vocabulary is `text` / `image_url` / `input_audio` /
+#: `file`; there is no `video_url` and no `input_video`. vLLM's `video_url` is
+#: a documented OpenAI-INCOMPATIBLE vendor extension, and the universal
+#: practice of sampling a video into N frames and sending N `image_url` parts
+#: is IMAGES wearing a hat.
+#:
+#: So video gets NO COLUMN. A boolean that is NULL on every row forever is
+#: schema rot with extra steps, and a chip that can never light on a
+#: conforming server is worse than an honest permanent explanation. It is
+#: projected as the sixth state, `unrepresentable`, at zero requests and zero
+#: tokens.
+UNREPRESENTABLE_MODALITIES: tuple[str, ...] = ("video",)
+
+#: Every modality the UI breaks out, probed or not.
+MODALITY_NAMES: tuple[str, ...] = WIRE_MODALITIES + UNREPRESENTABLE_MODALITIES
+
+#: The six states one modality can be in. NO TWO OF THEM COLLAPSE:
+#:
+#:   supported/unsupported - probed, and we know.
+#:   unprobed        - nobody asked. Press Probe.
+#:   probe_failed    - somebody asked and the ASKING broke. Re-probing is
+#:                     often the wrong next move; read the reason first.
+#:   undetectable    - we asked, the server answered 200, and the answer does
+#:                     not decide it. THE DANGEROUS ONE: the request SUCCEEDS
+#:                     and the input vanishes.
+#:   unrepresentable - the wire format has no way to say it (video). Not an
+#:                     observation; a property of the protocol.
+#:
+#: `unprobed` vs `probe_failed` are both NULL and both refuse at dispatch, but
+#: they tell the operator to do different things. `undetectable` vs
+#: `unsupported` differ in that `unsupported` is a refusal you can quote and
+#: `undetectable` is a success that did nothing.
+MODALITY_STATES: tuple[str, ...] = (
+    "supported",
+    #: The server ACCEPTED the content part, but nothing corroborated that the
+    #: model actually consumed it. Distinct from `supported` on purpose: a shim
+    #: that flattens content parts into the prompt as prose moves the token
+    #: ledger exactly like a real vision encoder does, so the matched-pair
+    #: control votes yes for a model that never saw the image. Rendering that
+    #: as a plain green check is the product claiming a capability it has not
+    #: proven. It is still USABLE - dispatch allows it - but a human choosing
+    #: an endpoint deserves to see which of the two they are getting.
+    "supported_unverified",
+    "unsupported",
+    "unprobed",
+    "undetectable",
+    "probe_failed",
+    "unrepresentable",
+)
+
+#: Where a modality answer came from. `wire_format` is NOT an observation -
+#: it is a constant of the protocol (text always works; video never can).
+MODALITY_SOURCES: tuple[str, ...] = (
+    "ollama_capabilities",
+    "wire_probe",
+    "wire_format",
+)
+
 #: `name` regex (wave8 s1.1). Capped so `endpoint:<name>` fits `gpu_node_id`'s
 #: String(64) with room to spare.
 NAME_PATTERN = r"^[a-z0-9][a-z0-9-]{0,38}$"
@@ -174,6 +244,27 @@ class ModelEndpoint(Base):
     #: Does the server return a `usage` block at all? The whole cost story
     #: depends on this one.
     reports_usage: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    #: PROBED, THREE-STATE - the `supports_tools` doctrine, inherited WHOLE.
+    #: `None` is "we have not asked", never "assume no". **Every endpoint
+    #: registered before M14.6 reads None here until it is re-probed**, and
+    #: the UI must say NOT PROBED - never "does not support images". Those are
+    #: different facts, and 0013 deliberately backfills NOTHING for exactly
+    #: that reason.
+    #:
+    #: `True` means, precisely: the endpoint ACCEPTED an image content part,
+    #: and where a `usage` block made it measurable, the image demonstrably
+    #: entered the prompt (a positive prompt-token delta against a matched
+    #: control request). It makes NO claim that the model is any GOOD at
+    #: vision - judging on what a 7B model says about a 32x32 square would be
+    #: testing its competence, and a wrong answer would record False against a
+    #: model that genuinely sees.
+    supports_images: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    #: Same doctrine, same meaning, for `input_audio` content parts. Also
+    #: three-state; also never backfilled. Note the ASYMMETRY with images:
+    #: ollama's free capability array has a `vision` member and NO `audio`
+    #: member, so audio is only ever answered by the (paid) wire probe.
+    supports_audio: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     probe_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="unprobed", server_default="unprobed"

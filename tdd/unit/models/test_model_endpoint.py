@@ -29,10 +29,15 @@ from app.models.model_endpoint import (  # noqa: E402
     ENDPOINT_FAILURE_THRESHOLD,
     HEALTH_STATES,
     IN_FLIGHT_STEP_STATUSES,
+    MODALITY_NAMES,
+    MODALITY_SOURCES,
+    MODALITY_STATES,
     NODE_ID_PREFIX,
     PROBE_STATUSES,
     REACH_MODES,
     SERVER_KINDS,
+    UNREPRESENTABLE_MODALITIES,
+    WIRE_MODALITIES,
     ModelEndpoint,
     default_gpu_node_id,
     default_runner_label,
@@ -45,13 +50,23 @@ from app.schemas.model_endpoint import (  # noqa: E402
     base_url_warning,
     capabilities_of,
     endpoint_read,
+    modalities_of,
     validate_auth_fields,
 )
-from app.services.model_endpoints.probe import PROBE_TTL_SECONDS  # noqa: E402
+from app.services.model_endpoints.probe import (  # noqa: E402
+    MODALITY_FAILURE_REASONS,
+    MODALITY_REASONS,
+    PROBE_TTL_SECONDS,
+    UNDETECTABLE_MODALITY_REASONS,
+    modality_state,
+)
 from app.services.model_endpoints.resolve import (  # noqa: E402
     ENDPOINT_MODEL_PREFIX,
+    STEP_ATTACHMENTS_KEY,
     endpoint_dispatch_refusal,
+    endpoint_modality_refusal,
     parse_endpoint_reference,
+    step_modality_needs,
 )
 
 
@@ -420,13 +435,22 @@ class TestSchemas:
         assert ModelEndpointUpdate().model_dump(exclude_unset=True) == {}
 
     def test_capabilities_snapshot_shape(self):
-        """The 10 keys the agent-config `capabilities` block carries
-        (cross-agent contract #2's CAPABILITY_KEYS)."""
+        """The keys the capability snapshot carries (cross-agent contract #2).
+
+        M14.6 added three: two three-state booleans and the DERIVED
+        `modalities` list. `modalities` is on the wire snapshot but must NOT
+        be added to the agent-config `capabilities` block - it is a UI
+        vocabulary, and shipping it into the container would make renaming a
+        chip label a runner-image redeploy.
+        """
         caps = capabilities_of(make_endpoint(context_window=32768))
         assert set(caps.model_dump()) == {
             "supports_tools",
             "supports_streaming",
             "reports_usage",
+            "supports_images",
+            "supports_audio",
+            "modalities",
             "context_window",
             "max_output_tokens",
             "probe_status",
@@ -501,3 +525,430 @@ class TestDispatchWarnings:
             make_endpoint(context_window=32768, reach="proxy")
         )
         assert "bottleneck" in warning
+
+
+# -----------------------------------------------------------------------------
+# Modalities (M14.6)
+# -----------------------------------------------------------------------------
+
+def probed_endpoint(**overrides) -> ModelEndpoint:
+    """A probed endpoint carrying a `probe_detail` blob, for the projection."""
+    detail = overrides.pop("detail", None)
+    endpoint = make_endpoint(**overrides)
+    if detail is not None:
+        endpoint.set_probe_detail(detail)
+    return endpoint
+
+
+def modality(endpoint, name: str):
+    """The one `Modality` for `name` out of the projection."""
+    return next(m for m in modalities_of(endpoint) if m.modality == name)
+
+
+class TestModalityVocabularies:
+    def test_video_is_declared_unrepresentable_not_probed(self):
+        """The wire format has no video content part, so video is a property
+        of the PROTOCOL rather than an observation about any server. It is
+        deliberately absent from the probeable set."""
+        assert UNREPRESENTABLE_MODALITIES == ("video",)
+        assert "video" not in WIRE_MODALITIES
+        assert WIRE_MODALITIES == ("text", "images", "audio")
+
+    def test_there_is_no_supports_video_column(self):
+        """A column NULL on every row forever is schema rot with extra steps,
+        and a boolean cannot carry `unrepresentable` anyway."""
+        columns = set(ModelEndpoint.__table__.columns.keys())
+        assert "supports_video" not in columns
+        assert {"supports_images", "supports_audio"} <= columns
+
+    def test_every_modality_name_is_wire_or_unrepresentable(self):
+        assert MODALITY_NAMES == WIRE_MODALITIES + UNREPRESENTABLE_MODALITIES
+
+    def test_the_states_are_all_distinct_and_cover_the_known_answers(self):
+        assert len(MODALITY_STATES) == len(set(MODALITY_STATES))
+
+        # A SUPERSET assertion, not an equality. Every member below is a
+        # distinct answer the product must be able to give, and losing one is
+        # a regression - but ADDING one is how this vocabulary is supposed to
+        # grow. An equality made "the probe learned to say something new" fail
+        # here, which teaches the next person to edit the test rather than
+        # think about the state.
+        assert set(MODALITY_STATES) >= {
+            "supported",
+            "unsupported",
+            "unprobed",
+            "undetectable",
+            "probe_failed",
+            "unrepresentable",
+        }
+
+    def test_an_unverified_acceptance_is_not_the_same_state_as_a_proven_one(self):
+        # FP-1. The probe's matched-pair control cannot tell a vision encoder
+        # from a shim that flattens content parts into the prompt as prose -
+        # both move the token ledger. So an acceptance carrying a caveat gets
+        # its own state rather than borrowing the proven one's green check.
+        assert "supported_unverified" in MODALITY_STATES
+        assert "supported_unverified" != "supported"
+
+    def test_sources_separate_observation_from_protocol(self):
+        assert set(MODALITY_SOURCES) == {
+            "ollama_capabilities",
+            "wire_probe",
+            "wire_format",
+        }
+
+    def test_undetectable_and_failure_reasons_do_not_overlap(self):
+        """They are both a NULL column, and they mean opposite things to an
+        operator: one says the server answered and the answer was empty, the
+        other says the asking broke."""
+        assert not set(UNDETECTABLE_MODALITY_REASONS) & set(MODALITY_FAILURE_REASONS)
+        for reason in UNDETECTABLE_MODALITY_REASONS + MODALITY_FAILURE_REASONS:
+            assert reason in MODALITY_REASONS, reason
+
+
+class TestModalityColumnsAreThreeState:
+    def test_a_fresh_row_reads_none_not_false(self):
+        """A brand new `ModelEndpoint()` has ASKED NOTHING. `False` here would
+        be a capability claim invented by the constructor."""
+        endpoint = ModelEndpoint(name="fresh", base_url="http://x/v1", model="m")
+        assert endpoint.supports_images is None
+        assert endpoint.supports_audio is None
+
+    def test_the_columns_are_nullable_at_the_ddl_level(self):
+        for name in ("supports_images", "supports_audio"):
+            assert ModelEndpoint.__table__.columns[name].nullable is True, name
+
+    def test_the_columns_carry_no_server_default(self):
+        """A `server_default='0'` would be a backfill in disguise: every row
+        inserted without naming the column would silently become False."""
+        for name in ("supports_images", "supports_audio"):
+            assert ModelEndpoint.__table__.columns[name].server_default is None, name
+
+
+class TestModalityStateTable:
+    @pytest.mark.parametrize(
+        "value,reason,expected",
+        [
+            (True, None, "supported"),
+            (False, "http_400", "unsupported"),
+            (False, "not_in_capabilities", "unsupported"),
+            # The three ways a NULL splits, and the split is entirely in the
+            # reason - which is why the reason is recorded at all.
+            (None, None, "unprobed"),
+            (None, "no_prompt_token_delta", "undetectable"),
+            (None, "timeout", "probe_failed"),
+            (None, "deadline_exhausted", "probe_failed"),
+            (None, "http_5xx", "probe_failed"),
+            (None, "bad_response_shape", "probe_failed"),
+        ],
+    )
+    def test_state_table(self, value, reason, expected):
+        assert modality_state(value, reason) == expected
+
+    def test_a_failed_probe_is_never_read_as_unsupported(self):
+        """Constraint 4, as a test: a failed probe is UNKNOWN, not FALSE."""
+        for reason in MODALITY_FAILURE_REASONS:
+            assert modality_state(None, reason) != "unsupported", reason
+
+
+class TestModalityProjection:
+    def test_all_four_modalities_are_always_present_and_in_order(self):
+        """A modality the UI has to look up by name is one the UI can
+        silently fail to render."""
+        names = [m.modality for m in modalities_of(make_endpoint())]
+        assert names == list(MODALITY_NAMES)
+
+    def test_video_is_permanently_unrepresentable_with_a_reason(self):
+        row = modality(make_endpoint(supports_images=True), "video")
+        assert row.state == "unrepresentable"
+        assert row.source == "wire_format"
+        assert row.reason == "wire_format_has_no_video_content_part"
+
+    def test_text_is_a_property_of_the_protocol_not_a_probe(self):
+        row = modality(make_endpoint(probe_status="unprobed"), "text")
+        assert row.state == "supported"
+        assert row.source == "wire_format"
+
+    def test_a_pre_m146_endpoint_reads_unprobed_and_never_unsupported(self):
+        """THE headline case. Every endpoint registered before this wave has
+        NULL here, and the difference between 'not probed' and 'does not
+        support images' is the entire doctrine."""
+        endpoint = make_endpoint()  # probed for tools, never asked about images
+        assert endpoint.probe_status == "ok"
+        for name in ("images", "audio"):
+            row = modality(endpoint, name)
+            assert row.state == "unprobed", name
+            assert row.source is None, "an unprobed row must not claim a source"
+
+    def test_a_refusal_is_unsupported_and_carries_quotable_evidence(self):
+        endpoint = probed_endpoint(
+            supports_images=False,
+            detail={
+                "images_source": "wire_probe",
+                "images_reason": "http_400",
+                "images_status": 400,
+                "images_body": '{"error": "this model does not support image input"}',
+            },
+        )
+        row = modality(endpoint, "images")
+        assert row.state == "unsupported"
+        assert row.source == "wire_probe"
+        assert "does not support image input" in row.evidence
+
+    def test_a_silent_drop_is_undetectable_and_not_unsupported(self):
+        """The nastiest row: the request SUCCEEDED and the image went
+        nowhere. Calling that `unsupported` would lose the fact that the
+        endpoint will happily accept and ignore the next one too."""
+        endpoint = probed_endpoint(
+            supports_images=None,
+            detail={
+                "images_source": "wire_probe",
+                "images_reason": "no_prompt_token_delta",
+                "images_prompt_tokens": 120,
+                "images_control_tokens": 120,
+            },
+        )
+        row = modality(endpoint, "images")
+        assert row.state == "undetectable"
+        assert row.reason == "no_prompt_token_delta"
+
+    def test_a_broken_probe_is_probe_failed_and_not_unprobed(self):
+        endpoint = probed_endpoint(
+            supports_images=None,
+            detail={
+                "images_source": "wire_probe",
+                "images_reason": "deadline_exhausted",
+            },
+        )
+        assert modality(endpoint, "images").state == "probe_failed"
+
+    def test_a_free_ollama_answer_names_its_source(self):
+        endpoint = probed_endpoint(
+            supports_images=True,
+            detail={
+                "images_source": "ollama_capabilities",
+                "ollama_capabilities": ["completion", "tools", "vision"],
+            },
+        )
+        row = modality(endpoint, "images")
+        assert (row.state, row.source) == ("supported", "ollama_capabilities")
+
+    def test_an_uncorroborated_true_carries_its_caveat(self):
+        """`supported` with no token ledger behind it means, precisely, "it
+        accepted the shape" - and the caveat is what stops that being read as
+        "the image demonstrably arrived"."""
+        endpoint = probed_endpoint(
+            supports_images=True,
+            detail={
+                "images_source": "wire_probe",
+                "images_caveat": "no_usage_no_control",
+            },
+        )
+        assert modality(endpoint, "images").caveat == "no_usage_no_control"
+
+    def test_the_snapshot_and_the_read_projection_agree(self):
+        endpoint = probed_endpoint(
+            supports_images=True,
+            supports_audio=False,
+            detail={"audio_reason": "http_400", "audio_source": "wire_probe"},
+        )
+        read = endpoint_read(endpoint)
+        assert read.capabilities.supports_images is True
+        assert read.capabilities.supports_audio is False
+        states = {m.modality: m.state for m in read.capabilities.modalities}
+        assert states == {
+            "text": "supported",
+            "images": "supported",
+            "audio": "unsupported",
+            "video": "unrepresentable",
+        }
+
+
+class TestStepModalityNeeds:
+    def test_no_attachments_needs_nothing(self):
+        assert step_modality_needs({"model": "endpoint:local-4090"}) == frozenset()
+        assert step_modality_needs(None) == frozenset()
+
+    @pytest.mark.parametrize(
+        "attachments,expected",
+        [
+            ([{"type": "image", "url": "..."}], {"images"}),
+            ([{"modality": "images"}], {"images"}),
+            (["image_url"], {"images"}),
+            ([{"type": "input_audio"}], {"audio"}),
+            ([{"type": "video"}], {"video"}),
+            ([{"type": "image"}, {"type": "audio"}], {"images", "audio"}),
+            # text is the base content type; it is never a "need".
+            ([{"type": "text"}], set()),
+            # `schemas.playground.PlaygroundAttachment` carries a SNIFFED MIME
+            # type and no modality tag. Once `ATTACHMENTS_REACH_THE_MODEL`
+            # flips, those objects reach a step config; a parser that read
+            # only `modality`/`type` would find nothing here and wave the
+            # request through with no modality check at all.
+            ([{"filename": "a.png", "media_type": "image/png"}], {"images"}),
+            ([{"filename": "a.wav", "media_type": "audio/wav"}], {"audio"}),
+            ([{"media_type": "video/mp4"}], {"video"}),
+        ],
+    )
+    def test_every_spelling_resolves_to_one_modality(self, attachments, expected):
+        needs = step_modality_needs({STEP_ATTACHMENTS_KEY: attachments})
+        assert set(needs) == expected
+
+    def test_an_unrecognised_tag_survives_rather_than_being_dropped(self):
+        """Dropping it would run the step with less input than its author
+        attached, and report success."""
+        assert "hologram" in step_modality_needs(
+            {STEP_ATTACHMENTS_KEY: [{"type": "hologram"}]}
+        )
+
+    def test_an_attachment_with_no_tag_at_all_becomes_untagged(self):
+        """An attachment this resolver cannot classify is one it cannot
+        check. It must not evaporate into `frozenset()`."""
+        from app.services.model_endpoints.resolve import UNTAGGED_ATTACHMENT
+
+        needs = step_modality_needs(
+            {STEP_ATTACHMENTS_KEY: [{"filename": "mystery.bin", "size_bytes": 12}]}
+        )
+        assert needs == frozenset({UNTAGGED_ATTACHMENT})
+        assert UNTAGGED_ATTACHMENT not in WIRE_MODALITIES
+
+
+class TestModalityDispatchRefusal:
+    def test_a_text_only_step_is_never_refused_for_a_null_modality(self):
+        """THE reason this is a separate function from
+        `endpoint_dispatch_refusal`. An unconditional refusal on
+        `supports_images is None` would have taken every endpoint registered
+        before M14.6 offline the moment 0013 landed, for a capability those
+        steps do not use."""
+        endpoint = make_endpoint()
+        assert endpoint.supports_images is None
+        assert endpoint_dispatch_refusal(endpoint) is None
+        assert endpoint_modality_refusal(endpoint, needs=frozenset()) is None
+
+    def test_null_refuses_the_moment_the_step_attaches_an_image(self):
+        endpoint = make_endpoint()
+        refusal = endpoint_modality_refusal(endpoint, needs=frozenset({"images"}))
+        assert "no images observation" in refusal
+        assert "re-probe" in refusal.lower()
+        assert "silently drop" in refusal
+
+    def test_a_probed_supporting_endpoint_passes(self):
+        endpoint = make_endpoint(supports_images=True)
+        assert endpoint_modality_refusal(endpoint, needs=frozenset({"images"})) is None
+
+    def test_a_refusal_quotes_what_the_server_actually_said(self):
+        endpoint = probed_endpoint(
+            supports_images=False,
+            detail={
+                "images_reason": "http_400",
+                "images_body": "this model does not support image input",
+            },
+        )
+        refusal = endpoint_modality_refusal(endpoint, needs=frozenset({"images"}))
+        assert "REFUSED images" in refusal
+        assert "does not support image input" in refusal
+
+    def test_undetectable_refuses_and_says_the_step_would_have_succeeded(self):
+        """This is the state that MOST needs a refusal: without one the step
+        runs, succeeds, and answers from a prompt that lost its image."""
+        endpoint = probed_endpoint(
+            supports_images=None,
+            detail={"images_reason": "no_prompt_token_delta"},
+        )
+        refusal = endpoint_modality_refusal(endpoint, needs=frozenset({"images"}))
+        assert "silently discarded" in refusal
+        assert "SUCCEED" in refusal
+
+    def test_probe_failed_says_this_is_not_a_no(self):
+        endpoint = probed_endpoint(
+            supports_images=None, detail={"images_reason": "timeout"}
+        )
+        refusal = endpoint_modality_refusal(endpoint, needs=frozenset({"images"}))
+        assert "not a 'no'" in refusal.lower()
+        assert "timeout" in refusal
+
+    def test_video_is_refused_on_the_wire_format_not_on_the_endpoint(self):
+        """Refused even against an endpoint that supports everything else: no
+        re-probe can ever change this answer."""
+        endpoint = make_endpoint(supports_images=True, supports_audio=True)
+        refusal = endpoint_modality_refusal(endpoint, needs=frozenset({"video"}))
+        assert "cannot send video to ANY endpoint" in refusal
+        assert "no video content part" in refusal
+        assert "re-probing will not change it" in refusal
+
+    def test_an_unrecognised_modality_is_refused_rather_than_ignored(self):
+        endpoint = make_endpoint(supports_images=True)
+        refusal = endpoint_modality_refusal(endpoint, needs=frozenset({"hologram"}))
+        assert "unrecognised modality 'hologram'" in refusal
+
+    def test_an_untagged_attachment_is_refused_by_the_resolver(self):
+        from app.services.model_endpoints.resolve import UNTAGGED_ATTACHMENT
+
+        endpoint = make_endpoint(supports_images=True)
+        refusal = endpoint_modality_refusal(
+            endpoint, needs=frozenset({UNTAGGED_ATTACHMENT})
+        )
+        assert "declares no modality" in refusal
+        assert "media_type" in refusal
+
+    def test_a_structural_refusal_outranks_a_per_endpoint_one(self):
+        """A step attaching a video AND an image against an unprobed endpoint
+        must be told the video can never be sent, not "re-probe the
+        endpoint" - the two call for different actions and only one of them
+        is achievable."""
+        endpoint = make_endpoint()
+        refusal = endpoint_modality_refusal(
+            endpoint, needs=frozenset({"images", "video"})
+        )
+        assert "cannot send video to ANY endpoint" in refusal
+
+    def test_the_full_path_refuses_through_resolve_step_endpoint(self):
+        """The refusal is wired into the ONE resolver, and `needs` derives
+        itself from the step config - `needs=frozenset()` as a default would
+        have been a no-check dressed as a default."""
+        import asyncio
+
+        endpoint = make_endpoint()
+
+        class _DB:
+            async def execute(self, _statement):
+                class _R:
+                    def scalar_one_or_none(_self):
+                        return endpoint
+
+                    def all(_self):
+                        return []
+
+                return _R()
+
+        from app.services.model_endpoints.resolve import resolve_step_endpoint
+
+        config = {
+            "model": "endpoint:local-4090",
+            STEP_ATTACHMENTS_KEY: [{"media_type": "image/png"}],
+        }
+        with pytest.raises(ValueError) as excinfo:
+            asyncio.run(resolve_step_endpoint(_DB(), config, "agent"))
+        assert "no images observation" in str(excinfo.value)
+
+        # ...and the same endpoint resolves fine for a text-only step.
+        without = {"model": "endpoint:local-4090"}
+        assert asyncio.run(resolve_step_endpoint(_DB(), without, "agent")) is endpoint
+
+    def test_audio_is_judged_independently_of_images(self):
+        endpoint = make_endpoint(supports_images=True, supports_audio=False)
+        assert endpoint_modality_refusal(endpoint, needs=frozenset({"images"})) is None
+        assert endpoint_modality_refusal(endpoint, needs=frozenset({"audio"}))
+
+    def test_text_is_never_refused_because_there_is_no_column_to_consult(self):
+        """There is no `supports_text`. A caller that passes it explicitly -
+        the Playground builds `needs` outside the step config - must not get a
+        nonsense "no text observation" refusal from a missing attribute."""
+        endpoint = make_endpoint()
+        assert endpoint_modality_refusal(endpoint, needs=frozenset({"text"})) is None
+        assert (
+            endpoint_modality_refusal(
+                endpoint, needs=frozenset({"text", "images"})
+            )
+            is not None
+        )

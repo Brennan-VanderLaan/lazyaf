@@ -39,7 +39,7 @@ from app.database import ALEMBIC_BASELINE_REVISION, Base, _alembic_config, _run_
 
 # Tip of the migration chain. Every startup path (fresh upgrade, legacy
 # adoption stamp-then-upgrade) must end here.
-ALEMBIC_HEAD_REVISION = "0011"
+ALEMBIC_HEAD_REVISION = "0012"
 
 EXPECTED_TABLES = {
     "repos",
@@ -79,6 +79,8 @@ EXPECTED_TABLES = {
     # table plus step_executions.model_endpoint_id; deliberately adds NOTHING
     # to step_usages (the endpoint join goes through gpu_node_id).
     "model_endpoints",
+    # 0012 (M13-1) reshapes workspaces' uniqueness (a run owns one workspace
+    # PER LANE) - one column plus an index swap, no tables.
 }
 
 SPEC_TABLES = {"features", "user_stories", "acceptance_criteria", "prompt_templates"}
@@ -990,6 +992,232 @@ class TestModelEndpointsMigration:
                         "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
                     )
                 )
+
+
+def _workspace_row_sql(
+    ws_id: str, run_id: str, volume_name: str, worker_key: str | None = None
+) -> str:
+    """INSERT for one workspaces row, with or without the 0012 lane column."""
+    columns = "id, pipeline_run_id, repo_id, volume_name, status, use_count, created_at, updated_at"
+    values = (
+        f"'{ws_id}', '{run_id}', 'r1', '{volume_name}', 'ready', 0, "
+        "'2026-01-01 00:00:00', '2026-01-01 00:00:00'"
+    )
+    if worker_key is not None:
+        columns += ", worker_key"
+        values += f", '{worker_key}'"
+    return f"INSERT INTO workspaces ({columns}) VALUES ({values})"
+
+
+class TestWorkspacePerWorkerMigration:
+    """0012 (M13-1): a run owns one workspace PER LANE.
+
+    0002 made `pipeline_run_id` UNIQUE — one workspace, one volume, one
+    checkout per run. That is the constraint that makes the owner's
+    headline hypothesis unmeasurable: K parallel agent steps all mount the
+    same working tree, so any conflict rate a benchmark reports is a
+    property of this schema rather than of the strategy under test.
+
+    Two things are asserted here that comments cannot enforce: the lane
+    column is NOT NULL (a nullable one would constrain nothing, since both
+    SQLite and Postgres treat NULLs as distinct inside a unique index), and
+    an existing row keeps its VOLUME NAME across the upgrade (no rename
+    means no orphaned volume and no re-clone for a run in flight).
+    """
+
+    async def test_0012_adds_worker_key_not_null(self, engine_factory):
+        engine = engine_factory("lanes_schema.db")
+        await _migrate(engine)
+
+        columns = (await _snapshot(engine))["workspaces"]["columns"]
+        assert "worker_key" in columns
+        type_str, nullable, _ = columns["worker_key"]
+        assert nullable is False, (
+            "a nullable lane column constrains NOTHING: NULLs are DISTINCT in "
+            "a unique index, so the default-lane rows — the common case — "
+            "would lose all duplicate protection"
+        )
+        assert "64" in type_str
+
+    async def test_0012_swaps_the_run_index_for_the_composite_unique(
+        self, engine_factory
+    ):
+        engine = engine_factory("lanes_index.db")
+        await _migrate(engine)
+
+        indexes = (await _snapshot(engine))["workspaces"]["indexes"]
+        assert indexes["uq_workspaces_run_worker"] == (
+            ("pipeline_run_id", "worker_key"),
+            True,
+        )
+        # Dropped outright, not recreated non-unique: the composite index
+        # leads with pipeline_run_id and already serves those lookups.
+        assert "ix_workspaces_pipeline_run_id" not in indexes
+        assert "ix_workspaces_repo_id" in indexes
+        assert "ix_workspaces_status" in indexes
+
+    async def test_0012_backfills_existing_rows_without_renaming_volumes(
+        self, engine_factory
+    ):
+        """The upgrade must not strand a run that is in flight. Because the
+        default lane emits NO name suffix, the backfilled row's volume_name
+        is the string already on the live docker volume."""
+        engine = engine_factory("lanes_backfill.db")
+        await _upgrade_to(engine, "0011")
+        run_id = "pr-legacy"
+        volume_name = f"lazyaf-ws-{run_id}"
+        async with engine.begin() as conn:
+            await conn.execute(text(_workspace_row_sql("w-legacy", run_id, volume_name)))
+
+        await _upgrade_to(engine, "0012")
+
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT worker_key, volume_name FROM workspaces "
+                        "WHERE id = 'w-legacy'"
+                    )
+                )
+            ).one()
+        assert row[0] == "default"
+        assert row[1] == volume_name
+
+    async def test_two_lanes_of_one_run_are_insertable_after_0012(
+        self, engine_factory
+    ):
+        """The whole point: K parallel workers, K independent checkouts."""
+        engine = engine_factory("lanes_two.db")
+        await _migrate(engine)
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(_workspace_row_sql("w1", "pr1", "lazyaf-ws-pr1-w1", "w1"))
+            )
+            await conn.execute(
+                text(_workspace_row_sql("w2", "pr1", "lazyaf-ws-pr1-w2", "w2"))
+            )
+
+        async with engine.connect() as conn:
+            count = (
+                await conn.execute(
+                    text("SELECT COUNT(*) FROM workspaces WHERE pipeline_run_id = 'pr1'")
+                )
+            ).scalar()
+        assert count == 2
+
+    async def test_a_duplicate_lane_is_rejected_after_0012(self, engine_factory):
+        """Two rows for one lane means two volumes and two clones, one of
+        which nothing will ever find again, release, or clean. The in-process
+        lock is single-process by design, so the database is the backstop."""
+        engine = engine_factory("lanes_dup.db")
+        await _migrate(engine)
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(_workspace_row_sql("w1", "pr1", "lazyaf-ws-pr1-w1", "w1"))
+            )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(_workspace_row_sql("w1b", "pr1", "lazyaf-ws-other", "w1"))
+                )
+
+    async def test_two_default_lane_rows_for_one_run_are_still_rejected(
+        self, engine_factory
+    ):
+        """The regression a nullable lane column would have introduced: the
+        common case must keep exactly the protection 0002 gave it."""
+        engine = engine_factory("lanes_dup_default.db")
+        await _migrate(engine)
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(_workspace_row_sql("d1", "pr1", "lazyaf-ws-pr1", "default"))
+            )
+
+        with pytest.raises(IntegrityError):
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(_workspace_row_sql("d2", "pr1", "lazyaf-ws-pr1-b", "default"))
+                )
+
+    async def test_downgrade_to_0011_restores_the_single_workspace_shape(
+        self, engine_factory
+    ):
+        engine = engine_factory("lanes_down.db")
+        reference = engine_factory("lanes_ref.db")
+        await _migrate(engine)
+        await _upgrade_to(reference, "0011")
+
+        await _downgrade_to(engine, "0011")
+
+        snapshot = await _snapshot(engine)
+        assert "worker_key" not in snapshot["workspaces"]["columns"]
+        assert snapshot["workspaces"]["indexes"]["ix_workspaces_pipeline_run_id"] == (
+            ("pipeline_run_id",),
+            True,
+        )
+        assert "uq_workspaces_run_worker" not in snapshot["workspaces"]["indexes"]
+        assert snapshot["workspaces"] == (await _snapshot(reference))["workspaces"]
+        assert await _alembic_versions(engine) == ["0011"]
+
+    async def test_downgrade_drops_non_default_lanes_and_keeps_the_trunk(
+        self, engine_factory
+    ):
+        """DESTRUCTIVE and deliberately so: the old shape cannot represent a
+        per-worker lane, and leaving those rows would make the single-column
+        UNIQUE index fail to build. Their volumes become unmatched, which the
+        orphan audit's third sweep reaps. The default lane is untouched."""
+        engine = engine_factory("lanes_down_data.db")
+        await _migrate(engine)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(_workspace_row_sql("d1", "pr1", "lazyaf-ws-pr1", "default"))
+            )
+            await conn.execute(
+                text(_workspace_row_sql("w1", "pr1", "lazyaf-ws-pr1-w1", "w1"))
+            )
+            await conn.execute(
+                text(_workspace_row_sql("w2", "pr1", "lazyaf-ws-pr1-w2", "w2"))
+            )
+
+        await _downgrade_to(engine, "0011")
+
+        async with engine.connect() as conn:
+            rows = (
+                await conn.execute(text("SELECT id FROM workspaces ORDER BY id"))
+            ).scalars().all()
+        assert list(rows) == ["d1"]
+
+    async def test_0012_roundtrip_restores_head(self, engine_factory):
+        engine = engine_factory("lanes_rt.db")
+        await _migrate(engine)
+        head = await _snapshot(engine)
+
+        await _downgrade_to(engine, "0011")
+        await _upgrade_to(engine, "head")
+
+        assert await _snapshot(engine) == head
+        assert await _alembic_versions(engine) == [ALEMBIC_HEAD_REVISION]
+
+    async def test_upgrade_is_idempotent_over_a_healed_schema(self, engine_factory):
+        """The adopt path: create_all builds the CURRENT model schema — lane
+        column and composite index included — the DB is stamped behind head,
+        and 0012 then runs over objects that already exist. Every step is
+        guarded, so this must not raise."""
+        engine = engine_factory("lanes_idem.db")
+        await _create_all(engine)
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda c: command.stamp(_alembic_config(c), "0011"))
+
+        await _upgrade_to(engine, "0012")
+
+        assert await _alembic_versions(engine) == ["0012"]
+        indexes = (await _snapshot(engine))["workspaces"]["indexes"]
+        assert "uq_workspaces_run_worker" in indexes
+        assert "ix_workspaces_pipeline_run_id" not in indexes
 
 
 class TestLoggingIsUntouched:

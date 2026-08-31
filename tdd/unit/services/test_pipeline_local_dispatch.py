@@ -37,6 +37,7 @@ from app.services.pipeline_executor import (
 )
 from app.services.websocket import manager
 from app.services.workspace.state_machine import generate_volume_name
+from app.services.workspace.worker_key import DEFAULT_WORKER_KEY
 
 
 # -----------------------------------------------------------------------------
@@ -90,18 +91,29 @@ class FakeWorkspaceService:
         self.ops: list[tuple] = []
         self.workspaces: dict[str, SimpleNamespace] = {}
 
-    async def get_or_create(self, db, pipeline_run_id, repo_id, branch, commit_sha):
-        self.ops.append(("get_or_create", pipeline_run_id, repo_id, branch, commit_sha))
-        ws = self.workspaces.get(pipeline_run_id)
+    async def get_or_create(
+        self, db, pipeline_run_id, repo_id, branch, commit_sha, worker_key=None
+    ):
+        # `worker_key` mirrors the real service (M13-1): a run owns one
+        # workspace PER LANE. Keyed here the same way, so a test that fans out
+        # across lanes gets distinct fakes instead of silently sharing one -
+        # which is the production bug this parameter exists to prevent.
+        key = worker_key or DEFAULT_WORKER_KEY
+        self.ops.append(
+            ("get_or_create", pipeline_run_id, repo_id, branch, commit_sha, key)
+        )
+        lane = (pipeline_run_id, key)
+        ws = self.workspaces.get(lane)
         if ws is None:
             ws = SimpleNamespace(
-                id=f"ws-{pipeline_run_id[:8]}",
+                id=f"ws-{pipeline_run_id[:8]}-{key}",
                 pipeline_run_id=pipeline_run_id,
-                volume_name=generate_volume_name(pipeline_run_id),
+                worker_key=key,
+                volume_name=generate_volume_name(pipeline_run_id, key),
                 status="ready",
                 use_count=0,
             )
-            self.workspaces[pipeline_run_id] = ws
+            self.workspaces[lane] = ws
         return ws
 
     async def acquire(self, db, workspace_id):
@@ -621,7 +633,13 @@ class TestLocalLifecycle:
 
         assert run.status == RunStatus.PASSED.value
         op = env.workspace.ops[0]
-        assert op == ("get_or_create", run.id, repo.id, "feature-x", "abc123")
+        # The trailing element is the workspace LANE (M13-1). An ordinary
+        # step names no lane, so it resolves to the default one - and asserting
+        # it here means a step that silently landed in the WRONG checkout
+        # breaks this test instead of passing quietly.
+        assert op == (
+            "get_or_create", run.id, repo.id, "feature-x", "abc123", DEFAULT_WORKER_KEY,
+        )
 
     async def test_local_execution_config_honours_contract(self, env):
         repo = await make_repo(env.factory)
@@ -751,7 +769,7 @@ class TestLocalFailurePaths:
 
     async def test_workspace_creation_failure_fails_step_and_run(self, env):
         class BrokenWorkspaceService(FakeWorkspaceService):
-            async def get_or_create(self, db, pipeline_run_id, repo_id, branch, commit_sha):
+            async def get_or_create(self, *args, **kwargs):
                 raise RuntimeError("volume creation refused")
 
         env.executor._workspace_service = BrokenWorkspaceService()

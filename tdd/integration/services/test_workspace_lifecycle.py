@@ -103,6 +103,26 @@ async def _fetch(db, run_id: str) -> Workspace | None:
     return result.scalar_one_or_none()
 
 
+async def _fetch_lane(db, run_id: str, worker_key: str) -> Workspace | None:
+    """_fetch, scoped to one LANE (a run may own several — M13-1)."""
+    result = await db.execute(
+        select(Workspace)
+        .where(Workspace.pipeline_run_id == run_id, Workspace.worker_key == worker_key)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
+def _our_volumes(docker_client) -> set:
+    """Every volume this service has ever labeled, by name."""
+    return {
+        v.name
+        for v in docker_client.volumes.list(
+            filters={"label": f"{WORKSPACE_VOLUME_LABEL}=true"}
+        )
+    }
+
+
 # -----------------------------------------------------------------------------
 # Volume lifecycle
 # -----------------------------------------------------------------------------
@@ -193,6 +213,181 @@ class TestRealVolumeLifecycle:
             assert not _volume_exists(docker_client, generate_volume_name(rid))
             row = await _fetch(db_session, rid)
             assert row.status == WorkspaceStatus.CLEANED.value
+
+
+# -----------------------------------------------------------------------------
+# Per-worker LANES against real named volumes (M13-1)
+#
+# A pipeline run owns one workspace PER LANE. Until this landed, K parallel
+# agent steps of one run all mounted ONE working tree, so the owner's
+# headline hypothesis - a planner splits the work, cheap workers execute in
+# parallel, and they integrate through git commits and merges rather than by
+# touching the same file on disk - could not be measured at all: any
+# conflict rate was a property of the schema.
+#
+# R6: real NAMED VOLUMES throughout, and the isolation claim is verified by
+# containers writing into them - not by asserting on strings.
+# -----------------------------------------------------------------------------
+
+
+class TestLaneVolumesRealDocker:
+    async def test_single_worker_run_creates_exactly_one_volume(
+        self, db_session, service, docker_client, populate, volume_tracker
+    ):
+        """THE non-negotiable. A run that names no lane must produce exactly
+        the objects it produced before lanes existed: ONE volume, named
+        without a suffix, gone after cleanup. Measured as a delta over the
+        daemon's real volume set, so an extra volume anywhere shows up."""
+        run_id = str(uuid4())
+        expected = generate_volume_name(run_id)
+        volume_tracker.append(expected)
+
+        before = _our_volumes(docker_client)
+        ws = await service.get_or_create(db_session, run_id, "repo-1", "main", None)
+        during = _our_volumes(docker_client)
+
+        assert during - before == {expected}
+        assert ws.volume_name == expected
+        assert ws.worker_key == "default"
+
+        await service.acquire(db_session, ws.id)
+        await service.release(db_session, ws.id)
+        assert _our_volumes(docker_client) - before == {expected}
+
+        await service.cleanup(db_session, run_id)
+
+        assert _our_volumes(docker_client) - before == set()
+
+    async def test_four_lanes_create_four_independent_volumes(
+        self, db_session, service, docker_client, populate, volume_tracker
+    ):
+        """The hypothesis-enabling test: K parallel writers, K checkouts,
+        ZERO shared bytes. Each lane's volume is written into by a container
+        and then read back - if two lanes shared a volume, every lane would
+        see every file."""
+        run_id = str(uuid4())
+        lanes = ["w1", "w2", "w3", "integrate"]
+        for lane in lanes:
+            volume_tracker.append(generate_volume_name(run_id, lane))
+
+        before = _our_volumes(docker_client)
+        workspaces = {}
+        for lane in lanes:
+            workspaces[lane] = await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=lane
+            )
+
+        names = {lane: ws.volume_name for lane, ws in workspaces.items()}
+        assert len(set(names.values())) == 4
+        assert _our_volumes(docker_client) - before == set(names.values())
+
+        # Write a distinct file into each lane's volume, then read every
+        # lane back and prove it holds ONLY its own.
+        mounts = {
+            name: {"bind": f"/lane/{lane}", "mode": "rw"}
+            for lane, name in names.items()
+        }
+        write = "; ".join(
+            f"echo {lane} > /lane/{lane}/{lane}.txt" for lane in lanes
+        )
+        docker_client.containers.run(
+            "python:3.12", ["bash", "-c", f"set -e; {write}"], volumes=mounts, remove=True
+        )
+
+        for lane in lanes:
+            output = docker_client.containers.run(
+                "python:3.12",
+                ["bash", "-c", "ls /workspace"],
+                volumes={names[lane]: {"bind": "/workspace", "mode": "ro"}},
+                remove=True,
+            ).decode()
+            assert output.split() == [f"{lane}.txt"], (lane, output)
+
+    async def test_cleanup_removes_every_lane_volume(
+        self, db_session, service, docker_client, populate, volume_tracker
+    ):
+        """Pipeline teardown passes a run id and nothing else, so cleanup has
+        to mean "every lane" - otherwise a K=4 fan-out leaks three volumes
+        per run, forever."""
+        run_id = str(uuid4())
+        lanes = [None, "w1", "w2", "w3"]
+        for lane in lanes:
+            volume_tracker.append(generate_volume_name(run_id, lane))
+
+        before = _our_volumes(docker_client)
+        for lane in lanes:
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=lane
+            )
+        assert len(_our_volumes(docker_client) - before) == 4
+
+        await service.cleanup(db_session, run_id)
+
+        assert _our_volumes(docker_client) - before == set()
+        rows = await service.list_for_run(db_session, run_id)
+        assert len(rows) == 4
+        for row in rows:
+            await db_session.refresh(row)
+            assert row.status == WorkspaceStatus.CLEANED.value
+
+    async def test_one_lane_can_be_cleaned_without_touching_its_siblings(
+        self, db_session, service, docker_client, populate, volume_tracker
+    ):
+        run_id = str(uuid4())
+        for lane in ("w1", "w2"):
+            volume_tracker.append(generate_volume_name(run_id, lane))
+        keep = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w1"
+        )
+        drop = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w2"
+        )
+
+        await service.cleanup(db_session, run_id, worker_key="w2")
+
+        assert _volume_exists(docker_client, keep.volume_name)
+        assert not _volume_exists(docker_client, drop.volume_name)
+
+
+class TestLaneOrphanSweepRealDocker:
+    async def test_sweep_reaps_an_orphaned_lane_and_keeps_its_live_siblings(
+        self, db_session, service, docker_client, populate, volume_tracker
+    ):
+        """The sweep is safe at N lanes for the same reason it was safe at
+        one: the ROW is committed before the volume exists, so an unmatched
+        old volume is garbage. That invariant is per-row, not per-run."""
+        run_id = str(uuid4())
+        live_lanes = ["w1", "w2"]
+        for lane in live_lanes:
+            volume_tracker.append(generate_volume_name(run_id, lane))
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=lane
+            )
+
+        # A third lane's volume with no row at all (the crash-after-reset
+        # case), planted old.
+        orphan = generate_volume_name(run_id, "w3")
+        volume_tracker.append(orphan)
+        docker_client.volumes.create(
+            name=orphan,
+            labels={
+                WORKSPACE_VOLUME_LABEL: "true",
+                "lazyaf.created_at": (datetime.utcnow() - timedelta(hours=1)).isoformat(),
+            },
+        )
+
+        # Exact prefix (this run's volumes only): host safety, per the
+        # module docstring - this daemon carries the owner's real volumes.
+        cleaned = await service.audit_orphans(
+            db_session, volume_prefix=generate_volume_name(run_id)
+        )
+
+        assert cleaned == [orphan]
+        assert not _volume_exists(docker_client, orphan)
+        for lane in live_lanes:
+            assert _volume_exists(docker_client, generate_volume_name(run_id, lane))
+            row = await _fetch_lane(db_session, run_id, lane)
+            assert row.status == WorkspaceStatus.READY.value
 
 
 # -----------------------------------------------------------------------------
@@ -409,6 +604,140 @@ class TestRealPopulation:
 
             await service.cleanup(db_session, run_id)
             assert not _volume_exists(docker_client, ws.volume_name)
+        finally:
+            if daemon is not None:
+                try:
+                    daemon.remove(force=True)
+                except docker.errors.NotFound:
+                    pass
+            try:
+                network.remove()
+            except docker.errors.APIError:
+                pass
+
+    async def test_two_lanes_are_populated_at_two_different_commits(
+        self, db_session, docker_client, session_factory, volume_tracker, monkeypatch
+    ):
+        """The end-to-end shape M13 needs, through the REAL clone path.
+
+        One run, two lanes, two DIFFERENT base commits, two independent
+        working trees. Under the old schema this could not even be
+        expressed: the second get_or_create returned the first lane's row
+        and the second worker silently inherited the first one's checkout.
+        The per-row `branch`/`commit_sha` columns carry the base, so a
+        per-worker checkout at a case's base commit needs no new columns.
+        """
+        import app.services.workspace.population  # noqa: F401
+        from app.config import get_settings
+
+        settings = get_settings()
+
+        suffix = uuid4().hex[:8]
+        net_name = f"lazyaf-test-lanenet-{suffix}"
+        seed_volume_name = f"lazyaf-test-laneseed-{suffix}"
+        daemon_name = f"lazyaf-test-lanesrv-{suffix}"
+        repo_id = "lanetestrepo"
+        run_id = str(uuid4())
+        volume_tracker.append(seed_volume_name)
+        for lane in ("w1", "w2"):
+            volume_tracker.append(generate_volume_name(run_id, lane))
+
+        network = docker_client.networks.create(net_name)
+        daemon = None
+        try:
+            # Seed a bare repo with TWO commits on main.
+            # Setup chatter is muted so the ONLY thing on stdout is the two
+            # commit shas (docker's run() returns stdout+stderr combined).
+            seed_script = (
+                "set -e; "
+                "{ "
+                f"git init --bare --initial-branch=main /srv/{repo_id}.git; "
+                f"git clone /srv/{repo_id}.git /tmp/w; "
+                "cd /tmp/w; "
+                "echo first > MARK.md; git add MARK.md; "
+                "git -c user.email=t@t -c user.name=t commit -m one; "
+                "echo second > MARK.md; git add MARK.md; "
+                "git -c user.email=t@t -c user.name=t commit -m two; "
+                "git push origin main; "
+                "} >/dev/null 2>&1; "
+                "git rev-list --reverse main"
+            )
+            shas = (
+                docker_client.containers.run(
+                    "python:3.12",
+                    ["bash", "-c", seed_script],
+                    volumes={seed_volume_name: {"bind": "/srv", "mode": "rw"}},
+                    remove=True,
+                )
+                .decode()
+                .split()
+            )
+            assert len(shas) == 2, shas
+            first_commit = shas[0]
+
+            daemon = docker_client.containers.run(
+                "python:3.12",
+                [
+                    "git", "daemon", "--export-all", "--base-path=/srv",
+                    "--reuseaddr", "--verbose",
+                ],
+                name=daemon_name,
+                network=net_name,
+                volumes={seed_volume_name: {"bind": "/srv", "mode": "ro"}},
+                detach=True,
+            )
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if b"Ready to rumble" in daemon.logs():
+                    break
+                daemon.reload()
+                if daemon.status == "exited":
+                    pytest.fail(f"git daemon died: {daemon.logs().decode(errors='replace')}")
+                time.sleep(0.25)
+            else:
+                pytest.fail("git daemon never became ready")
+
+            monkeypatch.setattr(settings, "container_network", net_name)
+            monkeypatch.setattr(
+                settings,
+                "container_git_url_template",
+                f"git://{daemon_name}/{{repo_id}}.git",
+            )
+
+            service = WorkspaceService(
+                docker_client=docker_client, session_factory=session_factory
+            )
+            # w1 branches off the FIRST commit; w2 takes the branch head.
+            lane_one = await service.get_or_create(
+                db_session, run_id, repo_id, "main", first_commit, worker_key="w1"
+            )
+            lane_two = await service.get_or_create(
+                db_session, run_id, repo_id, "main", None, worker_key="w2"
+            )
+
+            assert lane_one.id != lane_two.id
+            assert lane_one.volume_name != lane_two.volume_name
+            assert lane_one.commit_sha == first_commit
+            assert lane_two.commit_sha is None
+
+            def read_mark(volume_name: str) -> str:
+                return docker_client.containers.run(
+                    "python:3.12",
+                    ["bash", "-c", "cat /workspace/repo/MARK.md"],
+                    volumes={volume_name: {"bind": "/workspace", "mode": "ro"}},
+                    user="1000:1000",
+                    environment={"HOME": "/tmp"},
+                    remove=True,
+                ).decode()
+
+            # Two checkouts, two contents. THIS is what one shared working
+            # tree made impossible.
+            assert "first" in read_mark(lane_one.volume_name)
+            assert "second" in read_mark(lane_two.volume_name)
+
+            await service.cleanup(db_session, run_id)
+            assert not _volume_exists(docker_client, lane_one.volume_name)
+            assert not _volume_exists(docker_client, lane_two.volume_name)
         finally:
             if daemon is not None:
                 try:

@@ -29,12 +29,26 @@ transaction boundary — never with unrelated pending state on the session.
 The periodic orphan-audit task owns its sessions entirely (one per sweep,
 from app.database.async_session or an injected factory).
 
+Lanes (M13-1)
+-------------
+A pipeline run owns one workspace PER LANE — ``(pipeline_run_id,
+worker_key)`` is unique in the database. ``worker_key`` defaults to
+``DEFAULT_WORKER_KEY`` ("default"), and every entry point here takes it as a
+keyword argument that nobody is forced to pass, so a single-worker run
+behaves byte-identically to the pre-M13-1 service: same volume name, same
+lock key, same number of docker objects, same lifecycle.
+
 Locking
 -------
 All locks are keyed by the workspace's VOLUME NAME (deterministic from
-pipeline_run_id via generate_volume_name), so creation, acquire/release,
-cleanup, and the audit all contend on the same key. Locks are in-process
-(single backend process assumption, as on main today).
+``(pipeline_run_id, worker_key)`` via generate_volume_name), so creation,
+acquire/release, cleanup, and the audit all contend on the same key. Locks
+are in-process (single backend process assumption, as on main today).
+
+Because the lock key is now LANE-scoped, two lanes of one run never contend
+on acquire/release — where every step of a run previously serialized through
+one asyncio.Lock. The database's composite unique index, not the lock, is
+what makes concurrent creation of one lane safe across a crash.
 
 Blocking work
 -------------
@@ -59,7 +73,9 @@ from app.services.workspace.state_machine import (
     WorkspaceStatus,
     generate_volume_name,
     is_orphaned,
+    parse_volume_name_parts,
 )
+from app.services.workspace.worker_key import DEFAULT_WORKER_KEY, validate_worker_key
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +126,13 @@ except ImportError:  # pragma: no cover - transient while 12.2-INT lands in para
 # Ceiling on destructive actions per audit sweep: a single pathological
 # sweep (e.g. after a mass DB reset) must not spend minutes deleting
 # hundreds of volumes in one go; the next interval continues the job.
+#
+# M13-1 changed what this counts, not whether it is right: with per-worker
+# lanes, 25 removals covers ~3 runs of a K=8 fan-out rather than 25 runs.
+# A capped sweep is a DEFERRAL (the loop re-runs every 300s and logs the
+# cap hit), not a leak, so the constant stays put until a test shows real
+# starvation — raising it on a hunch just makes the pathological sweep the
+# long one again.
 ORPHAN_AUDIT_MAX_REMOVALS_PER_SWEEP = 25
 
 
@@ -240,11 +263,58 @@ class WorkspaceService:
     # Queries
     # ------------------------------------------------------------------
 
-    async def _get_by_run_id(self, db: AsyncSession, pipeline_run_id: str) -> Workspace | None:
+    async def _get_lane(
+        self, db: AsyncSession, pipeline_run_id: str, worker_key: str
+    ) -> Workspace | None:
+        """The ONE workspace row for a (run, lane), or None.
+
+        scalar_one_or_none is kept on purpose: with the composite unique
+        index in place, two rows for one lane is a corrupted database and
+        must raise, not be silently picked from.
+
+        ``populate_existing`` is load-bearing and is NOT an optimisation
+        knob. The session factory is ``expire_on_commit=False``
+        (``database.py``), so a row already in this session's identity map
+        comes back from cache and is never refreshed from the database. Two
+        callers racing for one lane therefore see this:
+
+            A: creates the row, populates the volume, commits status=READY
+            B: re-reads, gets its OWN CACHED COPY still saying 'creating',
+               concludes the row is stranded, and DELETES A's populated
+               volume out from under it
+
+        A is then left holding a workspace id that no longer exists and
+        ``acquire()`` raises. Measured at ~5% in a unit test whose populate
+        is instant; a real clone takes seconds, so the window is far wider
+        in production. Refreshing here closes it (60/60 green with, ~5%
+        failures without).
+        """
         result = await db.execute(
-            select(Workspace).where(Workspace.pipeline_run_id == pipeline_run_id)
+            select(Workspace)
+            .where(
+                Workspace.pipeline_run_id == pipeline_run_id,
+                Workspace.worker_key == worker_key,
+            )
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
+
+    async def list_for_run(
+        self, db: AsyncSession, pipeline_run_id: str
+    ) -> list[Workspace]:
+        """Every lane of a run, ordered by lane key.
+
+        The ONLY supported way to enumerate a run's workspaces. It exists so
+        no future caller reaches for ``scalar_one_or_none()`` on a
+        run-scoped query — which is exactly what breaks the instant a run
+        fans out (MultipleResultsFound, mid-pipeline).
+        """
+        result = await db.execute(
+            select(Workspace)
+            .where(Workspace.pipeline_run_id == pipeline_run_id)
+            .order_by(Workspace.worker_key)
+        )
+        return list(result.scalars().all())
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -257,33 +327,45 @@ class WorkspaceService:
         repo_id: str,
         branch: str,
         commit_sha: str | None = None,
+        *,
+        worker_key: str | None = None,
     ) -> Workspace:
-        """Idempotently get or create the workspace for a pipeline run.
+        """Idempotently get or create ONE LANE's workspace for a pipeline run.
+
+        ``worker_key`` names the lane (an independent checkout); ``None``
+        means the default lane, which produces exactly the volume name,
+        lock key and lifecycle the pre-M13-1 service produced. K parallel
+        workers pass K distinct keys and get K independent working trees.
 
         Returns the row in READY (or IN_USE) status. On first creation:
         commits a CREATING row (crash marker), creates the named volume,
         populates it (clone into /workspace/repo via populate_workspace),
-        then commits READY. Concurrent calls for the same run are
+        then commits READY. Concurrent calls for the same (run, lane) are
         serialized on an exclusive lock; losers return the winner's row.
+        Calls for DIFFERENT lanes of one run do not contend at all.
 
         A leftover CREATING (crashed create), FAILED, or CLEANED row for
-        the same run is replaced: its volume is removed and a fresh
-        lifecycle starts (new row id, same pipeline_run_id).
+        the same lane is replaced: its volume is removed and a fresh
+        lifecycle starts (new row id, same run + lane).
 
         Session ownership: COMMITS ``db`` (multiple times). Raises
         WorkspaceCreationError on volume/population failure, leaving the
         row FAILED with ``error`` set; the just-created volume is removed
         best-effort on the way out (no leak), and the orphan audit backstops
-        anything that survives a crash.
+        anything that survives a crash. Also raises WorkspaceCreationError
+        if an existing lane was checked out at a different branch/commit
+        than the one requested (see _assert_checkout_matches).
         """
-        volume_name = generate_volume_name(pipeline_run_id)
+        key = DEFAULT_WORKER_KEY if worker_key is None else validate_worker_key(worker_key)
+        volume_name = generate_volume_name(pipeline_run_id, key)
 
         # Fast path: no lock for the common re-read.
-        workspace = await self._get_by_run_id(db, pipeline_run_id)
+        workspace = await self._get_lane(db, pipeline_run_id, key)
         if workspace is not None and workspace.status in (
             WorkspaceStatus.READY.value,
             WorkspaceStatus.IN_USE.value,
         ):
+            self._assert_checkout_matches(workspace, branch, commit_sha)
             return workspace
         # End the fast-path's READ transaction before awaiting the lock:
         # holding it while a concurrent creator commits deadlocks file-backed
@@ -297,24 +379,26 @@ class WorkspaceService:
             volume_name, LockType.EXCLUSIVE, timeout=60.0, reason="get_or_create"
         ):
             # Re-check under the lock: a concurrent creator may have won.
-            workspace = await self._get_by_run_id(db, pipeline_run_id)
+            workspace = await self._get_lane(db, pipeline_run_id, key)
             if workspace is not None:
                 if workspace.status in (
                     WorkspaceStatus.READY.value,
                     WorkspaceStatus.IN_USE.value,
                 ):
+                    self._assert_checkout_matches(workspace, branch, commit_sha)
                     return workspace
                 if workspace.status == WorkspaceStatus.CLEANING.value:
                     raise WorkspaceCreationError(
-                        f"Workspace for run {pipeline_run_id} is being cleaned; "
-                        "cannot recreate mid-cleanup."
+                        f"Workspace for run {pipeline_run_id} lane {key!r} is "
+                        "being cleaned; cannot recreate mid-cleanup."
                     )
                 # CREATING (stranded), FAILED, or CLEANED: replace the row.
                 logger.warning(
-                    "Replacing stale workspace row %s (status=%s) for run %s",
+                    "Replacing stale workspace row %s (status=%s) for run %s lane %s",
                     workspace.id,
                     workspace.status,
                     pipeline_run_id,
+                    key,
                 )
                 await run_in_threadpool(self._sync_remove_volume, volume_name)
                 await db.delete(workspace)
@@ -324,6 +408,7 @@ class WorkspaceService:
             # orphan audit can recover if we die mid-create.
             workspace = Workspace(
                 pipeline_run_id=pipeline_run_id,
+                worker_key=key,
                 repo_id=repo_id,
                 volume_name=volume_name,
                 branch=branch,
@@ -360,10 +445,14 @@ class WorkspaceService:
                 _persist_machine(workspace, machine)
                 await db.commit()
                 logger.error(
-                    "Workspace creation failed for run %s: %s", pipeline_run_id, exc
+                    "Workspace creation failed for run %s lane %s: %s",
+                    pipeline_run_id,
+                    key,
+                    exc,
                 )
                 raise WorkspaceCreationError(
-                    f"Failed to create workspace for run {pipeline_run_id}: {exc}"
+                    f"Failed to create workspace for run {pipeline_run_id} "
+                    f"lane {key!r}: {exc}"
                 ) from exc
 
             machine.transition_to(WorkspaceStatus.READY)
@@ -371,12 +460,37 @@ class WorkspaceService:
             await db.commit()
             await db.refresh(workspace)
             logger.info(
-                "Workspace %s ready for run %s (volume %s)",
+                "Workspace %s ready for run %s lane %s (volume %s)",
                 workspace.id,
                 pipeline_run_id,
+                key,
                 volume_name,
             )
             return workspace
+
+    @staticmethod
+    def _assert_checkout_matches(
+        workspace: Workspace, branch: str, commit_sha: str | None
+    ) -> None:
+        """Refuse to hand back a lane checked out at something else (R1).
+
+        Harmless and unreachable while a run has one lane on one branch —
+        every caller passes the same values out of the run's
+        trigger_context. It stops being harmless the moment lanes carry
+        different bases (a worker branched off ``case.base_commit_sha``,
+        the trunk on the run's branch): returning the existing row would
+        silently give the caller a working tree at the WRONG commit, and the
+        run would look green while measuring nothing.
+        """
+        if workspace.branch == branch and workspace.commit_sha == commit_sha:
+            return
+        raise WorkspaceCreationError(
+            f"Workspace {workspace.id} (run {workspace.pipeline_run_id} lane "
+            f"{workspace.worker_key!r}) is checked out at branch "
+            f"{workspace.branch!r} commit {workspace.commit_sha!r}, but was "
+            f"requested at branch {branch!r} commit {commit_sha!r}. A lane is "
+            "one checkout: use a different worker_key for a different base."
+        )
 
     async def acquire(self, db: AsyncSession, workspace_id: str) -> None:
         """Acquire the workspace for a step: use_count += 1, READY -> IN_USE.
@@ -435,13 +549,31 @@ class WorkspaceService:
             "Released workspace %s (use_count=%d)", workspace_id, workspace.use_count
         )
 
-    async def cleanup(self, db: AsyncSession, pipeline_run_id: str) -> None:
-        """Remove the run's workspace volume and mark the row CLEANED.
+    async def cleanup(
+        self,
+        db: AsyncSession,
+        pipeline_run_id: str,
+        *,
+        worker_key: str | None = None,
+    ) -> None:
+        """Remove a run's workspace volume(s) and mark the row(s) CLEANED.
+
+        ``worker_key=None`` — the pipeline-teardown case, and what every
+        caller passes today — cleans EVERY lane of the run. For a
+        single-worker run that is a one-element list and the behavior is
+        exactly what it was before lanes existed. Pass a key to clean one
+        lane.
 
         MUST be called on pipeline completion AND failure. Idempotent:
         a missing row, an already-CLEANED row, and a missing volume are
         all no-ops. A leaked use_count is force-released with a WARNING
         (cleanup at pipeline end means no step can legitimately hold it).
+
+        Lanes are cleaned one at a time, each under its OWN volume lock —
+        never nested, so a slow lane cannot deadlock against a concurrent
+        acquire on another. A lane that fails does not abort the rest: all
+        lanes are attempted and the failures are re-raised together, because
+        stopping at the first would leak every volume behind it.
 
         Session ownership: ``db`` is only used to locate the database (its
         bind); cleanup NEVER reads from, commits, or otherwise touches the
@@ -450,35 +582,71 @@ class WorkspaceService:
         here would flush it mid-flight — so it opens and commits its OWN
         session (injected session_factory, or one bound to ``db``'s engine).
 
-        Raises WorkspaceCleanupError if volume removal fails (row left
-        FAILED with ``error`` set; cleanup may be retried — FAILED ->
-        CLEANING is a valid transition).
+        Raises WorkspaceCleanupError if any lane's volume removal fails
+        (those rows left FAILED with ``error`` set; cleanup may be retried —
+        FAILED -> CLEANING is a valid transition).
         """
         async with self._own_session(db) as session:
-            workspace = await self._get_by_run_id(session, pipeline_run_id)
-            if workspace is None:
+            if worker_key is None:
+                rows = await self.list_for_run(session, pipeline_run_id)
+            else:
+                key = validate_worker_key(worker_key)
+                one = await self._get_lane(session, pipeline_run_id, key)
+                rows = [one] if one is not None else []
+
+            if not rows:
                 logger.debug("cleanup: no workspace row for run %s", pipeline_run_id)
-                return
-            if workspace.status == WorkspaceStatus.CLEANED.value:
-                logger.debug(
-                    "cleanup: workspace for run %s already cleaned", pipeline_run_id
-                )
                 return
 
             # Same discipline as get_or_create's fast path: never hold a
             # read transaction across an await on the lock. (Capture the
-            # lock key first — rollback expires the instance, and expired
+            # lock keys first — rollback expires the instances, and expired
             # attribute access would lazy-load.)
-            volume_name = workspace.volume_name
+            targets = [
+                (row.id, row.volume_name, row.worker_key)
+                for row in rows
+                if row.status != WorkspaceStatus.CLEANED.value
+            ]
+            if not targets:
+                logger.debug(
+                    "cleanup: every lane of run %s is already cleaned", pipeline_run_id
+                )
+                return
             await session.rollback()
 
-            async with self._locks.lock(
-                volume_name, LockType.EXCLUSIVE, timeout=60.0, reason="cleanup"
-            ):
-                await session.refresh(workspace)
-                if workspace.status == WorkspaceStatus.CLEANED.value:
-                    return
-                await self._clean_row(session, workspace)
+            failures: list[str] = []
+            for ws_id, volume_name, lane in targets:
+                try:
+                    async with self._locks.lock(
+                        volume_name, LockType.EXCLUSIVE, timeout=60.0, reason="cleanup"
+                    ):
+                        workspace = await self._reload(session, ws_id)
+                        if (
+                            workspace is None
+                            or workspace.status == WorkspaceStatus.CLEANED.value
+                        ):
+                            continue
+                        await self._clean_row(session, workspace)
+                except WorkspaceCleanupError as exc:
+                    # Collected, not raised: the remaining lanes' volumes
+                    # would otherwise leak behind the first failure.
+                    failures.append(f"lane {lane!r} (volume {volume_name}): {exc}")
+
+            if failures:
+                raise WorkspaceCleanupError(
+                    f"Cleanup failed for {len(failures)} of {len(targets)} lane(s) "
+                    f"of run {pipeline_run_id}: " + "; ".join(failures)
+                )
+
+    @staticmethod
+    async def _reload(db: AsyncSession, workspace_id: str) -> Workspace | None:
+        """Re-read one row from the DATABASE, past the identity map."""
+        result = await db.execute(
+            select(Workspace)
+            .where(Workspace.id == workspace_id)
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
 
     async def _clean_row(self, db: AsyncSession, workspace: Workspace) -> None:
         """Drive one row to CLEANED through valid machine transitions.
@@ -491,9 +659,14 @@ class WorkspaceService:
         machine = _hydrate_machine(workspace)
 
         if machine.use_count > 0:
+            # The lane is named: in an 8-way fan-out an unattributed leak
+            # report tells you nothing about WHICH worker failed to release.
             logger.warning(
-                "Workspace %s cleaned with leaked use_count=%d; force-releasing",
+                "Workspace %s (run %s lane %s) cleaned with leaked "
+                "use_count=%d; force-releasing",
                 workspace.id,
+                workspace.pipeline_run_id,
+                workspace.worker_key,
                 machine.use_count,
             )
             while machine.use_count > 0:
@@ -515,7 +688,12 @@ class WorkspaceService:
             workspace.error = f"Cleanup failed: {exc}"
             _persist_machine(workspace, machine)
             await db.commit()
-            logger.error("Workspace %s cleanup failed: %s", workspace.id, exc)
+            logger.error(
+                "Workspace %s (lane %s) cleanup failed: %s",
+                workspace.id,
+                workspace.worker_key,
+                exc,
+            )
             raise WorkspaceCleanupError(
                 f"Failed to remove volume {workspace.volume_name}: {exc}"
             ) from exc
@@ -524,7 +702,12 @@ class WorkspaceService:
         _persist_machine(workspace, machine)
         workspace.cleaned_at = datetime.utcnow()
         await db.commit()
-        logger.info("Workspace %s cleaned (volume %s)", workspace.id, workspace.volume_name)
+        logger.info(
+            "Workspace %s cleaned (lane %s, volume %s)",
+            workspace.id,
+            workspace.worker_key,
+            workspace.volume_name,
+        )
 
     # ------------------------------------------------------------------
     # Orphan audit
@@ -556,6 +739,23 @@ class WorkspaceService:
            are created, so an unmatched old volume is garbage; a FAILED
            row's volume is likewise removable — the failure path already
            tried to remove it).
+
+        Lanes (M13-1). None of the three sweeps assumes one workspace per
+        run and none needed structural change when that stopped being true.
+        Sweep 1 is row-scoped; sweep 2's outer join is many-to-one and
+        already yields one result row per workspace; sweep 3 compares
+        against a set of live ROWS, not of runs. The safety property that
+        makes sweep 3 sound is not "one volume per run", it is **the row is
+        committed before the volume exists** (see get_or_create: the
+        CREATING row is committed, and only then is the volume created).
+        That invariant is per-row and holds for the Kth lane exactly as for
+        the first, so more volumes per run does not raise the chance of
+        reaping a live one.
+
+        What lanes DO change is the arithmetic of the cap: a K=8 fan-out
+        turns 25 removals into ~3 runs' worth instead of 25. That is a
+        DEFERRAL, not a leak — the loop re-runs every interval and logs
+        when it caps out — so the constant is deliberately left alone.
 
         Session ownership: COMMITS ``db``. Rows whose volume lock cannot be
         taken quickly are skipped (an active operation owns them).
@@ -646,7 +846,13 @@ class WorkspaceService:
                     name, LockType.EXCLUSIVE, timeout=1.0, reason="orphan-audit"
                 ):
                     await run_in_threadpool(self._sync_remove_volume, name)
-                logger.warning("Orphan audit removed unmatched volume %s", name)
+                run_id, lane_slug = parse_volume_name_parts(name)
+                logger.warning(
+                    "Orphan audit removed unmatched volume %s (run %s lane %s)",
+                    name,
+                    run_id,
+                    lane_slug or DEFAULT_WORKER_KEY,
+                )
                 cleaned.append(name)
                 removed += 1
             except LockTimeoutError:
@@ -668,9 +874,11 @@ class WorkspaceService:
                 if workspace.status == WorkspaceStatus.CLEANED.value:
                     return False
                 logger.warning(
-                    "Orphan audit cleaning workspace %s (run %s, status=%s): %s",
+                    "Orphan audit cleaning workspace %s (run %s, lane %s, "
+                    "status=%s): %s",
                     workspace.id,
                     workspace.pipeline_run_id,
+                    workspace.worker_key,
                     workspace.status,
                     why,
                 )

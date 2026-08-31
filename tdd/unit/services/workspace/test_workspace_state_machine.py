@@ -9,6 +9,7 @@ These tests define the contract for workspace lifecycle management:
 
 Write these tests BEFORE implementing the workspace state machine.
 """
+import re
 import sys
 from pathlib import Path
 from uuid import uuid4
@@ -384,6 +385,150 @@ class TestWorkspaceVolumeNaming:
         name = generate_volume_name(pipeline_run_id)
         parsed_id = parse_volume_name(name)
         assert parsed_id == pipeline_run_id
+
+
+# -----------------------------------------------------------------------------
+# Contract: Per-worker LANES (M13-1)
+# -----------------------------------------------------------------------------
+
+#: Docker's own rule for volume names: first character alphanumeric, the
+#: rest alphanumerics/underscore/dot/hyphen. A name outside this set is
+#: rejected by the daemon, i.e. a whole fan-out dies at provisioning.
+DOCKER_VOLUME_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+
+#: models/workspace.py caps volume_name at String(100).
+VOLUME_NAME_COLUMN_WIDTH = 100
+
+#: Keys chosen to break a naive slugger: path separators (the branch names
+#: M13's strategy catalog actually uses), spaces, uppercase, traversal,
+#: over-length, non-ASCII, empty, and separators-only.
+HOSTILE_KEYS = [
+    "trial/x/w1",
+    "W 1",
+    "../etc",
+    "w" * 200,
+    "\U0001f680",
+    "",
+    "...",
+    "---",
+    "w1 w2\tw3\n",
+    "Ünïcödé",
+]
+
+
+class TestWorkspaceLanes:
+    """A run owns one workspace PER LANE; the lane is part of the name."""
+
+    def test_default_lane_is_byte_identical_to_the_unkeyed_name(self):
+        """THE single-worker guarantee. If this ever drifts, every existing
+        run's volume is orphaned on upgrade and every existing caller
+        (executor mount, debug sidecar, cleanup) mounts a different volume
+        than the one the row points at."""
+        from app.services.workspace.state_machine import generate_volume_name
+        from app.services.workspace.worker_key import DEFAULT_WORKER_KEY
+
+        run_id = str(uuid4())
+        assert (
+            generate_volume_name(run_id)
+            == generate_volume_name(run_id, None)
+            == generate_volume_name(run_id, DEFAULT_WORKER_KEY)
+            == f"lazyaf-ws-{run_id}"
+        )
+
+    def test_a_named_lane_gets_a_suffixed_volume(self):
+        from app.services.workspace.state_machine import generate_volume_name
+
+        run_id = str(uuid4())
+        assert generate_volume_name(run_id, "w1") == f"lazyaf-ws-{run_id}-w1"
+        assert (
+            generate_volume_name(run_id, "integrate")
+            == f"lazyaf-ws-{run_id}-integrate"
+        )
+
+    def test_lanes_of_one_run_get_distinct_volumes(self):
+        from app.services.workspace.state_machine import generate_volume_name
+
+        run_id = str(uuid4())
+        names = {
+            generate_volume_name(run_id, key)
+            for key in (None, "w1", "w2", "w3", "w4", "integrate")
+        }
+        assert len(names) == 6
+
+    def test_a_named_lane_never_collides_with_the_default_lane(self):
+        """The default lane has no suffix and a slug is never empty, so no
+        key can name the trunk's volume — not even the empty string."""
+        from app.services.workspace.state_machine import generate_volume_name
+
+        run_id = str(uuid4())
+        trunk = generate_volume_name(run_id)
+        for key in HOSTILE_KEYS + ["w1", "DEFAULT"]:
+            assert generate_volume_name(run_id, key) != trunk
+
+    @pytest.mark.parametrize("key", HOSTILE_KEYS)
+    def test_hostile_keys_still_produce_legal_volume_names(self, key):
+        from app.services.workspace.state_machine import generate_volume_name
+
+        name = generate_volume_name(str(uuid4()), key)
+        assert DOCKER_VOLUME_NAME.match(name), name
+
+    @pytest.mark.parametrize("key", HOSTILE_KEYS)
+    def test_hostile_keys_fit_the_volume_name_column(self, key):
+        from app.services.workspace.state_machine import generate_volume_name
+
+        assert len(generate_volume_name(str(uuid4()), key)) <= VOLUME_NAME_COLUMN_WIDTH
+
+    def test_a_max_length_key_fits_the_column(self):
+        """The validator's ceiling and the column's width have to be
+        compatible, or a legal lane key is unstorable."""
+        from app.services.workspace.state_machine import generate_volume_name
+        from app.services.workspace.worker_key import MAX_WORKER_KEY_LENGTH
+
+        key = "w" * MAX_WORKER_KEY_LENGTH
+        name = generate_volume_name(str(uuid4()), key)
+        assert len(name) <= VOLUME_NAME_COLUMN_WIDTH
+        assert DOCKER_VOLUME_NAME.match(name)
+
+    def test_keys_that_slug_alike_are_disambiguated(self):
+        """Two lanes must never share one volume. These four all clean to
+        "w-1" and are separated only by the hash."""
+        from app.services.workspace.state_machine import generate_volume_name
+
+        run_id = str(uuid4())
+        keys = ["w/1", "w 1", "w:1", "W_1"]
+        names = {generate_volume_name(run_id, k) for k in keys}
+        assert len(names) == len(keys), names
+
+    def test_clean_keys_carry_no_hash(self):
+        """Legibility in `docker volume ls` is the point of slugging at all:
+        the hash appears only when information was actually lost."""
+        from app.services.workspace.state_machine import generate_volume_name
+
+        run_id = str(uuid4())
+        for key in ("w1", "w2", "integrate", "reviewer_2", "planner.a"):
+            assert generate_volume_name(run_id, key) == f"lazyaf-ws-{run_id}-{key}"
+
+    def test_parse_recovers_the_run_id_from_both_forms(self):
+        from app.services.workspace.state_machine import (
+            generate_volume_name, parse_volume_name
+        )
+
+        run_id = str(uuid4())
+        assert parse_volume_name(generate_volume_name(run_id)) == run_id
+        assert parse_volume_name(generate_volume_name(run_id, "w1")) == run_id
+        assert parse_volume_name(generate_volume_name(run_id, "trial/x/w1")) == run_id
+
+    def test_parse_parts_splits_run_id_from_lane_slug(self):
+        from app.services.workspace.state_machine import (
+            generate_volume_name, parse_volume_name_parts
+        )
+
+        run_id = str(uuid4())
+        assert parse_volume_name_parts(generate_volume_name(run_id)) == (run_id, None)
+        assert parse_volume_name_parts(generate_volume_name(run_id, "w1")) == (
+            run_id,
+            "w1",
+        )
 
 
 # -----------------------------------------------------------------------------

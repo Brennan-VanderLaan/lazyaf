@@ -53,13 +53,20 @@ class FakeWorkspaceService:
         self.ops: list[str] = []
         self.workspaces: dict[str, SimpleNamespace] = {}
 
-    async def get_or_create(self, db, pipeline_run_id, repo_id, branch, commit_sha):
+    async def get_or_create(
+        self, db, pipeline_run_id, repo_id, branch, commit_sha, worker_key=None
+    ):
+        # worker_key is the workspace LANE (M13-1). Keyed by (run, lane)
+        # like the real service, so a fan-out gets distinct workspaces
+        # instead of silently sharing one checkout.
+        lane = (pipeline_run_id, worker_key or "default")
         self.ops.append("get_or_create")
         ws = self.workspaces.setdefault(
-            pipeline_run_id,
+            lane,
             SimpleNamespace(
                 id=f"ws-{pipeline_run_id[:8]}",
-                volume_name=generate_volume_name(pipeline_run_id),
+                worker_key=lane[1],
+                volume_name=generate_volume_name(pipeline_run_id, lane[1]),
                 use_count=0,
             ),
         )

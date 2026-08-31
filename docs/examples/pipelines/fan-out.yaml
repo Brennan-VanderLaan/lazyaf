@@ -1,0 +1,222 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# K agents attempt the same change, each on its own branch; a later step
+# measures them and names the winner. This is the owner's own research
+# hypothesis - "does a wider search beat a better model?" - expressed in the
+# format that exists today.
+#
+# WHAT IS HONEST ABOUT THIS TODAY, and it is a lot:
+#
+#  1. THE ATTEMPTS ARE SEQUENTIAL, NOT PARALLEL. A repo YAML pipeline is a
+#     flat list and the executor walks it one step at a time. Parallel fan-out
+#     needs the graph format (edges + fan-in), which the executor runs
+#     internally but which `.lazyaf/pipelines/*.yaml` has no way to author.
+#
+#  2. ALL THREE ATTEMPTS SHARE ONE CHECKOUT. A run owns one workspace volume,
+#     lazyaf-ws-{run_id}, and every step mounts it. The BRANCHES are separate -
+#     each agent step commits and pushes to its own - but the working tree is
+#     not, and the agent wrapper's `git checkout -B <branch>` creates the
+#     branch AT CURRENT HEAD. Without the reset steps below, attempt 2 would
+#     branch from attempt 1's commit and you would be measuring a relay race,
+#     not a fan-out.
+#
+#     Per-worker workspace lanes are being built right now: as of 2026-08-30
+#     backend/app/services/workspace/worker_key.py defines the lane key and
+#     generate_volume_name() takes it, but the pipeline executor still asks for
+#     one volume per run and no YAML key selects a lane. Check whether that is
+#     still true before you rely on the reset steps.
+#
+#  3. THE RESET STEPS ARE THE ISOLATION. `git checkout --detach <base>` plus
+#     `git clean -fd` puts the tree back where attempt 1 found it. It is a
+#     workaround, and it costs you the real thing a per-worker checkout would
+#     buy: concurrency.
+#
+# COST: THREE FULL AGENT RUNS PER TRIGGER, each of which may commit. This is
+# not a per-commit lane. It fires on a card reaching in_review, so a human
+# asked for it. Point it at a self-hosted endpoint before pointing it at an
+# API - the whole hypothesis is about spending width instead of depth, and
+# width is what a paid API charges for.
+name: "Fan-Out Attempts"
+description: "Three agents attempt the same change on three branches, then a judge step runs the suite against each and names the winner. Sequential today: one run owns one checkout."
+
+triggers:
+  - type: card_complete
+    config:
+      status: in_review
+    on_pass: nothing
+    on_fail: nothing
+
+steps:
+  - id: "baseline"
+    name: "Record the base commit"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        mkdir -p .lazyaf-run
+        grep -qxF '/.lazyaf-run/' .git/info/exclude 2>/dev/null \
+          || echo '/.lazyaf-run/' >> .git/info/exclude
+        git rev-parse HEAD > .lazyaf-run/base-sha
+        echo "[baseline] $(cat .lazyaf-run/base-sha)"
+    on_success: next
+    on_failure: stop
+    timeout: 120
+
+  # An explicit `branch:` is what makes the attempts comparable. Without it
+  # each agent step still gets its OWN branch - lazyaf/agent-<8 hex of the
+  # StepRun id> - but the name is not knowable ahead of time, so the judge step
+  # could not find them.
+  #
+  # `branch:` is also the ONE way to push to the branch the run was triggered
+  # on. Never point it at a branch a push trigger watches: the push fires the
+  # trigger, the trigger starts the run again, and nothing depth-caps the loop.
+  - id: "attempt-1"
+    name: "Attempt 1"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      branch: "lazyaf/fanout-1"
+      commit:
+        enabled: true
+        message: "fanout attempt 1"
+        push: true
+      task: "Implement the card, then make the suite green"
+      description: |
+        Implement the change this card describes. Then run the tests that
+        cover it and keep working until they pass.
+
+        Do not touch anything outside what the card asks for. A smaller diff
+        that passes beats a larger one that also passes - a later step is
+        going to compare you against two other attempts.
+      harness:
+        max_iterations: 30
+        temperature: 0.6
+    on_success: next
+    on_failure: next
+    timeout: 2700
+
+  - id: "reset-1"
+    name: "Reset the tree for attempt 2"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        git checkout --detach "$(cat .lazyaf-run/base-sha)"
+        git clean -fd
+        echo "[reset] back at $(git rev-parse --short HEAD)"
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  - id: "attempt-2"
+    name: "Attempt 2"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      branch: "lazyaf/fanout-2"
+      commit:
+        enabled: true
+        message: "fanout attempt 2"
+        push: true
+      task: "Implement the card, then make the suite green"
+      description: |
+        Implement the change this card describes. Then run the tests that
+        cover it and keep working until they pass.
+
+        Do not touch anything outside what the card asks for. A smaller diff
+        that passes beats a larger one that also passes - a later step is
+        going to compare you against two other attempts.
+      harness:
+        max_iterations: 30
+        temperature: 0.6
+    on_success: next
+    on_failure: next
+    timeout: 2700
+
+  - id: "reset-2"
+    name: "Reset the tree for attempt 3"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        git checkout --detach "$(cat .lazyaf-run/base-sha)"
+        git clean -fd
+        echo "[reset] back at $(git rev-parse --short HEAD)"
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  - id: "attempt-3"
+    name: "Attempt 3"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      branch: "lazyaf/fanout-3"
+      commit:
+        enabled: true
+        message: "fanout attempt 3"
+        push: true
+      task: "Implement the card, then make the suite green"
+      description: |
+        Implement the change this card describes. Then run the tests that
+        cover it and keep working until they pass.
+
+        Do not touch anything outside what the card asks for. A smaller diff
+        that passes beats a larger one that also passes - a later step is
+        going to compare you against two other attempts.
+      harness:
+        max_iterations: 30
+        temperature: 0.6
+    on_success: next
+    on_failure: next
+    timeout: 2700
+
+  # The judge is a SCRIPT step on purpose. "Which attempt passes the suite with
+  # the smallest diff" is arithmetic, and paying a model to do arithmetic is
+  # how an eval becomes a vibe.
+  - id: "judge"
+    name: "Run the suite against each attempt"
+    type: script
+    config:
+      image: "lazyaf-test-runner:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        BASE="$(cat .lazyaf-run/base-sha)"
+        git fetch origin
+        : > .lazyaf-run/fanout-results.txt
+        for n in 1 2 3; do
+          BR="lazyaf/fanout-$n"
+          if ! git rev-parse --verify "origin/$BR" >/dev/null 2>&1; then
+            echo "$BR MISSING - -" >> .lazyaf-run/fanout-results.txt
+            continue
+          fi
+          git checkout --detach "origin/$BR"
+          git clean -fd
+          CHANGED="$(git diff --shortstat "$BASE" HEAD | tr -d '\n')"
+          if (cd backend && uv sync --extra test >/dev/null 2>&1 \
+              && uv run pytest ../tdd/unit -q >/dev/null 2>&1); then
+            echo "$BR PASS ${CHANGED:-no change}" >> .lazyaf-run/fanout-results.txt
+          else
+            echo "$BR FAIL ${CHANGED:-no change}" >> .lazyaf-run/fanout-results.txt
+          fi
+          git checkout --detach "$BASE"
+        done
+        echo "---- fan-out results ----"
+        cat .lazyaf-run/fanout-results.txt
+        grep -q ' PASS ' .lazyaf-run/fanout-results.txt || {
+          echo "no attempt produced a green suite" >&2
+          exit 1
+        }
+    on_success: next
+    on_failure: stop
+    timeout: 3600

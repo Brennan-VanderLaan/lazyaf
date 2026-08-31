@@ -1,0 +1,129 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# A migration safety reviewer that only does work when alembic/ changed.
+#
+# READ THIS FIRST - THE HONEST VERSION OF "ONLY RUNS WHEN":
+# There is no path filter on a trigger. A `push` trigger reads exactly one
+# key, `branches`, and matches it with fnmatch. And there is no conditional
+# step in the repo YAML format: on_success / on_failure take `next`, `stop`,
+# `trigger:{card_id}` and `merge:{branch}` - none of which means "skip the
+# next step". The graph format the executor runs internally DOES have
+# conditional edges, but `.lazyaf/pipelines/*.yaml` has no way to author a
+# graph: PipelineYaml.steps is a flat list.
+#
+# So "only when alembic/ changes" is approximated: a cheap script step decides
+# the scope, and the agent step is told to stop immediately when the scope is
+# SKIP. You still pay for ONE short round trip on commits that touch no
+# migration. On a self-hosted endpoint that is a second of GPU; on a paid API
+# it is a small but real charge on every push, which is the reason this recipe
+# leads with `endpoint:`.
+#
+# COST: one short agent turn on every push; a full review turn only when a
+# migration file changed.
+name: "Migration Review"
+description: "Review Alembic migrations for unsafe operations. A script step decides the scope so the agent no-ops on commits that touch no migration."
+
+triggers:
+  - type: push
+    config:
+      branches: ["main", "feature/*"]
+
+steps:
+  - id: "scope"
+    name: "Did this push touch alembic/?"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        mkdir -p .lazyaf-run
+        grep -qxF '/.lazyaf-run/' .git/info/exclude 2>/dev/null \
+          || echo '/.lazyaf-run/' >> .git/info/exclude
+        python3 - <<'PY'
+        import json, os, subprocess, urllib.request
+        run = json.load(urllib.request.urlopen(
+            f"{os.environ['LAZYAF_BACKEND_URL']}/api/pipeline-runs"
+            f"/{os.environ['LAZYAF_PIPELINE_RUN_ID']}", timeout=30))
+        ctx = run.get("trigger_context") or {}
+        new = ctx.get("commit_sha") or "HEAD"
+        old = ctx.get("old_sha") or ""
+        have = lambda r: subprocess.run(
+            ["git", "cat-file", "-e", r + "^{commit}"]).returncode == 0
+        if not old or set(old) == {"0"} or not have(old):
+            old = new + "~1" if have(new + "~1") else new
+        names = subprocess.run(
+            ["git", "diff", "--name-only", old, new, "--", "backend/alembic/"],
+            capture_output=True, text=True).stdout.split()
+        verdict = "REVIEW" if names else "SKIP"
+        body = subprocess.run(["git", "diff", old, new, "--",
+                               "backend/alembic/"],
+                              capture_output=True, text=True).stdout
+        open(".lazyaf-run/migration-scope", "w").write(verdict + "\n")
+        open(".lazyaf-run/migration.patch", "w", encoding="utf-8").write(body)
+        print(f"[scope] {verdict}: {len(names)} migration file(s) changed")
+        for n in names:
+            print(f"  {n}")
+        PY
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  - id: "migration-review"
+    name: "Review the migration"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      commit: false
+      task: "Review the Alembic migration in this push for unsafe operations"
+      description: |
+        FIRST, read .lazyaf-run/migration-scope. If it says SKIP, write a
+        two-line .lazyaf-run/migration.md - the word SAFE, then the line
+        "no migration changed in this push" - and finish immediately. Do not
+        read anything else. This is the common case and it should cost one
+        turn.
+
+        If it says REVIEW, read .lazyaf-run/migration.patch and judge it
+        against the tables it touches (backend/app/models/).
+
+        Write .lazyaf-run/migration.md, first line exactly one of:
+
+          UNSAFE
+          SAFE
+
+        UNSAFE means at least one of:
+        - a column or table is dropped, or renamed, with no two-step
+          deploy (add-and-backfill first, drop in a later release);
+        - a NOT NULL column is added with no server_default and no backfill,
+          so the migration fails on any non-empty table;
+        - a unique constraint or index is added over data that may already
+          violate it;
+        - a data migration with no batching over a table that can be large;
+        - no downgrade path, or a downgrade that loses data silently.
+
+        Under `## Why`, one sentence per finding, naming the operation and
+        the table. Under `## Safer`, the two-step version.
+      harness:
+        max_iterations: 16
+        temperature: 0
+    on_success: next
+    on_failure: stop
+    timeout: 900
+
+  - id: "verdict"
+    name: "Fail on an unsafe migration"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        cat .lazyaf-run/migration.md
+        if head -n 1 .lazyaf-run/migration.md | grep -q '^UNSAFE'; then
+          echo "migration review reported UNSAFE" >&2
+          exit 1
+        fi
+    on_success: next
+    on_failure: stop
+    timeout: 120

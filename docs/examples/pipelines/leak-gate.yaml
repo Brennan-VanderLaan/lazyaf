@@ -1,0 +1,30 @@
+# EXAMPLE - INERT. This file is in docs/, so LazyAF never reads it.
+# Copy it into .lazyaf/pipelines/ to arm it, and read docs/examples/README.md
+# first: a file in .lazyaf/pipelines/ runs on the next push.
+#
+# COST: zero model calls. .github/scripts/scan_repo_secrets.py is stdlib-only.
+# Measured on this repo at the time this was written: 660 tracked files
+# scanned, exit 0, 0.55s including interpreter startup.
+#
+# branches: ["*"] is safe HERE because this pipeline has no agent step that
+# pushes. See "the push loop" in docs/examples/README.md before copying that
+# glob into a pipeline that does.
+name: "Leak Gate"
+description: "Refuse a push carrying a credential-shaped string. No model call: a stdlib scan of every tracked file, on every branch."
+
+triggers:
+  - type: push
+    config:
+      branches: ["*"]
+
+steps:
+  - id: "secret-scan"
+    name: "Secret scan"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        python3 .github/scripts/scan_repo_secrets.py
+    on_success: next
+    on_failure: stop
+    timeout: 120

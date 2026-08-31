@@ -1,0 +1,112 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# "What did this diff leave untested?"
+#
+# The thing a coverage tool cannot tell you: coverage says which LINES ran,
+# not which BEHAVIOURS have an assertion. An agent reading the diff can name
+# the behaviour and the test that should exist.
+#
+# COST: one agent step per push. On `endpoint: local-4090` that is GPU
+# seconds (cost_source="gpu-node"); swap `agent`/`endpoint` for
+# `agent: claude-code` and it is a real API bill per push.
+#
+# This lane INFORMS by default - a named gap is not automatically a reason to
+# refuse a push, and a gate you argue with is a gate you turn off. The last
+# step shows the two-line change that makes it blocking.
+name: "Test Gap"
+description: "An agent reads the pushed diff and names the behaviours it added or changed that no test exercises."
+
+triggers:
+  - type: push
+    config:
+      branches: ["main", "feature/*"]
+
+steps:
+  - id: "collect-diff"
+    name: "Collect the pushed diff"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        mkdir -p .lazyaf-run
+        grep -qxF '/.lazyaf-run/' .git/info/exclude 2>/dev/null \
+          || echo '/.lazyaf-run/' >> .git/info/exclude
+        python3 - <<'PY'
+        import json, os, subprocess, urllib.request
+        run = json.load(urllib.request.urlopen(
+            f"{os.environ['LAZYAF_BACKEND_URL']}/api/pipeline-runs"
+            f"/{os.environ['LAZYAF_PIPELINE_RUN_ID']}", timeout=30))
+        ctx = run.get("trigger_context") or {}
+        new = ctx.get("commit_sha") or "HEAD"
+        old = ctx.get("old_sha") or ""
+        have = lambda r: subprocess.run(
+            ["git", "cat-file", "-e", r + "^{commit}"]).returncode == 0
+        if not old or set(old) == {"0"} or not have(old):
+            old = new + "~1" if have(new + "~1") else new
+        diff = subprocess.run(["git", "diff", old, new],
+                              capture_output=True, text=True).stdout
+        open(".lazyaf-run/diff.patch", "w", encoding="utf-8").write(diff[:200000])
+        print(f"[diff] {old[:12]}..{new[:12]} -> .lazyaf-run/diff.patch "
+              f"({len(diff)} bytes)")
+        PY
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  - id: "gap-scan"
+    name: "Name the untested behaviour"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      commit: false
+      task: "List the behaviours this diff added or changed that no test asserts"
+      description: |
+        Read .lazyaf-run/diff.patch, then look at the test suite in the
+        checkout you are sitting in.
+
+        For every behaviour the diff ADDED or CHANGED, decide whether an
+        existing test would FAIL if that behaviour regressed. A test that
+        merely executes the line does not count - the question is whether it
+        would go red.
+
+        Write .lazyaf-run/test-gaps.md:
+
+          ## Gaps
+          - <source file>:<symbol> - <the behaviour, in one sentence>
+            test: <the test file and test name that should exist>
+            fails when: <what breaks it, concretely>
+
+        Rules:
+        - Name a concrete failing input for every gap. "Should test errors"
+          is not a gap, it is a mood.
+        - Skip pure refactors that changed no behaviour. Say so instead.
+        - If nothing is missing, write "## Gaps" and nothing under it.
+      harness:
+        max_iterations: 20
+        temperature: 0
+    on_success: next
+    on_failure: stop
+    timeout: 1200
+
+  - id: "report"
+    name: "Report the gaps"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        cat .lazyaf-run/test-gaps.md
+        # TO MAKE THIS BLOCKING, uncomment the two lines below. The run then
+        # goes red whenever the gap list is non-empty, because on_failure is
+        # `stop` and a `stop` completes the run with the STEP's verdict.
+        # grep -q '^- ' .lazyaf-run/test-gaps.md \
+        #   && { echo "untested behaviour in this push" >&2; exit 1; }
+        echo "[test-gap] informational lane: this step fails only when the"
+        echo "[test-gap] agent wrote no report at all, never on a gap."
+    on_success: next
+    on_failure: stop
+    timeout: 120

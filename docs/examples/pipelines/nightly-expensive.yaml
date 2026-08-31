@@ -1,0 +1,169 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# THE EXPENSIVE LANE, and the other half of the split. Everything here needs
+# judgement, takes minutes, and costs either GPU time or money. None of it
+# belongs on a push.
+#
+# HOW IT FIRES: not on a push. `triggers: []` means nothing starts it
+# automatically, because there is no scheduler in LazyAF - TriggerService
+# handles `push` and `card_complete` and nothing else. Your host's cron does:
+#
+#     0 2 * * *  curl -fsS -XPOST \
+#       -H 'content-type: application/json' -d '{"trigger_type":"schedule"}' \
+#       http://lazyaf:8000/api/pipelines/<pipeline_id>/run
+#
+# `schedule` is in the accepted trigger_type vocabulary on that endpoint, so
+# the run is LABELLED as scheduled in the run list and in the usage rollup.
+# It is a label, not a scheduler.
+#
+# HOW TO DECIDE WHAT GOES WHERE:
+#   cheap lane      deterministic, seconds, same answer twice     every push
+#   expensive lane  judgement, minutes, a bill or a GPU           nightly
+#
+# COST: three agent steps per run, once a night rather than once a push. On a
+# trunk taking 30 pushes a day that is a 30x difference, which is the entire
+# reason the split exists. Every step here names `endpoint:` so the bill is
+# GPU-hours on hardware you own (cost_source="gpu-node") rather than API
+# dollars; swap in `agent: claude-code` per step when you want the better
+# model on the one question that deserves it.
+name: "Nightly (expensive)"
+description: "The judgement lane: full suite, then an AI review, a test-gap pass and a doc-drift pass over everything that landed since yesterday. Fired by your own cron, never by a push."
+
+triggers: []
+
+steps:
+  - id: "collect-range"
+    name: "Collect everything that landed since yesterday"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        mkdir -p .lazyaf-run
+        grep -qxF '/.lazyaf-run/' .git/info/exclude 2>/dev/null \
+          || echo '/.lazyaf-run/' >> .git/info/exclude
+        FROM="$(git rev-list -1 --before='24 hours ago' HEAD || true)"
+        [ -n "$FROM" ] || FROM="$(git rev-list --max-count=20 HEAD | tail -n 1)"
+        echo "$FROM" > .lazyaf-run/range-from
+        git diff "$FROM..HEAD" > .lazyaf-run/diff.patch
+        git log --no-merges --pretty='%h %s' "$FROM..HEAD" \
+          > .lazyaf-run/commits.txt
+        echo "[range] $FROM..HEAD, $(wc -l < .lazyaf-run/commits.txt) commits, \
+        $(wc -c < .lazyaf-run/diff.patch) bytes of diff"
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  - id: "full-suite"
+    name: "Full test suite"
+    type: script
+    config:
+      image: "lazyaf-test-runner:dev"
+      command: |
+        set -e
+        cd backend
+        uv sync --all-extras
+        uv run pytest ../tdd/unit ../tdd/integration -q
+    on_success: next
+    on_failure: stop
+    timeout: 3600
+
+  - id: "review"
+    name: "AI review of the day's diff"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      commit: false
+      task: "Review everything that landed in the last day"
+      description: |
+        .lazyaf-run/diff.patch is everything that landed since yesterday and
+        .lazyaf-run/commits.txt lists the commits.
+
+        Write .lazyaf-run/review.md with a `## Verdict` line - BLOCKER or OK -
+        then `## Findings` as `file:line - one sentence` entries. Only report
+        what you can point at a line for. BLOCKER means unsafe to ship: data
+        loss, a credential, a broken migration, an unhandled failure path, or
+        a test that cannot fail.
+      harness:
+        max_iterations: 30
+        temperature: 0
+    on_success: next
+    on_failure: stop
+    timeout: 2700
+
+  - id: "gaps"
+    name: "Test-gap pass"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      commit: false
+      task: "Name the behaviour this day's work left untested"
+      description: |
+        Read .lazyaf-run/diff.patch, then the test suite in the checkout.
+
+        For every behaviour the diff added or changed, decide whether an
+        existing test would GO RED if it regressed. Write
+        .lazyaf-run/test-gaps.md as `## Gaps` and, per gap, the source symbol,
+        the test that should exist, and a concrete input that breaks it.
+      harness:
+        max_iterations: 30
+        temperature: 0
+    on_success: next
+    on_failure: stop
+    timeout: 2700
+
+  - id: "docs"
+    name: "Doc-drift pass"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      commit: false
+      task: "Find the documentation this day's work made false"
+      description: |
+        Read .lazyaf-run/diff.patch, then the docs describing what it touched.
+
+        You are looking for sentences that are now FALSE - not missing ones.
+        Write .lazyaf-run/doc-drift.md: first line DRIFT or OK, then one entry
+        per stale claim as `doc:line says "<claim>", but <file>:<symbol> now
+        <what it does>`.
+      harness:
+        max_iterations: 24
+        temperature: 0
+    on_success: next
+    on_failure: stop
+    timeout: 2700
+
+  # One report, one verdict. A nightly lane that fails silently is a nightly
+  # lane nobody reads, so this step is the only one allowed to be red.
+  - id: "report"
+    name: "Nightly report"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        for f in review.md test-gaps.md doc-drift.md; do
+          echo "================ $f ================"
+          cat ".lazyaf-run/$f" 2>/dev/null || echo "(not written)"
+        done
+        FAIL=0
+        if grep -qi '^BLOCKER' .lazyaf-run/review.md 2>/dev/null; then
+          echo "review reported a BLOCKER" >&2
+          FAIL=1
+        fi
+        if head -n 1 .lazyaf-run/doc-drift.md 2>/dev/null | grep -q '^DRIFT'; then
+          echo "the docs drifted" >&2
+          FAIL=1
+        fi
+        if [ "$FAIL" != "0" ]; then
+          exit 1
+        fi
+        echo "[nightly] clean"
+    on_success: next
+    on_failure: stop
+    timeout: 300

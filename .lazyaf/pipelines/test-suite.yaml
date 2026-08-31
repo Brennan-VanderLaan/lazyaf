@@ -1,5 +1,5 @@
 name: "Test Suite"
-description: "Tiered dogfood CI: T1 unit/demos/integration, T2 Docker integration, T3 e2e quick - each tier gated by scripts/ci_gate.py (R4: skip baseline + executed-count floors), then verify-executor asserts the local execution path (and, from 12.3, the control-layer reporting path) ran every script step"
+description: "Tiered dogfood CI: a stdlib secret scan, then T1 unit/demos/integration, T2 Docker integration, T3 e2e quick - each tier gated by scripts/ci_gate.py (R4: skip baseline + executed-count floors), then verify-executor asserts the local execution path (and, from 12.3, the control-layer reporting path) ran every script step"
 triggers:
   - type: push
     config:
@@ -29,6 +29,47 @@ triggers:
 # volume; the images bake PIP_USER/PYTHONUSERBASE/NPM_CONFIG_PREFIX/PATH so
 # per-step tool installs land there without any PATH exports in commands.
 steps:
+  # LEAK GATE, FIRST AND CHEAPEST. `.github/scripts/scan_repo_secrets.py`
+  # existed and ran in the RELEASE workflow, but the dogfood pipeline never
+  # called it - so a credential committed and pushed to LazyAF passed LazyAF.
+  # A push gate that does not run the project's own leak gate is exactly the
+  # dark behaviour R1 exists to remove, and the owner's standing constraint is
+  # "do not leak AI api keys".
+  #
+  # It is the FIRST step because it is the cheapest one that can refuse a
+  # push: stdlib-only, no dependency sync, no Docker socket, and a full pass
+  # over every tracked file finishes in about a second (660 files at the time
+  # this landed). Every second it saves is a second a real key is not sitting
+  # in a public repo.
+  #
+  # It runs on lazyaf-base:dev in CONTROL MODE like every other step, so it is
+  # covered by verify-executor's assertions the same way: executor == 'local'
+  # (no `requires:`), non-marker logs delivered over POST /api/steps/{id}/logs
+  # (the scanner always prints its "scanned N of M tracked files" line), and a
+  # StepUsage row. lazyaf-base bakes git and python3.12, which is everything
+  # the scanner needs: `git ls-files`, `git check-ignore` and the stdlib.
+  #
+  # `on_failure: stop` is the point. Exit 1 = a finding, and a `stop` completes
+  # the run with THIS step's verdict - so a finding FAILS THE RUN rather than
+  # warning into a log nobody reads. Exit 2 ("the scanner could not run", e.g.
+  # not a git checkout) fails it too, which is the honest reading: a leak gate
+  # that could not look is not a leak gate that found nothing.
+  #
+  # NOT --history: the working tree is what gets published, a history scan
+  # needs an unshallow clone, and this must stay cheap enough to sit in front
+  # of every push. The secret-scan workflow exposes --history as an on-demand
+  # audit.
+  - id: "secret-scan"
+    name: "Secret scan (leak gate)"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        python3 .github/scripts/scan_repo_secrets.py
+    on_success: next
+    on_failure: stop
+    timeout: 120
+
   # uv and node are BAKED into lazyaf-test-runner (the 12.2-INT install-uv
   # bootstrap step dissolved into the image at 12.3, per PLAN).
   - id: "sync-deps"

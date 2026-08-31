@@ -1,0 +1,100 @@
+# EXAMPLE - INERT. Copy into .lazyaf/pipelines/ to arm it.
+#
+# Release notes written from the actual commit range, and committed to a
+# branch you can read before you tag.
+#
+# NOTE THE EMPTY TRIGGER LIST. This pipeline fires on nothing. There is no
+# built-in scheduler: TriggerService handles exactly two events, `push` and
+# `card_complete`, and nothing in the backend polls a clock. "Nightly" is your
+# host's cron calling
+#
+#     POST /api/pipelines/{pipeline_id}/run   {"trigger_type": "manual"}
+#
+# which is also what the Run button does. `schedule` is an accepted
+# trigger_type on that endpoint - it is a LABEL for the run, not a scheduler.
+#
+# COST: one agent step per run, and you choose when to run it. This is the
+# shape every expensive lane should have.
+name: "Release Notes"
+description: "An agent reads the commit range since the last tag and writes CHANGELOG-draft.md, committed to its own branch. Fired by hand or by your own cron, never by a push."
+
+triggers: []
+
+steps:
+  - id: "commit-range"
+    name: "Collect the commit range"
+    type: script
+    config:
+      image: "lazyaf-base:dev"
+      command: |
+        set -e
+        cd /workspace/repo
+        mkdir -p .lazyaf-run
+        grep -qxF '/.lazyaf-run/' .git/info/exclude 2>/dev/null \
+          || echo '/.lazyaf-run/' >> .git/info/exclude
+        # The clone carries full history and tags, so the range is a local
+        # question. If the repo has never been tagged, fall back to a window.
+        if FROM="$(git describe --tags --abbrev=0 2>/dev/null)"; then
+          echo "[range] since tag $FROM"
+        else
+          FROM="$(git rev-list --max-count=50 HEAD | tail -n 1)"
+          echo "[range] no tag found; using the last 50 commits from $FROM"
+        fi
+        echo "$FROM" > .lazyaf-run/range-from
+        git log --no-merges --pretty='%h %s' "$FROM..HEAD" \
+          > .lazyaf-run/commits.txt
+        git diff --stat "$FROM..HEAD" > .lazyaf-run/range-stat.txt
+        echo "[range] $(wc -l < .lazyaf-run/commits.txt) commits"
+        cat .lazyaf-run/commits.txt
+    on_success: next
+    on_failure: stop
+    timeout: 300
+
+  # This step COMMITS, unlike every read-only reviewer in this catalog.
+  # `branch:` is explicit so the draft lands somewhere you can find. It is a
+  # `lazyaf/` branch and no trigger in this catalog watches `lazyaf/*`, which
+  # is what keeps the push from starting another run.
+  - id: "write-notes"
+    name: "Write the release notes"
+    type: agent
+    config:
+      agent: openai-harness
+      endpoint: "local-4090"
+      branch: "lazyaf/release-notes"
+      commit:
+        enabled: true
+        message: "docs: release notes draft"
+        push: true
+      task: "Write CHANGELOG-draft.md for the commit range"
+      description: |
+        .lazyaf-run/commits.txt is every non-merge commit in this release
+        range, one per line. .lazyaf-run/range-stat.txt is the diffstat.
+
+        Write CHANGELOG-draft.md at the repository root:
+
+          # <the range, e.g. v0.4.0..HEAD>
+
+          ## Added
+          ## Changed
+          ## Fixed
+          ## Breaking
+
+        Rules:
+        - One bullet per user-visible change, in the words of someone who
+          uses this software - not in the words of the commit message.
+        - Group the commits that are one change into one bullet. Ten commits
+          that build one feature are one line.
+        - Read the actual diff when a subject line is not enough. You are
+          sitting in the checkout.
+        - Drop pure chores: version bumps, formatting, dependency pins with
+          no behaviour change. A changelog nobody trims is a changelog
+          nobody reads.
+        - Leave a section out entirely if it is empty. Do not write
+          "None".
+        - Under Breaking, say what a reader has to DO, not just what moved.
+      harness:
+        max_iterations: 24
+        temperature: 0.2
+    on_success: next
+    on_failure: stop
+    timeout: 1800

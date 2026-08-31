@@ -69,6 +69,7 @@ from app.services.workspace.pipeline_state_machine import (
     PipelineStatus,
 )
 from app.services.workspace.state_machine import generate_volume_name
+from app.services.workspace.worker_key import worker_key_for_step
 # 12.7 debug re-run. Imported at module scope rather than lazily for two
 # reasons: the gate runs on EVERY executor step (a lazy import per step is
 # noise), and this import is what registers `app.models.debug` - and with it
@@ -2797,13 +2798,24 @@ class PipelineExecutor:
                 branch = context.get("branch") or repo.default_branch
                 commit_sha = context.get("commit_sha")
 
+                # The LANE this step runs in (M13-1). Every pre-M13 step
+                # resolves to DEFAULT_WORKER_KEY, whose volume name is
+                # byte-identical to the old one-per-run name - so this is a
+                # no-op until a strategy template writes lazyaf_workspace.
+                workspace_volume = None
                 if not is_remote:
                     workspace = await workspace_service.get_or_create(
-                        db, run_id, repo.id, branch, commit_sha
+                        db, run_id, repo.id, branch, commit_sha,
+                        worker_key=worker_key_for_step(step_config),
                     )
                     await workspace_service.acquire(db, workspace.id)
                     acquired = True
                     workspace_id = workspace.id
+                    # Carry the row's OWN name forward rather than recomputing
+                    # it downstream. Two independent derivations of one volume
+                    # name is how a worker silently gets handed the trunk
+                    # checkout on an otherwise green run (R3).
+                    workspace_volume = workspace.volume_name
 
                 executor = await self._get_executor(mode)
                 # M14: resolved a SECOND time here, on this task's own session
@@ -2819,7 +2831,7 @@ class PipelineExecutor:
                 )
                 exec_config, exec_context = self._build_local_execution_config(
                     pipeline_run, step_run, step_type, step_config, timeout, params,
-                    endpoint=endpoint,
+                    endpoint=endpoint, workspace_volume=workspace_volume,
                 )
                 if step_type == "agent":
                     await self._attach_agent_payload(
@@ -3187,6 +3199,7 @@ class PipelineExecutor:
         timeout: int,
         params: dict[str, Any] | None,
         endpoint=None,
+        workspace_volume: str | None = None,
     ) -> tuple[dict, dict]:
         """Build (step_config, execution_context) for LocalExecutor.execute_step.
 
@@ -3282,7 +3295,11 @@ class PipelineExecutor:
             # Unique per StepRun so a re-run never hits the idempotency cache
             # of an older attempt.
             "execution_key": f"{pipeline_run.id}:{step_run.step_index}:{step_run.id}",
-            "workspace_volume": generate_volume_name(pipeline_run.id),
+            # The acquired row's own name when the caller has one; the
+            # default-lane name otherwise (the remote path, which owns no
+            # Workspace row). NEVER recompute a lane name here - see the
+            # note at the get_or_create call site.
+            "workspace_volume": workspace_volume or generate_volume_name(pipeline_run.id),
         }
         if endpoint is not None:
             # The three lines wave 5 named (see the docstring). `gpu_fraction`

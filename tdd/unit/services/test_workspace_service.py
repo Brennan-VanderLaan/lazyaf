@@ -20,6 +20,7 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
@@ -29,9 +30,11 @@ from app.database import Base
 from app.models.pipeline import Pipeline, PipelineRun
 from app.models.workspace import Workspace
 from app.services.workspace.state_machine import WorkspaceStatus, generate_volume_name
+from app.services.workspace.worker_key import DEFAULT_WORKER_KEY
 from app.services import workspace_service as ws_module
 from app.services.workspace_service import (
     WorkspaceAcquisitionError,
+    WorkspaceCleanupError,
     WorkspaceCreationError,
     WorkspaceService,
     start_orphan_audit,
@@ -155,6 +158,18 @@ async def _fetch(db: AsyncSession, run_id: str) -> Workspace | None:
     result = await db.execute(
         select(Workspace)
         .where(Workspace.pipeline_run_id == run_id)
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _fetch_lane(db: AsyncSession, run_id: str, worker_key: str) -> Workspace | None:
+    """_fetch, scoped to one LANE (a run may own several — M13-1)."""
+    result = await db.execute(
+        select(Workspace)
+        .where(
+            Workspace.pipeline_run_id == run_id, Workspace.worker_key == worker_key
+        )
         .execution_options(populate_existing=True)
     )
     return result.scalar_one_or_none()
@@ -531,11 +546,14 @@ def _old(minutes: int) -> datetime:
     return datetime.utcnow() - timedelta(minutes=minutes)
 
 
-async def _plant_row(db, run_id, status, updated_minutes_ago, use_count=0):
+async def _plant_row(
+    db, run_id, status, updated_minutes_ago, use_count=0, worker_key=DEFAULT_WORKER_KEY
+):
     ws = Workspace(
         pipeline_run_id=run_id,
+        worker_key=worker_key,
         repo_id="repo-1",
-        volume_name=generate_volume_name(run_id),
+        volume_name=generate_volume_name(run_id, worker_key),
         status=status.value,
         use_count=use_count,
         updated_at=_old(updated_minutes_ago),
@@ -849,3 +867,479 @@ class TestModuleContract:
     def test_volume_names_use_full_run_id(self):
         run_id = "abcd1234-5678-9012-3456-789012345678"
         assert generate_volume_name(run_id) == f"lazyaf-ws-{run_id}"
+
+
+# -----------------------------------------------------------------------------
+# Per-worker LANES (M13-1)
+#
+# A run owns one workspace PER LANE. Without this, K parallel agent steps in
+# a fan-out all mount ONE working tree and any conflict rate a benchmark
+# reports is a property of the schema rather than of the strategy under
+# test. The lane axis is what lets K workers hold K independent checkouts
+# and integrate through git instead of through a shared directory.
+# -----------------------------------------------------------------------------
+
+
+class TestLanes:
+    async def test_two_lanes_get_two_rows_and_two_volumes(
+        self, db_session, service, fake_docker, populate, run_id
+    ):
+        """THE enabling behavior: one run, two independent checkouts."""
+        a = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w1"
+        )
+        b = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w2"
+        )
+
+        assert a.id != b.id
+        assert a.volume_name != b.volume_name
+        assert a.volume_name == f"lazyaf-ws-{run_id}-w1"
+        assert b.volume_name == f"lazyaf-ws-{run_id}-w2"
+        # Two REAL volumes, and two clones into them.
+        assert a.volume_name in fake_docker.store
+        assert b.volume_name in fake_docker.store
+        assert len(populate.calls) == 2
+
+        rows = (await db_session.execute(select(Workspace))).scalars().all()
+        assert {r.worker_key for r in rows} == {"w1", "w2"}
+
+    async def test_same_lane_is_idempotent(
+        self, db_session, service, populate, run_id
+    ):
+        first = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w1"
+        )
+        second = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w1"
+        )
+
+        assert second.id == first.id
+        assert len(populate.calls) == 1
+
+    async def test_default_key_and_no_key_are_the_same_workspace(
+        self, db_session, service, fake_docker, populate, run_id
+    ):
+        """The single-worker guarantee at the service level: passing the
+        sentinel explicitly must not fork a second checkout."""
+        implicit = await service.get_or_create(db_session, run_id, "repo-1", "main", None)
+        explicit = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key=DEFAULT_WORKER_KEY
+        )
+
+        assert explicit.id == implicit.id
+        assert implicit.worker_key == DEFAULT_WORKER_KEY
+        assert implicit.volume_name == f"lazyaf-ws-{run_id}"
+        assert len(populate.calls) == 1
+        assert len(fake_docker.store) == 1
+
+    async def test_a_single_worker_run_creates_exactly_one_object_of_each_kind(
+        self, db_session, service, fake_docker, populate, run_id
+    ):
+        """The non-negotiable: the overwhelmingly common case is byte-for-byte
+        what it was before lanes existed — one row, one volume with the
+        unsuffixed name, one populate container, one lock key, and nothing
+        left behind after cleanup."""
+        ws = await service.get_or_create(db_session, run_id, "repo-1", "main", None)
+        await service.acquire(db_session, ws.id)
+        await service.release(db_session, ws.id)
+
+        assert ws.volume_name == generate_volume_name(run_id)
+        assert set(fake_docker.store) == {f"lazyaf-ws-{run_id}"}
+        assert len(populate.calls) == 1
+        rows = (await db_session.execute(select(Workspace))).scalars().all()
+        assert len(rows) == 1
+
+        await service.cleanup(db_session, run_id)
+
+        assert fake_docker.store == {}
+        assert service._locks.get_lock_count(ws.volume_name) == 0
+        row = await _fetch(db_session, run_id)
+        assert row.status == WorkspaceStatus.CLEANED.value
+
+    async def test_invalid_lane_key_is_refused_loudly(
+        self, db_session, service, populate, run_id
+    ):
+        with pytest.raises(ValueError, match="non-empty"):
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=""
+            )
+        with pytest.raises(ValueError, match="must be a string"):
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=7
+            )
+        assert populate.calls == []
+
+    async def test_duplicate_row_for_one_lane_is_refused_by_the_database(
+        self, db_session, service, populate, run_id
+    ):
+        """The in-process lock is single-process by design, so the DATABASE
+        has to be the backstop. Without the composite unique index a second
+        row for one lane means a second volume and a second clone that
+        nothing will ever find again, release, or clean."""
+        await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w1"
+        )
+
+        db_session.add(
+            Workspace(
+                pipeline_run_id=run_id,
+                worker_key="w1",
+                repo_id="repo-1",
+                volume_name="lazyaf-ws-some-other-name",
+                status=WorkspaceStatus.CREATING.value,
+                use_count=0,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await db_session.commit()
+        await db_session.rollback()
+
+    async def test_two_runs_may_share_a_lane_name(
+        self, db_session, service, populate
+    ):
+        """Uniqueness is (run, lane), not lane: every run has a "w1"."""
+        run_a, run_b = str(uuid4()), str(uuid4())
+        a = await service.get_or_create(
+            db_session, run_a, "repo-1", "main", None, worker_key="w1"
+        )
+        b = await service.get_or_create(
+            db_session, run_b, "repo-1", "main", None, worker_key="w1"
+        )
+        assert a.id != b.id
+        assert a.volume_name != b.volume_name
+
+    async def test_list_for_run_enumerates_every_lane(
+        self, db_session, service, populate, run_id
+    ):
+        for key in ("w2", "w1", None):
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=key
+            )
+
+        rows = await service.list_for_run(db_session, run_id)
+
+        assert [r.worker_key for r in rows] == [DEFAULT_WORKER_KEY, "w1", "w2"]
+
+    async def test_use_count_is_per_lane(
+        self, db_session, service, populate, run_id
+    ):
+        """use_count survives lanes as an INTEGER because a single lane still
+        has concurrent holders (parallel entry points, the debug gate's pin
+        alongside a paused step). What lanes change is that lane B's count is
+        not lane A's."""
+        a = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w1"
+        )
+        b = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w2"
+        )
+
+        await service.acquire(db_session, a.id)
+        await service.acquire(db_session, a.id)
+        await service.acquire(db_session, b.id)
+
+        assert (await _fetch_lane(db_session, run_id, "w1")).use_count == 2
+        assert (await _fetch_lane(db_session, run_id, "w2")).use_count == 1
+
+    async def test_lanes_do_not_contend_on_one_lock(
+        self, db_session, service, populate, run_id
+    ):
+        """Lock keys are volume names and volume names are lane-scoped, so
+        K workers no longer serialize through one asyncio.Lock the way every
+        step of a run used to."""
+        a = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w1"
+        )
+        b = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w2"
+        )
+        assert a.volume_name != b.volume_name
+
+    async def test_concurrent_calls_for_one_lane_create_one_workspace(
+        self, tmp_path, service, populate, run_id
+    ):
+        """The existing single-workspace race, re-run at lane grain."""
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{(tmp_path / 'lanes.db').as_posix()}", echo=False
+        )
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        async def call(key):
+            async with factory() as session:
+                ws = await service.get_or_create(
+                    session, run_id, "repo-1", "main", None, worker_key=key
+                )
+                return ws.id
+
+        try:
+            ids = await asyncio.gather(call("w1"), call("w1"), call("w2"))
+            assert ids[0] == ids[1]
+            assert ids[2] != ids[0]
+            assert len(populate.calls) == 2
+            async with factory() as session:
+                rows = (await session.execute(select(Workspace))).scalars().all()
+                assert len(rows) == 2
+        finally:
+            await engine.dispose()
+
+    async def test_branch_mismatch_on_an_existing_lane_raises(
+        self, db_session, service, populate, run_id
+    ):
+        """A lane IS one checkout. Returning the existing row for a different
+        base would hand the caller a working tree at the wrong commit — a
+        green run measuring nothing (R1)."""
+        await service.get_or_create(
+            db_session, run_id, "repo-1", "main", "a" * 40, worker_key="w1"
+        )
+
+        with pytest.raises(WorkspaceCreationError) as exc:
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "feature", "a" * 40, worker_key="w1"
+            )
+        assert "main" in str(exc.value) and "feature" in str(exc.value)
+
+    async def test_commit_mismatch_on_an_existing_lane_raises(
+        self, db_session, service, populate, run_id
+    ):
+        await service.get_or_create(
+            db_session, run_id, "repo-1", "main", "a" * 40, worker_key="w1"
+        )
+
+        with pytest.raises(WorkspaceCreationError, match="b" * 40):
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", "b" * 40, worker_key="w1"
+            )
+
+    async def test_matching_checkout_still_returns_the_same_row(
+        self, db_session, service, populate, run_id
+    ):
+        """The mismatch guard must not fire on the path every caller takes:
+        the executor and the debug gate both pass the run's trigger_context."""
+        first = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", "a" * 40
+        )
+        second = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", "a" * 40
+        )
+        assert second.id == first.id
+
+
+class TestLaneCleanup:
+    async def test_cleanup_without_a_lane_cleans_every_lane(
+        self, db_session, service, fake_docker, populate, run_id
+    ):
+        """Pipeline teardown passes a run id and nothing else — which is why
+        cleanup absorbs "all lanes" instead of the executor learning about
+        them."""
+        keys = [None, "w1", "w2", "w3"]
+        for key in keys:
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=key
+            )
+        assert len(fake_docker.store) == 4
+
+        await service.cleanup(db_session, run_id)
+
+        assert fake_docker.store == {}
+        rows = await service.list_for_run(db_session, run_id)
+        assert len(rows) == 4
+        for row in rows:
+            await db_session.refresh(row)
+            assert row.status == WorkspaceStatus.CLEANED.value
+            assert row.cleaned_at is not None
+
+    async def test_cleanup_of_one_lane_leaves_its_siblings_alone(
+        self, db_session, service, fake_docker, populate, run_id
+    ):
+        keep = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w1"
+        )
+        drop = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w2"
+        )
+
+        await service.cleanup(db_session, run_id, worker_key="w2")
+
+        assert keep.volume_name in fake_docker.store
+        assert drop.volume_name not in fake_docker.store
+        assert (
+            await _fetch_lane(db_session, run_id, "w1")
+        ).status == WorkspaceStatus.READY.value
+        assert (
+            await _fetch_lane(db_session, run_id, "w2")
+        ).status == WorkspaceStatus.CLEANED.value
+
+    async def test_multi_lane_cleanup_is_idempotent(
+        self, db_session, service, fake_docker, populate, run_id
+    ):
+        for key in (None, "w1"):
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=key
+            )
+
+        await service.cleanup(db_session, run_id)
+        await service.cleanup(db_session, run_id)  # second call: no-op
+
+        assert fake_docker.store == {}
+
+    async def test_cleanup_reports_all_lane_failures_not_just_the_first(
+        self, db_session, service, fake_docker, populate, run_id, monkeypatch
+    ):
+        """Stopping at the first failed lane would leak every volume behind
+        it, and the operator would only ever hear about one of them."""
+        for key in ("w1", "w2", "w3"):
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=key
+            )
+
+        def broken_remove(name):
+            raise RuntimeError(f"daemon refused {name}")
+
+        monkeypatch.setattr(service, "_sync_remove_volume", broken_remove)
+
+        with pytest.raises(WorkspaceCleanupError) as exc:
+            await service.cleanup(db_session, run_id)
+
+        message = str(exc.value)
+        assert "3 of 3" in message
+        for key in ("w1", "w2", "w3"):
+            assert key in message
+            # Every lane was ATTEMPTED, not just the first.
+            row = await _fetch_lane(db_session, run_id, key)
+            assert row.status == WorkspaceStatus.FAILED.value
+
+    async def test_one_failing_lane_does_not_block_its_siblings(
+        self, db_session, service, fake_docker, populate, run_id, monkeypatch
+    ):
+        for key in ("w1", "w2"):
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=key
+            )
+        doomed = generate_volume_name(run_id, "w1")
+        real_remove = service._sync_remove_volume
+
+        def flaky_remove(name):
+            if name == doomed:
+                raise RuntimeError("daemon refused")
+            return real_remove(name)
+
+        monkeypatch.setattr(service, "_sync_remove_volume", flaky_remove)
+
+        with pytest.raises(WorkspaceCleanupError, match="w1"):
+            await service.cleanup(db_session, run_id)
+
+        # w2 was cleaned even though w1 blew up first.
+        assert generate_volume_name(run_id, "w2") not in fake_docker.store
+        assert (
+            await _fetch_lane(db_session, run_id, "w2")
+        ).status == WorkspaceStatus.CLEANED.value
+
+    async def test_leak_warning_names_the_lane(
+        self, db_session, service, fake_docker, populate, run_id, caplog
+    ):
+        """In an 8-way fan-out an unattributed leak report says nothing about
+        WHICH worker failed to release."""
+        ws = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w3"
+        )
+        await service.acquire(db_session, ws.id)
+
+        with caplog.at_level("WARNING"):
+            await service.cleanup(db_session, run_id)
+
+        leak = [r for r in caplog.records if "leaked use_count" in r.message]
+        assert leak and "w3" in leak[0].getMessage()
+
+
+class TestLaneOrphanAudit:
+    async def test_sweep_keeps_every_live_lane_of_one_run(
+        self, db_session, service, fake_docker, populate, run_id
+    ):
+        """Sweep 3 compares against live ROWS, not runs. Seven lanes of one
+        run must all survive while a genuinely unmatched volume goes."""
+        lanes = [None, "w1", "w2", "w3", "w4", "w5", "integrate"]
+        for key in lanes:
+            await service.get_or_create(
+                db_session, run_id, "repo-1", "main", None, worker_key=key
+            )
+        orphan = generate_volume_name(str(uuid4()), "w1")
+        fake_docker.volumes.create(
+            orphan,
+            labels={
+                "lazyaf.workspace": "true",
+                "lazyaf.created_at": _old(60).isoformat(),
+            },
+        )
+
+        cleaned = await service.audit_orphans(db_session)
+
+        assert cleaned == [orphan]
+        assert orphan not in fake_docker.store
+        for key in lanes:
+            assert generate_volume_name(run_id, key) in fake_docker.store
+
+    async def test_sweep_reaps_an_orphaned_lane_and_keeps_its_siblings(
+        self, db_session, service, fake_docker, populate, run_id
+    ):
+        """A crash between the row commit and the volume create leaves a
+        stranded lane. Sweep 1 finishes it without touching the run's other
+        checkouts."""
+        live = await service.get_or_create(
+            db_session, run_id, "repo-1", "main", None, worker_key="w1"
+        )
+        stranded = await _plant_row(
+            db_session, run_id, WorkspaceStatus.CREATING, 60, worker_key="w2"
+        )
+        fake_docker.volumes.create(
+            stranded.volume_name, labels={"lazyaf.workspace": "true"}
+        )
+
+        cleaned = await service.audit_orphans(db_session)
+
+        assert stranded.volume_name in cleaned
+        assert stranded.volume_name not in fake_docker.store
+        assert live.volume_name in fake_docker.store
+        assert (
+            await _fetch_lane(db_session, run_id, "w1")
+        ).status == WorkspaceStatus.READY.value
+
+    async def test_audit_clean_log_names_the_lane(
+        self, db_session, service, fake_docker, run_id, caplog
+    ):
+        ws = await _plant_row(
+            db_session, run_id, WorkspaceStatus.CREATING, 60, worker_key="w7"
+        )
+        fake_docker.volumes.create(ws.volume_name, labels={"lazyaf.workspace": "true"})
+
+        with caplog.at_level("WARNING"):
+            await service.audit_orphans(db_session)
+
+        cleaning = [
+            r for r in caplog.records if "Orphan audit cleaning workspace" in r.message
+        ]
+        assert cleaning and "w7" in cleaning[0].getMessage()
+
+    async def test_unmatched_volume_log_names_the_lane(
+        self, db_session, service, fake_docker, caplog
+    ):
+        """A fan-out orphan report is unreadable if the lines only say
+        "removed <44 random characters>"."""
+        orphan = generate_volume_name(str(uuid4()), "w4")
+        fake_docker.volumes.create(
+            orphan,
+            labels={
+                "lazyaf.workspace": "true",
+                "lazyaf.created_at": _old(60).isoformat(),
+            },
+        )
+
+        with caplog.at_level("WARNING"):
+            await service.audit_orphans(db_session)
+
+        removed = [
+            r for r in caplog.records if "removed unmatched volume" in r.message
+        ]
+        assert removed and "lane w4" in removed[0].getMessage()

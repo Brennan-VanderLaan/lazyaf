@@ -162,20 +162,31 @@ class _T1StubWorkspaceService:
         self.ops: list[tuple] = []
         self._workspaces: dict = {}
 
-    async def get_or_create(self, db, pipeline_run_id, repo_id, branch, commit_sha):
+    async def get_or_create(
+        self, db, pipeline_run_id, repo_id, branch, commit_sha, worker_key=None
+    ):
+        # `worker_key` is the workspace LANE (M13-1): a run owns one workspace
+        # per lane, so a fan-out's workers get independent checkouts. Keyed by
+        # (run, lane) here for the same reason the real service is - a stub
+        # that collapsed the lanes would hand every worker one tree and hide
+        # exactly the bug the parameter exists to prevent.
+        key = worker_key or "default"
         self.ops.append(
-            ("get_or_create", pipeline_run_id, repo_id, branch, commit_sha)
+            ("get_or_create", pipeline_run_id, repo_id, branch, commit_sha, key)
         )
-        ws = self._workspaces.get(pipeline_run_id)
+        lane = (pipeline_run_id, key)
+        ws = self._workspaces.get(lane)
         if ws is None:
+            suffix = "" if key == "default" else f"-{key}"
             ws = SimpleNamespace(
-                id=f"t1-ws-{pipeline_run_id[:8]}",
+                id=f"t1-ws-{pipeline_run_id[:8]}{suffix}",
                 pipeline_run_id=pipeline_run_id,
-                volume_name=f"lazyaf-ws-{pipeline_run_id[:8]}",
+                worker_key=key,
+                volume_name=f"lazyaf-ws-{pipeline_run_id[:8]}{suffix}",
                 status="ready",
                 use_count=0,
             )
-            self._workspaces[pipeline_run_id] = ws
+            self._workspaces[lane] = ws
         return ws
 
     async def acquire(self, db, workspace_id):

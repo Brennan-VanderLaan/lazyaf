@@ -64,18 +64,25 @@ class FakeWorkspaceService:
         self.ops: list[tuple] = []
         self.workspaces: dict[str, SimpleNamespace] = {}
 
-    async def get_or_create(self, db, pipeline_run_id, repo_id, branch, commit_sha):
+    async def get_or_create(
+        self, db, pipeline_run_id, repo_id, branch, commit_sha, worker_key=None
+    ):
+        # worker_key is the workspace LANE (M13-1). Keyed by (run, lane)
+        # like the real service, so a fan-out gets distinct workspaces
+        # instead of silently sharing one checkout.
+        lane = (pipeline_run_id, worker_key or "default")
         self.ops.append(("get_or_create", pipeline_run_id))
-        ws = self.workspaces.get(pipeline_run_id)
+        ws = self.workspaces.get(lane)
         if ws is None:
             ws = SimpleNamespace(
                 id=f"ws-{pipeline_run_id[:8]}",
                 pipeline_run_id=pipeline_run_id,
-                volume_name=generate_volume_name(pipeline_run_id),
+                worker_key=lane[1],
+                volume_name=generate_volume_name(pipeline_run_id, lane[1]),
                 status="ready",
                 use_count=0,
             )
-            self.workspaces[pipeline_run_id] = ws
+            self.workspaces[lane] = ws
         return ws
 
     async def acquire(self, db, workspace_id):
@@ -96,8 +103,10 @@ class FakeWorkspaceService:
     def op_names(self) -> list[str]:
         return [op[0] for op in self.ops]
 
-    def use_count(self, run_id: str) -> int:
-        ws = self.workspaces.get(run_id)
+    def use_count(self, run_id: str, worker_key: str = "default") -> int:
+        # Workspaces are keyed by (run, LANE) since M13-1. The default lane is
+        # what every pre-M13 step - and the debug gate - uses.
+        ws = self.workspaces.get((run_id, worker_key))
         return ws.use_count if ws else 0
 
 

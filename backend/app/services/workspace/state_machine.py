@@ -8,10 +8,21 @@ Manages workspace lifecycle with proper state transitions:
 - cleaning: Cleanup in progress
 - cleaned: Successfully removed (terminal)
 - failed: Error state (can retry cleanup)
+
+M13-1: a pipeline run may own MANY workspaces - one per parallel worker,
+each an independent checkout. generate_volume_name therefore takes an
+optional lane key (see workspace/worker_key.py); the default lane's name is
+byte-identical to the one-workspace-per-run name it replaces. use_count
+still counts concurrent HOLDERS of one lane's volume (parallel entry points
+in the same lane, plus the debug gate's pin), so it stays an integer.
 """
+import hashlib
+import re
 from enum import Enum
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
+
+from app.services.workspace.worker_key import DEFAULT_WORKER_KEY
 
 
 class WorkspaceStatus(str, Enum):
@@ -171,29 +182,100 @@ class WorkspaceStateMachine:
 # Helper Functions
 # -----------------------------------------------------------------------------
 
-def generate_volume_name(pipeline_run_id: str) -> str:
-    """
-    Generate Docker volume name for a pipeline run.
+VOLUME_PREFIX = "lazyaf-ws-"
 
-    Format: lazyaf-ws-{pipeline_run_id}
+#: Pipeline run ids are uuid4 strings, i.e. always this wide. The lane
+#: suffix is split off at this offset (see parse_volume_name_parts).
+_RUN_ID_LENGTH = 36
+
+#: Ceiling on the lane slug. models/workspace.py caps volume_name at
+#: String(100); the budget is 10 (prefix) + 36 (run id) + 1 (separator)
+#: + 32 (slug) + 1 + 8 (disambiguating hash) = 88.
+_MAX_SLUG = 32
+
+#: Docker volume names must match [a-zA-Z0-9][a-zA-Z0-9_.-]* - the first
+#: character alphanumeric, the rest alphanumerics, underscore, dot, hyphen.
+#: Everything outside this set is replaced when a lane key is slugged.
+_SLUG_SAFE = re.compile(r"[^a-z0-9._-]")
+_SLUG_RUNS = re.compile(r"-{2,}")
+
+
+def _volume_slug(worker_key: str) -> str:
+    """A docker-legal, collision-free volume suffix for a lane key.
+
+    Lowercases, replaces every character outside the docker charset with a
+    hyphen, collapses runs, and strips leading/trailing separators (the
+    first character of the full volume name is always ``l``, but a trailing
+    separator would be ugly and a doubled one unreadable).
+
+    A short sha256 prefix is appended IF AND ONLY IF information was lost -
+    the slug is empty, differs from the lowercased key, or had to be
+    truncated. That is what keeps two different lanes from ever slugging to
+    one volume, while leaving the clean cases (``w1``, ``integrate``)
+    legible in ``docker volume ls``. It is not a round-trippable encoding:
+    the workspaces row is the one source of truth for name -> lane.
     """
-    return f"lazyaf-ws-{pipeline_run_id}"
+    lowered = worker_key.lower()
+    cleaned = _SLUG_RUNS.sub("-", _SLUG_SAFE.sub("-", lowered)).strip("-._")
+    if cleaned and cleaned == lowered and len(cleaned) <= _MAX_SLUG:
+        return cleaned
+    digest = hashlib.sha256(worker_key.encode("utf-8")).hexdigest()[:8]
+    head = cleaned[:_MAX_SLUG].rstrip("-._")
+    return f"{head}-{digest}" if head else digest
+
+
+def generate_volume_name(pipeline_run_id: str, worker_key: str | None = None) -> str:
+    """
+    Generate the Docker volume name for one WORKSPACE LANE of a pipeline run.
+
+    Format: lazyaf-ws-{pipeline_run_id}            (the default lane)
+            lazyaf-ws-{pipeline_run_id}-{slug}     (any other lane)
+
+    A run may own many workspaces - one per parallel worker - each an
+    independent checkout that integrates through git rather than by sharing
+    a working tree (M13-1). ``worker_key`` names which one.
+
+    The default lane emits NO suffix, deliberately: that makes this function
+    byte-identical to its pre-M13-1 self for every existing caller, so the
+    single-worker path keeps the volume it already has (no rename, no
+    re-clone, no orphan) and ``worker_key`` can stay a keyword argument that
+    nobody is forced to pass.
+    """
+    if worker_key is None or worker_key == DEFAULT_WORKER_KEY:
+        return f"{VOLUME_PREFIX}{pipeline_run_id}"
+    return f"{VOLUME_PREFIX}{pipeline_run_id}-{_volume_slug(worker_key)}"
 
 
 def parse_volume_name(volume_name: str) -> str:
     """
-    Extract pipeline_run_id from volume name.
+    Extract pipeline_run_id from a volume name.
 
     Args:
-        volume_name: Volume name in format lazyaf-ws-{pipeline_run_id}
+        volume_name: lazyaf-ws-{pipeline_run_id}[-{lane slug}]
 
     Returns:
-        The pipeline_run_id portion
+        The pipeline_run_id portion.
+
+    DIAGNOSTIC ONLY. Lane slugs are lossy (see _volume_slug), so nothing may
+    be built on recovering the lane from a name - the workspaces row is the
+    source of truth (R3).
     """
-    prefix = "lazyaf-ws-"
-    if volume_name.startswith(prefix):
-        return volume_name[len(prefix):]
-    return volume_name
+    return parse_volume_name_parts(volume_name)[0]
+
+
+def parse_volume_name_parts(volume_name: str) -> tuple[str, Optional[str]]:
+    """
+    Split a volume name into (pipeline_run_id, lane slug or None).
+
+    The default lane has no slug and yields ``None``. DIAGNOSTIC ONLY - see
+    parse_volume_name.
+    """
+    rest = volume_name
+    if rest.startswith(VOLUME_PREFIX):
+        rest = rest[len(VOLUME_PREFIX):]
+    if len(rest) > _RUN_ID_LENGTH and rest[_RUN_ID_LENGTH] == "-":
+        return rest[:_RUN_ID_LENGTH], rest[_RUN_ID_LENGTH + 1:]
+    return rest, None
 
 
 def is_orphaned(

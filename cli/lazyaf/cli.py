@@ -74,13 +74,19 @@ def ingest(repo_path: str, name: str, branch: str | None, all_branches: bool, se
     console.print(Panel(f"Ingesting [cyan]{name}[/cyan] from {path}"))
 
     # Detect default branch if not specified
-    if not branch and not all_branches:
+    # --all-branches used to skip detection entirely and send
+    # `default_branch: "main"` below, so a repo whose trunk is `master` was
+    # ingested with every one of its branches present and a default naming
+    # none of them. The card then failed at workspace clone time. Detect in
+    # BOTH modes; --all-branches changes what gets PUSHED, not what the
+    # repo's default is.
+    if not branch:
         result = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=path)
         if result.returncode != 0:
             console.print(f"[red]Error:[/red] Could not detect current branch")
             sys.exit(1)
         branch = result.stdout.strip()
-        console.print(f"Using current branch: [cyan]{branch}[/cyan]")
+        console.print(f"Using current branch as the default: [cyan]{branch}[/cyan]")
 
     # Get remote URL if exists (for future landing)
     result = run_git(["remote", "get-url", "origin"], cwd=path)
@@ -95,7 +101,9 @@ def ingest(repo_path: str, name: str, branch: str | None, all_branches: bool, se
                 json={
                     "name": name,
                     "remote_url": remote_url,
-                    "default_branch": branch or "main",
+                    # Always the detected branch now - never a hardcoded
+                    # "main" that may name nothing in this repo.
+                    "default_branch": branch,
                 },
             )
             response.raise_for_status()

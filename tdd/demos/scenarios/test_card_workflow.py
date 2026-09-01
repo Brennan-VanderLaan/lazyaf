@@ -60,6 +60,17 @@ class TestCardWorkflowDemo:
         repo = repo_response.json()
         print(f"Created repo: {repo['name']} (ID: {repo['id'][:8]}...)")
 
+        # A PUSHED repo, not merely a registered one. Starting a card branches
+        # FROM the default branch, so a repo with no such branch is refused -
+        # correctly, and with instructions - before any agent runs. Step 4
+        # below re-seeds it as the merge base; this earlier seed is what lets
+        # Step 3 start at all.
+        from shared.git_seed import seed_branch as _seed
+        _default = (await client.get(f"/api/repos/{repo['id']}")).json()[
+            "default_branch"
+        ]
+        _seed(repo["id"], _default, path="README.md", content=b"base\n")
+
         # Step 2: Create a feature card
         print("\n=== Step 2: Creating Feature Card ===")
         card_response = await client.post(

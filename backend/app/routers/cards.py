@@ -529,6 +529,81 @@ async def promote_card_to_feature(card_id: str, db: AsyncSession = Depends(get_d
     return feature
 
 
+#: Shown in the refusal below. A separate constant so the JSON quoting
+#: does not have to survive nesting inside an f-string.
+_DEFAULT_BRANCH_PATCH_EXAMPLE = '{"default_branch": "<one of the above>"}'
+
+
+def _require_startable_default_branch(repo) -> None:
+    """Refuse to start work unless the repo's default branch actually exists.
+
+    Agent work branches FROM `repo.default_branch`, and the workspace clones
+    it with `git clone --branch <default>`. Two states get here and neither
+    used to be caught, so both failed identically: several seconds later,
+    deep in workspace population, as
+
+        local execution error: Failed to create workspace for run <id> lane
+        'default': Workspace population for volume 'lazyaf-ws-<id>' ...
+
+    by which point the card is already dirty, the user is reading executor
+    internals, and nothing names the remedy.
+
+    NO BRANCHES AT ALL - a registered repo has a bare repo and an UNBORN
+    HEAD, so it has no refs until someone pushes.
+
+    BRANCHES, BUT NOT THAT ONE - the more surprising case, and the one a
+    real repo hits. `lazyaf ingest --all-branches` pushes every branch but
+    sends `default_branch: "main"` regardless of what the repo's trunk is
+    called, so a repo with thousands of commits on `master` lands with a
+    default naming none of them. Checking merely "are there any branches"
+    passes that straight through.
+
+    A ref listing is cheap, and it is worth doing before a card is moved.
+    """
+    try:
+        branches = git_repo_manager.list_branches(repo.id)
+    except Exception:  # noqa: BLE001 - a listing failure is not a refusal
+        # Never block work because the listing itself broke; failing later
+        # and loudly is strictly better than refusing a repo that is fine.
+        return
+
+    if repo.default_branch in branches:
+        return
+
+    if not branches:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Repo '{repo.name}' has no commits yet, so there is no "
+                f"'{repo.default_branch}' to branch from and an agent would "
+                "have nothing to check out. Push your code first:\n\n"
+                f"    git remote add lazyaf {repo.internal_git_url or '<clone-url>'}\n"
+                f"    git push lazyaf {repo.default_branch}\n\n"
+                "Then start the card again."
+            ),
+        )
+
+    real = sorted(b for b in branches if not b.startswith("lazyaf/"))
+    shown = ", ".join(real[:8]) or "(only agent branches)"
+    more = f" (+{len(real) - 8} more)" if len(real) > 8 else ""
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Repo '{repo.name}' says its default branch is "
+            f"'{repo.default_branch}', but no such branch exists here, so an "
+            f"agent has nothing to branch from. Branches present: "
+            f"{shown}{more}.\n\n"
+            "This is what `lazyaf ingest --all-branches` produces when the "
+            "repo's trunk is not called 'main'. Point the repo at the right "
+            "branch:\n\n"
+            f"    PATCH /api/repos/{repo.id}   body: "
+            + _DEFAULT_BRANCH_PATCH_EXAMPLE
+            + "\n\n"
+            "Then start the card again."
+        ),
+    )
+
+
 @router.post("/api/cards/{card_id}/start", response_model=CardRead)
 async def start_card(
     card_id: str,
@@ -570,6 +645,8 @@ async def start_card(
             status_code=400,
             detail="Repo must be ingested before starting work. Use the CLI to ingest the repo first."
         )
+
+    _require_startable_default_branch(repo)
 
     # Get agent file IDs from the card
     agent_file_ids = parse_agent_file_ids(card.agent_file_ids) or []

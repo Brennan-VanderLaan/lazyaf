@@ -12,9 +12,14 @@ from pathlib import Path
 
 import pytest
 
-# Add backend to path for imports
+# Add backend and tdd to path for imports
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
+tdd_path = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(backend_path))
+sys.path.insert(0, str(tdd_path))
+
+# After the path setup, matching the pattern in tdd/integration/api/*.
+from shared.git_seed import seed_branch  # noqa: E402
 
 
 @pytest.mark.demo
@@ -141,6 +146,11 @@ class TestAPISmokeTests:
             json={"name": "lifecycle-repo"},
         )
         repo_id = repo_response.json()["id"]
+        # A card cannot start on a repo with no default branch to branch FROM.
+        default_branch = (await client.get(f"/api/repos/{repo_id}")).json()[
+            "default_branch"
+        ]
+        seed_branch(repo_id, default_branch, path="README.md", content=b"seed\n")
 
         card_response = await client.post(
             f"/api/repos/{repo_id}/cards",

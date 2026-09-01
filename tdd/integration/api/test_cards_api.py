@@ -50,12 +50,27 @@ async def repo(client):
 
 @pytest_asyncio.fixture
 async def ingested_repo(client, clean_git_repos):
-    """Create an ingested repo for card lifecycle tests that require starting jobs."""
+    """Create an ingested repo for card lifecycle tests that require starting jobs.
+
+    Seeds a REAL commit on the default branch. `POST /start` refuses a repo
+    whose default branch does not exist, because agent work branches FROM it
+    and the workspace clones it - so a repo with no such branch used to be
+    accepted, dirty the card, and fail seconds later inside workspace
+    population. An ingested-but-empty repo is a legitimate state, it is just
+    not one a card can start on, so a fixture for STARTING cards has to look
+    like a repo somebody pushed to.
+    """
     response = await client.post(
         "/api/repos/ingest",
         json=repo_ingest_payload(name="IngestedCardTestRepo"),
     )
-    return response.json()
+    body = response.json()
+    # The ingest response does not carry default_branch; read it back
+    # rather than assuming "main", which is the exact assumption that
+    # produced the bug this fixture now guards against.
+    default_branch = (await client.get(f"/api/repos/{body['id']}")).json()["default_branch"]
+    seed_branch(body["id"], default_branch, path="README.md", content=b"seed\n")
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -1927,7 +1942,15 @@ class TestStartingACardIsAtomic:
             "/api/repos/ingest", json=repo_ingest_payload(name="RaceRepo")
         )
         assert response.status_code in (200, 201), response.text
-        return response.json()
+        body = response.json()
+        # Seed the default branch: /start refuses a repo that has no branch to
+        # branch FROM, so without this all five racers get a 400 and the test
+        # measures the guard instead of the claim.
+        default_branch = (await client.get(f"/api/repos/{body['id']}")).json()[
+            "default_branch"
+        ]
+        seed_branch(body["id"], default_branch, path="README.md", content=b"seed\n")
+        return body
 
     async def _counts(self, async_engine, card_id):
         factory = async_sessionmaker(

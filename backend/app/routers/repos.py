@@ -19,6 +19,8 @@ from app.routers.pipelines import IN_FLIGHT_RUN_STATUSES, live_run_refusal
 
 IN_FLIGHT_JOB_STATUSES = (JobStatus.QUEUED.value, JobStatus.RUNNING.value)
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/repos", tags=["repos"])
 
 
@@ -322,17 +324,19 @@ async def test_setup_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
     return repo
 
 
-@router.get("/{repo_id}/branches")
-async def list_branches(repo_id: str, db: AsyncSession = Depends(get_db)):
-    """List all branches in the internal git repo."""
-    result = await db.execute(select(Repo).where(Repo.id == repo_id))
-    repo = result.scalar_one_or_none()
-    if not repo:
-        raise HTTPException(status_code=404, detail="Repo not found")
+async def build_branch_listing(db: AsyncSession, repo: Repo) -> dict:
+    """Read the repo's refs and project them the way the UI consumes them.
 
-    if not repo.is_ingested:
-        raise HTTPException(status_code=400, detail="Repo is not ingested")
+    THE one place that answers "which branches exist" (R3). Both readers go
+    through it: ``GET /{repo_id}/branches`` returns this dict verbatim, and
+    ``broadcast_repo_refs_changed`` ships the same dict as the
+    ``repo_refs_changed`` websocket payload. A panel hydrated by the fetch and
+    a panel updated by the frame therefore cannot disagree.
 
+    Side effect, kept from the endpoint this was extracted from: an existing
+    HEAD branch that differs from the stored row wins, and is written back.
+    """
+    repo_id = repo.id
     branches = git_repo_manager.list_branches(repo_id)
     git_default_branch = git_repo_manager.get_default_branch(repo_id)
 
@@ -379,6 +383,54 @@ async def list_branches(repo_id: str, db: AsyncSession = Depends(get_db)):
         "default_branch": default_branch,
         "total": len(branches),
     }
+
+
+async def broadcast_repo_refs_changed(db: AsyncSession, repo_id: str) -> None:
+    """Tell every open client that this repo's branches moved.
+
+    Called from every path that writes a ref: the git push endpoints
+    (``routers.git``), branch delete, orphan cleanup, reinitialize and sync.
+    Without it a push reaches the UI as silence - see
+    ``ConnectionManager.send_repo_refs_changed``.
+
+    A repo that is gone or not ingested has no branch listing to send; that is
+    a real absence, not a swallowed failure, so it returns quietly. Anything
+    else - a damaged pack, an unreadable ref - is LOGGED at error level rather
+    than raised: this runs after the refs are already written, and turning a
+    successful push into a 500 would report the opposite of what happened.
+    The remedy is in the message.
+    """
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo or not repo.is_ingested:
+        return
+
+    try:
+        listing = await build_branch_listing(db, repo)
+    except Exception as e:
+        logger.error(
+            f"[repos] Could not build the branch listing for repo {repo_id} "
+            f"after its refs changed, so open clients will keep showing the "
+            f"branches they last fetched until reloaded: {e}. "
+            f"Check the repo's git storage (POST /api/repos/{repo_id}/sync)."
+        )
+        return
+
+    await manager.send_repo_refs_changed(repo_id, listing)
+
+
+@router.get("/{repo_id}/branches")
+async def list_branches(repo_id: str, db: AsyncSession = Depends(get_db)):
+    """List all branches in the internal git repo."""
+    result = await db.execute(select(Repo).where(Repo.id == repo_id))
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    if not repo.is_ingested:
+        raise HTTPException(status_code=400, detail="Repo is not ingested")
+
+    return await build_branch_listing(db, repo)
 
 
 @router.get("/{repo_id}/commits")
@@ -509,6 +561,8 @@ async def delete_branch(
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["error"])
 
+    await broadcast_repo_refs_changed(db, repo_id)
+
     return result
 
 
@@ -527,6 +581,9 @@ async def cleanup_orphaned_branches(repo_id: str, db: AsyncSession = Depends(get
         raise HTTPException(status_code=400, detail="Repo is not ingested")
 
     result = git_repo_manager.cleanup_orphaned_branches(repo_id)
+
+    await broadcast_repo_refs_changed(db, repo_id)
+
     return result
 
 
@@ -550,6 +607,10 @@ async def reinitialize_repo(repo_id: str, db: AsyncSession = Depends(get_db)):
 
     if not reinit_result["success"]:
         raise HTTPException(status_code=500, detail=reinit_result.get("error", "Reinitialize failed"))
+
+    # Every ref is gone. Open clients have to hear THAT too, or they keep
+    # offering branches to a repo that no longer has any.
+    await broadcast_repo_refs_changed(db, repo_id)
 
     return reinit_result
 
@@ -584,5 +645,7 @@ async def sync_repo_from_disk(repo_id: str, db: AsyncSession = Depends(get_db)):
         if default_branches and default_branches[0]["name"] != repo.default_branch:
             repo.default_branch = default_branches[0]["name"]
             await db.commit()
+
+    await broadcast_repo_refs_changed(db, repo_id)
 
     return sync_result

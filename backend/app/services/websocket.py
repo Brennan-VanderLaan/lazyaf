@@ -213,5 +213,28 @@ class ConnectionManager:
     async def send_repo_deleted(self, repo_id: str):
         await self.broadcast("repo_deleted", {"id": repo_id})
 
+    async def send_repo_refs_changed(self, repo_id: str, listing: dict) -> None:
+        """Broadcast the FULL branch listing of one repo after its refs moved.
+
+        The repo row broadcast by ``send_repo_updated`` says nothing about
+        refs, so a push - which changes no row at all - used to reach the UI
+        as complete silence: the sidebar kept rendering "No branches yet. Push
+        your repo to get started." after the push that answered it, and only
+        F5 fixed it. Same after an agent created a ``lazyaf/`` branch.
+
+        ``listing`` is the SAME body ``GET /api/repos/{id}/branches`` returns
+        (built by ``routers.repos.build_branch_listing`` - one source of truth,
+        R3), so a panel hydrated by the snapshot and a panel updated by this
+        frame cannot show different branches. ``repo_id`` is added on top so a
+        receiver can ignore frames for a repo it is not showing.
+
+        ``repo_refs_changed`` is a NEW frame type and lands on both sides in
+        one commit: this publisher and ``stores/websocket.ts``'s
+        ``ServerMessageType`` + ``HANDLED_MESSAGE_TYPES`` + switch. The drift
+        guard in ``websocket.test.ts`` greps this source, so adding it here
+        without the frontend half FAILS that test - which is the point.
+        """
+        await self.broadcast("repo_refs_changed", {"repo_id": repo_id, **listing})
+
 
 manager = ConnectionManager()

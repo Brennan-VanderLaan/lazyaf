@@ -192,7 +192,6 @@ class TestPipelineExecutorStartPipeline:
             id=str(uuid4()),
             repo_id=repo.id,
             name="Not Authored Yet",
-            steps="[]",
             steps_graph=None,
         )
         db_session.add(pipeline)
@@ -225,7 +224,6 @@ class TestPipelineExecutorStartPipeline:
             id=str(uuid4()),
             repo_id=repo.id,
             name="Corrupt",
-            steps="[]",
             steps_graph="{not json",
         )
         db_session.add(pipeline)
@@ -471,7 +469,6 @@ async def _graph_rows(db, graph_dict, *, trigger_context=None):
         id=str(uuid4()),
         repo_id=repo.id,
         name="graph pipeline",
-        steps="[]",
         steps_graph=json.dumps(graph_dict),
     )
     db.add(pipeline)
@@ -1548,7 +1545,9 @@ class TestTheJobCallbackHasNoArrayFallback:
             id=str(uuid4()),
             repo_id=repo.id,
             name="graphless",
-            steps=json.dumps([{"name": "Step 1", "type": "script"}]),
+            # No `steps=` any more: 12.8 P6 dropped the column, so this row
+            # cannot carry an array to be mistakenly read even in principle.
+            # `steps_graph=None` IS the graphless state now.
             steps_graph=None,
         )
         db_session.add(pipeline)
@@ -1769,7 +1768,9 @@ class TestALocalStepWithNoGraphIsNotStranded:
             id=str(uuid4()),
             repo_id=repo.id,
             name="graphless",
-            steps=json.dumps([{"name": "Step 1", "type": "script"}]),
+            # No `steps=` any more: 12.8 P6 dropped the column, so this row
+            # cannot carry an array to be mistakenly read even in principle.
+            # `steps_graph=None` IS the graphless state now.
             steps_graph=None,
         )
         db.add(pipeline)

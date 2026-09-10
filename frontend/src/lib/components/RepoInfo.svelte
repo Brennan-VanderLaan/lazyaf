@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { selectedRepo } from '../stores/repos';
+  import { branchesStore, selectedRepo } from '../stores/repos';
   import { repos } from '../api/client';
   import type { BranchInfo, Commit } from '../api/types';
   import BranchManager from './BranchManager.svelte';
@@ -9,12 +9,24 @@
   let showBranchManager = false;
 
   let cloneUrl = '';
-  let branches: BranchInfo[] = [];
+  let cloneUrlError = '';
   let commits: Commit[] = [];
-  let loadingBranches = false;
   let loadingCommits = false;
   let copied = false;
   let selectedBranch: string | null = null;
+
+  /**
+   * The branch list is NOT local state. It lives in `branchesStore`, which is
+   * snapshot-then-delta: this component's load() is the snapshot, and the
+   * `repo_refs_changed` websocket frame is the delta. That is what makes a
+   * push show up here without a reload - the defect this panel was reported
+   * for. Keeping a private copy would reintroduce it.
+   */
+  $: branches = $branchesStore.repoId === $selectedRepo?.id ? $branchesStore.branches : [];
+  $: branchesLoading = $branchesStore.repoId === $selectedRepo?.id && $branchesStore.loading;
+  $: branchesError = $branchesStore.repoId === $selectedRepo?.id ? $branchesStore.error : null;
+  $: branchesLoaded = $branchesStore.repoId === $selectedRepo?.id && $branchesStore.loaded;
+  $: agentBranchCount = branches.filter(b => b.is_lazyaf).length;
 
   // Collapsible state - persisted to localStorage
   let isCollapsed = false;
@@ -41,33 +53,52 @@
 
   async function loadRepoDetails() {
     if (!$selectedRepo) return;
+    const repoId = $selectedRepo.id;
 
     try {
-      const urlResponse = await repos.cloneUrl($selectedRepo.id);
+      const urlResponse = await repos.cloneUrl(repoId);
       cloneUrl = urlResponse.clone_url;
+      cloneUrlError = '';
     } catch (e) {
+      // Say so. An empty URL silently rendered as "..." forever, so the
+      // copy buttons below handed out `git remote add lazyaf ` (R1).
       cloneUrl = '';
+      cloneUrlError = e instanceof Error ? e.message : 'Failed to load the clone URL';
     }
 
     if ($selectedRepo.is_ingested) {
-      loadingBranches = true;
-      try {
-        const branchResponse = await repos.branches($selectedRepo.id);
-        branches = branchResponse.branches;
-        // Auto-select default branch
-        const defaultBranch = branches.find(b => b.is_default);
-        if (defaultBranch && !selectedBranch) {
-          selectedBranch = defaultBranch.name;
-        }
-      } catch (e) {
-        branches = [];
-      } finally {
-        loadingBranches = false;
-      }
+      await branchesStore.load(repoId);
     } else {
-      branches = [];
+      branchesStore.clear();
       commits = [];
     }
+  }
+
+  /**
+   * Keep a branch selected for the commit history below.
+   *
+   * Runs off the STORE, not off the fetch, so it settles the same way whether
+   * the list arrived by fetch or by a live `repo_refs_changed` frame. A branch
+   * that disappears from under the selection (deleted, or cleaned up) falls
+   * back to the default rather than leaving the history pinned to a ref that
+   * no longer exists.
+   */
+  $: if (branches.length === 0) {
+    selectedBranch = null;
+  } else if (!selectedBranch || !branches.some(b => b.name === selectedBranch)) {
+    selectedBranch = (branches.find(b => b.is_default) ?? branches[0]).name;
+  }
+
+  function selectBranch(name: string) {
+    selectedBranch = name;
+  }
+
+  function shortSha(sha: string | null | undefined): string {
+    return sha ? sha.slice(0, 7) : '';
+  }
+
+  function retryBranches() {
+    if ($selectedRepo) branchesStore.load($selectedRepo.id);
   }
 
   async function loadCommits(branch: string) {
@@ -115,38 +146,110 @@
       <div class="info-section">
         <label>Internal Git URL</label>
         <div class="url-box">
-          <code>{cloneUrl || '...'}</code>
+          <code>{cloneUrl || (cloneUrlError ? 'unavailable' : '...')}</code>
           <button
             class="btn-copy"
             on:click={() => copyToClipboard(cloneUrl)}
+            disabled={!cloneUrl}
             title="Copy URL"
           >
             {copied ? 'Copied!' : 'Copy'}
           </button>
         </div>
+        {#if cloneUrlError}
+          <p class="failure" data-testid="clone-url-error">
+            Could not read this repo's git URL: {cloneUrlError}
+          </p>
+        {/if}
       </div>
 
-      {#if branches.length > 0}
-        <div class="info-section">
-          <div class="section-header">
-            <label>Branches ({branches.length})</label>
+      <!--
+        THE BRANCH LIST. Owner's words: "I need to be able to see which
+        branches are available in lazyaf".
+
+        This was a <select>, which shows exactly ONE branch until you open a
+        native popup, and showed no commit at all. Every fact he asked for is
+        now on the row: the name, which one is default, which came from an
+        agent (the `lazyaf/` prefix), and the tip commit.
+      -->
+      <div class="info-section" data-testid="branches-section">
+        <div class="section-header">
+          <label>
+            Branches{#if branchesLoaded && !branchesError}
+              ({branches.length}{#if agentBranchCount > 0}, {agentBranchCount} from agents{/if})
+            {/if}
+          </label>
+          {#if branches.length > 0}
             <button type="button" class="btn-manage" on:click={() => showBranchManager = true} title="Manage branches">
               Manage
             </button>
-          </div>
-          <div class="branch-selector">
-            <select bind:value={selectedBranch}>
-              {#each branches as branch}
-                <option value={branch.name}>
-                  {branch.name}
-                  {branch.is_default ? ' (default)' : ''}
-                  {branch.is_lazyaf ? ' [agent]' : ''}
-                </option>
-              {/each}
-            </select>
-          </div>
+          {/if}
         </div>
 
+        {#if branchesError}
+          <!--
+            An unreadable listing is NOT an empty repo. Conflating them was the
+            reported defect's second half: a failed fetch rendered as "No
+            branches yet. Push your repo to get started.", which told the user
+            to redo a push that had already worked (R1).
+          -->
+          <div class="branch-failure" data-testid="branches-error">
+            <p class="failure">Could not list branches: {branchesError}</p>
+            <p class="muted">
+              The repo and its commits are untouched — this is the listing that
+              failed. Retry, and if it keeps failing use Manage → Sync from disk.
+            </p>
+            <button type="button" class="btn-retry" on:click={retryBranches}>Retry</button>
+          </div>
+        {:else if branchesLoading}
+          <p class="muted">Loading branches...</p>
+        {:else if branches.length > 0}
+          <ul class="branch-list" data-testid="branch-list">
+            {#each branches as branch (branch.name)}
+              <li>
+                <button
+                  type="button"
+                  class="branch-item"
+                  class:lazyaf={branch.is_lazyaf}
+                  class:selected={branch.name === selectedBranch}
+                  data-testid="branch-row"
+                  data-branch={branch.name}
+                  on:click={() => selectBranch(branch.name)}
+                  title={`Show commits on ${branch.name}`}
+                >
+                  <span class="branch-name">
+                    <span class="branch-label">{branch.name}</span>
+                    {#if branch.is_default}
+                      <span class="badge default" data-testid="branch-badge-default">default</span>
+                    {/if}
+                    {#if branch.is_lazyaf}
+                      <span class="badge lazyaf" data-testid="branch-badge-agent">agent</span>
+                    {/if}
+                  </span>
+                  <code class="commit">{shortSha(branch.commit)}</code>
+                </button>
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <!--
+            The empty state a new repo lands in. It has to read as a step not
+            yet taken, and name the remedy - the owner hit this one straight
+            after creating a repo. The commands it points at are the copyable
+            ones in "Push Updates" below (R3: not duplicated here).
+          -->
+          <div class="branch-empty" data-testid="branches-empty">
+            <p>No branches here yet.</p>
+            <p class="muted">
+              LazyAF is hosting this repo but nothing has been pushed into it.
+              Run the two commands under <strong>Push Updates</strong> below —
+              this list fills in the moment the push lands, no reload needed.
+            </p>
+          </div>
+        {/if}
+      </div>
+
+      {#if branches.length > 0}
         <div class="info-section">
           <label>Commit History</label>
           {#if loadingCommits}
@@ -183,16 +286,6 @@
           {:else}
             <p class="muted">No commits found.</p>
           {/if}
-        </div>
-      {:else if loadingBranches}
-        <div class="info-section">
-          <label>Branches</label>
-          <p class="muted">Loading...</p>
-        </div>
-      {:else}
-        <div class="info-section">
-          <label>Branches</label>
-          <p class="muted">No branches yet. Push your repo to get started.</p>
         </div>
       {/if}
 
@@ -512,36 +605,104 @@
     opacity: 0.9;
   }
 
+  /*
+    The branch list. These rules already existed, unused, from the list a
+    <select> had replaced - the markup came back to them rather than growing a
+    second parallel set (R3).
+  */
   .branch-list {
     list-style: none;
     padding: 0;
     margin: 0;
-    max-height: 150px;
+    max-height: 180px;
     overflow-y: auto;
+    background: var(--surface-alt, #181825);
+    border-radius: 6px;
   }
 
   .branch-item {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 0.5rem;
+    width: 100%;
     padding: 0.4rem 0.5rem;
+    border: none;
+    border-left: 2px solid transparent;
     border-radius: 4px;
+    background: none;
     font-size: 0.8rem;
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
   }
 
   .branch-item:hover {
     background: var(--hover-color, #313244);
   }
 
-  .branch-item.lazyaf {
-    background: var(--surface-alt, #181825);
+  .branch-item.selected {
+    background: var(--hover-color, #313244);
+    border-left-color: var(--primary-color, #89b4fa);
+  }
+
+  .branch-item:focus-visible {
+    outline: 2px solid var(--primary-color, #89b4fa);
+    outline-offset: -2px;
   }
 
   .branch-name {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 0.4rem;
+    min-width: 0;
     color: var(--text-color, #cdd6f4);
+  }
+
+  .branch-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .branch-empty p {
+    margin: 0 0 0.35rem 0;
+    font-size: 0.8rem;
+    color: var(--text-color, #cdd6f4);
+  }
+
+  .branch-empty p:last-child {
+    margin-bottom: 0;
+  }
+
+  .branch-failure {
+    background: var(--warning-bg, rgba(249, 226, 175, 0.1));
+    border: 1px solid var(--warning-color, #f9e2af);
+    border-radius: 6px;
+    padding: 0.6rem;
+  }
+
+  .failure {
+    margin: 0 0 0.35rem 0;
+    font-size: 0.8rem;
+    color: var(--warning-color, #f9e2af);
+  }
+
+  .btn-retry {
+    margin-top: 0.4rem;
+    padding: 0.25rem 0.7rem;
+    background: var(--primary-color, #89b4fa);
+    color: var(--primary-text, #1e1e2e);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    font-weight: 500;
+  }
+
+  .btn-copy:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .commit {
@@ -584,25 +745,11 @@
     margin: 0;
   }
 
-  .branch-selector {
-    margin-bottom: 0.5rem;
-  }
-
-  .branch-selector select {
-    width: 100%;
-    padding: 0.5rem;
-    background: var(--surface-alt, #181825);
-    border: 1px solid var(--border-color, #45475a);
-    border-radius: 4px;
-    color: var(--text-color, #cdd6f4);
-    font-size: 0.85rem;
-    cursor: pointer;
-  }
-
-  .branch-selector select:focus {
-    outline: none;
-    border-color: var(--primary-color, #89b4fa);
-  }
+  /*
+    `.branch-selector` went with the <select> it styled. Rules for markup that
+    no longer exists are a lie the next reader has to disprove, and svelte
+    warns on every one of them.
+  */
 
   .git-graph {
     max-height: 300px;

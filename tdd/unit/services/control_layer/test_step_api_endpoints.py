@@ -722,7 +722,7 @@ async def step_execution(client, db_session):
         id=pipeline_id,
         repo_id=repo_id,
         name="test-pipeline",
-        steps="[]",
+
     )
     db_session.add(pipeline)
 

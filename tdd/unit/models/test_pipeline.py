@@ -60,17 +60,19 @@ class TestPipelineModel:
         assert pipeline.description == "Run tests and build"
         assert_model_has_id(pipeline)
 
-    def test_pipeline_default_steps_is_empty_json(self):
-        """Pipeline steps should default to empty JSON array.
-
-        12.8 P3 keeps this deliberately. `pipelines.steps` is `nullable=False`
-        with NO server_default, so the python-side `default="[]"` is the only
-        thing that lets a row be inserted without naming the column - which is
-        exactly what every converted fixture now does. It goes at P6, with the
-        column.
-        """
-        pipeline = PipelineFactory.build()
-        assert pipeline.steps == "[]"
+    # `test_pipeline_default_steps_is_empty_json` and
+    # `test_pipeline_with_steps_json` stood here until 12.8 P6. Both asserted
+    # on `Pipeline.steps`; P3's docstring said outright that the first "goes at
+    # P6, with the column", and it did - migration 0015 dropped
+    # `pipelines.steps` and the mapped attribute went with it, so neither test
+    # could do anything but raise TypeError on an unexpected kwarg.
+    #
+    # Nothing is uncovered by the deletion. The default they pinned exists to
+    # let a row be inserted without naming the column, and there is no column;
+    # that a pipeline's definition is a GRAPH is pinned by
+    # `test_with_steps_trait_writes_a_graph_definition` below, and that the
+    # column is really gone by
+    # `tdd/unit/services/test_no_legacy_code.py::test_pipelines_table_has_no_steps_column`.
 
     def test_pipeline_default_is_template_is_false(self):
         """Pipeline is_template should default to False."""
@@ -91,12 +93,6 @@ class TestPipelineModel:
         pipeline = PipelineFactory.build()
         assert pipeline.repo_id is not None
         assert len(pipeline.repo_id) == 36  # UUID format
-
-    def test_pipeline_with_steps_json(self):
-        """Pipeline can store steps as JSON string."""
-        steps_json = '[{"name": "Test", "type": "script", "config": {"command": "npm test"}}]'
-        pipeline = PipelineFactory.build(steps=steps_json)
-        assert pipeline.steps == steps_json
 
     def test_pipeline_template_trait(self):
         """Pipeline with template trait has is_template=True."""

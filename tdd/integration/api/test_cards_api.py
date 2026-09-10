@@ -1168,7 +1168,7 @@ class TestCancelJobCancelsTheRun:
             id=str(uuid4()),
             repo_id=ingested_repo["id"],
             name=agent_run.adhoc_pipeline_name("card_work", card_id),
-            steps="[]",
+
             triggers="[]",
         )
         job = Job(id=str(uuid4()), card_id=card_id, status="running")
@@ -1227,7 +1227,7 @@ class TestCancelJobCancelsTheRun:
             id=str(uuid4()),
             repo_id=ingested_repo["id"],
             name="a-real-pipeline",
-            steps="[]",
+
             triggers="[]",
         )
         run = PipelineRun(
@@ -2055,3 +2055,183 @@ class TestStartingACardIsAtomic:
             assert body["status"] == "done" and body["branch_name"] == branch
         else:
             assert body["status"] == "todo" and body["branch_name"] is None
+
+
+class TestCardModelSelection:
+    """Choosing WHICH MODEL executes a card.
+
+    The owner's report: "on the story cards if I don't have preset agents
+    defined then I need to be able to set which model is going to execute on
+    the card."
+
+    The model axis already existed end to end - `Card.step_config` is free-form
+    JSON, `agent_run.start_card_work` pops `step_config["model"]` and
+    `build_agent_step_config` takes it - so these tests pin the axis rather
+    than a new column. There is deliberately NO migration behind them: the
+    tests below would pass on the schema as it shipped, EXCEPT the
+    `openai-harness` ones, which fail on the enum alone.
+    """
+
+    async def test_runner_type_enum_covers_the_agent_vocabulary(self):
+        """`RunnerType` and `AGENT_BY_RUNNER_TYPE` are ONE list (R3).
+
+        This is the test for the bug the lane found: dispatch understood
+        `openai-harness`, the card modal offered it, and `CardCreate` 422'd on
+        the way past because the enum had never been widened. Every layer
+        agreed except the one doing validation, so the feature was
+        unreachable from the UI while looking implemented everywhere else.
+
+        Pinned in BOTH directions on purpose. A value in the enum that
+        dispatch cannot map falls back to claude-code with a warning
+        (`resolve_agent`), which is a card that silently runs on an agent
+        nobody chose.
+        """
+        from app.models.card import RunnerType
+        from app.services.agent_run import AGENT_BY_RUNNER_TYPE
+
+        assert {rt.value for rt in RunnerType} == set(AGENT_BY_RUNNER_TYPE), (
+            "app.models.card.RunnerType and agent_run.AGENT_BY_RUNNER_TYPE "
+            "have drifted. A card cannot be SAVED with a runner_type missing "
+            "from the enum, and a runner_type missing from the map silently "
+            "falls back to the default agent."
+        )
+
+    async def test_create_card_with_self_hosted_runner_type(self, client, repo):
+        """A self-hosted card can be created at all.
+
+        Regression: this returned 422 ("Input should be 'any', 'claude-code',
+        'gemini' or 'mock'") while the card modal offered the option.
+        """
+        response = await client.post(
+            f"/api/repos/{repo['id']}/cards",
+            json={
+                "title": "Self-hosted card",
+                "runner_type": "openai-harness",
+                "step_config": {"model": "endpoint:local-4090"},
+            },
+        )
+        assert response.status_code == 201, response.text
+        result = response.json()
+        assert result["runner_type"] == "openai-harness"
+        assert result["step_config"] == {"model": "endpoint:local-4090"}
+
+    async def test_hosted_model_round_trips_on_step_config(self, client, repo):
+        """A hosted model id is stored and read back verbatim - no column."""
+        response = await client.post(
+            f"/api/repos/{repo['id']}/cards",
+            json={
+                "title": "Opus card",
+                "runner_type": "claude-code",
+                "step_config": {"model": "claude-opus-4-5-20250929"},
+            },
+        )
+        assert response.status_code == 201, response.text
+        card_id = response.json()["id"]
+
+        fetched = await client.get(f"/api/cards/{card_id}")
+        assert fetched.json()["step_config"]["model"] == "claude-opus-4-5-20250929"
+
+    async def test_patch_changes_the_model_without_touching_anything_else(
+        self, client, repo
+    ):
+        """Re-picking the model is a PATCH of step_config, not a new card."""
+        created = await client.post(
+            f"/api/repos/{repo['id']}/cards",
+            json={
+                "title": "Switcher",
+                "runner_type": "claude-code",
+                "step_config": {"model": "claude-sonnet-4-5-20250929"},
+            },
+        )
+        card_id = created.json()["id"]
+
+        patched = await client.patch(
+            f"/api/cards/{card_id}",
+            json={
+                "runner_type": "openai-harness",
+                "step_config": {"model": "endpoint:local-4090"},
+            },
+        )
+        assert patched.status_code == 200, patched.text
+        body = patched.json()
+        assert body["runner_type"] == "openai-harness"
+        assert body["step_config"] == {"model": "endpoint:local-4090"}
+        assert body["title"] == "Switcher"
+
+    async def test_chosen_model_reaches_the_dispatched_step(
+        self, client, ingested_repo, db_session, parked_executor
+    ):
+        """THE one that matters: the card's model lands in the step config.
+
+        A picker that stores a model the executor never reads would look
+        completely correct from the API and change nothing about the run. This
+        follows the value all the way into the ad-hoc PipelineRun's graph,
+        which is what the executor actually dispatches.
+        """
+        repo_row = await db_session.get(Repo, ingested_repo["id"])
+        seed_branch(ingested_repo["id"], repo_row.default_branch, path="README.md")
+
+        created = await client.post(
+            f"/api/repos/{ingested_repo['id']}/cards",
+            json={
+                "title": "Model reaches dispatch",
+                "description": "Do the thing in the title.",
+                "runner_type": "mock",
+                "step_type": "agent",
+                "step_config": {"model": "claude-opus-4-5-20250929"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        card_id = created.json()["id"]
+
+        started = await client.post(f"/api/cards/{card_id}/start")
+        assert started.status_code == 200, started.text
+        await await_dispatch(parked_executor)
+
+        run = await adhoc_run_for(db_session, card_id)
+        from app.models import Pipeline
+
+        pipeline = await db_session.get(Pipeline, run.pipeline_id)
+        graph = json.loads(pipeline.steps_graph)
+        step = next(iter(graph["steps"].values()))
+        assert step["config"]["model"] == "claude-opus-4-5-20250929", (
+            "the model chosen on the card did not reach the step config the "
+            f"executor dispatches; got {step['config']!r}"
+        )
+
+    async def test_unmodelled_step_config_keys_survive_a_model_change(
+        self, client, repo
+    ):
+        """Keys this form does not know about are not collateral damage.
+
+        `agent_run` forwards every non-reserved step_config key to the step as
+        `extra_config`, so a PATCH that rewrites step_config for the model
+        alone would silently delete configuration the card was created with.
+        """
+        created = await client.post(
+            f"/api/repos/{repo['id']}/cards",
+            json={
+                "title": "Has extras",
+                "runner_type": "claude-code",
+                "step_config": {
+                    "model": "claude-sonnet-4-5-20250929",
+                    "harness": {"max_turns": 12},
+                },
+            },
+        )
+        card_id = created.json()["id"]
+
+        patched = await client.patch(
+            f"/api/cards/{card_id}",
+            json={
+                "step_config": {
+                    "model": "claude-opus-4-5-20250929",
+                    "harness": {"max_turns": 12},
+                }
+            },
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["step_config"] == {
+            "model": "claude-opus-4-5-20250929",
+            "harness": {"max_turns": 12},
+        }

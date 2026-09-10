@@ -40,7 +40,7 @@ from app.services.execution.runner_state import RunnerState
 async def chain(db_session):
     repo = Repo(id=str(uuid4()), name="recovery-split-repo")
     pipeline = Pipeline(
-        id=str(uuid4()), repo_id=repo.id, name="recovery-split", steps="[]"
+        id=str(uuid4()), repo_id=repo.id, name="recovery-split"
     )
     run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id, status="running")
     step_run = StepRun(

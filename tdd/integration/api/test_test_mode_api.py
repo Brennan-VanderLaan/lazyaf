@@ -154,7 +154,7 @@ class TestReset:
         repo = Repo(name="doomed-repo")
         db_session.add(repo)
         await db_session.flush()
-        pipeline = Pipeline(repo_id=repo.id, name="doomed-pipeline", steps="[]")
+        pipeline = Pipeline(repo_id=repo.id, name="doomed-pipeline")
         db_session.add(pipeline)
         await db_session.flush()
         db_session.add(PipelineRun(pipeline_id=pipeline.id))

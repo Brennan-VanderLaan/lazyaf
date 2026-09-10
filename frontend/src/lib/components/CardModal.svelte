@@ -1,6 +1,8 @@
 <script lang="ts">
   import { createEventDispatcher, onMount, tick } from 'svelte';
-  import { EndpointSelect } from './endpoint';
+  import { EndpointOptionGroup } from './endpoint';
+  import { ENDPOINT_MODEL_PREFIX, endpointOptions, endpointsStore } from '../stores/endpoints';
+  import { modelsStore, claudeModels, geminiModels, modelsLoading } from '../stores/models';
   import type { Card, CardStatus, BranchInfo, MergeResult, RebaseResult, RunnerType, StepType, StepConfig, AgentFile, RepoAgent, MergedAgent, Feature, UserStory } from '../api/types';
   import { cardsStore } from '../stores/cards';
   import { selectedRepo } from '../stores/repos';
@@ -36,11 +38,16 @@
   let description = card?.description ?? '';
   let runnerType: RunnerType = card?.runner_type ?? 'any';
   /**
-   * M14. A self-hosted card names an ENDPOINT, carried in `step_config.model`
-   * as `endpoint:<name>` - the same field an API model would occupy, which is
-   * why `agent_run.start_card_work` needs no new parameter for it.
+   * WHICH MODEL RUNS THIS CARD, carried in `step_config.model`.
+   *
+   * One field for every kind of model, because that is what the backend
+   * already reads: `agent_run.start_card_work` pops `step_config["model"]`
+   * and hands it to `build_agent_step_config(model=...)`, whether it holds an
+   * API model id (`claude-opus-4-5-...`) or the `endpoint:<name>` sugar
+   * `resolve_step_endpoint` parses. No column, no schema change - the card
+   * already had somewhere to put this and nothing to put it there with.
    */
-  let endpointModel: string = card?.step_config?.model ?? '';
+  let modelId: string = card?.step_config?.model ?? '';
   let stepType: StepType = card?.step_type ?? 'agent';
   let stepCommand: string = card?.step_config?.command ?? '';
   let stepImage: string = card?.step_config?.image ?? '';
@@ -133,8 +140,13 @@
       .replace(/^-|-$/g, '');
   }
 
+  /**
+   * Labels for the agent axis. Still needed after the two controls merged:
+   * the read-only meta section below renders `card.runner_type` on a card
+   * that is already running, where there is nothing left to choose.
+   */
   const runnerTypeOptions: { value: RunnerType; label: string }[] = [
-    { value: 'any', label: 'Any Runner' },
+    { value: 'any', label: 'Platform default' },
     { value: 'claude-code', label: 'Claude Code' },
     { value: 'gemini', label: 'Gemini CLI' },
     // M14: the LazyAF harness against a self-hosted OpenAI-compatible
@@ -142,6 +154,132 @@
     { value: 'openai-harness', label: 'Self-hosted endpoint' },
     { value: 'mock', label: 'Mock (Testing)' },
   ];
+
+  // ---------------------------------------------------------------------------
+  // WHICH MODEL EXECUTES THIS CARD - one control, two stored fields
+  // ---------------------------------------------------------------------------
+  //
+  // A card carries the choice on TWO axes that must agree: `runner_type` (the
+  // agent) and `step_config.model` (the model that agent drives). They used to
+  // be two independent controls here, which let a human save the one pairing
+  // that cannot work: `runner_type: claude-code` with `model:
+  // 'endpoint:local-4090'`. Nothing refuses that - `_resolve_step_endpoint`
+  // returns None for every agent that is not `openai-harness`
+  // (pipeline_executor.py), so the literal string `endpoint:local-4090` is
+  // handed to the Claude CLI as a model name and the step dies inside an
+  // opaque CLI error, thirty seconds in.
+  //
+  // So the pairing is DERIVED from one selection instead of being assembled by
+  // hand: picking a model picks the agent that can run it, and the broken
+  // combination is not representable. R1, at the earliest point - the point
+  // where it would otherwise be typed.
+  //
+  // `::` is an OPTION-VALUE encoding and nothing else. It never reaches the
+  // wire: `handleModelChange` splits it back into the same two fields the card
+  // has always had, so there is no new spelling for anything to parse (R3).
+  // Endpoint options are exempt - they arrive from `EndpointOptionGroup`
+  // already spelled `endpoint:<name>`, which is the ONE sugar spelling
+  // `resolve_step_endpoint` reads, and re-wrapping it here would be the second
+  // producer that contract exists to prevent.
+  const CHOICE_SEPARATOR = '::';
+
+  /**
+   * Tells "no endpoints are registered" from "the snapshot has not landed".
+   * Without it the empty-state hint below flashes on every open and tells the
+   * operator to go register an endpoint they already have.
+   */
+  const endpointsLoaded = endpointsStore.loaded;
+
+  interface ModelChoice {
+    value: string;
+    label: string;
+    title: string;
+  }
+
+  function choiceValue(runner: RunnerType, model: string): string {
+    return `${runner}${CHOICE_SEPARATOR}${model}`;
+  }
+
+  /** The two fields one option value stands for. */
+  function parseChoice(value: string): { runner: RunnerType; model: string } {
+    // An endpoint option carries the sugar spelling verbatim; the agent that
+    // drives every endpoint is fixed, so it is implied rather than encoded.
+    if (value.startsWith(ENDPOINT_MODEL_PREFIX)) {
+      return { runner: 'openai-harness', model: value };
+    }
+    const at = value.indexOf(CHOICE_SEPARATOR);
+    if (at < 0) return { runner: 'any', model: '' };
+    return {
+      runner: value.slice(0, at) as RunnerType,
+      model: value.slice(at + CHOICE_SEPARATOR.length),
+    };
+  }
+
+  function handleModelChange(value: string) {
+    const { runner, model } = parseChoice(value);
+    runnerType = runner;
+    modelId = model;
+  }
+
+  /**
+   * The agents that need no model named: the platform default, and mock.
+   *
+   * `any` is NOT "whichever runner is free" any more - 12.5 deleted the
+   * polling queue, and `agent_run.AGENT_BY_RUNNER_TYPE` maps it to
+   * claude-code. The label says the true thing rather than the 12.4 one.
+   *
+   * Mock is listed because e2e and hand-testing genuinely dispatch it, and its
+   * title says out loud that the model field is ignored - offering it inside a
+   * model picker without that sentence would imply a choice that has no effect.
+   */
+  const agentDefaultChoices: ModelChoice[] = [
+    {
+      value: choiceValue('any', ''),
+      label: 'Platform default (Claude Code, model chosen by the CLI)',
+      title:
+        'No model is recorded on the card; the Claude Code CLI picks its own. ' +
+        "Dispatch resolves 'any' to claude-code.",
+    },
+    {
+      value: choiceValue('mock', ''),
+      label: 'Mock executor (testing only)',
+      title: 'Runs the mock executor. It ignores the model entirely.',
+    },
+  ];
+
+  $: hostedGroups = [
+    { label: 'Anthropic — run by Claude Code', runner: 'claude-code' as RunnerType, models: $claudeModels },
+    { label: 'Google — run by the Gemini CLI', runner: 'gemini' as RunnerType, models: $geminiModels },
+  ].filter((group) => group.models.length > 0);
+
+  /** The option value standing for what the card currently holds. */
+  $: selectedChoice =
+    runnerType === 'openai-harness' ? modelId : choiceValue(runnerType, modelId);
+
+  $: offeredValues = new Set<string>([
+    ...agentDefaultChoices.map((c) => c.value),
+    ...hostedGroups.flatMap((g) => g.models.map((m) => choiceValue(g.runner, m.id))),
+    ...$endpointOptions.map((o) => o.value),
+  ]);
+
+  /**
+   * True when the card's SAVED pairing is not in the list on offer - a model
+   * retired from `/api/models`, an endpoint since deleted, or simply a list
+   * that has not landed yet.
+   *
+   * It gets its own visible option rather than being dropped. A `<select>`
+   * whose value matches nothing silently displays its FIRST option, so
+   * dropping it would show a different model than the card will actually run
+   * and would then save that model on the next Save - changing the card by
+   * doing nothing. The option below is how the stored pair stays visible and
+   * round-trips untouched.
+   */
+  $: storedPairUnoffered =
+    Boolean(selectedChoice) && !offeredValues.has(selectedChoice);
+
+  $: storedPairLabel = modelId
+    ? `${modelId} (saved on this card${$modelsLoading ? '; still loading the model list' : '; not in the current list'})`
+    : `${runnerType} (saved on this card)`;
 
   /**
    * Step types a NEW card may be given.
@@ -171,11 +309,16 @@
   // Build step config from individual fields
   function buildStepConfig(): StepConfig | null {
     if (stepType === 'agent') {
-      // A self-hosted agent card carries exactly one extra fact: which
-      // endpoint. Everything else about the step is unchanged.
-      return runnerType === 'openai-harness' && endpointModel
-        ? { model: endpointModel }
-        : null;
+      // The model axis is the only key this modal OWNS. Everything else on an
+      // agent card's step_config is passed through untouched, because
+      // `agent_run.start_card_work` forwards every non-reserved key to the
+      // step as `extra_config` (see `_RESERVED_STEP_CONFIG_KEYS`) - so
+      // rebuilding the object from this form's fields alone would silently
+      // delete configuration the card was created with, on an unrelated save.
+      const config: StepConfig = { ...(card?.step_config ?? {}) };
+      delete config.model;
+      if (modelId) config.model = modelId;
+      return Object.keys(config).length > 0 ? config : null;
     }
 
     const config: StepConfig = {};
@@ -203,6 +346,12 @@
     loadRepoAgents();
     // Load spec features/stories for the optional story link selector
     loadSpecOptions();
+    // The two halves of the model list. Both are cached in their stores, so a
+    // reopened modal costs nothing; neither is awaited, because a card can be
+    // written and saved before either lands (the stored-pair option above is
+    // what keeps that safe).
+    modelsStore.load();
+    endpointsStore.load();
   });
 
   async function loadBranches() {
@@ -502,37 +651,80 @@
         </div>
 
         {#if stepType === 'agent'}
+          <!--
+            ONE control for the whole "what runs this card" question.
+
+            Hosted models and self-hosted endpoints sit in the same list
+            because they are the same decision, and the agent that drives the
+            chosen model comes along with it (see CHOICE_SEPARATOR above) - so
+            the pairing that cannot dispatch is not offerable.
+
+            Self-hosted rows come from `EndpointOptionGroup`, the shared
+            drop-in: unusable endpoints stay VISIBLE and disabled with the
+            reason ('probe required', 'disabled', 'unreachable') rather than
+            being filtered out, because M14 refuses dispatch on an unprobed
+            endpoint and an absent row is indistinguishable from one that was
+            never registered.
+          -->
           <div class="form-group">
-            <label for="runner-type">Runner Type</label>
-            <select id="runner-type" bind:value={runnerType}>
-              {#each runnerTypeOptions as option}
-                <option value={option.value}>{option.label}</option>
+            <label for="card-model">
+              Model
+              {#if $modelsLoading}<span class="loading-indicator">(loading…)</span>{/if}
+            </label>
+            <select
+              id="card-model"
+              data-testid="card-model-select"
+              value={selectedChoice}
+              on:change={(e) => handleModelChange(e.currentTarget.value)}
+            >
+              {#if storedPairUnoffered}
+                <!--
+                  The card's saved pairing, kept selectable so a Save that did
+                  not touch this field cannot change which model runs.
+                -->
+                <option value={selectedChoice} data-testid="card-model-stored">
+                  {storedPairLabel}
+                </option>
+              {/if}
+              {#each agentDefaultChoices as choice}
+                <option value={choice.value} title={choice.title}>{choice.label}</option>
               {/each}
+              {#each hostedGroups as group}
+                <optgroup label={group.label}>
+                  {#each group.models as model}
+                    <option value={choiceValue(group.runner, model.id)} title={model.description}>
+                      {model.name}
+                    </option>
+                  {/each}
+                </optgroup>
+              {/each}
+              <EndpointOptionGroup
+              label="Self-hosted — run by the LazyAF harness"
+              autoload={false}
+            />
             </select>
-            <p class="form-hint">
-              {#if runnerType === 'any'}
-                First available runner will pick up this task.
-              {:else if runnerType === 'claude-code'}
-                Only Claude Code runners will work on this task.
-              {:else if runnerType === 'gemini'}
-                Only Gemini CLI runners will work on this task.
-              {:else if runnerType === 'openai-harness'}
+            <p class="form-hint" data-testid="card-model-hint">
+              {#if runnerType === 'openai-harness'}
                 LazyAF supplies the agent loop and drives a model you host yourself.
+              {:else if runnerType === 'mock'}
+                The mock executor ignores the model — for testing the board, not for real work.
+              {:else if modelId}
+                Runs on {runnerTypeOptions.find((o) => o.value === runnerType)?.label ?? runnerType}.
+              {:else}
+                No model recorded on the card; the agent's CLI picks its own.
               {/if}
             </p>
+            {#if $endpointsLoaded && $endpointOptions.length === 0}
+              <!--
+                R1: say why the Self-hosted group is absent. A missing group is
+                otherwise indistinguishable from a broken page.
+              -->
+              <p class="form-hint" data-testid="card-model-no-endpoints">
+                No self-hosted endpoints are registered — add one on the Endpoints page to run
+                this card against your own GPU.
+              </p>
+            {/if}
           </div>
-
-          {#if runnerType === 'openai-harness'}
-            <div class="form-group">
-              <label for="card-endpoint">Model endpoint</label>
-              <EndpointSelect
-                id="card-endpoint"
-                testid="card-endpoint-select"
-                value={endpointModel}
-                onChange={(value) => (endpointModel = value)}
-              />
-            </div>
-          {/if}
 
           {#if mergedAgents.length > 0}
             <div class="form-group">

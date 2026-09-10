@@ -98,7 +98,7 @@ async def _make_step_execution(db, index=0, status=StepExecutionStatus.PREPARING
     db.add(repo)
     await db.commit()
     pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name=f"p{index}",
-                        steps="[]", triggers="[]")
+                        triggers="[]")
     db.add(pipeline)
     await db.commit()
     run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id, status="running")

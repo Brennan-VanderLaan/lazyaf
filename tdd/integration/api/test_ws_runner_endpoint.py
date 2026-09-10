@@ -823,7 +823,7 @@ def _seed_step():
     async def _op(db):
         repo = Repo(id=str(uuid4()), name="ws-repo", default_branch="main")
         pipeline = Pipeline(
-            id=str(uuid4()), repo_id=repo.id, name="ws-pipeline", steps="[]"
+            id=str(uuid4()), repo_id=repo.id, name="ws-pipeline"
         )
         run = PipelineRun(
             id=str(uuid4()),

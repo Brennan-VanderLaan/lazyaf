@@ -39,8 +39,7 @@ async def setup_test_data(db_session):
     pipeline = Pipeline(
         id=str(uuid4()),
         repo_id=repo.id,
-        name="test-pipeline",
-        steps="[]"
+        name="test-pipeline"
     )
     db_session.add(pipeline)
 

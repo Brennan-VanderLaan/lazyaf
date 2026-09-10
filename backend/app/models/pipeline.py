@@ -40,7 +40,15 @@ class Pipeline(Base):
     repo_id: Mapped[str] = mapped_column(String(36), ForeignKey("repos.id"), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    steps: Mapped[str] = mapped_column(Text, nullable=False, default="[]")  # JSON array of PipelineStep (legacy v1)
+    # `steps` - the v1 JSON array - was RETIRED in 12.8 P6 and dropped by
+    # migration 0015. It is not commented out and it is not deprecated; it is
+    # gone, and `steps_graph` is the only definition a pipeline has, at the
+    # database, the wire and the executor alike. The field and the column left
+    # in the SAME commit on purpose: the column was `nullable=False` with no
+    # server_default, so a model that stopped declaring it while the column
+    # survived would be a backend that could not INSERT a pipeline.
+    # `tdd/unit/services/test_no_legacy_code.py::test_pipelines_table_has_no_steps_column`
+    # is what stops it coming back.
     steps_graph: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON PipelineGraphModel (v2 graph-based)
     # Why this pipeline's definition could not be materialized, or NULL when
     # it could (12.8 §1.7). `sync_repo_pipelines` swallows every parse
@@ -66,9 +74,13 @@ class Pipeline(Base):
     repo: Mapped["Repo"] = relationship("Repo", back_populates="pipelines")
     runs: Mapped[list["PipelineRun"]] = relationship("PipelineRun", back_populates="pipeline", cascade="all, delete-orphan")
 
-    def has_graph_definition(self) -> bool:
-        """Check if pipeline uses graph-based (v2) definition."""
-        return self.steps_graph is not None and self.steps_graph != ""
+    # `has_graph_definition()` went with the fork it fed. It answered "is this
+    # row v2?", a question that only had two answers while there were two
+    # formats; after 12.8 every pipeline is a graph and the honest question is
+    # "does this row have a definition at all?", which its callers now ask
+    # directly of `steps_graph`. Its `!= ""` half is preserved where it still
+    # matters - migration 0014's `_has_graph`, which must treat a row holding
+    # `''` as graphless however NOT NULL the old column looked.
 
 
 class PipelineRun(Base):

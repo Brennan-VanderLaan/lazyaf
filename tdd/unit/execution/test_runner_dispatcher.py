@@ -113,7 +113,7 @@ async def chain(db_session):
     """Repo -> Pipeline -> PipelineRun -> StepRun, the parents a StepExecution needs."""
     repo = Repo(id=str(uuid4()), name="dispatch-repo")
     pipeline = Pipeline(
-        id=str(uuid4()), repo_id=repo.id, name="dispatch-pipeline", steps="[]"
+        id=str(uuid4()), repo_id=repo.id, name="dispatch-pipeline"
     )
     run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id, status="running")
     step_run = StepRun(

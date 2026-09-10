@@ -151,7 +151,7 @@ async def make_cell(db_session, experiment, *, cell_index=0, model="mock-0",
 
 async def make_step_ctx(db_session, repo, *, trigger_type, trigger_ref):
     """Full StepExecution chain for a run with the given persisted trigger."""
-    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci", steps="[]")
+    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci")
     db_session.add(pipeline)
     await db_session.commit()
     run = PipelineRun(

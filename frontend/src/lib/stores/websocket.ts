@@ -16,7 +16,7 @@ import { experimentsStore } from './experiments';
 import { debugSessionsStore } from './debug';
 import { jobsStore, type JobStatusUpdate } from './jobs';
 import { pipelinesStore, activeRunsStore, liveStepLogsStore } from './pipelines';
-import { reposStore, selectedRepoId } from './repos';
+import { branchesStore, reposStore, selectedRepoId, type RepoRefsChangedFrame } from './repos';
 import { runnersStore } from './runners';
 import { endpointsStore } from './endpoints';
 
@@ -47,6 +47,7 @@ export type ServerMessageType =
   | 'repo_created'
   | 'repo_updated'
   | 'repo_deleted'
+  | 'repo_refs_changed'
   | 'experiment_status'
   | 'experiment_cell_status'
   | 'debug_session_status'
@@ -72,6 +73,7 @@ export const HANDLED_MESSAGE_TYPES: readonly ServerMessageType[] = [
   'repo_created',
   'repo_updated',
   'repo_deleted',
+  'repo_refs_changed',
   'experiment_status',
   'experiment_cell_status',
   'debug_session_status',
@@ -183,6 +185,17 @@ export function handleServerMessage(message: WebSocketMessage) {
       break;
     case 'repo_deleted':
       reposStore.deleteLocal((message.payload as { id: string }).id);
+      break;
+    case 'repo_refs_changed':
+      // LANE 3: branches live in git refs, not in the Repo row, so a push
+      // changes them while broadcasting no repo_updated at all. Without this
+      // case the sidebar kept saying "No branches yet. Push your repo to get
+      // started." after the push that answered it, until F5.
+      //
+      // The payload is a FULL listing - the same body GET /branches returns,
+      // plus repo_id - so the store replaces rather than reconciling, and a
+      // frame for another repo is dropped by the store, not here.
+      branchesStore.applyRefsFrame(message.payload as RepoRefsChangedFrame);
       break;
     case 'experiment_status':
       // 12.6.5: a PROGRESS DELTA, not a full experiment row — it carries no

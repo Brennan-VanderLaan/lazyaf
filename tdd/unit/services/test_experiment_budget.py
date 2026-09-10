@@ -182,7 +182,7 @@ class TestPushTriggerWarning:
         repo = await make_repo(db_session)
         db_session.add(
             Pipeline(
-                id=str(uuid4()), repo_id=repo.id, name="Test Suite", steps="[]",
+                id=str(uuid4()), repo_id=repo.id, name="Test Suite",
                 triggers=json.dumps([{"type": "push", "config": {}}]),
             )
         )
@@ -202,7 +202,7 @@ class TestPushTriggerWarning:
         repo = await make_repo(db_session)
         db_session.add(
             Pipeline(
-                id=str(uuid4()), repo_id=repo.id, name="Test Suite", steps="[]",
+                id=str(uuid4()), repo_id=repo.id, name="Test Suite",
                 triggers=json.dumps([{"type": "push", "config": {}}]),
             )
         )
@@ -217,7 +217,7 @@ class TestPushTriggerWarning:
         repo = await make_repo(db_session)
         db_session.add(
             Pipeline(
-                id=str(uuid4()), repo_id=repo.id, name="Release", steps="[]",
+                id=str(uuid4()), repo_id=repo.id, name="Release",
                 triggers=json.dumps(
                     [{"type": "push", "config": {"branches": ["main", "release/*"]}}]
                 ),
@@ -235,7 +235,7 @@ class TestPushTriggerWarning:
         repo = await make_repo(db_session)
         db_session.add(
             Pipeline(
-                id=str(uuid4()), repo_id=repo.id, name="Off", steps="[]",
+                id=str(uuid4()), repo_id=repo.id, name="Off",
                 triggers=json.dumps([{"type": "push", "enabled": False, "config": {}}]),
             )
         )

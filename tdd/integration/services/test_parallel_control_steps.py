@@ -231,7 +231,7 @@ class TestParallelControlSteps:
                 id=str(uuid4()),
                 repo_id=repo.id,
                 name="parallel-control-pipeline",
-                steps="[]",
+
                 steps_graph=json.dumps(graph),
             )
             db.add(repo)

@@ -17,10 +17,28 @@ class CardStatus(str, Enum):
 
 
 class RunnerType(str, Enum):
+    """Which AGENT executes a card.
+
+    ONE list, and it is the card-shaped half of
+    `agent_run.AGENT_BY_RUNNER_TYPE` (cross-agent contract #5) - a value
+    missing here cannot be saved even though dispatch understands it, which
+    is exactly the gap `openai-harness` sat in: the card modal offered
+    "Self-hosted endpoint", every layer below accepted it, and CardCreate
+    422'd on the way past. A test pins the two together
+    (test_cards_api.TestCardModelSelection.test_runner_type_enum_covers_the_agent_vocabulary).
+
+    NOT a DB migration: `Card.runner_type` is String(50) and stores the wire
+    value, so adding a member widens what validation accepts and touches no
+    column.
+    """
+
     ANY = "any"  # Any available runner
     CLAUDE_CODE = "claude-code"
     GEMINI = "gemini"
     MOCK = "mock"  # Mock executor for E2E testing
+    # M14. LazyAF supplies the agent loop and drives a model the operator
+    # hosts; the endpoint is named in `step_config.model` as `endpoint:<name>`.
+    OPENAI_HARNESS = "openai-harness"
 
 
 class StepType(str, Enum):

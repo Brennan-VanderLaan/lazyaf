@@ -202,7 +202,10 @@ class PipelineFactory(BaseFactory):
     repo_id = factory.LazyFunction(generate_uuid)
     name = factory.LazyFunction(lambda: fake.word().capitalize() + " Pipeline")
     description = factory.LazyFunction(lambda: fake.sentence())
-    steps = "[]"  # JSON string of steps
+    # No `steps` default: the v1 array column was dropped at 12.8 P6
+    # (migration 0015). A pipeline built without a trait has NO definition,
+    # which is now sayable - `steps_graph` is NULL - where the old `"[]"`
+    # said "defined, and empty", a state the graph format cannot represent.
     is_template = False
     created_at = factory.LazyFunction(datetime.utcnow)
     updated_at = factory.LazyFunction(datetime.utcnow)

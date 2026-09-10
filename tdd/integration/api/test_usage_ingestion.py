@@ -64,7 +64,7 @@ async def _make_run(db_session) -> dict:
     repo = Repo(id=str(uuid4()), name=f"usage-repo-{uuid4().hex[:8]}", is_ingested=True)
     db_session.add(repo)
 
-    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci", steps="[]")
+    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci")
     db_session.add(pipeline)
 
     pipeline_run = PipelineRun(

@@ -345,7 +345,7 @@ async def _make_run(db, graph_dict, *, completed=(), active=(), failed=()):
         id=str(uuid4()),
         repo_id=repo.id,
         name="graph pipeline",
-        steps="[]",
+
         steps_graph=json.dumps(graph_dict),
     )
     db.add(pipeline)
@@ -541,7 +541,7 @@ async def _make_graph_run(db, graph_dict):
         id=str(uuid4()),
         repo_id=repo.id,
         name="graph pipeline",
-        steps="[]",
+
         steps_graph=json.dumps(graph_dict),
     )
     db.add(pipeline)

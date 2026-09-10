@@ -408,102 +408,31 @@ class TestGraphPipelineParallelExecution:
 
 
 # =============================================================================
-# User Story 3: Legacy Pipeline Conversion
+# User Story 3: Legacy Pipeline Conversion - DELETED at 12.8 P6
 # =============================================================================
-
-@pytest.mark.skip(reason="Legacy pipeline format removed - conversion not needed")
-class TestGraphPipelineLegacyConversion:
-    """
-    User Story 3: Convert Legacy Pipelines to Graph Format
-
-    As a developer with existing sequential pipelines,
-    I want to convert them to graph format
-    So that I can edit them in the visual node graph editor
-
-    Acceptance Criteria:
-    - Existing array-based pipelines can be converted to graph format
-    - Conversion preserves step order and dependencies
-    - Auto-layout positions nodes in a readable arrangement
-    - Original pipeline functionality is unchanged
-    """
-
-    async def test_legacy_pipeline_still_works(self, api_client, test_repo):
-        """Existing array-based pipelines continue to work."""
-        # Legacy format with steps as array
-        response = await api_client.post(
-            f"/api/repos/{test_repo['id']}/pipelines",
-            json={
-                "name": "Legacy Pipeline",
-                "steps": [
-                    {"name": "Step 1", "type": "script", "config": {"command": "echo 1"}},
-                    {"name": "Step 2", "type": "script", "config": {"command": "echo 2"}}
-                ]
-            },
-        )
-
-        assert response.status_code == 201
-        pipeline = response.json()
-        assert len(pipeline["steps"]) == 2
-
-    async def test_convert_legacy_to_graph(self, api_client, test_repo):
-        """Legacy pipeline can be converted to graph format."""
-        # Create legacy pipeline
-        create_response = await api_client.post(
-            f"/api/repos/{test_repo['id']}/pipelines",
-            json={
-                "name": "To Convert",
-                "steps": [
-                    {"name": "Build", "type": "script", "config": {"command": "npm build"}},
-                    {"name": "Test", "type": "script", "config": {"command": "npm test"}},
-                    {"name": "Deploy", "type": "script", "config": {"command": "npm deploy"}}
-                ]
-            },
-        )
-        pipeline_id = create_response.json()["id"]
-
-        # Convert to graph format
-        convert_response = await api_client.post(f"/api/pipelines/{pipeline_id}/convert-to-graph")
-        assert convert_response.status_code == 200
-
-        converted = convert_response.json()
-        assert "steps_graph" in converted
-
-        # Should have 3 nodes
-        assert len(converted["steps_graph"]["steps"]) == 3
-
-        # Should have 2 edges (Build->Test, Test->Deploy)
-        assert len(converted["steps_graph"]["edges"]) == 2
-
-        # First step should be entry point
-        entry_points = converted["steps_graph"]["entry_points"]
-        assert len(entry_points) == 1
-
-    async def test_converted_pipeline_executes_same_as_legacy(self, api_client, test_repo):
-        """Converted pipeline produces same execution result as legacy."""
-        # Create and run legacy pipeline
-        legacy_response = await api_client.post(
-            f"/api/repos/{test_repo['id']}/pipelines",
-            json={
-                "name": "Legacy",
-                "steps": [
-                    {"name": "Echo", "type": "script", "config": {"command": "echo hello"}}
-                ]
-            },
-        )
-        legacy_id = legacy_response.json()["id"]
-
-        # Run legacy
-        legacy_run = await api_client.post(f"/api/pipelines/{legacy_id}/run")
-
-        # Convert to graph
-        await api_client.post(f"/api/pipelines/{legacy_id}/convert-to-graph")
-
-        # Run graph version
-        graph_run = await api_client.post(f"/api/pipelines/{legacy_id}/run")
-
-        # Both should complete with same status
-        # (This is a behavior contract - actual implementation may vary)
-        assert legacy_run.status_code == graph_run.status_code
+#
+# `TestGraphPipelineLegacyConversion` stood here under
+# `@pytest.mark.skip(reason="Legacy pipeline format removed - conversion not
+# needed")`. That reason is finally TRUE: migration 0015 dropped
+# `pipelines.steps`, the model field went with it, and there is no v1 array
+# left to convert FROM.
+#
+# The three tests went with it, and so did their `tdd/skip_baseline.json`
+# entry - that file's own note demanded they be deleted together, and leaving
+# the entry behind would have left a baseline prefix nothing can ever match.
+# Two of the three POSTed to `/api/pipelines/{id}/convert-to-graph`, an
+# endpoint that never existed; it was NOT implemented on the way out. The
+# third asserted `len(pipeline["steps"]) == 2` on a create response, which is
+# now a field the wire does not carry.
+#
+# What replaced the coverage, so this is a deletion and not a hole: the
+# conversion is now the BOUNDARY, not an endpoint - `.lazyaf/pipelines/*.yaml`
+# is still authored as an array and converted on every push. That path is
+# covered by `tdd/unit/schemas/test_graph_pipeline_schemas.py`
+# (`TestArrayToGraphConversion`, one test per action per direction),
+# `tdd/integration/api/test_pipeline_sync_on_push.py`, and - for every row
+# that already existed - the frozen converter in migration 0014, pinned by
+# `tdd/integration/test_migrations_pipeline_retirement.py`.
 
 
 # =============================================================================

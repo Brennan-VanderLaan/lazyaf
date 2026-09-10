@@ -77,7 +77,7 @@ async def execution(db_session):
     """A StepExecution with a real StepRun/PipelineRun chain behind it."""
     repo = Repo(id=str(uuid4()), name="log-writer-repo")
     pipeline = Pipeline(
-        id=str(uuid4()), repo_id=repo.id, name="log-writer-pipeline", steps="[]"
+        id=str(uuid4()), repo_id=repo.id, name="log-writer-pipeline"
     )
     run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id, status="running")
     step_run = StepRun(

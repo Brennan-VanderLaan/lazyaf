@@ -39,7 +39,7 @@ from app.database import ALEMBIC_BASELINE_REVISION, Base, _alembic_config, _run_
 
 # Tip of the migration chain. Every startup path (fresh upgrade, legacy
 # adoption stamp-then-upgrade) must end here.
-ALEMBIC_HEAD_REVISION = "0014"
+ALEMBIC_HEAD_REVISION = "0015"
 
 EXPECTED_TABLES = {
     "repos",
@@ -187,9 +187,11 @@ async def _seed_usage_chain(engine):
         )
         await conn.execute(
             text(
-                "INSERT INTO pipelines (id, repo_id, name, steps, triggers, is_template, "
+                # No `steps`: 12.8 P6 (migration 0015) dropped the column,
+                # and these rows are seeded at HEAD.
+                "INSERT INTO pipelines (id, repo_id, name, triggers, is_template, "
                 "created_at, updated_at) "
-                "VALUES ('p1', 'r1', 'pipe', '[]', '[]', 0, '2026-01-01 00:00:00', "
+                "VALUES ('p1', 'r1', 'pipe', '[]', 0, '2026-01-01 00:00:00', "
                 "'2026-01-01 00:00:00')"
             )
         )
@@ -559,8 +561,9 @@ class TestRoundTrip:
             )
             await conn.execute(
                 text(
-                    "INSERT INTO pipelines (id, repo_id, name, steps, triggers, is_template, created_at, updated_at) "
-                    "VALUES ('p1', 'r1', 'pipe', '[]', '[]', 0, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                    # No `steps`: dropped by 0015, and this row is seeded at HEAD.
+                    "INSERT INTO pipelines (id, repo_id, name, triggers, is_template, created_at, updated_at) "
+                    "VALUES ('p1', 'r1', 'pipe', '[]', 0, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
                 )
             )
             await conn.execute(

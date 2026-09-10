@@ -98,7 +98,7 @@ async def make_experiment(
 
 async def make_run(db, repo, *, status=RunStatus.RUNNING.value, trigger_ref=None):
     pipeline = Pipeline(
-        id=str(uuid4()), repo_id=repo.id, name=f"p-{uuid4().hex[:6]}", steps="[]"
+        id=str(uuid4()), repo_id=repo.id, name=f"p-{uuid4().hex[:6]}"
     )
     db.add(pipeline)
     await db.commit()

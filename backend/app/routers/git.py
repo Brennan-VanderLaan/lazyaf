@@ -165,6 +165,12 @@ async def git_receive_pack(repo_id: str, request: Request, db: AsyncSession = De
     each pushed branch: trigger_service.on_push first re-syncs repo-defined
     pipelines (.lazyaf/pipelines/) from the pushed commit, then matches push
     triggers - so CI changes take effect on the push that introduces them.
+
+    It then broadcasts the repo's new branch listing. A push moves refs and
+    touches no database row, so before this it reached open clients as
+    complete silence: the sidebar went on saying "No branches yet. Push your
+    repo to get started." after the very push that answered it, and only a
+    reload fixed it.
     """
     if not git_repo_manager.repo_exists(repo_id):
         raise HTTPException(status_code=404, detail="Repository not found")
@@ -207,6 +213,12 @@ async def git_receive_pack(repo_id: str, request: Request, db: AsyncSession = De
                 except Exception as e:
                     # Don't fail the push if trigger fails
                     print(f"[git] Warning: Push trigger failed: {e}")
+
+            # One frame for the whole push, after every ref has landed - not
+            # one per ref, which would make a multi-branch push render as a
+            # sequence of half-states.
+            from app.routers.repos import broadcast_repo_refs_changed
+            await broadcast_repo_refs_changed(db, repo_id)
 
         return Response(
             content=output,
@@ -264,6 +276,7 @@ async def handle_push_event(
     if not git_repo_manager.repo_exists(repo_id):
         raise HTTPException(status_code=404, detail="Repository not found")
 
+    from app.routers.repos import broadcast_repo_refs_changed
     from app.services.trigger_service import trigger_service
 
     runs = await trigger_service.on_push(
@@ -273,6 +286,12 @@ async def handle_push_event(
         commit_sha=event.new_sha,
         old_sha=event.old_sha,
     )
+
+    # The refs are already on disk by the time this is called (the git server
+    # calls it after the write), so the listing this broadcasts is the one a
+    # client would get by fetching. This is the OTHER push path - a repo whose
+    # branches only refreshed on one of the two would be worse than neither.
+    await broadcast_repo_refs_changed(db, repo_id)
 
     return {
         "triggered_runs": len(runs),

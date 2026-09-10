@@ -2,6 +2,7 @@
   import { createEventDispatcher } from 'svelte';
   import { repos } from '../api/client';
   import type { BranchInfo } from '../api/client';
+  import { branchesStore } from '../stores/repos';
   import { formatRelative, fromEpochSeconds } from '../utils/time';
 
   export let repoId: string;
@@ -28,6 +29,29 @@
 
   $: if (repoId) {
     loadBranches(true);  // Always verify on load
+  }
+
+  /**
+   * Re-read when this repo's refs move under the modal.
+   *
+   * `branchesStore` is updated by the `repo_refs_changed` websocket frame, so
+   * this fires on a push (or an agent branch) that lands while the modal is
+   * open. It cannot just adopt the frame's list: this modal shows the RICHER
+   * `/branches/info` projection - orphan and integrity flags the frame does
+   * not carry - so it refetches rather than half-filling those in (R3).
+   *
+   * Guarded on `loaded` so the store's initial empty state does not trigger a
+   * second fetch on top of the one above.
+   */
+  // Identity only - never rendered. `client.ts` and `types.ts` each declare
+  // their own BranchInfo (the modal needs the richer one), so naming a type
+  // here would only pick a side of that pre-existing split.
+  let lastSeenRefs: unknown = null;
+  $: if ($branchesStore.repoId === repoId && $branchesStore.loaded) {
+    if (lastSeenRefs !== null && lastSeenRefs !== $branchesStore.branches) {
+      loadBranches(true);
+    }
+    lastSeenRefs = $branchesStore.branches;
   }
 
   async function loadBranches(verify: boolean = true) {
@@ -517,7 +541,13 @@
 
     <div class="modal-footer">
       <button type="button" class="btn btn-secondary" on:click={() => dispatch('close')}>Close</button>
-      <button type="button" class="btn btn-primary" on:click={loadBranches} disabled={loading}>
+      <!--
+        `on:click={loadBranches}` handed the MouseEvent to loadBranches's
+        `verify` parameter. It happened to work only because an event object is
+        truthy - flip that default to false and the button would silently stop
+        verifying while still saying "Refresh". Call it explicitly.
+      -->
+      <button type="button" class="btn btn-primary" on:click={() => loadBranches()} disabled={loading}>
         {loading ? 'Loading...' : 'Refresh'}
       </button>
     </div>

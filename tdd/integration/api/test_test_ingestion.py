@@ -54,7 +54,7 @@ async def _make_step_ctx(db_session, repo_name: str) -> dict:
     repo = Repo(id=str(uuid4()), name=repo_name, is_ingested=True)
     db_session.add(repo)
 
-    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci", steps="[]")
+    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci")
     db_session.add(pipeline)
 
     pipeline_run = PipelineRun(

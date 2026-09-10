@@ -238,7 +238,11 @@ class TestRefusesResultsManifest:
             def __exit__(self, *args):
                 return False
 
-            def post(self, url, json=None):
+            def request(self, method, url, json=None):
+                # cli.api_request drives every verb through Client.request;
+                # the double follows so that what is asserted below is the
+                # call the CLI actually makes.
+                posted["method"] = method
                 posted["url"] = url
                 posted["json"] = json
                 return _Response()
@@ -251,6 +255,7 @@ class TestRefusesResultsManifest:
 
         assert result.exit_code == 0
         assert "Warning" in result.output
+        assert posted["method"] == "POST"
         assert posted["json"]["repo_id"] == "repo-123"
         assert posted["json"]["refs"] == [
             {"lazyaf_test_id": "us1.ran", "file_path": "tdd/unit/test_x.py"}
@@ -349,7 +354,7 @@ class TestManifestHelpers:
             def __exit__(self, *a):
                 return False
 
-            def post(self, url, json=None):
+            def request(self, method, url, json=None):
                 sent.update(json)
                 return _Response()
 

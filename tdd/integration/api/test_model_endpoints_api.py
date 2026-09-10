@@ -234,7 +234,7 @@ def lan_ollama(name="local-4090", **overrides) -> dict:
 async def _make_step(db_session, *, status="running", endpoint_id=None, runner_id=None):
     repo = Repo(id=str(uuid4()), name=f"ep-repo-{uuid4().hex[:8]}", is_ingested=True)
     db_session.add(repo)
-    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci", steps="[]")
+    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci")
     db_session.add(pipeline)
     run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id, status="running")
     db_session.add(run)

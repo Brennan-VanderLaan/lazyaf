@@ -330,3 +330,249 @@ class TestDeleteRepoWithLiveWork:
 
         response = await client.delete(f"/api/repos/{repo_id}")
         assert_deleted_response(response)
+
+
+# -----------------------------------------------------------------------------
+# LANE 3: "I need to be able to see which branches are available in lazyaf".
+#
+# Branches live in the internal repo's REFS, not in the Repo row, so every ref
+# write used to reach the UI as silence: the sidebar went on saying "No
+# branches yet. Push your repo to get started." after the push that answered
+# it, and only F5 fixed it. These pin both halves of the fix - the listing
+# itself, and the `repo_refs_changed` frame that keeps an open page honest.
+# -----------------------------------------------------------------------------
+
+@pytest.fixture
+def captured_frames(monkeypatch):
+    """Record every WS frame the manager broadcasts during one test."""
+    from app.services.websocket import manager
+
+    frames: list[tuple] = []
+    original = manager.broadcast
+
+    async def _spy(message_type, payload):
+        frames.append((message_type, payload))
+        return await original(message_type, payload)
+
+    monkeypatch.setattr(manager, "broadcast", _spy)
+    return frames
+
+
+def refs_frames(frames) -> list[dict]:
+    """Just the repo_refs_changed payloads, in order."""
+    return [
+        payload for message_type, payload in frames
+        if message_type == "repo_refs_changed"
+    ]
+
+
+def make_branch(repo_id: str, branch: str, parent: str | None = None) -> str:
+    """Put a real branch on the internal git server. Returns its tip sha."""
+    from dulwich.objects import Blob, Commit, Tree
+
+    from app.services.git_server import git_repo_manager
+
+    repo = git_repo_manager.get_repo(repo_id)
+    assert repo is not None, f"repo {repo_id} is not on the internal git server"
+
+    blob = Blob.from_string(f"content of {branch}\n".encode())
+    tree = Tree()
+    tree.add(b"work.txt", 0o100644, blob.id)
+    commit = Commit()
+    commit.tree = tree.id
+    commit.author = commit.committer = b"LazyAF QA <qa@lazyaf.test>"
+    commit.commit_time = commit.author_time = 1756000000
+    commit.commit_timezone = commit.author_timezone = 0
+    commit.encoding = b"UTF-8"
+    commit.message = f"work on {branch}".encode()
+    if parent:
+        commit.parents = [parent.encode("ascii")]
+
+    repo.object_store.add_object(blob)
+    repo.object_store.add_object(tree)
+    repo.object_store.add_object(commit)
+    repo.refs[f"refs/heads/{branch}".encode()] = commit.id
+    return commit.id.decode("ascii")
+
+
+class TestBranchListing:
+    """GET /api/repos/{id}/branches - what the sidebar renders."""
+
+    async def test_ingested_repo_with_no_pushes_lists_no_branches(
+        self, client, clean_git_repos
+    ):
+        """The state a brand new repo sits in, and it is NOT an error.
+
+        Ingesting without a path creates the bare repo and marks it ingested;
+        nothing has been pushed yet. This has to answer 200 with an empty
+        list - a 4xx/5xx here is what let the UI render a failed listing and
+        an empty repo identically, and then tell the user to push a repo they
+        had already pushed.
+        """
+        created = await client.post(
+            "/api/repos/ingest",
+            json={"name": "no-pushes-yet", "default_branch": "main"},
+        )
+        assert_status_code(created, 201)
+        repo_id = created.json()["id"]
+
+        response = await client.get(f"/api/repos/{repo_id}/branches")
+        assert_status_code(response, 200)
+        body = response.json()
+        assert body["branches"] == []
+        assert body["total"] == 0
+
+    async def test_listing_names_default_and_agent_branches_with_their_tips(
+        self, client, ingested_repo, clean_git_repos
+    ):
+        """Every fact the branch list renders comes from this one response."""
+        repo_id = ingested_repo["id"]
+        default_branch = ingested_repo["default_branch"]
+
+        default_tip = clean_git_repos.get_branch_commit(repo_id, default_branch)
+        agent_tip = make_branch(repo_id, "lazyaf/ab12cd34", parent=default_tip)
+
+        response = await client.get(f"/api/repos/{repo_id}/branches")
+        assert_status_code(response, 200)
+        by_name = {b["name"]: b for b in response.json()["branches"]}
+
+        assert set(by_name) == {default_branch, "lazyaf/ab12cd34"}
+        assert by_name[default_branch]["is_default"] is True
+        assert by_name[default_branch]["is_lazyaf"] is False
+        # The `lazyaf/` prefix is how a human tells agent work apart from
+        # their own - it is the whole reason the flag exists.
+        assert by_name["lazyaf/ab12cd34"]["is_lazyaf"] is True
+        assert by_name["lazyaf/ab12cd34"]["is_default"] is False
+        # The tip commits, or a row can only say a branch exists, never where
+        # it is.
+        assert by_name[default_branch]["commit"] == default_tip
+        assert by_name["lazyaf/ab12cd34"]["commit"] == agent_tip
+
+    async def test_unknown_repo_is_a_404_not_an_empty_list(self, client):
+        """An empty list is a fact about a repo. A missing repo is not that."""
+        assert_not_found(await client.get("/api/repos/does-not-exist/branches"))
+
+
+class TestRefsChangedBroadcast:
+    """Every path that writes a ref announces the new listing (LANE 3).
+
+    Without this an open page shows the branches it happened to fetch once,
+    forever. The reported symptom was a push that changed nothing on screen.
+    """
+
+    async def test_the_frame_carries_exactly_what_the_endpoint_returns(
+        self, client, ingested_repo, clean_git_repos, captured_frames
+    ):
+        """One source of truth: frame and fetch are built by one function.
+
+        A page hydrated by GET and a page updated by the frame must not be
+        able to disagree about which branches exist, so this compares them
+        field for field rather than spot-checking a name.
+        """
+        repo_id = ingested_repo["id"]
+        default_tip = clean_git_repos.get_branch_commit(
+            repo_id, ingested_repo["default_branch"]
+        )
+        make_branch(repo_id, "lazyaf/frame-check", parent=default_tip)
+
+        # Any ref-writing endpoint will do; sync is the cheapest.
+        assert_status_code(await client.post(f"/api/repos/{repo_id}/sync"), 200)
+
+        frames = refs_frames(captured_frames)
+        assert frames, "a ref write broadcast no repo_refs_changed frame"
+        frame = frames[-1]
+
+        fetched = (await client.get(f"/api/repos/{repo_id}/branches")).json()
+        assert frame["repo_id"] == repo_id
+        assert {k: v for k, v in frame.items() if k != "repo_id"} == fetched
+
+    async def test_deleting_a_branch_broadcasts_the_shorter_list(
+        self, client, ingested_repo, clean_git_repos, captured_frames
+    ):
+        repo_id = ingested_repo["id"]
+        default_tip = clean_git_repos.get_branch_commit(
+            repo_id, ingested_repo["default_branch"]
+        )
+        make_branch(repo_id, "lazyaf/going-away", parent=default_tip)
+
+        response = await client.delete(
+            f"/api/repos/{repo_id}/branches/lazyaf/going-away"
+        )
+        assert_status_code(response, 200)
+
+        frames = refs_frames(captured_frames)
+        assert frames, (
+            "deleting a branch broadcast nothing - open pages keep offering it"
+        )
+        names = [b["name"] for b in frames[-1]["branches"]]
+        assert "lazyaf/going-away" not in names
+
+    async def test_a_refused_delete_broadcasts_nothing(
+        self, client, ingested_repo, captured_frames
+    ):
+        """A refusal changed no ref. Announcing one would be a lie."""
+        repo_id = ingested_repo["id"]
+
+        response = await client.delete(
+            f"/api/repos/{repo_id}/branches/lazyaf/never-existed"
+        )
+        assert response.status_code == 400, response.text
+        assert refs_frames(captured_frames) == []
+
+    async def test_the_push_endpoint_announces_the_branch_it_just_created(
+        self, client, ingested_repo, clean_git_repos, captured_frames
+    ):
+        """The owner's exact path: a push, then the list he is looking at.
+
+        The git server calls this internal endpoint after the refs are on
+        disk, so the branch created here must be IN the frame it emits - not
+        in some later one.
+        """
+        repo_id = ingested_repo["id"]
+        default_tip = clean_git_repos.get_branch_commit(
+            repo_id, ingested_repo["default_branch"]
+        )
+        pushed_sha = make_branch(repo_id, "lazyaf/just-pushed", parent=default_tip)
+
+        response = await client.post(
+            f"/git/{repo_id}.git/_internal/push-event",
+            json={
+                "branch": "lazyaf/just-pushed",
+                "new_sha": pushed_sha,
+                "old_sha": "",
+            },
+        )
+        assert_status_code(response, 200)
+
+        frames = refs_frames(captured_frames)
+        assert frames, (
+            "a push broadcast no repo_refs_changed - this is the reported "
+            "defect: the panel keeps saying 'No branches yet. Push your repo "
+            "to get started.' after the push that answered it"
+        )
+        pushed = [
+            b for b in frames[-1]["branches"] if b["name"] == "lazyaf/just-pushed"
+        ]
+        assert pushed, f"frame does not carry the pushed branch: {frames[-1]}"
+        assert pushed[0]["commit"] == pushed_sha
+        assert pushed[0]["is_lazyaf"] is True
+
+    async def test_a_repo_with_no_git_storage_does_not_break_the_caller(
+        self, client, db_session, captured_frames
+    ):
+        """The broadcast must never turn a completed write into a failure.
+
+        A repo row that was never ingested has no listing to send. That is a
+        real absence rather than a swallowed error, and the push path that
+        called it carries on.
+        """
+        from app.routers.repos import broadcast_repo_refs_changed
+
+        created = await client.post(
+            "/api/repos", json=repo_create_payload(name="NoGitStorage")
+        )
+        repo_id = created.json()["id"]
+
+        await broadcast_repo_refs_changed(db_session, repo_id)
+
+        assert refs_frames(captured_frames) == []

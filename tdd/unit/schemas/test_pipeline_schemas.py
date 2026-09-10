@@ -367,18 +367,34 @@ class TestPipelineReadHasNoStepsArray:
         guarded = {field for v in validators.values() for field in v.info.fields}
         assert "steps" not in guarded
 
-    def test_an_orm_row_still_carrying_the_column_does_not_leak_it(self):
-        """`Pipeline.steps` stays on the ORM model until P6 (the column is
-        NOT NULL with no server_default, so a model that stopped declaring it
-        could not INSERT). The column outliving the wire field is the whole
-        point of the phase split - it must not travel."""
+    def test_the_orm_row_cannot_even_carry_the_column_any_more(self):
+        """P6 closed this from the other end.
+
+        This test used to build a row WITH `steps='[{"name": "Legacy"...}]'`
+        and prove the array did not travel onto the wire - `Pipeline.steps`
+        outlived `PipelineRead.steps` on purpose, because the column was NOT
+        NULL with no server_default and a model that stopped declaring it
+        could not INSERT. Migration 0015 dropped the column and the field
+        left with it in the same commit, so the array is no longer something
+        a row can hold and then leak. Asserting the ABSENCE is what is left
+        to assert, and it is strictly stronger than the round trip was."""
         from app.models.pipeline import Pipeline
+        from sqlalchemy import inspect as sa_inspect
+
+        assert "steps" not in {c.key for c in sa_inspect(Pipeline).columns}
+
+        with pytest.raises(TypeError):
+            Pipeline(
+                id="p1",
+                repo_id="r1",
+                name="P",
+                steps='[{"name": "Legacy", "type": "script"}]',
+            )
 
         row = Pipeline(
             id="p1",
             repo_id="r1",
             name="P",
-            steps='[{"name": "Legacy", "type": "script"}]',
             triggers="[]",
             is_template=False,
             created_at=datetime.utcnow(),
@@ -388,7 +404,6 @@ class TestPipelineReadHasNoStepsArray:
         dumped = PipelineRead.model_validate(row).model_dump()
 
         assert "steps" not in dumped
-        assert "Legacy" not in json.dumps(dumped, default=str)
 
     def test_an_unset_definition_is_none_not_an_empty_collection(self):
         """The distinction the deletion buys: "this pipeline has no graph" is
@@ -583,7 +598,6 @@ class TestPipelineReadDefinitionError:
             id="pipeline-123",
             repo_id="repo-456",
             name="Test Pipeline",
-            steps="[]",
             triggers="[]",
             is_template=False,
             created_at=datetime.utcnow(),

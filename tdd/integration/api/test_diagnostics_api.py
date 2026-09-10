@@ -99,7 +99,7 @@ async def _seed_run(db, *, step_logs: str, step_name: str = "agent-step"):
     db.add(repo)
     await db.flush()
 
-    pipeline = Pipeline(repo_id=repo.id, name="diag-pipeline", steps="[]")
+    pipeline = Pipeline(repo_id=repo.id, name="diag-pipeline")
     db.add(pipeline)
     await db.flush()
 

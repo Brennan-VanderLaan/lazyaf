@@ -1,13 +1,21 @@
-"""Migration 0014: the v1 array backfill and the `definition_error` column.
+"""Migrations 0014 and 0015: the v1 array's backfill, and its removal.
 
-Phase 12.8 P4. This suite is deliberately SEPARATE from
+Phase 12.8 P4 and P6. This suite is deliberately SEPARATE from
 `tdd/integration/test_migrations.py`, which owns the chain-wide invariants
 (head pin, fresh-vs-create_all parity, baseline round trip). What lives here
-is everything specific to retiring the v1 array pipeline format, and the one
-property the rest of the wave rests on:
+is everything specific to retiring the v1 array pipeline format, and the two
+properties the rest of the wave rests on:
 
     after 0014, no pipeline row in any database has an array definition and
-    no graph.
+    no graph;
+
+    after 0015, no database has the array column at all.
+
+The two revisions are split on purpose and the split is what buys R2: 0014 is
+pure `UPDATE` + additive `ALTER` and is fully reversible, the ACCEPTANCE GATE
+runs on the backfilled data, and only then does 0015 remove anything. This
+file reads in that order too - everything above `TestTheColumnIsDropped` is
+0014, and everything from there down is 0015.
 
 Every test drives the REAL revision through alembic against a real SQLite
 file, because the thing under test is a data migration and a data migration
@@ -26,10 +34,15 @@ from alembic.script import ScriptDirectory
 
 from app.database import _alembic_config
 
-#: The revision under test, and the one before it. Named rather than
-#: inlined so a future renumbering is one edit.
+#: The backfill revision, and the one before it. Named rather than inlined
+#: so a future renumbering is one edit.
 REVISION = "0014"
 PARENT = "0013"
+
+#: The DROP revision (12.8 P6). Its parent is `REVISION`: 0014 is what makes
+#: "every row has a graph" true, which is the precondition for removing the
+#: array, and the acceptance gate runs in between.
+DROP_REVISION = "0015"
 
 
 # -----------------------------------------------------------------------------
@@ -1229,3 +1242,739 @@ class TestAnAdoptedDatabaseIsBackfilledToo:
             assert graph["entry_points"] == ["build"]
         finally:
             engine.dispose()
+
+
+# =============================================================================
+# 0015 - the column drop (12.8 P6)
+# =============================================================================
+#
+# Everything below runs AFTER the acceptance gate. 0014 above made "every row
+# has a graph" true and did it reversibly; these tests cover the revision that
+# takes the array away for good.
+#
+# Two existing tests in `tdd/integration/test_migrations.py` are the real
+# regression gate for the downgrade and are deliberately NOT duplicated or
+# modified here: `test_downgrade_to_baseline_matches_pure_0001_schema` and
+# `test_roundtrip_restores_head_schema` compare a full schema snapshot against
+# a database built by a pure `0001`. `0001` declares `steps` NOT NULL, which is
+# why 0015's downgrade re-adds it as `nullable=False`, and `_schema_snapshot`
+# records `(type, nullable, primary_key)` and NOT server defaults, which is why
+# the `server_default='[]'` divergence is invisible to them. If those two go
+# red, 0015's downgrade is wrong - not them.
+
+
+def _seed_graph_pipeline(
+    engine: sa.Engine,
+    pipeline_id: str,
+    *,
+    name: str = "A Pipeline",
+    steps_graph: str | None = None,
+    repo_id: str = "repo-1",
+) -> str:
+    """Insert a pipeline row the POST-0015 way: no `steps` column at all.
+
+    `_seed_pipeline` above names `steps` in its INSERT, which is exactly right
+    for the backfill tests and impossible once the column is gone. Keeping two
+    seeders rather than one conditional one keeps each test honest about which
+    schema it is planting rows in.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO pipelines (id, repo_id, name, steps_graph, "
+                "triggers, is_template, created_at, updated_at) VALUES "
+                "(:id, :repo_id, :name, :graph, '[]', 0, "
+                "'2026-08-31', '2026-08-31')"
+            ),
+            {
+                "id": pipeline_id,
+                "repo_id": repo_id,
+                "name": name,
+                "graph": steps_graph,
+            },
+        )
+    return pipeline_id
+
+
+def _linear_graph(*names: str) -> str:
+    """A minimal valid graph, as JSON, for rows that only need to be defined."""
+    steps = {
+        name: {
+            "id": name,
+            "name": name,
+            "type": "script",
+            "config": {"command": f"run {name}"},
+            "position": {"x": 100.0, "y": float(i * 150)},
+            "timeout": 300,
+            "continue_in_context": False,
+            "actions": {"success": [], "failure": [], "always": []},
+        }
+        for i, name in enumerate(names)
+    }
+    edges = [
+        {
+            "id": f"edge_{i}_success",
+            "from_step": names[i],
+            "to_step": names[i + 1],
+            "condition": "success",
+        }
+        for i in range(len(names) - 1)
+    ]
+    return json.dumps(
+        {
+            "steps": steps,
+            "edges": edges,
+            "entry_points": [names[0]],
+            "version": 2,
+        }
+    )
+
+
+@pytest.fixture
+def at_pre_drop(tmp_path):
+    """A database at 0014 - backfilled, `definition_error` present, `steps`
+    still there. The state the acceptance gate ran against, and the exact
+    state 0015 has to take the column out of."""
+    engine = _engine(tmp_path, "predrop.db")
+    _upgrade(engine, REVISION)
+    _seed_repo(engine)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+class TestTheColumnIsDropped:
+    """The column goes, and nothing else does."""
+
+    def test_steps_is_not_in_the_pipelines_column_snapshot(self, at_pre_drop):
+        assert "steps" in _columns(at_pre_drop, "pipelines")
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        assert "steps" not in _columns(at_pre_drop, "pipelines")
+
+    def test_the_row_and_its_graph_survive_the_rebuild(self, at_pre_drop):
+        """`batch_alter_table` RENAMES, recreates and copies on SQLite. A
+        rebuild that lost the definition would be this revision deleting the
+        pipelines it was only supposed to reformat."""
+        graph = _linear_graph("build", "test")
+        _seed_pipeline(
+            at_pre_drop, "p1", steps=_array(_step("build")), steps_graph=graph
+        )
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        row = _row(at_pre_drop, "p1")
+        assert row["name"] == "A Pipeline"
+        assert row["steps_graph"] == graph
+        assert list(json.loads(row["steps_graph"])["steps"]) == ["build", "test"]
+
+    def test_the_other_columns_all_survive_the_rebuild(self, at_pre_drop):
+        """One dropped column, not two. `definition_error` arrived in 0014 and
+        is the channel every refusal in this milestone surfaces on; losing it
+        to a rebuild would make the whole refusal strategy dark again."""
+        before = _columns(at_pre_drop, "pipelines")
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        assert _columns(at_pre_drop, "pipelines") == before - {"steps"}
+
+    def test_a_definition_error_survives_the_rebuild_with_its_text(
+        self, at_pre_drop
+    ):
+        _seed_pipeline(at_pre_drop, "p1", steps_graph=_linear_graph("a"))
+        with at_pre_drop.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE pipelines SET definition_error = :msg "
+                    "WHERE id = 'p1'"
+                ),
+                {"msg": "step 'a' declares an unknown action"},
+            )
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        assert _row(at_pre_drop, "p1")["definition_error"] == (
+            "step 'a' declares an unknown action"
+        )
+
+    def test_the_revision_is_rerunnable(self, at_pre_drop):
+        """The guard idiom every revision in this chain uses: a database
+        healed by `create_all` after the retirement already has no `steps`,
+        and this revision must tolerate that rather than raising on the schema
+        it exists to produce."""
+        _seed_pipeline(at_pre_drop, "p1", steps_graph=_linear_graph("a"))
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        _upgrade(at_pre_drop, DROP_REVISION)  # no-op, must not raise
+
+        assert "steps" not in _columns(at_pre_drop, "pipelines")
+        assert _row(at_pre_drop, "p1")["steps_graph"] == _linear_graph("a")
+
+    def test_a_database_with_no_pipelines_at_all_drops_cleanly(self, at_pre_drop):
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        assert "steps" not in _columns(at_pre_drop, "pipelines")
+
+
+class TestTheRebuildKeepsTheInboundForeignKey:
+    """`pipelines` is the target of `pipeline_runs.pipeline_id`, and 0011
+    refused a rebuild of `step_executions` for exactly that reason. This table
+    was verified to tolerate it (see 0015's docstring); these tests are what
+    turn that verification into something that stays true."""
+
+    def test_runs_seeded_before_the_rebuild_survive_and_still_join(
+        self, at_pre_drop
+    ):
+        _seed_pipeline(at_pre_drop, "p1", steps_graph=_linear_graph("a"))
+        with at_pre_drop.begin() as conn:
+            for i in range(3):
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO pipeline_runs (id, pipeline_id, status, "
+                        "trigger_type, current_step, steps_completed, "
+                        "steps_total, created_at) VALUES (:id, 'p1', 'passed', "
+                        "'manual', 0, 1, 1, '2026-08-31')"
+                    ),
+                    {"id": f"run-{i}"},
+                )
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        with at_pre_drop.connect() as conn:
+            joined = conn.execute(
+                sa.text(
+                    "SELECT r.id FROM pipeline_runs r JOIN pipelines p "
+                    "ON p.id = r.pipeline_id ORDER BY r.id"
+                )
+            ).scalars().all()
+        assert joined == ["run-0", "run-1", "run-2"], (
+            "a rebuild that dropped rows or changed ids would orphan every "
+            "run in the database, and an orphaned run is invisible until "
+            "somebody opens it"
+        )
+
+    def test_a_step_run_two_tables_deep_still_reaches_its_pipeline(
+        self, at_pre_drop
+    ):
+        _seed_pipeline(at_pre_drop, "p1", steps_graph=_linear_graph("a"))
+        with at_pre_drop.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO pipeline_runs (id, pipeline_id, status, "
+                    "trigger_type, current_step, steps_completed, steps_total, "
+                    "created_at) VALUES ('run-1', 'p1', 'passed', 'manual', "
+                    "0, 1, 1, '2026-08-31')"
+                )
+            )
+            conn.execute(
+                sa.text(
+                    "INSERT INTO step_runs (id, pipeline_run_id, step_index, "
+                    "step_id, step_name, status, logs) VALUES "
+                    "('sr-1', 'run-1', 0, 'a', 'a', 'passed', '')"
+                )
+            )
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        with at_pre_drop.connect() as conn:
+            name = conn.execute(
+                sa.text(
+                    "SELECT p.name FROM step_runs s "
+                    "JOIN pipeline_runs r ON r.id = s.pipeline_run_id "
+                    "JOIN pipelines p ON p.id = r.pipeline_id "
+                    "WHERE s.id = 'sr-1'"
+                )
+            ).scalar()
+        assert name == "A Pipeline"
+
+    def test_the_rebuild_introduces_no_foreign_key_violation(self, at_pre_drop):
+        """A join succeeding is not the same as the constraint still being
+        declared. SQLite will happily join across a table whose FK definition
+        the rebuild mangled, so ask SQLite itself."""
+        _seed_pipeline(at_pre_drop, "p1", steps_graph=_linear_graph("a"))
+        with at_pre_drop.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO pipeline_runs (id, pipeline_id, status, "
+                    "trigger_type, current_step, steps_completed, steps_total, "
+                    "created_at) VALUES ('run-1', 'p1', 'passed', 'manual', "
+                    "0, 1, 1, '2026-08-31')"
+                )
+            )
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        with at_pre_drop.connect() as conn:
+            violations = conn.exec_driver_sql(
+                "PRAGMA foreign_key_check(pipeline_runs)"
+            ).fetchall()
+            declared = conn.exec_driver_sql(
+                "PRAGMA foreign_key_list(pipeline_runs)"
+            ).fetchall()
+        assert violations == []
+        assert any(row[2] == "pipelines" for row in declared), (
+            "pipeline_runs no longer declares its FK to pipelines: the "
+            "rebuild silently dropped the constraint"
+        )
+
+
+class TestTheDropRefusesToStrandADefinition:
+    """0014 is supposed to leave no row with an array and no graph - but 0014
+    could have run days ago, on a backend that then kept inserting. Dropping
+    the column is the one irreversible step in this milestone, so it looks
+    once more while the array is still there to be read (R1)."""
+
+    def test_a_row_with_an_array_and_no_graph_raises_naming_it(self, at_pre_drop):
+        _seed_pipeline(
+            at_pre_drop,
+            "stranded",
+            name="Written After The Backfill",
+            steps=_array(_step("build")),
+            steps_graph=None,
+        )
+
+        with pytest.raises(RuntimeError) as caught:
+            _upgrade(at_pre_drop, DROP_REVISION)
+
+        message = str(caught.value)
+        assert "stranded" in message
+        assert "Written After The Backfill" in message
+        assert REVISION in message, (
+            "the refusal must name the remedy, not just the problem"
+        )
+
+    def test_the_refusal_leaves_the_column_and_its_definition_intact(
+        self, at_pre_drop
+    ):
+        array = _array(_step("build"))
+        _seed_pipeline(at_pre_drop, "stranded", steps=array, steps_graph=None)
+
+        with pytest.raises(RuntimeError):
+            _upgrade(at_pre_drop, DROP_REVISION)
+
+        assert "steps" in _columns(at_pre_drop, "pipelines")
+        assert _row(at_pre_drop, "stranded")["steps"] == array
+
+    def test_running_the_backfill_first_clears_the_refusal(self, at_pre_drop):
+        """The remedy the message names actually works - otherwise the
+        refusal is a dead end dressed as advice."""
+        _seed_pipeline(at_pre_drop, "stranded", steps=_array(_step("build")))
+        with pytest.raises(RuntimeError):
+            _upgrade(at_pre_drop, DROP_REVISION)
+
+        _downgrade(at_pre_drop, PARENT)
+        _upgrade(at_pre_drop, REVISION)  # the backfill, re-run
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        assert "steps" not in _columns(at_pre_drop, "pipelines")
+        assert list(_graph(at_pre_drop, "stranded")["steps"]) == ["step_0"]
+
+    def test_an_empty_array_with_no_graph_is_not_stranded(self, at_pre_drop):
+        """`[]` is not a definition. 0014 deliberately leaves such a row with
+        a NULL graph and logs it; refusing here would make an
+        already-undefined pipeline block every operator's upgrade forever."""
+        _seed_pipeline(at_pre_drop, "undefined", steps="[]", steps_graph=None)
+        _seed_pipeline(at_pre_drop, "blank", steps="   ", steps_graph=None)
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        assert "steps" not in _columns(at_pre_drop, "pipelines")
+        for pipeline_id in ("undefined", "blank"):
+            assert _row(at_pre_drop, pipeline_id)["steps_graph"] is None
+
+    def test_a_row_with_both_an_array_and_a_graph_is_not_stranded(
+        self, at_pre_drop
+    ):
+        """Every backfilled row is this shape - 0014 never modifies `steps`."""
+        _seed_pipeline(
+            at_pre_drop,
+            "backfilled",
+            steps=_array(_step("build")),
+            steps_graph=_linear_graph("build"),
+        )
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        assert "steps" not in _columns(at_pre_drop, "pipelines")
+
+
+class TestTheDropDowngradeRestoresTheShapeNotTheData:
+    """`steps` comes back NOT NULL, which is what the two schema-snapshot
+    tests in `test_migrations.py` require, and every row comes back holding
+    `'[]'`, which is all that can honestly be restored."""
+
+    def test_steps_comes_back_and_it_is_not_nullable(self, at_pre_drop):
+        _seed_pipeline(at_pre_drop, "p1", steps_graph=_linear_graph("a"))
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        _downgrade(at_pre_drop, REVISION)
+
+        with at_pre_drop.connect() as conn:
+            column = next(
+                col
+                for col in sa.inspect(conn).get_columns("pipelines")
+                if col["name"] == "steps"
+            )
+        assert column["nullable"] is False, (
+            "0001 declares `steps` NOT NULL, and "
+            "test_downgrade_to_baseline_matches_pure_0001_schema compares a "
+            "full snapshot against a pure 0001. A nullable re-add fails there"
+        )
+
+    def test_every_surviving_row_holds_the_empty_array(self, at_pre_drop):
+        # Both rows carry a graph: 0015 refuses to run at all while any row
+        # holds an array and nothing else, so a backfilled row is the only
+        # shape this downgrade can be asked about.
+        _seed_pipeline(
+            at_pre_drop,
+            "p1",
+            steps=_array(_step("build")),
+            steps_graph=_linear_graph("build"),
+        )
+        _seed_pipeline(at_pre_drop, "p2", steps_graph=_linear_graph("a"))
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        _downgrade(at_pre_drop, REVISION)
+
+        assert _row(at_pre_drop, "p1")["steps"] == "[]"
+        assert _row(at_pre_drop, "p2")["steps"] == "[]"
+
+    def test_the_original_arrays_are_gone_and_that_is_the_documented_cost(
+        self, at_pre_drop
+    ):
+        """Named as a positive assertion rather than left implied. Nothing in
+        the database records what the arrays were once the column is dropped,
+        and a downgrade that quietly produced `[]` while the docstring implied
+        recovery would be the dark behaviour this milestone exists to
+        remove."""
+        array = _array(_step("build"), _step("test"))
+        _seed_pipeline(
+            at_pre_drop,
+            "p1",
+            steps=array,
+            steps_graph=_linear_graph("build", "test"),
+        )
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        _downgrade(at_pre_drop, REVISION)
+
+        row = _row(at_pre_drop, "p1")
+        assert row["steps"] != array
+        assert row["steps"] == "[]"
+        assert row["steps_graph"], (
+            "the real definition is in steps_graph, which the downgrade does "
+            "not touch - that is why losing the array costs nothing"
+        )
+
+    def test_the_restored_column_accepts_an_insert_that_omits_it(
+        self, at_pre_drop
+    ):
+        """The `server_default='[]'` half. Without it, a NOT NULL column
+        cannot be added to a populated table in one statement, and the
+        downgraded database would reject every INSERT from an application
+        that no longer supplies `steps`."""
+        _upgrade(at_pre_drop, DROP_REVISION)
+        _downgrade(at_pre_drop, REVISION)
+
+        _seed_graph_pipeline(at_pre_drop, "after", steps_graph=_linear_graph("a"))
+
+        assert _row(at_pre_drop, "after")["steps"] == "[]"
+
+    def test_a_run_still_joins_after_the_downgrade_rebuild(self, at_pre_drop):
+        """The downgrade rebuilds the table too - the FK has to survive in
+        both directions, not just forward."""
+        _seed_pipeline(at_pre_drop, "p1", steps_graph=_linear_graph("a"))
+        with at_pre_drop.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO pipeline_runs (id, pipeline_id, status, "
+                    "trigger_type, current_step, steps_completed, steps_total, "
+                    "created_at) VALUES ('run-1', 'p1', 'passed', 'manual', "
+                    "0, 1, 1, '2026-08-31')"
+                )
+            )
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        _downgrade(at_pre_drop, REVISION)
+
+        with at_pre_drop.connect() as conn:
+            joined = conn.execute(
+                sa.text(
+                    "SELECT p.name FROM pipeline_runs r JOIN pipelines p "
+                    "ON p.id = r.pipeline_id WHERE r.id = 'run-1'"
+                )
+            ).scalar()
+        assert joined == "A Pipeline"
+
+    def test_upgrade_downgrade_upgrade_round_trips(self, at_pre_drop):
+        _seed_pipeline(at_pre_drop, "p1", steps_graph=_linear_graph("a", "b"))
+
+        _upgrade(at_pre_drop, DROP_REVISION)
+        after_first = _columns(at_pre_drop, "pipelines")
+        _downgrade(at_pre_drop, REVISION)
+        _upgrade(at_pre_drop, DROP_REVISION)
+
+        assert _columns(at_pre_drop, "pipelines") == after_first
+        assert _row(at_pre_drop, "p1")["steps_graph"] == _linear_graph("a", "b")
+
+
+class TestTheModelAndTheColumnLeftTogether:
+    """The hazard the phase split was designed around, asserted rather than
+    argued: `steps` was `nullable=False` with NO server_default, so a model
+    that stopped declaring the field while the column survived would be a
+    backend that could not INSERT a pipeline at all. The field and the column
+    ship in one commit, and these tests are what say so."""
+
+    def test_the_orm_model_declares_no_steps(self):
+        from app.models.pipeline import Pipeline
+
+        assert "steps" not in {c.key for c in sa.inspect(Pipeline).columns}
+        assert not hasattr(Pipeline, "steps")
+
+    def test_a_head_database_and_the_model_agree_on_the_pipelines_columns(
+        self, tmp_path
+    ):
+        """Either half arriving without the other shows up here: a model that
+        still declared `steps` would have a column the schema lacks, and a
+        revision that never ran would have a column the model lacks."""
+        from app.models.pipeline import Pipeline
+
+        engine = _engine(tmp_path, "parity.db")
+        try:
+            _upgrade(engine, "head")
+            actual = _columns(engine, "pipelines")
+        finally:
+            engine.dispose()
+
+        assert actual == {
+            c.name for c in sa.inspect(Pipeline).local_table.columns
+        }
+
+    def test_a_pipeline_inserts_through_the_orm_at_head(self, tmp_path):
+        """The failure mode the split avoided, run for real. If the field had
+        been removed while the column stayed, this INSERT would raise
+        `NOT NULL constraint failed: pipelines.steps`."""
+        from sqlalchemy.orm import Session
+
+        from app.models.pipeline import Pipeline
+        from app.models.repo import Repo
+
+        engine = _engine(tmp_path, "insert.db")
+        try:
+            _upgrade(engine, "head")
+            with Session(engine) as session:
+                session.add(Repo(id="repo-1", name="demo", is_ingested=True))
+                session.add(
+                    Pipeline(
+                        id="p1",
+                        repo_id="repo-1",
+                        name="Authored At Head",
+                        steps_graph=_linear_graph("a"),
+                    )
+                )
+                session.commit()
+            assert _row(engine, "p1")["name"] == "Authored At Head"
+        finally:
+            engine.dispose()
+
+
+class TestAnAdoptedDatabaseStillCarryingTheRetiredColumn:
+    """s4.8's hole, closed and pinned.
+
+    `_adopt_unversioned` classifies an unversioned database by asking only
+    what is MISSING. A retired column is the opposite shape - present in the
+    database, absent from the models - so after 0015 a pre-alembic dev
+    database (the `lazyaf-data` docker volume) looks like PERFECT parity and
+    would be stamped at HEAD with `pipelines.steps` surviving as an orphan:
+    still NOT NULL, still with no server default. The backfill never runs, the
+    drop never runs, and the next pipeline INSERT dies with
+    `NOT NULL constraint failed: pipelines.steps` - from a database that
+    reports itself as current.
+
+    `app.database._RETIRED_COLUMNS` is the fix: stamp the revision BEFORE the
+    drop and let the caller's upgrade-to-head heal the database properly.
+    """
+
+    def _pre_alembic_database(self, tmp_path, *, steps: str) -> sa.Engine:
+        """A database built by `create_all` at the CURRENT model schema, with
+        `pipelines.steps` hand-added and no `alembic_version`.
+
+        This is the shape s4.8 describes exactly: everything the models
+        declare (so `missing_current` is empty), PLUS the retired column.
+        """
+        import app.models  # noqa: F401  (register every table)
+        from app.database import Base
+
+        engine = _engine(tmp_path, "orphan.db")
+        with engine.begin() as conn:
+            Base.metadata.create_all(conn)
+            conn.execute(
+                sa.text(
+                    "ALTER TABLE pipelines ADD COLUMN steps TEXT NOT NULL "
+                    "DEFAULT '[]'"
+                )
+            )
+        _seed_repo(engine)
+        _seed_pipeline(engine, "legacy", steps=steps, steps_graph=None)
+        return engine
+
+    def test_it_is_healed_to_head_with_the_column_gone_and_the_array_converted(
+        self, tmp_path
+    ):
+        from app.database import _run_migrations
+
+        engine = self._pre_alembic_database(
+            tmp_path,
+            steps=_array(_step("build", id="build"), _step("test", id="test")),
+        )
+        try:
+            with engine.begin() as conn:
+                _run_migrations(conn)
+
+            with engine.connect() as conn:
+                version = conn.execute(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ).scalar()
+                heads = ScriptDirectory.from_config(
+                    _alembic_config(conn)
+                ).get_heads()
+
+            assert version in heads, (
+                "the database must end at head - stamping the pre-drop "
+                "revision is a step on the way there, not the destination"
+            )
+            assert "steps" not in _columns(engine, "pipelines"), (
+                "the orphan column survived: this database is stamped at head "
+                "with a NOT NULL column no model declares, and the next "
+                "pipeline INSERT will fail"
+            )
+            graph = _graph(engine, "legacy")
+            assert list(graph["steps"]) == ["build", "test"], (
+                "the array was dropped without being backfilled - stamping "
+                "head skipped 0014 as well as 0015"
+            )
+            assert graph["entry_points"] == ["build"]
+        finally:
+            engine.dispose()
+
+    def test_the_healed_database_can_then_insert_a_pipeline(self, tmp_path):
+        """The consequence, not just the schema. This is the INSERT that fails
+        with `NOT NULL constraint failed: pipelines.steps` when the orphan
+        column is left behind - the actual symptom an operator would hit, a
+        restart or two after an upgrade that looked clean."""
+        from sqlalchemy.orm import Session
+
+        from app.database import _run_migrations
+        from app.models.pipeline import Pipeline
+
+        engine = self._pre_alembic_database(
+            tmp_path, steps=_array(_step("build", id="build"))
+        )
+        try:
+            with engine.begin() as conn:
+                _run_migrations(conn)
+
+            with Session(engine) as session:
+                session.add(
+                    Pipeline(
+                        id="fresh",
+                        repo_id="repo-1",
+                        name="Authored After Adoption",
+                        steps_graph=_linear_graph("a"),
+                    )
+                )
+                session.commit()
+
+            assert _row(engine, "fresh")["name"] == "Authored After Adoption"
+        finally:
+            engine.dispose()
+
+    def test_a_database_with_no_retired_column_still_stamps_straight_to_head(
+        self, tmp_path
+    ):
+        """The negative half. `_RETIRED_COLUMNS` must not turn every adoption
+        into a full re-upgrade: a genuinely head-shaped database still takes
+        the one-step path it always did."""
+        import app.models  # noqa: F401
+        from app.database import Base, _run_migrations
+
+        engine = _engine(tmp_path, "clean.db")
+        try:
+            with engine.begin() as conn:
+                Base.metadata.create_all(conn)
+            _seed_repo(engine)
+            _seed_graph_pipeline(engine, "p1", steps_graph=_linear_graph("a"))
+
+            with engine.begin() as conn:
+                _run_migrations(conn)
+
+            with engine.connect() as conn:
+                version = conn.execute(
+                    sa.text("SELECT version_num FROM alembic_version")
+                ).scalar()
+                heads = ScriptDirectory.from_config(
+                    _alembic_config(conn)
+                ).get_heads()
+            assert version in heads
+            assert _row(engine, "p1")["steps_graph"] == _linear_graph("a")
+        finally:
+            engine.dispose()
+
+
+class TestTheRetiredColumnMapIsWellFormed:
+    """`_RETIRED_COLUMNS` is a hand-maintained mapping onto revision ids, and
+    a typo in it would only ever be discovered on the one database shape it
+    exists to rescue - i.e. on an operator's machine, at startup, as a failed
+    stamp. Checked here instead."""
+
+    def test_it_stamps_the_parent_of_the_BACKFILL_not_of_the_drop(self):
+        """The obvious answer here is wrong, and it is wrong silently.
+
+        `steps` is retired by TWO revisions: 0014 backfills every array into
+        `steps_graph` and 0015 drops the column. Naming 0014 - "the revision
+        immediately before the drop" - marks the backfill as already done, so
+        `upgrade("head")` runs 0015 alone over rows that still hold an array
+        and no graph. 0015 then refuses (correctly), and the adopted database
+        is left at 0014 with the retirement half-applied. So the entry names
+        the parent of the FIRST revision in the retirement.
+
+        `TestAnAdoptedDatabaseStillCarryingTheRetiredColumn` is what catches
+        this end to end; this test says which line to change when it does.
+        """
+        from app.database import _RETIRED_COLUMNS
+
+        assert _RETIRED_COLUMNS[("pipelines", "steps")] == PARENT, (
+            f"the entry must name {PARENT} - the parent of {REVISION}, the "
+            f"BACKFILL - so that upgrade-to-head runs the backfill and then "
+            f"{DROP_REVISION}. Naming {REVISION} skips the backfill and "
+            f"{DROP_REVISION} refuses; naming {DROP_REVISION} skips both"
+        )
+
+    def test_every_mapped_revision_exists_in_the_chain(self, tmp_path):
+        from app.database import _RETIRED_COLUMNS, _validate_retired_columns
+
+        engine = _engine(tmp_path, "map.db")
+        try:
+            with engine.connect() as conn:
+                _validate_retired_columns(_alembic_config(conn))
+                script = ScriptDirectory.from_config(_alembic_config(conn))
+                known = {rev.revision for rev in script.walk_revisions()}
+        finally:
+            engine.dispose()
+
+        assert set(_RETIRED_COLUMNS.values()) <= known
+
+    def test_no_mapped_column_is_still_declared_by_its_model(self):
+        """An entry for a column that is still live would stamp working
+        databases backwards on every adoption."""
+        import app.models  # noqa: F401
+        from app.database import Base, _RETIRED_COLUMNS
+
+        for (table, column) in _RETIRED_COLUMNS:
+            declared = {c.name for c in Base.metadata.tables[table].columns}
+            assert column not in declared, (
+                f"_RETIRED_COLUMNS says {table}.{column} was dropped, but the "
+                "model still declares it"
+            )

@@ -379,7 +379,7 @@ async def _make_execution(db, endpoint_id=None):
     repo = Repo(id=str(uuid4()), name="r", default_branch="main")
     db.add(repo)
     await db.commit()
-    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="p", steps="[]",
+    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="p",
                         triggers="[]")
     db.add(pipeline)
     await db.commit()
@@ -672,7 +672,7 @@ class TestFullAgentPayload:
         db.add(repo)
         await db.commit()
         pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci",
-                            steps="[]", triggers="[]")
+                            triggers="[]")
         db.add(pipeline)
         await db.commit()
         run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id,
@@ -892,7 +892,7 @@ class TestEndpointIsAnnouncedInTheStepLog:
         db.add(repo)
         await db.commit()
         pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci",
-                            steps="[]", triggers="[]")
+                            triggers="[]")
         db.add(pipeline)
         await db.commit()
         run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id,

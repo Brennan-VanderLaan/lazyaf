@@ -154,7 +154,7 @@ async def attach(
         id=str(uuid4()),
         repo_id=repo_row.id,
         name="agent pipeline",
-        steps="[]",
+
     )
     db.add(pipeline)
     run = PipelineRun(

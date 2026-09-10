@@ -82,7 +82,7 @@ async def env(tmp_path):
             is_ingested=True,
         )
         pipeline = Pipeline(
-            id=str(uuid4()), repo_id=repo.id, name="remote-pipeline", steps="[]"
+            id=str(uuid4()), repo_id=repo.id, name="remote-pipeline"
         )
         run = PipelineRun(
             id=str(uuid4()),

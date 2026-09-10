@@ -402,7 +402,7 @@ class TestTriggerVocabularyAfterRegistration:
         from app.models import Pipeline
 
         pipeline = Pipeline(
-            id=str(uuid4()), repo_id=repo.id, name="public", steps="[]"
+            id=str(uuid4()), repo_id=repo.id, name="public"
         )
         db_session.add(pipeline)
         await db_session.commit()

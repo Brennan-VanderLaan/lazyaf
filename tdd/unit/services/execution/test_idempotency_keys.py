@@ -137,8 +137,7 @@ class TestIdempotentCreation:
         pipeline = Pipeline(
             id=str(uuid4()),
             repo_id=repo.id,
-            name="test-pipeline",
-            steps="[]"
+            name="test-pipeline"
         )
         db_session.add(pipeline)
 
@@ -236,8 +235,7 @@ class TestExecutionLookup:
         pipeline = Pipeline(
             id=str(uuid4()),
             repo_id=repo.id,
-            name="test-pipeline",
-            steps="[]"
+            name="test-pipeline"
         )
         db_session.add(pipeline)
 
@@ -315,8 +313,7 @@ class TestConcurrentCreation:
         pipeline = Pipeline(
             id=str(uuid4()),
             repo_id=repo.id,
-            name="test-pipeline",
-            steps="[]"
+            name="test-pipeline"
         )
         db_session.add(pipeline)
 
@@ -383,8 +380,7 @@ class TestExecutionKeyUniqueness:
         pipeline = Pipeline(
             id=str(uuid4()),
             repo_id=repo.id,
-            name="test-pipeline",
-            steps="[]"
+            name="test-pipeline"
         )
         db_session.add(pipeline)
 

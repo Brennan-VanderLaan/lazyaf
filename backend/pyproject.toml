@@ -36,6 +36,14 @@ test = [
     "faker>=30.0.0",
     "pytest-timeout>=2.3.0",
     "pytest-playwright>=0.5.0",
+    # NOT a backend runtime dependency. `tdd/unit/scripts/test_cli_errors.py`
+    # has a class that renders through the REAL rich to prove the markup bug
+    # the CLI's `markup=False` exists to avoid - a stub can pin the call but
+    # not the effect. Every tier runs pytest from backend/, so without this
+    # those four tests importorskip'd in EVERY tier and ran nowhere at all.
+    # Same bound as cli/pyproject.toml so the behaviour under test is the
+    # behaviour that ships.
+    "rich>=13.0.0,<15",
 ]
 dev = [
     "lazyaf-backend[test]",

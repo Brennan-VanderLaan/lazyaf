@@ -66,21 +66,14 @@ def live_run_refusal(subject: str, runs: list) -> str:
 
 
 
-def parse_steps(steps_str: str | None) -> list:
-    """Parse the LEGACY v1 steps array from its JSON string.
 
-    12.8: the only two readers left are the run gate and the export fallback
-    below, and both exist solely for rows written BEFORE this phase - nothing
-    writes the column any more (`create_pipeline` / `update_pipeline` /
-    `upsert_materialized_pipeline` all write `steps_graph`). Both readers, and
-    this function, go with the column at P6.
-    """
-    if not steps_str:
-        return []
-    try:
-        return json.loads(steps_str)
-    except (json.JSONDecodeError, TypeError):
-        return []
+# `parse_steps` was deleted with `pipelines.steps` at 12.8 P6 (migration
+# 0015), along with its two remaining readers - the run gate and the export
+# fallback below. Both existed only for rows written before the graph
+# cutover; 0014 backfilled every one of them into `steps_graph`, so there is
+# no array left to read and nothing to fall back TO. Where those readers
+# stood, a pipeline with no `steps_graph` now REFUSES rather than quietly
+# behaving as if it had an empty definition (R1).
 
 
 def parse_steps_graph(steps_graph_str: str | None) -> dict | None:
@@ -281,8 +274,9 @@ async def create_pipeline(repo_id: str, pipeline: PipelineCreate, db: AsyncSessi
         raise HTTPException(status_code=404, detail="Repo not found")
 
     # ONE definition reaches the row, and it is always the graph (12.8 §4.4).
-    # `steps` is not passed at all: the column keeps its python-side "[]"
-    # default until it is dropped, so nothing new is ever written into it.
+    # An inbound `steps` array is still ACCEPTED - that is the authoring
+    # dialect - but it is converted here and never stored as an array: since
+    # P6 dropped `pipelines.steps` there is no column left to store it in.
     graph = graph_from_request(pipeline.steps, pipeline.steps_graph)
     triggers_json = serialize_triggers(pipeline.triggers)
 
@@ -472,13 +466,13 @@ async def run_pipeline(
                 raise HTTPException(status_code=400, detail="Pipeline must have at least one entry point")
         except (json.JSONDecodeError, TypeError) as e:
             raise HTTPException(status_code=400, detail=f"Invalid steps_graph: {e}")
-    else:
-        # Rows written BEFORE the graph cutover, which migration 0014 has not
-        # backfilled yet. Nothing writes the array any more; this branch and
-        # the executor's array fork die together at P5/P6.
-        steps = parse_steps(pipeline.steps)
 
     if not steps:
+        # No array fallback any more: 12.8 P6 dropped `pipelines.steps` and
+        # 0014 backfilled every row that had one. A pipeline with no
+        # `steps_graph` has no definition at all - the shape 0014 logs a
+        # warning for and leaves alive-but-unrunnable - so this is where it
+        # is told so, at the point of the run request.
         raise HTTPException(status_code=400, detail="Pipeline has no steps defined")
 
     # Import executor here to avoid circular imports
@@ -899,22 +893,20 @@ async def export_pipeline_yaml(pipeline_id: str, db: AsyncSession = Depends(get_
                 ),
             )
     else:
-        # Rows written before the graph cutover that migration 0014 has not
-        # backfilled yet. They are already the authoring dialect; fill in the
-        # keys the array left optional so the export has one shape either way.
-        export_data["steps"] = [
-            {
-                "id": step.get("id") or f"step_{index}",
-                "name": step.get("name", f"step_{index}"),
-                "type": step.get("type", "script"),
-                "config": step.get("config") or {},
-                "on_success": step.get("on_success", "next"),
-                "on_failure": step.get("on_failure", "stop"),
-                "timeout": step.get("timeout", 300),
-                "continue_in_context": bool(step.get("continue_in_context", False)),
-            }
-            for index, step in enumerate(parse_steps(pipeline.steps))
-        ]
+        # No array fallback any more (12.8 P6). A row with no `steps_graph`
+        # has no definition to export, and emitting `steps: []` would hand
+        # the operator a file that re-imports as a pipeline which runs
+        # nothing and reports PASSED - the exact silent green QA4-08 records.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Pipeline '{pipeline.name}' has no definition to export: "
+                "its `steps_graph` is empty. Author its steps in the "
+                "pipeline editor first, or commit a "
+                "`.lazyaf/pipelines/*.yaml` file and push, which "
+                "materializes one."
+            ),
+        )
 
     # Generate YAML with nice formatting
     yaml_content = yaml.dump(export_data, default_flow_style=False, sort_keys=False, allow_unicode=True)

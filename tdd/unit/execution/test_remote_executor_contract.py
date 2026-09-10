@@ -230,7 +230,7 @@ async def remote(registry, dispatcher, sessions):
 async def chain(db_session):
     repo = Repo(id=str(uuid4()), name="contract-repo")
     pipeline = Pipeline(
-        id=str(uuid4()), repo_id=repo.id, name="contract-pipeline", steps="[]"
+        id=str(uuid4()), repo_id=repo.id, name="contract-pipeline"
     )
     run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id, status="running")
     step_run = StepRun(

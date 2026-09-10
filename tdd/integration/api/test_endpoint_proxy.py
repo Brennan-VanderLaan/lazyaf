@@ -145,7 +145,7 @@ async def _make_endpoint(db, *, reach="proxy", auth_style="bearer",
 async def _make_step(db, *, endpoint_id=None, status="running"):
     repo = Repo(id=str(uuid4()), name=f"r-{uuid4().hex[:6]}", is_ingested=True)
     db.add(repo)
-    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci", steps="[]")
+    pipeline = Pipeline(id=str(uuid4()), repo_id=repo.id, name="ci")
     db.add(pipeline)
     run = PipelineRun(id=str(uuid4()), pipeline_id=pipeline.id, status="running")
     db.add(run)

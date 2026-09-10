@@ -529,9 +529,16 @@ class TestExportContentDisposition:
     """The export header is built from a user-supplied name (RFC 6266)."""
 
     async def _pipeline_named(self, client, repo, name):
+        # A real step, because since 12.8 a pipeline with no definition is
+        # refused at export with 409 - correctly. These tests are about the
+        # Content-Disposition header built from `name`, so they need a
+        # pipeline that gets far enough to HAVE a header.
         response = await client.post(
             f"/api/repos/{repo['id']}/pipelines",
-            json=pipeline_create_payload(name=name),
+            json=pipeline_create_payload(
+                name=name,
+                steps=[pipeline_step_payload(name="Only Step", on_success="stop")],
+            ),
         )
         assert response.status_code in (200, 201), response.text
         return response.json()["id"]

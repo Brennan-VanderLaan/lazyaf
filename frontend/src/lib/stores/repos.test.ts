@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { get } from 'svelte/store';
-import type { Repo } from '../api/types';
+import type { BranchInfo, Repo } from '../api/types';
 
 vi.mock('../api/client', () => ({
   repos: {
@@ -9,10 +9,11 @@ vi.mock('../api/client', () => ({
     create: vi.fn(),
     ingest: vi.fn(),
     delete: vi.fn(),
+    branches: vi.fn(),
   },
 }));
 
-import { reposStore } from './repos';
+import { branchesStore, reposStore } from './repos';
 import { repos as reposApi } from '../api/client';
 
 function makeRepo(overrides: Partial<Repo> = {}): Repo {
@@ -95,5 +96,151 @@ describe('reposStore insert-or-replace by id', () => {
     reposStore.deleteLocal('repo-1');
 
     expect(get(reposStore).map(r => r.id)).toEqual(['repo-2']);
+  });
+});
+
+
+/**
+ * LANE 3 - the branch list the sidebar renders.
+ *
+ * Branches are not part of the Repo row: a push moves refs and changes no row
+ * at all. So the panel is snapshot-then-delta, and these pin the two failures
+ * that made "I need to be able to see which branches are available" a bug
+ * report - a delta that never arrives, and a failed fetch that renders as an
+ * empty repo.
+ */
+describe('branchesStore', () => {
+  const branch = (name: string, extra: Partial<BranchInfo> = {}): BranchInfo => ({
+    name,
+    commit: `sha-${name}`,
+    is_default: false,
+    is_lazyaf: name.startsWith('lazyaf/'),
+    ...extra,
+  });
+
+  const listing = (repoId: string, branches: BranchInfo[]) => ({
+    repo_id: repoId,
+    branches,
+    default_branch: branches.find(b => b.is_default)?.name ?? null,
+    total: branches.length,
+  });
+
+  beforeEach(() => {
+    branchesStore.clear();
+  });
+
+  it('loads the listing for a repo', async () => {
+    vi.mocked(reposApi.branches).mockResolvedValueOnce(
+      listing('repo-1', [branch('main', { is_default: true })]) as never,
+    );
+
+    await branchesStore.load('repo-1');
+
+    const state = get(branchesStore);
+    expect(state.repoId).toBe('repo-1');
+    expect(state.branches.map(b => b.name)).toEqual(['main']);
+    expect(state.defaultBranch).toBe('main');
+    expect(state.error).toBeNull();
+    expect(state.loaded).toBe(true);
+  });
+
+  it('a refs frame adds a pushed branch without any refetch', async () => {
+    // THE reported defect. The push happens outside the browser, changes no
+    // repo row, and before this frame existed the panel went on rendering the
+    // list it had fetched before the push - "No branches yet. Push your repo
+    // to get started." - until someone pressed F5.
+    vi.mocked(reposApi.branches).mockResolvedValueOnce(listing('repo-1', []) as never);
+    await branchesStore.load('repo-1');
+    expect(get(branchesStore).branches).toEqual([]);
+
+    branchesStore.applyRefsFrame(
+      listing('repo-1', [branch('main', { is_default: true }), branch('lazyaf/ab12cd34')]),
+    );
+
+    expect(get(branchesStore).branches.map(b => b.name)).toEqual(['main', 'lazyaf/ab12cd34']);
+    expect(vi.mocked(reposApi.branches)).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a frame for a repo the user is not looking at', async () => {
+    // Frames are broadcast for every repo on the backend. Adopting one for
+    // another repo would label its branches with this repo's name.
+    vi.mocked(reposApi.branches).mockResolvedValueOnce(
+      listing('repo-1', [branch('main', { is_default: true })]) as never,
+    );
+    await branchesStore.load('repo-1');
+
+    branchesStore.applyRefsFrame(listing('repo-2', [branch('someone-elses')]));
+
+    expect(get(branchesStore).branches.map(b => b.name)).toEqual(['main']);
+  });
+
+  it('reports a failed listing as an error, never as an empty repo', async () => {
+    // R1. Rendered as "no branches", a 500 told the user to push a repo they
+    // had already pushed - the remedy for a state they were not in.
+    vi.mocked(reposApi.branches).mockRejectedValueOnce(new Error('500: git storage unreadable'));
+
+    await branchesStore.load('repo-1');
+
+    const state = get(branchesStore);
+    expect(state.error).toContain('git storage unreadable');
+    expect(state.branches).toEqual([]);
+    expect(state.loading).toBe(false);
+    expect(state.loaded).toBe(true);
+  });
+
+  it('a later frame clears a stale error', async () => {
+    vi.mocked(reposApi.branches).mockRejectedValueOnce(new Error('backend restarting'));
+    await branchesStore.load('repo-1');
+    expect(get(branchesStore).error).not.toBeNull();
+
+    branchesStore.applyRefsFrame(listing('repo-1', [branch('main', { is_default: true })]));
+
+    expect(get(branchesStore).error).toBeNull();
+    expect(get(branchesStore).branches.map(b => b.name)).toEqual(['main']);
+  });
+
+  it('drops a response for a repo the user has already navigated away from', async () => {
+    // Out-of-order replies must not resurrect an old repo's branches under a
+    // new repo's name.
+    let resolveSlow: (value: unknown) => void = () => {};
+    vi.mocked(reposApi.branches).mockImplementationOnce(
+      () => new Promise(resolve => { resolveSlow = resolve; }) as never,
+    );
+    const slow = branchesStore.load('repo-1');
+
+    vi.mocked(reposApi.branches).mockResolvedValueOnce(
+      listing('repo-2', [branch('trunk', { is_default: true })]) as never,
+    );
+    await branchesStore.load('repo-2');
+
+    resolveSlow(listing('repo-1', [branch('stale')]));
+    await slow;
+
+    const state = get(branchesStore);
+    expect(state.repoId).toBe('repo-2');
+    expect(state.branches.map(b => b.name)).toEqual(['trunk']);
+  });
+
+  it('keeps the current list visible while refreshing the SAME repo', async () => {
+    // The panel reloads on every repo_updated frame. Blanking to "Loading..."
+    // each time would make the list flicker for no reason.
+    vi.mocked(reposApi.branches).mockResolvedValueOnce(
+      listing('repo-1', [branch('main', { is_default: true })]) as never,
+    );
+    await branchesStore.load('repo-1');
+
+    let resolveRefresh: (value: unknown) => void = () => {};
+    vi.mocked(reposApi.branches).mockImplementationOnce(
+      () => new Promise(resolve => { resolveRefresh = resolve; }) as never,
+    );
+    const refreshing = branchesStore.load('repo-1');
+
+    expect(get(branchesStore).loading).toBe(false);
+    expect(get(branchesStore).branches.map(b => b.name)).toEqual(['main']);
+
+    resolveRefresh(listing('repo-1', [branch('main', { is_default: true }), branch('lazyaf/new')]));
+    await refreshing;
+
+    expect(get(branchesStore).branches).toHaveLength(2);
   });
 });

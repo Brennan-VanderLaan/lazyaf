@@ -104,6 +104,47 @@ are **absent** flip to orphaned. That is why there is no default input source â€
 feeding it one tier's partial results would orphan everything that tier did not
 run. The command refuses ambiguous input rather than guessing.
 
+### `lazyaf debug`
+
+Drive a pipeline re-run that pauses at breakpoints: `rerun`, `list`, `status`,
+`attach`, `resume`, `abort`, `extend`. Run `lazyaf debug --help` for the verbs.
+
+```bash
+lazyaf debug rerun <run_id> --break build
+lazyaf debug resume <session_id>
+```
+
+## When something goes wrong
+
+The CLI is meant to be readable both by a person and by a script, so failures
+follow one contract:
+
+* **Diagnostics go to stderr, results go to stdout.** `lazyaf list | ...` pipes
+  clean data; `2>&1` still interleaves everything for a human.
+* **A failure never exits 0.** Click's own usage errors exit 2; a command that
+  ran and refused exits 1. If you see a zero exit, the command succeeded.
+* **Somebody else's words are reproduced exactly.** When git or the server
+  explains a failure, that explanation is quoted verbatim underneath, indented
+  â€” including bracketed text like git's `! [rejected]`.
+* **Errors name the remedy.** A refusal states what is wrong and the command
+  that fixes it, rather than pointing at `--help`.
+* **The backend is always named.** Connection failures print the URL in use and
+  where it came from (`--server`, `$LAZYAF_SERVER`, or the built-in default).
+  A URL without an `http://` or `https://` scheme is refused, never guessed.
+
+```console
+$ lazyaf ingest .
+Error: Missing option '--name' / '-n'.
+
+A working lazyaf ingest looks like:
+    lazyaf ingest ./my-project --name my-project
+    lazyaf ingest ./my-project --name my-project --branch main
+    lazyaf ingest ./my-project --name my-project --all-branches
+```
+
+The CLI is non-interactive by design: it never prompts, so it behaves the same
+under a harness as it does in a terminal.
+
 ## Development
 
 This package lives in the `cli/` directory of the LazyAF monorepo. To build a

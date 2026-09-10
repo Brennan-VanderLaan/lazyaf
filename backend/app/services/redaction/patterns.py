@@ -282,6 +282,22 @@ ALLOWLIST = {
     "sk-ant-do-not-leak-me",
     # Placeholder shipped in .env.example so a new user knows the shape.
     "sk-ant-xxxxx",
+    # --- Bug-report bundle containment sentinels (12.9 diagnostics) --------
+    #
+    # Every one of these is asserted ABSENT from a rendered bundle by the test
+    # that owns it, so each has to be spelled out in full somewhere in the
+    # tree. They are allowlisted for the SOURCE SCAN only; the Redactor does
+    # not consult this set, so these still redact at runtime like any other
+    # key-shaped string (see the module docstring).
+    #
+    # tdd/integration/api/test_diagnostics_api.py, the four env/log/response
+    # containment cases:
+    "sk-ant-do-not-emit-this",
+    "sk-ant-api03-REALKEYSHAPEDVALUE0000",
+    "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "sk-ant-api03-BBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    # frontend/e2e/logs.spec.ts: the key the Logs tab must never render.
+    "sk-ant-api03-LiveLookingKeyMustNeverBeRendered-0123456789",
 }
 
 # --- Environment variables that must never carry a value in an image --------

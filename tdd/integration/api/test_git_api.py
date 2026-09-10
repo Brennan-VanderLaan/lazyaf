@@ -25,6 +25,7 @@ tdd_path = Path(__file__).parent.parent.parent.parent / "tdd"
 sys.path.insert(0, str(backend_path))
 sys.path.insert(0, str(tdd_path))
 
+from shared.factories import repo_ingest_payload
 from shared.assertions import (
     assert_status_code,
     assert_not_found,
@@ -432,3 +433,103 @@ class TestEdgeCases:
 
         for response in responses:
             assert_status_code(response, 200)
+
+
+class TestPushAdoptsADefaultBranchThatExists:
+    """A pushed repo whose trunk is not `main` must be startable immediately.
+
+    The UI's Add Repo form hardcodes `default_branch: "main"` and offers no
+    field to change it (RepoSelector.svelte). Push a repo whose trunk is
+    `develop` and the row named a branch that did not exist - so starting a
+    card refused with a 400 saying "no such branch exists here", naming a
+    branch the user had never chosen.
+
+    GET /branches always healed this, which is exactly why it survived
+    testing: anyone who opened the repo view fixed it by accident. A user who
+    pushed and went straight to a card did not. The row is corrected at the
+    push now, where the evidence arrives.
+    """
+
+    async def test_a_pushed_branch_becomes_the_default_when_the_row_names_nothing(
+        self, client, db_session, git_repo_manager
+    ):
+        from app.models import Repo
+        from app.routers.git import _adopt_pushed_default_branch
+        from shared.git_seed import seed_branch
+
+        payload = repo_ingest_payload(name="TrunkIsDevelop")
+        payload["default_branch"] = "main"
+        repo_id = (await client.post("/api/repos/ingest", json=payload)).json()["id"]
+
+        # What a `git push lazyaf develop` leaves behind: one ref, and it is
+        # not the one the row names.
+        seed_branch(repo_id, "develop", path="README.md", content=b"work' + BS + 'n")
+
+        await _adopt_pushed_default_branch(db_session, repo_id)
+
+        repo = await db_session.get(Repo, repo_id)
+        await db_session.refresh(repo)
+        assert repo.default_branch == "develop", (
+            "the row still names a branch that does not exist, so starting a "
+            "card will refuse with a 400"
+        )
+
+    async def test_a_default_that_exists_is_never_overwritten(
+        self, client, db_session, git_repo_manager
+    ):
+        """A deliberate choice survives. Someone who set `develop` while
+        `main` also exists means it."""
+        from app.models import Repo
+        from app.routers.git import _adopt_pushed_default_branch
+        from shared.git_seed import seed_branch
+
+        payload = repo_ingest_payload(name="DeliberateDefault")
+        payload["default_branch"] = "develop"
+        repo_id = (await client.post("/api/repos/ingest", json=payload)).json()["id"]
+
+        seed_branch(repo_id, "develop", path="a.txt", content=b"a' + BS + 'n")
+        seed_branch(repo_id, "main", path="b.txt", content=b"b' + BS + 'n")
+
+        await _adopt_pushed_default_branch(db_session, repo_id)
+
+        repo = await db_session.get(Repo, repo_id)
+        await db_session.refresh(repo)
+        assert repo.default_branch == "develop"
+
+    async def test_an_agent_branch_is_not_adopted_as_the_default(
+        self, client, db_session, git_repo_manager
+    ):
+        """`lazyaf/*` branches are the platform's own work, not a trunk."""
+        from app.models import Repo
+        from app.routers.git import _adopt_pushed_default_branch
+        from shared.git_seed import seed_branch
+
+        payload = repo_ingest_payload(name="AgentBranchOnly")
+        payload["default_branch"] = "main"
+        repo_id = (await client.post("/api/repos/ingest", json=payload)).json()["id"]
+
+        seed_branch(repo_id, "lazyaf/abc123", path="x.txt", content=b"x' + BS + 'n")
+        seed_branch(repo_id, "trunk", path="y.txt", content=b"y' + BS + 'n")
+
+        await _adopt_pushed_default_branch(db_session, repo_id)
+
+        repo = await db_session.get(Repo, repo_id)
+        await db_session.refresh(repo)
+        assert repo.default_branch == "trunk"
+
+    async def test_no_branches_leaves_the_row_alone(
+        self, client, db_session, git_repo_manager
+    ):
+        """An empty repo has nothing to adopt. Inventing a name would be worse
+        than leaving the honest default in place."""
+        from app.models import Repo
+        from app.routers.git import _adopt_pushed_default_branch
+
+        payload = repo_ingest_payload(name="StillEmpty")
+        payload["default_branch"] = "main"
+        repo_id = (await client.post("/api/repos/ingest", json=payload)).json()["id"]
+
+        await _adopt_pushed_default_branch(db_session, repo_id)
+
+        repo = await db_session.get(Repo, repo_id)
+        assert repo.default_branch == "main"

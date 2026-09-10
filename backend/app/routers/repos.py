@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,6 +10,8 @@ from app.schemas import RepoCreate, RepoRead, RepoUpdate, RepoIngest
 from app.schemas._datetime import utc_isoformat
 from app.services.git_server import git_repo_manager
 from app.services.websocket import manager
+
+logger = logging.getLogger(__name__)
 
 # One source of truth for what "still in flight" means and for the wording of
 # the refusal (R3) - the pipeline delete guard owns both.
@@ -50,6 +54,29 @@ async def create_repo(repo: RepoCreate, db: AsyncSession = Depends(get_db)):
     db.add(db_repo)
     await db.commit()
     await db.refresh(db_repo)
+
+    # Create the bare repo too, because this endpoint ADVERTISES a clone URL.
+    # `internal_git_url` is an unconditional property, so a row created here
+    # came back 201 carrying `/git/<id>.git` - and pushing to it answered
+    # "repository not found", because nothing had created it. A 201 whose own
+    # response body names an address that does not exist is the dark shape R1
+    # forbids: the caller did everything right and the product lied about the
+    # result.
+    #
+    # `is_ingested` stays False - that flag means "has content", and this
+    # repo has none yet. The bare repo is the mailbox; the flag is whether
+    # anything has arrived.
+    try:
+        if not git_repo_manager.repo_exists(db_repo.id):
+            git_repo_manager.create_bare_repo(db_repo.id, db_repo.default_branch)
+    except Exception as exc:  # noqa: BLE001
+        # Do not strand a committed row behind a git failure - the repo is
+        # real, it simply cannot be pushed to yet, and /repos/{id}/init can
+        # retry. Say so rather than failing a create that already happened.
+        logger.warning(
+            "repo %s: created the row but not the bare repo: %s",
+            db_repo.id[:8], exc,
+        )
 
     # Broadcast repo creation
     await manager.send_repo_created(repo_to_dict(db_repo))

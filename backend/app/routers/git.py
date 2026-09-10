@@ -10,8 +10,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import logging
+
+from sqlalchemy import select
+
 from app.database import get_db
 from app.services.git_server import git_backend, git_repo_manager
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/git", tags=["git"])
 
@@ -104,6 +110,50 @@ async def git_upload_pack(repo_id: str, request: Request):
         raise HTTPException(status_code=500, detail=f"Git error: {e}")
 
 
+async def _adopt_pushed_default_branch(db: AsyncSession, repo_id: str) -> None:
+    """Point the repo row at a branch that exists, if it does not already.
+
+    Same rule GET /branches applies, run at the moment the evidence arrives:
+    prefer git HEAD when it names a real branch, else the first non-agent
+    branch. Never invents a name, and never overwrites a default that IS
+    present - a user who deliberately set `develop` while `main` also exists
+    keeps their choice.
+
+    Best effort: a push that succeeded must not fail because bookkeeping did.
+    """
+    from app.models import Repo
+
+    try:
+        branches = git_repo_manager.list_branches(repo_id)
+        if not branches:
+            return
+
+        result = await db.execute(select(Repo).where(Repo.id == repo_id))
+        repo = result.scalar_one_or_none()
+        if repo is None or repo.default_branch in branches:
+            return
+
+        head = git_repo_manager.get_default_branch(repo_id)
+        if head in branches:
+            adopted = head
+        else:
+            non_agent = [b for b in branches if not b.startswith("lazyaf/")]
+            adopted = (non_agent or branches)[0]
+
+        logger.info(
+            "repo %s: default branch %r does not exist; adopting %r from the "
+            "push (branches: %s)",
+            repo_id[:8], repo.default_branch, adopted, ", ".join(sorted(branches)),
+        )
+        repo.default_branch = adopted
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - bookkeeping never fails a push
+        logger.warning(
+            "repo %s: could not adopt a default branch after push: %s",
+            repo_id[:8], exc,
+        )
+
+
 @router.post("/{repo_id}.git/git-receive-pack")
 async def git_receive_pack(repo_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     """
@@ -125,6 +175,22 @@ async def git_receive_pack(repo_id: str, request: Request, db: AsyncSession = De
         result = git_backend.handle_receive_pack(repo_id, body)
         output = result["output"]
         pushed_refs = result.get("pushed_refs", [])
+
+        # Correct the repo's default branch NOW, not lazily.
+        #
+        # A repo row carries a default branch chosen before anything was
+        # pushed - the UI's Add Repo form hardcodes "main" and offers no field
+        # to change it. Push a repo whose trunk is `develop` and the row still
+        # says `main`, naming a branch that does not exist. Starting a card
+        # then refuses with a 400, because agent work branches FROM the
+        # default and there is nothing to branch from.
+        #
+        # GET /branches already heals this, which is why it looked fine in
+        # testing: anyone who opened the repo view fixed it by accident. A
+        # user who pushed and went straight to a card did not, and got a 400
+        # naming a branch they had never heard of. Healing at the push means
+        # the row is right the moment there is evidence for it.
+        await _adopt_pushed_default_branch(db, repo_id)
 
         # Trigger pipelines for each pushed branch
         if pushed_refs:

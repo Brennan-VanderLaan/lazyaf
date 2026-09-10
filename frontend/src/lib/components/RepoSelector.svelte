@@ -167,9 +167,14 @@
       <input
         id="repo-default-branch"
         type="text"
-        placeholder="Default branch"
+        placeholder="main"
         bind:value={newRepo.default_branch}
       />
+      <p class="field-hint">
+        Pre-filled with <code>main</code>. If your trunk is called something
+        else, LazyAF corrects this from the first branch you push — you do not
+        have to get it right here.
+      </p>
       {#if createError}
         <p class="form-error" data-testid="repo-create-error" role="alert">{createError}</p>
       {/if}
@@ -264,6 +269,23 @@
 
   .btn-icon:hover {
     background: var(--hover-color, #313244);
+  }
+
+  .field-hint {
+    /* Sits under the branch input. This field used to be pre-filled with
+       "main" and say nothing, so a repo whose trunk was `develop` was
+       created naming a branch that did not exist - and starting a card then
+       refused with a 400 naming a branch the user had never chosen. The
+       backend heals it at push time now; this says so, because a field that
+       silently does not matter is worse than one that explains itself. */
+    margin: -0.15rem 0 0.35rem;
+    font-size: 0.72rem;
+    line-height: 1.35;
+    opacity: 0.72;
+  }
+
+  .field-hint code {
+    font-size: 0.95em;
   }
 
   .add-form {

@@ -50,7 +50,10 @@ services:
   backend:
     image: ${LAZYAF_IMAGE_PREFIX:-ghcr.io/brennan-vanderlaan/lazyaf}/backend:${LAZYAF_VERSION:-latest}
     ports:
-      - "${LAZYAF_BACKEND_PORT:-8000}:8000"
+      # Loopback by default: this API has no authentication. Override
+      # LAZYAF_BACKEND_PORT (it takes `[HOST_IP:]PORT`) to publish wider,
+      # and read SECURITY.md before you do.
+      - "${LAZYAF_BACKEND_PORT:-127.0.0.1:8000}:8000"
     volumes:
       # Database AND git repo storage. Back this up; it is all of your state.
       - lazyaf-data:/app/data
@@ -103,7 +106,7 @@ services:
   frontend:
     image: ${LAZYAF_IMAGE_PREFIX:-ghcr.io/brennan-vanderlaan/lazyaf}/frontend:${LAZYAF_VERSION:-latest}
     ports:
-      - "${LAZYAF_FRONTEND_PORT:-5173}:80"
+      - "${LAZYAF_FRONTEND_PORT:-127.0.0.1:5173}:80"
     depends_on:
       backend:
         condition: service_healthy

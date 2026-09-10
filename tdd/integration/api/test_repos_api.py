@@ -16,6 +16,7 @@ sys.path.insert(0, str(backend_path))
 sys.path.insert(0, str(tdd_path))
 
 from shared.factories import repo_create_payload, repo_update_payload
+from shared.auth_headers import push_event_auth
 from shared.assertions import (
     assert_status_code,
     assert_created_response,
@@ -541,6 +542,7 @@ class TestRefsChangedBroadcast:
                 "new_sha": pushed_sha,
                 "old_sha": "",
             },
+            headers=push_event_auth(),
         )
         assert_status_code(response, 200)
 

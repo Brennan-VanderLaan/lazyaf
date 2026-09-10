@@ -134,15 +134,24 @@ def make_docker_client() -> DockerClient:
 def bind_mount_allowlist() -> tuple[str, ...]:
     """Bind-mount sources pipeline step config may request (fix 10).
 
-    Settings-driven via ``step_bind_mount_allowlist`` when present (config.py
-    is owned by a parallel change - read defensively); default is the docker
-    socket only. The workspace volume mount is internal and unaffected.
+    EMPTY unless the operator opts in via ``LAZYAF_STEP_BIND_ALLOWLIST``. The
+    workspace volume mount is internal and unaffected.
+
+    This used to default to the docker socket, which made `needs: [docker]`
+    work out of the box - and a bind of the host socket is host-root
+    equivalent, so every repo whose pipeline definition asked for it could
+    start a privileged container mounting `/`. Since a pipeline definition
+    can arrive by `git push`, that was not a decision the operator was making.
+
+    The read is `is not None`, not a truth test, ON PURPOSE: an empty tuple is
+    a real answer meaning "deny everything", and treating it as "unconfigured"
+    would fall through to a default the operator just tried to turn off (R1).
     """
     settings = get_settings()
     configured = getattr(settings, "step_bind_mount_allowlist", None)
-    if configured:
+    if configured is not None:
         return tuple(configured)
-    return (DOCKER_SOCKET_SOURCE,)
+    return ()
 
 
 # -----------------------------------------------------------------------------
@@ -219,9 +228,12 @@ def validate_step_mounts(
         if spec.addressing is MountAddressing.BIND and spec.source not in allowed:
             raise ValueError(
                 f"bind mount source {spec.source!r} is not permitted from "
-                f"pipeline step config (allowed: {sorted(allowed)}). Use the "
-                "shared workspace volume for data, or 'needs: [docker]' for "
-                "the docker socket."
+                f"pipeline step config (allowed: {sorted(allowed) or 'none'}). "
+                "Use the shared workspace volume for data. If this step really "
+                "needs a host path - the docker socket for 'needs: [docker]', "
+                "say - the operator must opt in by naming it in "
+                "LAZYAF_STEP_BIND_ALLOWLIST; mounting the docker socket into a "
+                "step is host-root-equivalent, so it is not a default."
             )
         validated.append(spec)
     return validated

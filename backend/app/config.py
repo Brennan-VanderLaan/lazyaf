@@ -280,6 +280,19 @@ def _absent_reason(var_name: str, inline: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def _parse_bind_allowlist(raw: str | None) -> tuple[str, ...]:
+    """Parse LAZYAF_STEP_BIND_ALLOWLIST (comma-separated host paths).
+
+    Unset and empty both mean DENY EVERYTHING, which is the default posture -
+    there is deliberately no spelling of this variable that means "allow
+    anything". Blank entries are dropped so a trailing comma cannot smuggle in
+    an empty source, and order is preserved for a legible error message.
+    """
+    if not raw:
+        return ()
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 def _parse_gpu_node_rates(raw: str | None) -> dict:
     """Parse LAZYAF_GPU_NODE_RATES (JSON object) — never fatal.
 
@@ -343,6 +356,20 @@ class Settings(BaseModel):
     # HOME inside step containers - lives on the shared workspace volume so
     # tools installed in one step survive to the next (12.3 persistence contract).
     step_home_dir: str = "/workspace/home"
+    # Host paths a PIPELINE STEP DEFINITION may bind-mount, and the only way
+    # `needs: [docker]` can get the docker socket.
+    #
+    # EMPTY BY DEFAULT, and that is the security posture: a bind mount of the
+    # host docker socket is host-root-equivalent, so a step that has it can
+    # start a privileged container mounting `/`. It used to be allowlisted out
+    # of the box, which meant every repo's pipeline definition could take the
+    # host - including one pushed by someone who is not you.
+    #
+    # Set LAZYAF_STEP_BIND_ALLOWLIST to a comma-separated list of host paths
+    # to opt in. LazyAF's OWN dogfood pipeline needs it, because its T2/T3
+    # tiers spawn containers to test the executor:
+    #   LAZYAF_STEP_BIND_ALLOWLIST=/var/run/docker.sock
+    step_bind_mount_allowlist: tuple[str, ...] = ()
     # Secret for step auth tokens (control layer <-> /api/steps/*). REQUIRED:
     # there is no default, and get_settings() raises MissingSecretError rather
     # than invent one. See the module docstring.
@@ -387,6 +414,9 @@ def get_settings() -> Settings:
         step_default_image=os.getenv("STEP_DEFAULT_IMAGE", "python:3.12"),
         step_working_dir=os.getenv("STEP_WORKING_DIR", "/workspace/repo"),
         step_home_dir=os.getenv("STEP_HOME_DIR", "/workspace/home"),
+        step_bind_mount_allowlist=_parse_bind_allowlist(
+            os.getenv("LAZYAF_STEP_BIND_ALLOWLIST")
+        ),
         step_auth_secret=resolve_secret("LAZYAF_STEP_AUTH_SECRET"),
         runner_auth_secret=resolve_secret("LAZYAF_RUNNER_AUTH_SECRET"),
         gpu_node_rates=_parse_gpu_node_rates(os.getenv("LAZYAF_GPU_NODE_RATES")),

@@ -213,33 +213,36 @@ it:
    `POST /api/debug/{id}/join-token`).
 2. **The backend holds the host Docker socket.** Both compose files bind-mount
    `/var/run/docker.sock` into the backend container, because that is how it spawns step
-   containers. That is root-equivalent on the host. A step can also request the socket for
-   itself with `needs: [docker]`.
-3. **Nothing binds to loopback.** Both compose files publish with no host-IP prefix —
-   `"8000:8000"` in `docker-compose.yml`, `"${LAZYAF_BACKEND_PORT:-8000}:8000"` in
-   `docker-compose.release.yml` — which Docker publishes on `0.0.0.0`, every interface.
-   Check yours with `docker compose config` and look for `host_ip`; if there is no
-   `host_ip` line, the port is open to your whole network. The frontend port is a second
-   door to the same API: its nginx reverse-proxies `/api` and `/ws` to the backend. The dev
-   stack publishes a third port, `8099`, a mock OpenAI server.
+   containers. That is root-equivalent on the host. A step can request the socket for
+   itself with `needs: [docker]`, but only if you opt in: `LAZYAF_STEP_BIND_ALLOWLIST`
+   is empty by default and a step that asks without it fails loudly. Setting it grants
+   host root to every pipeline definition that can reach this server.
+3. **Everything binds to loopback — keep it that way.** Both compose files default
+   `LAZYAF_BACKEND_PORT` / `LAZYAF_FRONTEND_PORT` to `127.0.0.1:8000` and
+   `127.0.0.1:5173`, and the dev stack's mock port is hardcoded to loopback. Check yours
+   with `docker compose config` and look for `host_ip`; if there is no `host_ip` line, the
+   port is open to your whole network. The frontend port is a second door to the same API:
+   its nginx reverse-proxies `/api` and `/ws` to the backend.
 
 Put together: an unauthenticated POST creates a pipeline, a pipeline step is a container
 image plus a command on your daemon, and the daemon is the host's. On a coffee-shop Wi-Fi
-or a cloud VM with a public IP, that is a takeover, not a misconfiguration.
+or a cloud VM with a public IP, that is a takeover, not a misconfiguration. The loopback
+default is the one thing standing between those sentences and you.
 
-**Bind it to loopback yourself. Nothing does it for you.** For the release stack, the port
-variables are interpolated straight into the mapping, so a host IP in them works:
+**If you widen it, you are supplying the security yourself.** The port variables are
+interpolated straight into the mapping, so the host IP lives in them:
 
 ```bash
-# .env
-LAZYAF_BACKEND_PORT=127.0.0.1:8000
-LAZYAF_FRONTEND_PORT=127.0.0.1:5173
+# .env — read SECURITY.md before doing this
+LAZYAF_BACKEND_PORT=0.0.0.0:8000
+LAZYAF_FRONTEND_PORT=0.0.0.0:5173
 ```
 
-`docker compose -f docker-compose.release.yml config` then shows `host_ip: 127.0.0.1` on
-both. The dev stack (`docker-compose.yml`) hardcodes its mappings, so it needs a compose
-override file or an edit. Either way, verify with `docker compose config` rather than
-trusting this paragraph — and put a firewall in front of the host regardless.
+There is no authentication on the API or the git server, so the only safe version of this
+is behind something that provides it — a reverse proxy that authenticates, a VPN, or a
+tailnet. A bare LAN is not that. Verify whatever you chose with
+`docker compose config` rather than trusting this paragraph, and put a firewall in front
+of the host regardless.
 
 Run it on a machine you trust, on a network you trust. Do not put it on the open internet.
 There is no configuration that makes that safe today.

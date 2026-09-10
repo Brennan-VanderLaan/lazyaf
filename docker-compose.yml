@@ -2,7 +2,9 @@ services:
   backend:
     build: ./backend
     ports:
-      - "8000:8000"
+      # Loopback by default: there is no auth on this API. Override
+      # LAZYAF_BACKEND_PORT (it takes `[HOST_IP:]PORT`) to publish wider.
+      - "${LAZYAF_BACKEND_PORT:-127.0.0.1:8000}:8000"
     volumes:
       - ./backend/app:/app/app
       # Migrations live in the IMAGE (12.3: production boots self-sufficiently),
@@ -32,7 +34,7 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "5173:80"
+      - "${LAZYAF_FRONTEND_PORT:-127.0.0.1:5173}:80"
     depends_on:
       - backend
     networks:
@@ -132,7 +134,8 @@ services:
     volumes:
       - ./tdd:/app/tdd:ro
     ports:
-      - "8099:8099"
+      # Dev-only mock. Never wants to be reachable off this host.
+      - "127.0.0.1:8099:8099"
     networks:
       - lazyaf-network
     restart: unless-stopped
@@ -154,7 +157,8 @@ services:
       args:
         INCLUDE_DEV: "true"
     ports:
-      - "8765:8000"
+      # Dev-only e2e backend, test-mode ON. Loopback, always.
+      - "127.0.0.1:8765:8000"
     environment:
       - DATABASE_URL=sqlite+aiosqlite:////tmp/e2e_test.db
       - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}

@@ -117,6 +117,14 @@ steps:
   # as the retired runner-socket variant (host-root-equivalent for these
   # two steps only). If the socket is missing, these tests skip with
   # "Docker not available" - out of baseline, gate fails (R4).
+  #
+  # THIS NOW REQUIRES AN EXPLICIT OPT-IN ON THE BACKEND:
+  #   LAZYAF_STEP_BIND_ALLOWLIST=/var/run/docker.sock
+  # The socket used to be allowlisted by default, which meant ANY repo's
+  # pushed pipeline could take the host. This repo is the one that really
+  # needs it - its T2/T3 tiers spawn containers to test the executor - so
+  # this pipeline is exactly the case the opt-in exists for. Without the
+  # variable these two steps fail at dispatch with a message naming it.
   - id: "tier2"
     name: "T2: Docker-dependent integration"
     type: script

@@ -13,10 +13,14 @@ container command on your daemon, and that is root-equivalent on this
 machine. The internal git server is open too — anyone who can reach it can
 clone or push to every repo you ingest.
 
-**No compose file binds to localhost.** Both publish with no host-IP prefix,
-which means `0.0.0.0` — every interface your machine has. If you want
-loopback, you have to say so; see [Binding it to
-localhost](#binding-it-to-localhost) below, and the fuller explanation in
+**Every compose file binds to localhost.** `LAZYAF_BACKEND_PORT` and
+`LAZYAF_FRONTEND_PORT` default to `127.0.0.1:8000` and `127.0.0.1:5173`, so
+out of the box only this machine can reach it. That is the single control
+that keeps everything above from mattering — if you drop the `127.0.0.1:` to
+reach it from elsewhere, you are publishing an unauthenticated API to that
+network. See [Exposing it beyond
+localhost](#exposing-it-beyond-localhost) below, [SECURITY.md](SECURITY.md),
+and the fuller explanation in
 [README.md](README.md#before-you-expose-it-what-this-actually-opens).
 
 Run this on a machine and a network you trust. Do not put it on the open
@@ -155,7 +159,8 @@ three service images from scratch — so start it and come back.
 
 It brings up four services: `backend` (8000), `frontend` (5173), a loopback
 `runner-agent`, and `mock-endpoint` (8099, a stdlib OpenAI-compatible server
-used by the test suite). All four publish or attach on `0.0.0.0`.
+used by the test suite). All four publish on `127.0.0.1` or attach to the
+internal network only.
 
 ### 4b. Pull prebuilt images — faster, if they exist for your tag
 
@@ -180,19 +185,23 @@ a health check at http://localhost:8000/health.
 > different volumes, so they do not share a database. Bring one down before
 > starting the other.
 
-### Binding it to localhost
+### Exposing it beyond localhost
 
-Neither compose file does this for you. For the release stack, the port
-variables are interpolated straight into the mapping, so put a host IP in
-them:
+Both compose files already bind to loopback, so this section is about
+UNDOING that — deliberately. The port variables are interpolated straight
+into the mapping, so the host IP lives in them:
 
 ```bash
-# .env
-LAZYAF_BACKEND_PORT=127.0.0.1:8000
-LAZYAF_FRONTEND_PORT=127.0.0.1:5173
+# .env — reachable from anywhere on the network. Read SECURITY.md first.
+LAZYAF_BACKEND_PORT=0.0.0.0:8000
+LAZYAF_FRONTEND_PORT=0.0.0.0:5173
 ```
 
-Confirm it took:
+There is no authentication on the API or the git server, so the only safe
+version of this is behind something that provides it: a reverse proxy that
+authenticates, a VPN, or a tailnet. A bare LAN is not that.
+
+Confirm whichever you chose actually took:
 
 ```bash
 docker compose -f docker-compose.release.yml config | grep -A1 host_ip

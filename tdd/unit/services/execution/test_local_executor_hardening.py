@@ -233,11 +233,59 @@ class TestMountAddressing:
                 [{"addressing": "guess", "source": "x", "target": "/y"}]
             )
 
-    async def test_allowlisted_bind_mount_flows_through(self, mock_docker_client, execution_context):
-        """(fix 10) the docker socket is the one default-allowlisted bind
-        source from step config; it flows through the typed Mount API."""
+    async def test_the_docker_socket_is_NOT_allowlisted_by_default(
+        self, mock_docker_client, execution_context
+    ):
+        """The socket used to be the one default-allowlisted bind source.
+
+        It is not any more, and this test is the acceptance for that. A bind
+        of /var/run/docker.sock into a step is host-root-equivalent - the step
+        can start a privileged container mounting `/` - and a pipeline
+        definition arrives by `git push`, so allowlisting it by default handed
+        that power to anyone who could push. It is now opt-in via
+        LAZYAF_STEP_BIND_ALLOWLIST, and the refusal names the setting.
+        """
         from app.services.execution.local_executor import DOCKER_SOCKET_SOURCE
 
+        mock_docker_client.containers.run.return_value = make_mock_container()
+        events, _ = await run_step(
+            mock_docker_client,
+            {
+                "type": "script",
+                "command": "docker ps",
+                "mounts": [
+                    {
+                        "addressing": "bind",
+                        "source": DOCKER_SOCKET_SOURCE,
+                        "target": DOCKER_SOCKET_SOURCE,
+                        "mode": "rw",
+                    }
+                ],
+            },
+            execution_context,
+        )
+        result = next(e for e in events if e["type"] == "result")
+        assert result["status"] == "failed"
+        assert "not permitted" in result["error"]
+        assert DOCKER_SOCKET_SOURCE in result["error"]
+        # The refusal names the opt-in, so the operator is not left guessing.
+        assert "LAZYAF_STEP_BIND_ALLOWLIST" in result["error"]
+        # Refused at dispatch: no container was ever started.
+        mock_docker_client.containers.run.assert_not_called()
+
+    async def test_an_opted_in_bind_source_still_flows_through(
+        self, mock_docker_client, execution_context, monkeypatch
+    ):
+        """Opting in is a real path, not a dead one - LazyAF's own dogfood
+        pipeline needs the socket for its T2/T3 tiers."""
+        from app.services.execution import local_executor
+        from app.services.execution.local_executor import DOCKER_SOCKET_SOURCE
+
+        monkeypatch.setattr(
+            local_executor,
+            "bind_mount_allowlist",
+            lambda: (DOCKER_SOCKET_SOURCE,),
+        )
         mock_docker_client.containers.run.return_value = make_mock_container()
         _, call = await run_step(
             mock_docker_client,

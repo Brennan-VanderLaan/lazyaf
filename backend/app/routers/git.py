@@ -6,7 +6,7 @@ Implements the server side of git clone/fetch/push over HTTP.
 
 import gzip
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,8 +16,24 @@ from sqlalchemy import select
 
 from app.database import get_db
 from app.services.git_server import git_backend, git_repo_manager
+from app.routers.ws_runners import verify_runner_secret
 
 logger = logging.getLogger(__name__)
+
+
+def _bearer(authorization: str | None) -> str | None:
+    """The token out of an `Authorization: Bearer <token>` header, or None.
+
+    Tolerant of case and surrounding whitespace, and of nothing else: a header
+    that is not a bearer scheme yields None rather than being passed through
+    as if it were a secret.
+    """
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.strip().lower() != "bearer":
+        return None
+    return token.strip() or None
 
 router = APIRouter(prefix="/git", tags=["git"])
 
@@ -260,6 +276,7 @@ async def handle_push_event(
     repo_id: str,
     event: PushEventRequest,
     db: AsyncSession = Depends(get_db),
+    authorization: str | None = Header(default=None),
 ):
     """
     Internal endpoint called after git push to trigger pipelines.
@@ -272,7 +289,29 @@ async def handle_push_event(
     sync failure is caught and logged there, so a broken sync can neither
     poison this request's session nor turn the push event into a 500 -
     trigger matching always still runs.
+
+    AUTHENTICATED, and it was not. `_internal` named an intent nothing
+    enforced: the route is plain HTTP on the same port as everything else, so
+    an anonymous caller could FORGE a push - naming any branch and commit -
+    and make the platform materialize definitions and spawn containers
+    WITHOUT PUSHING ANYTHING. It takes the runner secret now.
+
+    Slated for deletion, not kept: `git_receive_pack` above already calls
+    `on_push` itself on the default path, so nothing in-tree needs this. It
+    is gated rather than removed today only because R2 says delete after
+    acceptance, and an out-of-tree git hook may still be posting here.
     """
+    if not verify_runner_secret(_bearer(authorization)):
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "push-event requires the runner secret. Send it as "
+                "`Authorization: Bearer <LAZYAF_RUNNER_AUTH_SECRET>`. If you "
+                "reached this by pushing, you do not need this endpoint at "
+                "all - git-receive-pack already fires the same triggers."
+            ),
+        )
+
     if not git_repo_manager.repo_exists(repo_id):
         raise HTTPException(status_code=404, detail="Repository not found")
 

@@ -37,6 +37,9 @@ sys.path.insert(0, str(backend_path))
 sys.path.insert(0, str(tdd_path))
 
 from shared.assertions import assert_status_code
+from shared.auth_headers import push_event_auth
+
+from app.config import get_settings
 
 
 PIPELINE_YAML_V1 = """name: repo-ci
@@ -155,6 +158,7 @@ async def _push_and_fire_event(client, clean_git_repos, repo, repo_path, branch)
 
     response = await client.post(
         f"/git/{repo['id']}.git/_internal/push-event",
+        headers=push_event_auth(),
         json={"branch": branch, "new_sha": new_sha, "old_sha": old_sha},
     )
     assert_status_code(response, 200)
@@ -185,6 +189,7 @@ class TestSyncOnPushCreatesPipeline:
 
         response = await client.post(
             f"/git/{repo['id']}.git/_internal/push-event",
+            headers=push_event_auth(),
             json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
         )
         assert_status_code(response, 200)
@@ -252,6 +257,7 @@ class TestSyncOnPushRefreshesPipeline:
         head_sha = _git(repo_path, "rev-parse", "HEAD")
         await client.post(
             f"/git/{repo['id']}.git/_internal/push-event",
+            headers=push_event_auth(),
             json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
         )
         pipeline_v1 = await _get_materialized_pipeline(client, repo["id"])
@@ -301,6 +307,7 @@ class TestSyncOnPushClearsRemovedYaml:
         head_sha = _git(repo_path, "rev-parse", "HEAD")
         await client.post(
             f"/git/{repo['id']}.git/_internal/push-event",
+            headers=push_event_auth(),
             json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
         )
         pipeline = await _get_materialized_pipeline(client, repo["id"])
@@ -365,6 +372,7 @@ class TestBrokenYamlKeepsTriggers:
         head_sha = _git(repo_path, "rev-parse", "HEAD")
         response = await client.post(
             f"/git/{repo['id']}.git/_internal/push-event",
+            headers=push_event_auth(),
             json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
         )
         assert_status_code(response, 200)
@@ -424,6 +432,7 @@ class TestSyncShortCircuit:
         head_sha = _git(repo_path, "rev-parse", "HEAD")
         await client.post(
             f"/git/{repo['id']}.git/_internal/push-event",
+            headers=push_event_auth(),
             json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
         )
         before = await _get_materialized_pipeline(client, repo["id"])
@@ -471,10 +480,10 @@ class TestPushTriggerDedup:
         event = {"branch": branch, "new_sha": head_sha, "old_sha": ""}
 
         response1 = await client.post(
-            f"/git/{repo['id']}.git/_internal/push-event", json=event
+            f"/git/{repo['id']}.git/_internal/push-event", json=event, headers=push_event_auth()
         )
         response2 = await client.post(
-            f"/git/{repo['id']}.git/_internal/push-event", json=event
+            f"/git/{repo['id']}.git/_internal/push-event", json=event, headers=push_event_auth()
         )
         assert_status_code(response1, 200)
         assert_status_code(response2, 200)
@@ -497,6 +506,7 @@ class TestPushTriggerDedup:
         head_sha = _git(repo_path, "rev-parse", "HEAD")
         await client.post(
             f"/git/{repo['id']}.git/_internal/push-event",
+            headers=push_event_auth(),
             json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
         )
 
@@ -519,14 +529,14 @@ class TestPushTriggerDedup:
         event = {"branch": branch, "new_sha": head_sha, "old_sha": ""}
 
         response1 = await client.post(
-            f"/git/{repo['id']}.git/_internal/push-event", json=event
+            f"/git/{repo['id']}.git/_internal/push-event", json=event, headers=push_event_auth()
         )
         assert response1.json()["triggered_runs"] == 1
 
         reset_trigger_dedup()
 
         response2 = await client.post(
-            f"/git/{repo['id']}.git/_internal/push-event", json=event
+            f"/git/{repo['id']}.git/_internal/push-event", json=event, headers=push_event_auth()
         )
         assert response2.json()["triggered_runs"] == 1
 
@@ -554,7 +564,7 @@ class TestDedupKeyLifecycle:
         pipeline_executor.start_pipeline = failing_start
         try:
             response1 = await client.post(
-                f"/git/{repo['id']}.git/_internal/push-event", json=event
+                f"/git/{repo['id']}.git/_internal/push-event", json=event, headers=push_event_auth()
             )
         finally:
             pipeline_executor.start_pipeline = original_start
@@ -564,7 +574,7 @@ class TestDedupKeyLifecycle:
 
         # Retry inside the dedup window: the key was released, so this fires
         response2 = await client.post(
-            f"/git/{repo['id']}.git/_internal/push-event", json=event
+            f"/git/{repo['id']}.git/_internal/push-event", json=event, headers=push_event_auth()
         )
         assert_status_code(response2, 200)
         assert response2.json()["triggered_runs"] == 1
@@ -620,6 +630,7 @@ class TestManualRunBranchScoping:
         head_sha = _git(repo_path, "rev-parse", "HEAD")
         await client.post(
             f"/git/{repo['id']}.git/_internal/push-event",
+            headers=push_event_auth(),
             json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
         )
         before = await _get_materialized_pipeline(client, repo["id"])
@@ -680,6 +691,7 @@ steps:
         head_sha = _git(repo_path, "rev-parse", "HEAD")
         response = await client.post(
             f"/git/{repo['id']}.git/_internal/push-event",
+            headers=push_event_auth(),
             json={"branch": branch, "new_sha": head_sha, "old_sha": ""},
         )
         assert_status_code(response, 200)
@@ -749,3 +761,66 @@ steps:
         assert broken is not None, "the unconvertible file left no row to look at"
         assert broken["definition_error"]
         assert broken["steps_graph"] is None
+
+
+class TestThePushEventEndpointIsAuthenticated:
+    """`_internal` named an intent that nothing enforced.
+
+    The route is plain HTTP on the same port as everything else, and it calls
+    `trigger_service.on_push` - so before this, an anonymous caller could
+    forge a push naming any branch and any sha, and make the platform
+    materialize repo definitions and spawn containers WITHOUT PUSHING
+    ANYTHING. No repo access, no credential, nothing on disk had to change.
+
+    These are the acceptance for closing that.
+    """
+
+    FORGED = {"branch": "main", "new_sha": "0" * 40, "old_sha": ""}
+
+    async def test_a_forged_push_with_no_credential_is_refused(self, client):
+        response = await client.post(
+            "/git/any-repo-id.git/_internal/push-event", json=self.FORGED
+        )
+        assert_status_code(response, 401)
+        assert "runner secret" in response.json()["detail"]
+
+    async def test_a_wrong_secret_is_refused(self, client):
+        response = await client.post(
+            "/git/any-repo-id.git/_internal/push-event",
+            json=self.FORGED,
+            headers={"Authorization": "Bearer not-the-secret"},
+        )
+        assert_status_code(response, 401)
+
+    async def test_a_non_bearer_header_is_not_mistaken_for_a_secret(self, client):
+        """The raw secret under the wrong scheme must not authenticate."""
+        response = await client.post(
+            "/git/any-repo-id.git/_internal/push-event",
+            json=self.FORGED,
+            headers={"Authorization": get_settings().runner_auth_secret},
+        )
+        assert_status_code(response, 401)
+
+    async def test_the_refusal_precedes_the_repo_lookup(self, client):
+        """401, not 404.
+
+        A 404 would mean the handler ran before the credential check, and
+        would confirm to an anonymous caller which repo ids exist. The id
+        above does not exist; the answer must still be 401.
+        """
+        response = await client.post(
+            "/git/definitely-not-a-real-repo.git/_internal/push-event",
+            json=self.FORGED,
+        )
+        assert_status_code(response, 401)
+
+    async def test_the_runner_secret_still_works(self, client, pushed_ci_repo):
+        """The gate refuses forgeries, not the legitimate caller."""
+        repo, repo_path, branch = pushed_ci_repo
+        head = _git(repo_path, "rev-parse", "HEAD")
+        response = await client.post(
+            f"/git/{repo['id']}.git/_internal/push-event",
+            json={"branch": branch, "new_sha": head, "old_sha": ""},
+            headers=push_event_auth(),
+        )
+        assert_status_code(response, 200)

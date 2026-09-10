@@ -28,6 +28,8 @@ import os
 import re
 from pathlib import Path
 
+from app.services.redaction.redactor import MARKER, Redactor, marker_render
+
 logger = logging.getLogger(__name__)
 
 #: Every backend env var a ModelEndpoint may reference starts with this.
@@ -44,12 +46,9 @@ ENDPOINT_SECRET_REF_RE = re.compile(r"^LAZYAF_ENDPOINT_[A-Z0-9_]{1,48}$")
 #: spelled here and nowhere else).
 HARNESS_API_KEY_ENV = "LAZYAF_ENDPOINT_API_KEY"
 
-#: Shapes that are a secret whatever they are called. Scrubbed unconditionally.
-_BEARER_RE = re.compile(r"(?i)bearer\s+\S+")
-_SK_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
-
-#: What a scrubbed span becomes.
-REDACTION = "***"
+#: What a scrubbed span becomes. Imported from the shared engine so this
+#: module and the bug-report bundle cannot drift on the marker either.
+REDACTION = MARKER
 
 #: Shortest value worth substring-scrubbing. A one- or two-character "secret"
 #: would redact half of every error body and tell the operator nothing.
@@ -187,16 +186,37 @@ def scrub_secrets(text, known_values=()) -> str:
     A 401 body that echoes the key back is a real failure mode, and it must
     not be the thing that puts the key in the database.
 
-    Three passes, in order: the known value(s) verbatim, `Bearer <x>`, and
-    `sk-...` shapes. Non-string input is coerced, because the callers include
-    JSON encoders handling whatever an unfamiliar server returned.
+    THIS FUNCTION NO LONGER OWNS ITS PATTERNS. It used to carry a private
+    `_BEARER_RE` / `_SK_RE` pair, which made it the third copy of LazyAF's
+    secret-shape table and the only one running in production. That copy knew
+    `sk-` and `Bearer` and nothing else, so a 401 body echoing back a GitHub
+    token, an AWS key id, a Google key, a JWT or a PEM private key landed in
+    `ModelEndpoint.last_error` UNREDACTED - and `GET /api/model-endpoints`
+    serves that column to anyone who can reach the port. Delegating to the
+    shared engine closes that hole as a side effect of removing the copy.
+
+    Two things are pinned here and must not drift:
+
+    * the marker stays the flat `***`, not the bundle's
+      `[REDACTED:label:digest]` placeholder. The UI and existing assertions
+      read `***`, and an endpoint error is not a public-issue attachment, so
+      it has no need of the correlation digest.
+    * the length floor stays 4. These `known_values` are values a CALLER
+      asserted are secret; the bug-report collector, which GUESSES from
+      variable names, uses a floor of 8 instead.
+
+    Non-string input is coerced, because the callers include JSON encoders
+    handling whatever an unfamiliar server returned.
     """
     if text is None:
         return ""
-    out = text if isinstance(text, str) else str(text)
-    for value in known_values or ():
-        if value and isinstance(value, str) and len(value) >= _MIN_SCRUBBABLE:
-            out = out.replace(value, REDACTION)
-    out = _BEARER_RE.sub(f"Bearer {REDACTION}", out)
-    out = _SK_RE.sub(REDACTION, out)
-    return out
+    return Redactor(
+        [v for v in (known_values or ()) if isinstance(v, str)],
+        min_known_length=_MIN_SCRUBBABLE,
+        # A probe error body is short, is read by an operator in a UI, and
+        # has no `\n`-wrapped tokens or base64 blobs worth chasing. Skipping
+        # both keeps this on the hot path of every probe.
+        whitespace_tolerant=False,
+        encodings=False,
+        render=marker_render,
+    ).redact(text)

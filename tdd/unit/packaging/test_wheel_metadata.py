@@ -16,6 +16,8 @@ The build-and-inspect-the-real-archive half lives in test_wheel_build.py
 (@slow, because a PEP 517 build takes seconds).
 """
 import re
+import sys
+from pathlib import Path
 
 import pytest
 from packaging.requirements import Requirement
@@ -33,15 +35,23 @@ from .conftest import (
 # Value-shaped credential patterns. Deliberately matches LIVE key SHAPES, not
 # variable names: code that redacts or documents ANTHROPIC_API_KEY is fine,
 # code carrying an actual key is not.
-SECRET_VALUE_PATTERNS = [
-    re.compile(r"sk-ant-[A-Za-z0-9_\-]{24,}"),
-    re.compile(r"sk-[A-Za-z0-9]{32,}"),
-    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
-    re.compile(r"gh[pousr]_[A-Za-z0-9]{36}"),
-    re.compile(r"github_pat_[A-Za-z0-9_]{40,}"),
-    re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-]
+#
+# THIS LIST USED TO BE WRITTEN OUT HERE, and it had drifted from the canonical
+# set in BOTH directions - it was the only place that knew Slack's `xox...`
+# shape, and its `sk-ant-` bound was 24 where the gate's was 12, so a 16-char
+# Anthropic-shaped value would have failed CI and passed this test. It now
+# imports the one table (backend/app/services/redaction/patterns.py) through
+# the same .github/scripts shim the CI scanners use, so a new provider added
+# for the leak gate tightens this packaging guard on the same commit.
+#
+# The wheel is a PUBLISHED artifact, so it takes the GATE set - `PATTERNS` -
+# not the redactor's wider `REDACT_PATTERNS`: a documentation example
+# containing `https://user:pass@host` in the CLI's README is not a leak, and
+# failing the build on it is how a blocking gate gets switched off.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / ".github" / "scripts"))
+from secret_patterns import PATTERNS as _SHARED_PATTERNS  # noqa: E402
+
+SECRET_VALUE_PATTERNS = [pattern for _label, pattern in _SHARED_PATTERNS]
 
 
 class TestVersionSingleSource:

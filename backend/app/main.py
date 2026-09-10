@@ -23,6 +23,7 @@ from app.database import init_db
 from app.routers import repos, cards, jobs, runners, agent_files, pipelines, lazyaf_files
 from app.routers import git, playground, models, steps, spec, test_results
 from app.routers import experiments, debug
+from app.routers import diagnostics
 from app.routers import model_endpoints
 from app.routers import ws_runners
 from app.services.websocket import manager
@@ -418,6 +419,13 @@ app.include_router(model_endpoints.router)
 # The debug router carries both the 12.7 HTTP surface and the terminal
 # WebSocket (/ws/debug/...); like ws_runners it declares its own paths.
 app.include_router(debug.router)
+# The diagnostics surface: the system strip, the log view, and the
+# bug-report bundle. Importing this module also attaches the backend log ring
+# buffer to the root logger (see the note in routers/diagnostics.py) - which
+# is why it is imported at module scope above rather than lazily: a handler
+# attached after startup would miss the startup records, and "when did this
+# process actually boot" is the question the whole surface exists to answer.
+app.include_router(diagnostics.router)
 # The runner WebSocket (/ws/runner). Registered here rather than under an
 # /api prefix: it is a transport, not a REST surface.
 app.include_router(ws_runners.router)

@@ -11,6 +11,7 @@
   import SpecsPage from './lib/pages/SpecsPage.svelte';
   import ExperimentsPage from './lib/pages/ExperimentsPage.svelte';
   import EndpointsPage from './lib/pages/EndpointsPage.svelte';
+  import LogsPage from './lib/pages/LogsPage.svelte';
   import { get } from 'svelte/store';
   import { websocketStore } from './lib/stores/websocket';
   import { reposStore, selectedRepoId } from './lib/stores/repos';
@@ -64,6 +65,7 @@
     '/specs': SpecsPage,
     '/experiments': ExperimentsPage,
     '/endpoints': EndpointsPage,
+    '/logs': LogsPage,
   };
 
   let stopRemembering: (() => void) | null = null;
@@ -142,6 +144,10 @@
       <a href="/endpoints" use:link class="nav-item" data-testid="nav-endpoints" class:active={$location === '/endpoints'}>
         <span class="nav-icon">🔌</span>
         <span class="nav-label">Endpoints</span>
+      </a>
+      <a href="/logs" use:link class="nav-item" data-testid="nav-logs" class:active={$location === '/logs'}>
+        <span class="nav-icon">📜</span>
+        <span class="nav-label">Logs</span>
       </a>
       <a href="/playground" use:link class="nav-item" class:active={$location === '/playground'}>
         <span class="nav-icon">{$playgroundRunning ? '⚙️' : '🧪'}</span>

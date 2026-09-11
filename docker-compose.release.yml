@@ -72,6 +72,18 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
+      # Host paths a pipeline step may bind-mount, and the ONLY way
+      # `needs: [docker]` can reach the host docker socket. Empty by default:
+      # that mount is host-root-equivalent and a pipeline definition arrives by
+      # `git push`, so it is opt-in. Without this line the setting is
+      # unreachable and the refusal names a variable nobody can set (R1).
+      - LAZYAF_STEP_BIND_ALLOWLIST=${LAZYAF_STEP_BIND_ALLOWLIST:-}
+      # Cost accounting for self-hosted GPU time. Read by config.py and used
+      # to price StepUsage; unreachable until now, so a self-hoster's dollars
+      # silently stayed at the built-in rates.
+      - LAZYAF_GPU_NODE_RATES=${LAZYAF_GPU_NODE_RATES:-}
+      # SQLAlchemy echo. Debugging only, and loud.
+      - LAZYAF_DB_ECHO=${LAZYAF_DB_ECHO:-}
       # SHARED SECRETS - REQUIRED, and there is no default anywhere.
       #
       # These two used to fall back to constants compiled into

@@ -2,27 +2,34 @@
 
 > Visual orchestrator for AI agents to handle feature development via Trello-style cards
 
-> **Reconciled against the tree 2026-08-31.** Status claims in this file name
-> their evidence. History lives in `historical-documents/`; this file is about
-> what is next.
+> **Reconciled against the tree 2026-09-10 at HEAD `ac777bc`.** Status claims
+> in this file name their evidence. History lives in `historical-documents/`;
+> this file is about what is next.
 >
-> The 2026-08-30 ledger below was re-verified against HEAD (`744376b`) on
-> 2026-08-31 by four independent lanes, after three waves had landed on top of
-> it (`4f529e1`, `b54dd19`, `08e356d`, `744376b`). Items that closed are in the
-> closed table; items whose evidence had drifted carry corrected file:line;
-> items nobody could execute say so instead of being asserted.
+> **What changed since the 2026-08-31 reconcile, and why this file needed one.**
+> Five waves landed (`aae20fa`, `c0a0b87`, `be5e943`, `0adfad0`, `ac777bc`) and
+> none of them updated this document, so it spent ten days telling its reader
+> that Phase 12.8 P3-P6 had "not started" and naming migration ids that the
+> tree had already used for other work. **Phase 12.8 is COMPLETE** and with it
+> Milestone 12, apart from 12.9 which is deliberately future. The whole "what
+> to do next" section below was rewritten, not patched.
 >
-> **Tree caveat, 2026-08-31.** HEAD is clean, but a concurrent wave is editing
-> `backend/app/schemas/pipeline.py`, `backend/app/services/agent_run.py`,
-> `backend/app/services/experiment_service.py` and `tdd/shared/factories/`.
-> Every line number in this file is **HEAD-relative**; re-check those four
-> before trusting a line number in them.
+> That failure is the one [Written-record drift](#written-record-drift-the-failure-this-survey-exists-to-catch)
+> exists to catch, and it caught nothing because nobody ran it. A plan that is
+> wrong about what is finished is worse than no plan: it sends the next session
+> to redo landed work. **If you land a wave, reconcile this file in the same
+> commit.**
+>
+> The 2026-08-31 tree caveat is retired: the concurrent wave it warned about
+> (`schemas/pipeline.py`, `services/agent_run.py`,
+> `services/experiment_service.py`, `tdd/shared/factories/`) has long since
+> landed. Line numbers in this file are HEAD-relative as always.
 
 ---
 
 ## What to do next
 
-> Reconciled against the tree on **2026-08-30**. Every status below names its
+> Reconciled against the tree on **2026-09-10**. Every status below names its
 > evidence — a file, a test, a commit, or a measured number. Where a claim could
 > not be checked in the tree, it says so rather than assuming.
 >
@@ -31,50 +38,73 @@
 > named individually) · **DESIGNED** (a written plan, zero implementation) ·
 > **NOT STARTED**.
 
-### 1. Now — finish Phase 12.8: retire the v1 array pipeline format
+### 1. Now — Phase 12.8 is COMPLETE; the open question is what follows it
 
-P1 and P2 landed in commit `b79bb7f`. **P3 through P6 have not started.** The
-plan of record, with the strict file-ownership split and the acceptance gate, is
-`upcoming/wave10-v1-retirement.md`.
+**Milestone 12 is finished** apart from 12.9, which is deliberately future.
+12.8 landed across two commits: P3-P5 in `96ed87d` and P6 in `0adfad0`.
 
-| Step | What it is | State |
+| Step | What it was | State |
 |---|---|---|
-| P1 | The graph gains terminal actions: `StepActions`, `describe_terminal_action`, `_run_terminal_action` | **COMPLETE** — `b79bb7f`; `STEP_ACTION_PREFIXES` and `_run_terminal_action` both live in `backend/app/services/pipeline_executor.py` |
-| P2 | `array_to_graph` becomes the faithful, *refusing* boundary converter | **COMPLETE** — `b79bb7f`; `backend/app/schemas/pipeline.py:597` |
-| **P3** | **Every writer emits graphs; every reader stops reading the array; `steps` leaves the wire** | **NOT STARTED — this is the next action.** `PipelineRead.steps`, `PipelineCreate.steps` and `PipelineUpdate.steps` are all still on the wire (`backend/app/schemas/pipeline.py:236,255,268`) |
-| P4 | Migration **`0013`**: backfill `steps` -> `steps_graph`, add the `definition_error` column | NOT STARTED. The `definition_error` *schema field* already exists (`schemas/pipeline.py:283`) but there is no column and no backfill revision. **Corrected 2026-08-31:** `0012_workspaces_per_worker.py` is **committed** (`08e356d`), so the committed head is `0012` and the next free id is **`0013`**, not "the next free id, pending". |
-| P5 | Delete the executor's array fork | NOT STARTED — every named identifier still branches at HEAD: `parse_steps` (`pipeline_executor.py:711`), `STEP_ACTIONS`/`STEP_ACTION_PREFIXES` (`:793-800`), `describe_step_action` (`:808`), `is_graph` threaded at `:694,704,3034,3171,4139,4306,4393`, `_handle_action` dispatch at `:2575,3112,4406,4546`, `Pipeline.has_graph_definition` (`models/pipeline.py:53`) |
-| — | **ACCEPTANCE GATE** (`wave10-v1-retirement.md` §5). Nothing below runs until it passes. | — |
-| P6 | Migration **`0014`** (the revision after P4's): drop the `steps` column; the tombstone lands | NOT STARTED |
+| P1 | The graph gains terminal actions: `StepActions`, `describe_terminal_action`, `_run_terminal_action` | **COMPLETE** — `b79bb7f` |
+| P2 | `array_to_graph` becomes the faithful, *refusing* boundary converter | **COMPLETE** — `b79bb7f`; `backend/app/schemas/pipeline.py` |
+| P3 | Every writer emits graphs; every reader stops reading the array; `steps` leaves the READ wire | **COMPLETE** — `96ed87d`. `PipelineRead.steps` is deleted, not made optional, and the schema says why at `backend/app/schemas/pipeline.py:345-350`: an `= []` default made every failure look like an empty pipeline |
+| P4 | Migration **`0014_pipeline_steps_to_graph.py`**: backfill `steps` -> `steps_graph` with a frozen inlined converter, add `definition_error` | **COMPLETE** — `96ed87d`. **Numbered `0014`, not `0013`** |
+| P5 | Delete the executor's array fork | **COMPLETE** — `96ed87d`. Every identifier the old table listed is gone: `parse_steps`, `STEP_ACTIONS`, `describe_step_action`, `is_graph`, `Pipeline.has_graph_definition`. What survives is `parse_steps_graph` (the v2 reader, a different function) and tombstone comments. Pinned by `tdd/unit/services/test_no_legacy_code.py` |
+| — | **ACCEPTANCE GATE** (`wave10-v1-retirement.md` §5) | **PASSED** |
+| P6 | Migration **`0015_drop_pipeline_steps.py`**: drop the `steps` column; the model field goes with it; the tombstone lands | **COMPLETE** — `0adfad0`. **Numbered `0015`, not `0014`** |
 
-Three things to carry into P3 that the tree confirms:
+**The migration renumbering, stated once so the next reader is not confused by
+the old text.** This file used to promise P4 = `0013` and P6 = `0014`. Neither
+happened: `0013` went to endpoint modalities (`70f9d6c`) while 12.8 was parked,
+so the backfill took `0014` and the drop took `0015`. `tdd/integration/test_migrations.py:42`
+pins `ALEMBIC_HEAD_REVISION = "0015"`. The hardcoded `0012`/`0013` in
+`upcoming/wave10-v1-retirement.md` are now historical and that document is
+closed — do not author from it.
 
-- ~~`PipelineRead.definition_error` must land **with** P4's column, not before
-  it.~~ **WRONG AND OBSOLETE — corrected 2026-08-31.** The field already landed
-  at P1 (`b79bb7f`), deliberately ahead of the column, and
-  `schemas/pipeline.py:279-283` documents exactly why that is safe:
-  `from_attributes` falls back to the default for an attribute the ORM does not
-  declare. Two tests pin it
-  (`tdd/unit/schemas/test_pipeline_schemas.py::TestPipelineReadDefinitionError`
-  — 6 passed). **The constraint that actually survives** is about the ORM
-  *model*, not the schema: `backend/app/models/pipeline.py` must not gain a
-  `definition_error` attribute before the `ALTER`, because SQLAlchemy emits the
-  model's full column list in every `SELECT`. That is the version stated
-  correctly in `upcoming/wave10-v1-retirement.md:723`.
-- **The revision numbers in `upcoming/wave10-v1-retirement.md` are a live
-  trap.** Fourteen lines there hardcode `0012`/`0013`, including the filenames
-  it tells B3 to create (`:283`, `:454`, `:463`) and the acceptance-gate test
-  names (`:522-523`). `0012` is now taken. §4.7 (`:449`) does hedge — "if M14
-  has taken `0012`, take `0013`/`0014`" — and its answer is now literally
-  correct, but it names the wrong wave (M13-1 took it, not M14) and `:445` still
-  asserts "head `0011`". An agent reading §3.5's ownership table before §4.7
-  would author `0012_pipeline_steps_to_graph.py` and fork the chain into two
-  heads.
-- YAML export is a P3-adjacent hazard, not a cosmetic one — and it is **worse
-  than the 08-30 ledger said**. See T18 below: on top of the steps-as-dict,
-  `timeout`, `continue_in_context` and `actions` losses, `triggers` is never
-  written at all, and the *legacy* branch re-imports **cleanly** while silently
-  resetting every step's `on_success`/`on_failure` to `next`/`stop`.
+**What P6 cost to verify, because it is the lesson worth keeping.** The work was
+parked as an explicitly UNVERIFIED wip commit, and no tier had ever been run
+against it. The first real T1 run returned **60 failures in six files** — three
+shared fixtures still passing `steps="[]"` to a constructor that no longer took
+it, two tombstone tests whose own docstring said they went at P6, and three
+export-header tests that build a graphless pipeline and expect 200 where 409 is
+now correct. All six were the retirement's own fallout. *A wave that has not
+been run is not a wave that mostly works.*
+
+Two adjacent things fell out of the same run and are worth knowing:
+
+- **The secret scan was passing for the wrong reason.** It scans TRACKED files,
+  and the diagnostics test sentinels were untracked when the previous T1 ran.
+  Committing them made the gate see them for the first time. Five fake
+  `sk-ant-` values are now allowlisted by exact value in
+  `backend/app/services/redaction/patterns.py`, each commented with the test
+  that owns it; the Redactor does not consult that allowlist, so they still
+  redact at runtime.
+- **Four tests ran nowhere.** `TestAgainstRealRich` in
+  `tdd/unit/scripts/test_cli_errors.py` renders through the real `rich` to pin
+  the EFFECT of the CLI's `markup=False`. It `importorskip`ped on a backend env
+  with no `rich` — but every tier runs pytest from `backend/`, so "runs where
+  the CLI runs" meant ran nowhere. `rich` is now in backend's `test` extra.
+
+#### So what IS next? This is a decision, not a queue.
+
+Nothing is blocked, which is why this needs saying out loud rather than being
+implied by ordering. The candidates, each with its verified state:
+
+| Candidate | State | The argument for it |
+|---|---|---|
+| **The open-item ledger** | Live defects, see [Open items](#open-items-verified-2026-08-31) | Cheapest, and some of it is measurement-integrity rather than polish |
+| **Rung 1 — authentication** | **DESIGNED**, `upcoming/security-posture.md` §3.2 | The API has no auth on any human-facing router. Rung 0 (`ac777bc`) made it loopback-only, which is a real mitigation for one operator on one box — so this is urgent exactly when the box stops being alone |
+| **The experiment harness** | **DESIGNED**, `upcoming/experiment-harness.md` | The thing the owner has asked for most, and the reason the platform exists. Also the largest |
+| **Milestone 13** | **DESIGNED**, zero implementation | See §2 — but read the conflict note there first |
+| **Phase 14.5** | **DESIGNED**, zero implementation | See §3 |
+
+**The conflict that has to be resolved before either measurement track starts:**
+`upcoming/experiment-harness.md` and `docs/milestone-13/` are two designs for
+overlapping problems, and the newer one explicitly proposes deferring most of
+M13's machinery (`test_patch`, bench-case derivation, the oracle, nodeid id
+mode) as unnecessary for greenfield problems. One of them has to become the
+plan of record; under **R3** they cannot both be. That choice is the owner's
+and it is not made yet.
 
 ### 2. Then — Milestone 13: the benchmark & evaluation harness
 
@@ -167,7 +197,7 @@ table so the shrinkage is visible.
 | Milestone | Status | Evidence |
 |---|---|---|
 | 1-11 (foundation through playground) | COMPLETE | `historical-documents/phase-01…phase-11` |
-| **12 — Runner architecture + spec/eval layer** | **IN PROGRESS** — every phase through 12.7 COMPLETE; **12.8 open** | Detail retired to [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md); 12.8 tracked below |
+| **12 — Runner architecture + spec/eval layer** | **COMPLETE** (2026-09-10) apart from 12.9, which is deliberately out of scope | Every phase through 12.8 landed; 12.8 closed in `96ed87d` (P3-P5) + `0adfad0` (P6). Detail retired to [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md) |
 | **13 — Benchmark & evaluation harness** | **NOT STARTED** | Zero implementation. Grep for `BenchmarkCase` / `StrategyTemplate` / `TrialIteration` / `fail_to_pass` / `cost_to_solve` across `backend/`, `frontend/`, `cli/`, `tdd/` returns one hit, a comment at `backend/app/services/agent_run.py:15`. Design: this document + `docs/milestone-13/` |
 | **14 — Self-hosted OpenAI-compatible endpoints** | **COMPLETE** (2026-08-30) | Commit `4b429c6`: 56 files, ~21.5k lines. `ModelEndpoint` + migration `0011_model_endpoints.py`, capability probe, agent harness in `runner-common/runner_common/harness/`, stdlib mock OpenAI server, Endpoints UI. Out of the 12.x sequence |
 | **14.5 — Runner images with inference baked in** | **DESIGNED** | Zero implementation. Evidence corrected 2026-08-31 — the old "no `vllm`/`ollama` anywhere" line was false (M14's endpoint layer uses both words). The absent 14.5 identifiers are the evidence: no `images/node-layer/`, `images/runner-ollama/`, `images/runner-vllm/`; no `scripts/build_inference_images.py`; no `refuses_without_gpu`; no `gpu.py` `detect()`/`verdict()`; no GPU-yield mechanism. Doc: `upcoming/wave9-145-runner-images.md` |
@@ -192,7 +222,7 @@ exit gates: [`historical-documents/phase-12-runner-architecture.md`](historical-
 | 12.6.5 — Experiments & leaderboards | COMPLETE | Migration `0010_experiments.py`; `GET /api/experiments/{id}/leaderboard` and `GET /api/leaderboards/feature/{id}` (`routers/experiments.py:521,549`); finalize is one atomic CAS |
 | 12.6.6 — Spec-curated agent context | COMPLETE | `backend/app/routers/spec_context.py`; `GET /api/cards/{id}/spec-context`; `card_id` resolves from step config as well as run context |
 | 12.7 — Debug re-run mode | COMPLETE | `backend/app/routers/debug.py`, migration `0009_debug_sessions.py`, `images/debug-sidecar/`, `WS /api/debug/{id}/terminal`, `lazyaf debug` shipped in the wheel |
-| **12.8 — Retire the v1 array format** | **IN PROGRESS** | P1+P2 landed (`b79bb7f`); **P3-P6 not started.** Plan: `upcoming/wave10-v1-retirement.md`. See [Phase 12.8](#phase-128--retire-the-v1-array-pipeline-format-in-progress) |
+| **12.8 — Retire the v1 array format** | **COMPLETE** | `b79bb7f` (P1-P2), `96ed87d` (P3-P5), `0adfad0` (P6). `pipelines.steps` is dropped by migration `0015`; `steps_graph` is the only definition a pipeline has. The array survives as the AUTHORING dialect only, converted at the boundary by `array_to_graph`. Pinned by `tdd/unit/services/test_no_legacy_code.py` and `tdd/integration/test_migrations_pipeline_retirement.py` |
 | 12.9 — Kubernetes orchestrator | NOT STARTED (deliberately future) | Scope decision 2026-08-29: K8s stays out of Milestone 12 |
 
 > **Correction, 2026-08-30.** Earlier revisions of this file carried a note
@@ -208,10 +238,10 @@ exit gates: [`historical-documents/phase-12-runner-architecture.md`](historical-
 
 | Thing | Value | Source |
 |---|---|---|
-| T1 (unit + non-Docker integration) | **4836 passed / 0 failed / 0 errors, 1 baselined skip, 0 xfailed** (executed = 4836) | Measured 2026-08-31 against the current tree; the count is re-derivable by tallying `junit-t1.xml` with `ci_gate`'s own rules. Floor in `tdd/tier_floors.json` is **4432** (measured 4523, stamped 2026-08-30) — three waves behind. **RATCHET DUE: raise the floor to ~4739 (4836 minus ~2% slack) and set `measured` to 4836.** The floor was stale-low *by design* at 08-30; as of 08-31 it is stale-low by **neglect**, and the file's own standing instruction ("raise on the next green T1: measured minus ~2%") is now due twice over. |
+| T1 (unit + non-Docker integration) | **5493 passed / 0 failed / 0 errors, 1 baselined skip, 0 xfailed** (executed = 5493) | Measured 2026-09-10 at `ac777bc`; `python scripts/run_tier.py T1` reports `CI GATE [T1]: OK - executed=5493 ... failed=0 ... skipped=1`. Floor in `tdd/tier_floors.json` is still **4432** (measured 4523, stamped 2026-08-30) — now **five waves and ~970 tests behind**. **RATCHET DUE, and overdue for the third consecutive reconcile: raise the floor to ~5383 (5493 minus ~2% slack) and set `measured` to 5493.** The file's own standing instruction is "raise on the next green T1: measured minus ~2%", and T1 has been green at every reconcile since. A floor a thousand tests below the measurement cannot catch a regression, which is the only thing a floor is for. |
 | T2 (Docker integration) | **83 passed / 0 failed / 0 errors, 1 baselined skip** (executed = 83) | Measured 2026-08-31, same method, against `junit-t2.xml`. Floor 75 / measured 77 in `tdd/tier_floors.json`. **RATCHET DUE: raise to ~81.** |
 | T3 (e2e quick) | floor 21, **measured 22 on 2026-08-30 — NOT re-measured on 2026-08-31** | `tdd/tier_floors.json`. Stated rather than assumed: `junit-t3.xml` **does not exist on this host**, so "both tiers green" covers T1 and T2 only and T3's 22 tests are unmeasured here. |
-| Alembic head (committed) | **`0012_workspaces_per_worker`** | Corrected 2026-08-31. `git ls-files backend/alembic/versions/` — 0001-0007, 0009, 0010, 0011, **0012**. There is no `0008`. `0012` (revision `0012`, down `0011`) landed in `08e356d`; `tdd/integration/test_migrations.py:42` pins `ALEMBIC_HEAD_REVISION = "0012"`. The next free id is **`0013`**, and only one wave wants it (12.8 P4). |
+| Alembic head (committed) | **`0015_drop_pipeline_steps`** | Corrected 2026-09-10. `backend/alembic/versions/` holds 0001-0007, 0009-0015 (there is no `0008`); `tdd/integration/test_migrations.py:42` pins `ALEMBIC_HEAD_REVISION = "0015"` and `uv run alembic heads` reports a single head. `0013` went to endpoint modalities (`70f9d6c`), so 12.8's two revisions became **`0014`** (backfill) and **`0015`** (drop) rather than the `0013`/`0014` this file used to promise. The next free id is **`0016`**. |
 | MCP tools | 45 | `grep -c '@mcp.tool' backend/app/mcp/server.py` |
 | Release CI | Publishes **9 images** to GHCR: 3 service (`backend`, `frontend`, `runner-agent`) + 6 step (`base`, `agent-base`, `claude`, `gemini`, `test-runner`, `debug-sidecar`) | `.github/workflows/images.yml`; the step list is read from `scripts/build_images.py`'s `IMAGES` table, not duplicated |
 | Release tags | **None. `git tag` is empty.** `release.yml` triggers only on `push: tags: ['v*']` (plus manual dispatch), so the tag path has never fired. `images.yml` also runs on push to `main`. | `.github/workflows/release.yml:51-54`, `images.yml:60-64` |
@@ -231,9 +261,37 @@ schedule the security block on its own.
 
 ### Security posture
 
-**S1 — No authentication on any human-facing router, while compose binds
-`0.0.0.0` and mounts the Docker socket.** CONFIRMED, re-verified 2026-08-31,
-statically and live.
+> **Updated 2026-09-10 (`ac777bc`).** A full review landed as
+> **[`upcoming/security-posture.md`](upcoming/security-posture.md)** — ranked
+> findings and a four-rung hardening ladder — and **Rung 0 is implemented**.
+> That review's Lane A did something this ledger had not: it executed the whole
+> chain on the QA sandbox and confirmed an **anonymous caller could run
+> arbitrary code on the host docker daemon** (create a repo, push a
+> `.lazyaf/pipelines/*.yaml`, run it; `docker inspect` showed the injected
+> command). S1 below is not theoretical.
+>
+> **What Rung 0 changed, so the items below read correctly:**
+> - Compose no longer binds `0.0.0.0`. `LAZYAF_BACKEND_PORT` /
+>   `LAZYAF_FRONTEND_PORT` default to `127.0.0.1:8000` / `127.0.0.1:5173`, and
+>   the dev-only mock (8099) and e2e backend (8765) are hardcoded to loopback.
+>   **This does not fix S1; it decides who can reach it.**
+> - The host docker socket is **no longer in the default step bind allowlist**.
+>   `needs: [docker]` now fails loudly unless the operator sets
+>   `LAZYAF_STEP_BIND_ALLOWLIST`. This repo's own dogfood pipeline is the case
+>   that legitimately needs it.
+> - `POST /git/{repo_id}.git/_internal/push-event` **now requires the runner
+>   secret**, checked before the repo lookup so a 404 cannot enumerate ids. See
+>   the sub-item below, which is CLOSED.
+>
+> **Still open and unchanged: there is no authentication on any human-facing
+> router.** That is Rung 1 (`security-posture.md` §3.2) and it is the largest
+> single item in this ledger. A new `SECURITY.md` at the repo root states the
+> honest threat model in the meantime.
+
+**S1 — No authentication on any human-facing router, while the backend mounts
+the Docker socket.** CONFIRMED, re-verified 2026-08-31 statically and live, and
+re-confirmed end-to-end 2026-09-10. *(The original heading also said "compose
+binds `0.0.0.0`" — that half is fixed, see the note above.)*
 
 A decorator-walk over all 20 files in `backend/app/routers/` finds only three
 non-`get_db` `Depends(` in the whole tree, and none of them is auth
@@ -259,10 +317,16 @@ the git server serves clone **and** push to anyone.
 
 **Two specifics the 08-30 ledger did not name:**
 
-- `POST /git/{repo_id}.git/_internal/push-event` (`routers/git.py:180-199`) is
-  unauthenticated and calls `trigger_service.on_push`. An anonymous caller can
-  **forge a push event and start pipeline runs** — i.e. spawn containers on the
-  host daemon — without pushing anything.
+- ~~`POST /git/{repo_id}.git/_internal/push-event` is unauthenticated and calls
+  `trigger_service.on_push`.~~ **CLOSED 2026-09-10 (`ac777bc`).** It now
+  requires the runner secret as `Authorization: Bearer`, verified *before* the
+  repo lookup. Five tests pin it, including that the raw secret under a
+  non-bearer scheme does not authenticate and that an unknown repo id still
+  answers 401 rather than 404
+  (`tdd/integration/api/test_pipeline_sync_on_push.py::TestThePushEventEndpointIsAuthenticated`).
+  Gated rather than deleted per **R2**: `git_receive_pack` already fires
+  `on_push` on the default path, so nothing in-tree needs this route — delete
+  it once no out-of-tree git hook is posting to it.
 - **CORS is one of the few things NOT wide open, and this is written down so
   nobody "fixes" it.** `config.py:313` defaults `cors_origins` to
   `["http://localhost:5173"]` with `allow_credentials=True` (`main.py:249-255`) —
@@ -855,10 +919,15 @@ read this pass. Do not treat any of these as evidenced.
 ### Closed — verified fixed, not just claimed
 
 Kept as a list so a reader can tell the ledger shrank on evidence. **Closed on
-2026-08-31** first, then the 08-30 set.
+2026-09-10** first, then 2026-08-31, then the 08-30 set.
 
 | Was | Fixed by | Verified how |
 |---|---|---|
+| **An experiment could report a 100% pass rate over ZERO measurements.** `classify_cell` returned `passed` on a run that exited 0 *without reading a single `TestRun` row*, while the failure branch demanded evidence and returned `error` when there was none. `experiment_metrics` computes `pass_rate = passed / (passed + failed)` and states in its own module docstring that "Only MEASURED cells enter denominators" — so a matrix whose pipelines all no-opped was admitted as a clean sweep. The R4 failure in the one subsystem whose entire product is a number. | 2026-09-10 | The evidence check moved *before* the outcome is consulted, so both directions ask the same question (`services/experiment_service.py`). Two tests pin it and BOTH were proven to fail against the old code before the fix was kept: `test_successful_run_with_no_test_evidence_is_error_not_a_free_pass`, and an end-to-end `test_a_matrix_that_measured_nothing_has_no_pass_rate_not_a_perfect_one` that drives three green-but-empty cells and asserts the rate is `None` with a reason rather than `1.0`. The `/resume` orphan sweep also used to set the status without an `error` message, leaving an ERROR cell with nothing a human could read (R1); both callers now share `UNMEASURED_CELL_ERROR` |
+| **`POST /git/{id}.git/_internal/push-event` let an anonymous caller forge a push and spawn containers** | `ac777bc` | See the [Security posture](#security-posture) note; five tests, including that a 401 precedes the repo lookup |
+| **Compose published every port on `0.0.0.0`, and the host docker socket was in the DEFAULT step bind allowlist** | `ac777bc` | `docker compose -f docker-compose.release.yml config` now reports `host_ip: 127.0.0.1`; `bind_mount_allowlist()` returns `()` unless `LAZYAF_STEP_BIND_ALLOWLIST` is set, and `tdd/unit/services/execution/test_local_executor_hardening.py::test_the_docker_socket_is_NOT_allowlisted_by_default` is the acceptance |
+| **Four `TestAgainstRealRich` tests ran in no tier at all** — they `importorskip`ped on a backend env with no `rich`, and every tier runs pytest from `backend/` | `0adfad0` | `rich` added to backend's `test` extra on the same bound `cli/pyproject.toml` ships; the suite reports 77 passed, 0 skipped |
+| **The secret scan was green because the files were untracked**, not because the tree was clean | `0adfad0` | Committing the diagnostics sentinels made the gate see them; five fake `sk-ant-` values are allowlisted by exact value, each commented with the test that owns it, and the Redactor does not consult that allowlist |
 | **M13 BLOCKER — `Workspace.pipeline_run_id` was `unique=True`, so K parallel agents would share one checkout** | `08e356d` | `models/workspace.py:79` has no `unique=True`; the composite `Index("uq_workspaces_run_worker", "pipeline_run_id", "worker_key", unique=True)` is at `:65-67`; migration `0012_workspaces_per_worker.py` committed (down `0011`), `worker_key` NOT NULL with a `"default"` sentinel (deliberately not nullable — both SQLite and Postgres treat NULLs as distinct in a unique index). `tdd/integration/test_migrations.py` pins the index swap **and** volume-name stability; `tdd/unit/services/test_workspace_service.py` 66 passed; `tdd/integration/services/test_workspace_lifecycle.py:261` writes into and reads back four independent volumes |
 | **The M13-1 change did not weaken run isolation** (checked because "per worker" could have meant volumes shared across runs) | — | Volume names still carry the full run id (`models/workspace.py:93-94`): `lazyaf-ws-{run_id}` for the default lane, `-{slug}` otherwise. A lane is a checkout **within** one run; two runs never share a volume, and `HOME=/workspace/home` does not bleed between runs |
 | **The `08e356d` `populate_existing` race fix** — `expire_on_commit=False` served a stale cached row to `_get_lane` and a rival caller deleted a populated volume | `08e356d` | Present and documented with the failure mode written out at `workspace_service.py:266-300` |
@@ -1034,11 +1103,21 @@ Part 1.)
 
 ---
 
-### Phase 12.8 — Retire the v1 array pipeline format [IN PROGRESS]
+### Phase 12.8 — Retire the v1 array pipeline format [COMPLETE]
 
-The last open phase of Milestone 12, and the only one with work left in it.
-Plan of record — ordered phases, strict file ownership, pinned cross-agent
-contracts, and the acceptance gate: **`upcoming/wave10-v1-retirement.md`**.
+The last open phase of Milestone 12, closed 2026-09-10 across `b79bb7f`
+(P1-P2), `96ed87d` (P3-P5) and `0adfad0` (P6). The plan of record was
+**`upcoming/wave10-v1-retirement.md`**; it is now **historical and must not be
+authored from** — its hardcoded `0012`/`0013` revision ids are wrong (the work
+landed as `0014` and `0015`) and its file-ownership split describes a wave that
+has finished. Kept for the reasoning, not for the instructions.
+
+**Where the truth is now.** `steps_graph` is the only definition a pipeline
+has, at the database, the wire and the executor alike. The v1 array survives in
+exactly one role: the AUTHORING dialect at two edges — repo YAML and
+`PipelineCreate`/`PipelineUpdate` — both converting through `array_to_graph` at
+the boundary and neither storing an array. That is why
+`.lazyaf/pipelines/*.yaml` is still written as a list and is not a leftover.
 
 **The decision** (owner, 2026-08-30): execution goes **graph-only**. The array
 survives only as an authoring convenience at two edges — repo YAML and the
@@ -1059,13 +1138,18 @@ before anything was removed.
 |---|---|---|
 | P1 | `StepActions` on `PipelineStepV2`, `describe_terminal_action`, `_run_terminal_action` and its dispatch site; `_trigger_card` / `_merge_branch` / `_resolve_merge_source_branch` gain `step_id`-keyed forms. Plus executed tests for graph `failure` and `always` edges, which had **never** been dispatched by any test in any tier. | **COMPLETE** — `b79bb7f` |
 | P2 | `array_to_graph` becomes faithful and *refuses loudly* what it cannot represent — naming the step, the value and the vocabulary. Refuses `trigger:pipeline:`, unknown actions, duplicate ids, empty input, and any conversion producing an unreachable node. Two deliberate carve-outs: a mid-array `stop` is a refusal (v1 could hold a contradiction the graph cannot), and flow on the *terminal* step is neither an edge nor a refusal (the dogfood pipeline's last step is `on_success: next` with nothing after it). | **COMPLETE** — `b79bb7f` |
-| **P3** | Every writer emits `steps_graph=`; `PipelineRead.steps` and its `parse_steps` validator are deleted; `pipeline_to_ws_dict` loses the key; `PipelineUpdate._reject_nulls` drops `"steps"`; `serialize_steps` goes; `verify_executor` re-keys on `step_id`; the frontend loses `convertLegacyToGraph`. | **NOT STARTED — next action** |
-| P4 | Migration: backfill `Pipeline.steps` -> `steps_graph` for every row without a graph using an **inlined, frozen** converter, and add the `definition_error` column. Pure `UPDATE` + additive `ALTER` — no column dropped, no table rebuilt, fully reversible. | NOT STARTED |
-| P5 | Delete the executor fork: `_execute_step`, `_handle_action`, `_trigger_pipeline`, `parse_steps`, `describe_step_action` / `STEP_ACTIONS` / `STEP_ACTION_PREFIXES`, `Pipeline.has_graph_definition()`, the `else:` branch of `start_pipeline`, and the `is_graph` / `steps` parameters threaded through the local-step helpers. **The fork that gets missed**: `_on_step_complete_locked` (the job-callback path) recomputes `graph` itself rather than receiving `is_graph`. | NOT STARTED |
+| **P3** | Every writer emits `steps_graph=`; `PipelineRead.steps` and its `parse_steps` validator are deleted; `pipeline_to_ws_dict` loses the key; `PipelineUpdate._reject_nulls` drops `"steps"`; `serialize_steps` goes; `verify_executor` re-keys on `step_id`; the frontend loses `convertLegacyToGraph`. | **COMPLETE** — `96ed87d` |
+| P4 | Migration: backfill `Pipeline.steps` -> `steps_graph` for every row without a graph using an **inlined, frozen** converter, and add the `definition_error` column. Pure `UPDATE` + additive `ALTER` — no column dropped, no table rebuilt, fully reversible. | **COMPLETE** — `96ed87d`, as **`0014_pipeline_steps_to_graph.py`**. The frozen converter is pinned by `tdd/integration/test_migrations_pipeline_retirement.py::TestTheConverterIsFrozen` |
+| P5 | Delete the executor fork: `_execute_step`, `_handle_action`, `_trigger_pipeline`, `parse_steps`, `describe_step_action` / `STEP_ACTIONS` / `STEP_ACTION_PREFIXES`, `Pipeline.has_graph_definition()`, the `else:` branch of `start_pipeline`, and the `is_graph` / `steps` parameters threaded through the local-step helpers. **The fork that gets missed**: `_on_step_complete_locked` (the job-callback path) recomputes `graph` itself rather than receiving `is_graph`. | **COMPLETE** — `96ed87d`. The named fork WAS handled. Only `parse_steps_graph` (the v2 reader) and tombstone comments still match a grep for these names |
 | — | **ACCEPTANCE GATE** — `wave10-v1-retirement.md` §5: named tests exist and pass, all three tiers green, and the dogfood ratchet holds on **real backfilled data**. Nothing below runs until it passes. | — |
-| P6 | Migration: `batch_alter_table('pipelines')` + `drop_column('steps')`; `Pipeline.steps` removed from the model; `_adopt_unversioned` taught about retired columns; the no-legacy guards added. | NOT STARTED |
+| P6 | Migration: `batch_alter_table('pipelines')` + `drop_column('steps')`; `Pipeline.steps` removed from the model; `_adopt_unversioned` taught about retired columns; the no-legacy guards added. | **COMPLETE** — `0adfad0`, as **`0015_drop_pipeline_steps.py`**. `_RETIRED_COLUMNS` lives in `backend/app/database.py`; the drop refuses rather than stranding a definition |
 
-#### The invariant that makes this safe
+#### The invariant that made this safe [SATISFIED — kept for the reasoning]
+
+This was the constraint the two-revision split existed to honour. It is spent:
+P6 removed the model field and the column together in `0adfad0`. Restated
+because the *shape* of the argument is reusable by the next column retirement,
+and `backend/app/database.py`'s `_RETIRED_COLUMNS` table exists because of it.
 
 `Pipeline.steps` stays on the ORM model, with its python-side `default="[]"`,
 until the very last phase. The column is `nullable=False` with **no
@@ -1079,13 +1163,21 @@ happens *between* the two revisions.
 
 #### Also in 12.8
 
-- The dogfood pipeline converts to a v2 graph. That conversion is what proves
-  the retirement, not a unit test. **NOT DONE** (checked 2026-08-31 because
-  `b54dd19` edited this file): `.lazyaf/pipelines/test-suite.yaml:31` still
-  declares `steps:` as a YAML **list** (`- id: "secret-scan"` at `:62`), with no
-  `version: 2` and no `entry_points:`. `b54dd19` added the secret-scan step at
-  the front and kept the v1 format — so the file this must convert is now **one
-  step longer (11)**.
+- ~~The dogfood pipeline converts to a v2 graph.~~ **OBSOLETE — the decision
+  changed what "done" means here.** `.lazyaf/pipelines/test-suite.yaml` still
+  declares `steps:` as an 11-entry YAML list and that is now CORRECT: the array
+  is the authoring dialect and `array_to_graph` converts it on every push, so a
+  hand-written `version: 2` / `entry_points:` block in a repo YAML would be
+  authoring in the storage format for no benefit. What actually proves the
+  retirement is that the push path materialises a graph row —
+  `tdd/integration/api/test_pipeline_sync_on_push.py` — plus the frozen
+  converter pinned in migration `0014`.
+
+  One real change here, from `ac777bc`: the file's `needs: ["docker"]` steps
+  (T2 and T3) now require the operator to opt in with
+  `LAZYAF_STEP_BIND_ALLOWLIST=/var/run/docker.sock`. The socket used to be
+  allowlisted by default for every repo; this repo is the one that genuinely
+  needs it, and the YAML says so at the step.
 - Retire completed phase sections to `historical-documents/`. **Done
   2026-08-30**: the 12.0-12.7 narrative moved to
   [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md),

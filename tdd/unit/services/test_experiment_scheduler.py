@@ -43,6 +43,7 @@ from tdd.unit.services.experiment_rows import (  # noqa: E402
     make_experiment,
     make_repo,
     make_run,
+    seed_test_evidence,
 )
 
 
@@ -310,30 +311,34 @@ class TestClassification:
         await db.commit()
 
         for status in tests or []:
-            ref = TestRef(id=str(uuid4()), lazyaf_test_id=f"t-{uuid4().hex[:6]}",
-                          repo_id=repo.id, status="active")
-            db.add(ref)
-            await db.commit()
-            db.add(
-                TestRun(
-                    id=str(uuid4()), test_ref_id=ref.id, pipeline_run_id=run.id,
-                    commit_sha="", status=status, experiment_run_id=cell.id,
-                )
-            )
+            await seed_test_evidence(db, repo.id, run.id, cell.id, status)
         await db.commit()
         return experiment, cell, run
 
-    async def test_successful_run_is_passed(self, db_session):
-        _, cell, run = await self._cell_with_run(db_session, RunStatus.PASSED.value)
+    async def test_successful_run_with_test_evidence_is_passed(self, db_session):
+        _, cell, run = await self._cell_with_run(
+            db_session, RunStatus.PASSED.value, tests=["passed"]
+        )
         await svc.on_cell_complete(db_session, run, True)
         await db_session.refresh(cell)
         assert cell.status == ExperimentRunStatus.PASSED.value
 
-    async def test_successful_run_with_no_tests_is_still_passed(self, db_session):
+    async def test_successful_run_with_no_test_evidence_is_error_not_a_free_pass(
+        self, db_session
+    ):
+        """A green exit proves the pipeline ran, not that anything was checked.
+
+        This asserted the OPPOSITE until the asymmetry was found: the failure
+        branch demanded evidence and the success branch did not, so a cell that
+        exited 0 having measured nothing was admitted as a measured pass. It is
+        the same fact in both directions - nothing was measured - and it gets
+        the same answer now.
+        """
         _, cell, run = await self._cell_with_run(db_session, RunStatus.PASSED.value)
         await svc.on_cell_complete(db_session, run, True)
         await db_session.refresh(cell)
-        assert cell.status == ExperimentRunStatus.PASSED.value
+        assert cell.status == ExperimentRunStatus.ERROR.value
+        assert "nothing was measured" in cell.error
 
     async def test_failed_run_with_test_evidence_is_failed_not_error(self, db_session):
         """The suite came back red: that IS the measurement."""
@@ -362,7 +367,9 @@ class TestClassification:
         assert cell.status == ExperimentRunStatus.CANCELLED.value
 
     async def test_completion_is_idempotent(self, db_session):
-        _, cell, run = await self._cell_with_run(db_session, RunStatus.PASSED.value)
+        _, cell, run = await self._cell_with_run(
+            db_session, RunStatus.PASSED.value, tests=["passed"]
+        )
         await svc.on_cell_complete(db_session, run, True)
         first_completed_at = cell.completed_at
         await svc.on_cell_complete(db_session, run, False)
@@ -418,6 +425,7 @@ class TestFinalization:
         async def _immediate(db, exp, cell):
             run = await make_run(db, repo, status=RunStatus.PASSED.value,
                                  trigger_ref=cell.id)
+            await seed_test_evidence(db, repo.id, run.id, cell.id)
             await svc.on_cell_complete(db, run, True)
             return run
 
@@ -429,6 +437,53 @@ class TestFinalization:
         assert experiment.completed_at is not None
         counts = await cells_by_status(db_session, experiment.id)
         assert counts == {ExperimentRunStatus.PASSED.value: 3}
+
+    async def test_a_matrix_that_measured_nothing_has_no_pass_rate_not_a_perfect_one(
+        self, db_session, monkeypatch
+    ):
+        """The consequence of the classification rule, pinned end to end.
+
+        `experiment_metrics` computes `pass_rate = passed / (passed + failed)`
+        and states in its own module docstring that only MEASURED cells enter
+        denominators. While a green exit with no evidence was admitted as
+        `passed`, a matrix whose pipelines all no-opped reported a pass rate of
+        **1.0** - a fabricated 100% over zero measurements, produced by the one
+        module that promises a zero denominator comes back as None with a
+        reason and never as a number.
+
+        Identical to the test above except that nothing seeds evidence. Three
+        green runs, three cells, nothing measured, and therefore no rate.
+        """
+        from app.services.experiment_metrics import pass_rate
+
+        repo = await make_repo(db_session)
+        card = await make_card(db_session, repo)
+        experiment = await make_experiment(
+            db_session, repo, card, concurrency=2, models=3
+        )
+
+        async def _green_but_empty(db, exp, cell):
+            # Exits 0 and ties back NO TestRun - a test step that collected
+            # nothing, or a manifest that never reached /test-results.
+            run = await make_run(db, repo, status=RunStatus.PASSED.value,
+                                 trigger_ref=cell.id)
+            await svc.on_cell_complete(db, run, True)
+            return run
+
+        monkeypatch.setattr(svc, "start_cell_run", _green_but_empty)
+        await svc.launch(db_session, experiment)
+
+        counts = await cells_by_status(db_session, experiment.id)
+        assert counts == {ExperimentRunStatus.ERROR.value: 3}, (
+            "a green run with no test evidence measured nothing; admitting it "
+            "as a pass is what fabricated the 100%"
+        )
+
+        passed = counts.get(ExperimentRunStatus.PASSED.value, 0)
+        failed = counts.get(ExperimentRunStatus.FAILED.value, 0)
+        rate, reason = pass_rate(passed, failed)
+        assert rate is None, f"expected no pass rate, got {rate}"
+        assert reason
 
     async def test_running_experiment_is_not_finalized_early(
         self, db_session, fake_dispatch
@@ -488,6 +543,7 @@ class TestAbort:
         run = await db_session.get(PipelineRun, live.pipeline_run_id)
         run.status = RunStatus.PASSED.value
         await db_session.commit()
+        await seed_test_evidence(db_session, repo.id, run.id, live.id)
         await svc.on_cell_complete(db_session, run, True)
 
         await db_session.refresh(live)
@@ -624,6 +680,7 @@ class TestStallAndResume:
         run = await db_session.get(PipelineRun, cell.pipeline_run_id)
         run.status = RunStatus.PASSED.value
         await db_session.commit()
+        await seed_test_evidence(db_session, repo.id, run.id, cell.id)
         svc._pump_locks.clear()
 
         await svc.resume(db_session, experiment)

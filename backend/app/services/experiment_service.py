@@ -1245,10 +1245,7 @@ async def on_cell_complete(
         cell.status = await classify_cell(db, pipeline_run, success)
         cell.completed_at = datetime.utcnow()
         if cell.status == ExperimentRunStatus.ERROR.value and not cell.error:
-            cell.error = (
-                "the run failed with no test result tied back to it - nothing "
-                "was measured, so this cell is an error, not a 0% score"
-            )
+            cell.error = UNMEASURED_CELL_ERROR
         await db.commit()
         await broadcast_cell(db, cell.id)
         await pump(db, cell.experiment_id)
@@ -1260,6 +1257,17 @@ async def on_cell_complete(
         )
 
 
+#: Why a cell with no test evidence is an error. Shared by both callers:
+#: `on_cell_complete` and the `/resume` orphan sweep, which used to set no
+#: reason at all and left an ERROR cell with an empty `error` (R1).
+UNMEASURED_CELL_ERROR = (
+    "the run finished with no test result tied back to it - nothing was "
+    "measured, so this cell is an error, not a score. A green exit proves "
+    "the pipeline ran, not that anything was checked: look for a test step "
+    "that collected nothing, or a manifest that never reached /test-results"
+)
+
+
 async def classify_cell(
     db: AsyncSession, pipeline_run: PipelineRun, success: bool
 ) -> str:
@@ -1267,7 +1275,8 @@ async def classify_cell(
 
     | run outcome | TestRun rows | cell     |
     |-------------|--------------|----------|
-    | passed      | any / none   | passed   |
+    | passed      | >= 1         | passed   |
+    | passed      | zero         | error    |
     | failed      | >= 1         | failed   |
     | failed      | zero         | error    |
     | cancelled   | any          | cancelled|
@@ -1275,11 +1284,29 @@ async def classify_cell(
     No string matching on error messages, no heuristics. "The suite was red"
     and "nothing was ever measured" are different facts, and only the first
     belongs in a pass-rate denominator.
+
+    THE SUCCESS BRANCH USED TO SKIP THE EVIDENCE CHECK, and the table used to
+    read `passed | any / none | passed`. That asymmetry was a fake green in
+    the one place this platform cannot afford one. `experiment_metrics` states
+    the invariant it depends on in its own module docstring - "Only MEASURED
+    cells (passed / failed) enter denominators" - and computes
+    `pass_rate = passed / (passed + failed)`. A cell that exited 0 having run
+    no test was admitted as a measured pass, so an experiment whose pipelines
+    all no-op reported a pass rate of 1.0: a fabricated 100% over zero
+    measurements, which is precisely the number that module promises never to
+    produce (it returns None with a reason for a zero denominator, never 0.0
+    - and, now, never 1.0 either).
+
+    Nothing is lost by the symmetry. An experiment that genuinely measures
+    nothing now reports "no test ran" instead of a perfect score, which is the
+    honest answer and the one the metrics layer was already built to render.
     """
     if getattr(pipeline_run, "status", None) == RunStatus.CANCELLED.value:
         return ExperimentRunStatus.CANCELLED.value
-    if success:
-        return ExperimentRunStatus.PASSED.value
+
+    # ONE evidence check, before the outcome is consulted. Whether the run
+    # exited 0 is a fact about the pipeline; whether anything was measured is
+    # a fact about the experiment, and only the second decides admission.
     measured = (
         await db.execute(
             select(func.count())
@@ -1287,10 +1314,12 @@ async def classify_cell(
             .where(TestRun.pipeline_run_id == pipeline_run.id)
         )
     ).scalar_one()
+    if not measured:
+        return ExperimentRunStatus.ERROR.value
     return (
-        ExperimentRunStatus.FAILED.value
-        if measured
-        else ExperimentRunStatus.ERROR.value
+        ExperimentRunStatus.PASSED.value
+        if success
+        else ExperimentRunStatus.FAILED.value
     )
 
 
@@ -1399,6 +1428,10 @@ async def resume(db: AsyncSession, experiment: Experiment) -> tuple[int, int]:
         cell.status = await classify_cell(
             db, run, run.status == RunStatus.PASSED.value
         )
+        if cell.status == ExperimentRunStatus.ERROR.value and not cell.error:
+            # The sweep used to leave this blank, so a cell the resume path
+            # errored carried no reason a human could read (R1).
+            cell.error = UNMEASURED_CELL_ERROR
         cell.completed_at = cell.completed_at or datetime.utcnow()
     if orphans:
         await db.commit()

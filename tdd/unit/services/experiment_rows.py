@@ -27,6 +27,8 @@ from app.models import (
     StepExecution,
     StepRun,
     StepUsage,
+    TestRef,
+    TestRun,
 )
 from app.models.experiment import Experiment, ExperimentRun, ExperimentStatus
 from app.services import experiment_service as svc
@@ -152,6 +154,36 @@ async def add_usage(
     db.add(usage)
     await db.commit()
     return usage
+
+
+async def seed_test_evidence(db, repo_id, run_id, cell_id, status="passed"):
+    """Tie one TestRun to a run, so classification has something to measure.
+
+    `classify_cell` admits a cell on PERSISTED evidence in BOTH directions: a
+    run that exited 0 having measured nothing is an `error`, not a free pass.
+    That is deliberate - `experiment_metrics` computes
+    `pass_rate = passed / (passed + failed)` and only measured cells may enter
+    that denominator, so admitting an unmeasured green would fabricate a 100%
+    over nothing.
+
+    The consequence for tests: a suite whose subject is scheduling, budget,
+    abort accounting or resume still has to leave a measurement behind, or its
+    cells come back `error` for a reason unrelated to what it is testing. One
+    seeder rather than a copy per suite (R3).
+    """
+    ref = TestRef(
+        id=str(uuid4()), lazyaf_test_id=f"t-{uuid4().hex[:6]}",
+        repo_id=repo_id, status="active",
+    )
+    db.add(ref)
+    await db.commit()
+    db.add(
+        TestRun(
+            id=str(uuid4()), test_ref_id=ref.id, pipeline_run_id=run_id,
+            commit_sha="", status=status, experiment_run_id=cell_id,
+        )
+    )
+    await db.commit()
 
 
 async def cells_by_status(db, experiment_id) -> dict[str, int]:

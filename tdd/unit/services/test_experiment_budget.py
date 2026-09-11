@@ -56,6 +56,7 @@ from tdd.unit.services.experiment_rows import (  # noqa: E402
     make_experiment,
     make_repo,
     make_run,
+    seed_test_evidence,
 )
 
 
@@ -265,6 +266,7 @@ class TestCap:
             run = await make_run(db, repo, status=RunStatus.PASSED.value,
                                  trigger_ref=cell.id)
             await add_usage(db, run.id, cost="0.60")
+            await seed_test_evidence(db, repo.id, run.id, cell.id)
             await svc.on_cell_complete(db, run, True)
             return run
 
@@ -290,6 +292,7 @@ class TestCap:
             run = await make_run(db, repo, status=RunStatus.PASSED.value,
                                  trigger_ref=cell.id)
             await add_usage(db, run.id, cost="0.90")
+            await seed_test_evidence(db, repo.id, run.id, cell.id)
             await svc.on_cell_complete(db, run, True)
             return run
 
@@ -321,6 +324,7 @@ class TestCap:
             run = await make_run(db, repo, status=RunStatus.PASSED.value,
                                  trigger_ref=cell.id)
             await add_usage(db, run.id, cost="2.50")
+            await seed_test_evidence(db, repo.id, run.id, cell.id)
             await svc.on_cell_complete(db, run, True)
             return run
 
@@ -343,6 +347,7 @@ class TestCap:
             run = await make_run(db, repo, status=RunStatus.PASSED.value,
                                  trigger_ref=cell.id)
             await add_usage(db, run.id, cost="0.01")
+            await seed_test_evidence(db, repo.id, run.id, cell.id)
             await svc.on_cell_complete(db, run, True)
             return run
 
@@ -368,6 +373,7 @@ class TestCap:
             run = await make_run(db, repo, status=RunStatus.PASSED.value,
                                  trigger_ref=cell.id)
             await add_usage(db, run.id, cost="99.00", source="unknown")
+            await seed_test_evidence(db, repo.id, run.id, cell.id)
             await svc.on_cell_complete(db, run, True)
             return run
 
@@ -399,6 +405,7 @@ class TestCap:
             run = await make_run(db, repo, status=RunStatus.PASSED.value,
                                  trigger_ref=cell.id)
             await add_usage(db, run.id, cost="0.50")
+            await seed_test_evidence(db, repo.id, run.id, cell.id)
             await svc.on_cell_complete(db, run, True)
             return run
 
@@ -420,6 +427,7 @@ class TestCap:
                                  trigger_ref=cell.id)
             source = "cli-reported" if cell.cell_index == 0 else "unknown"
             await add_usage(db, run.id, cost="0.25", source=source)
+            await seed_test_evidence(db, repo.id, run.id, cell.id)
             await svc.on_cell_complete(db, run, True)
             return run
 

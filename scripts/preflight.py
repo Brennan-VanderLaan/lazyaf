@@ -435,17 +435,34 @@ def port_in_use(port):
 
 
 def resolve_port(values, var, default, what):
-    """Read a port from .env, reporting a bad value instead of crashing."""
+    """Read a port from .env, reporting a bad value instead of crashing.
+
+    The value is interpolated straight into a docker compose port mapping, so
+    it takes the full ``[HOST_IP:]PORT`` form docker accepts - and since the
+    Rung 0 hardening it DEFAULTS to `127.0.0.1:8000` / `127.0.0.1:5173` in
+    `.env.example`. A bare `int(raw)` therefore failed on a correctly
+    configured install and told the user to "set it to a port number", whose
+    only effect would have been to republish an unauthenticated API on
+    0.0.0.0. A preflight that fails a good config and talks the user into a
+    worse one is worse than no preflight (R1).
+
+    Only the PORT half is returned: the free-port probe below connects to
+    127.0.0.1 regardless, and a host-IP-specific liveness check is not what
+    this is for.
+    """
     raw = (values.get(var) or "").strip()
     if not raw:
         return default
+    host_part, sep, port_part = raw.rpartition(":")
+    candidate = port_part if sep else raw
     try:
-        port = int(raw)
+        port = int(candidate)
     except ValueError:
         report(
             FAIL,
-            "{} is not a number".format(var),
-            "Set it to a port number in .env, or remove it to use {}.".format(default),
+            "{} is not a port ({!r})".format(var, raw),
+            "Use PORT or HOST_IP:PORT - e.g. {0} or 0.0.0.0:{0}.".format(default),
+            "Remove it from .env to use the shipped default, 127.0.0.1:{}.".format(default),
         )
         return None
     if not 1 <= port <= 65535:

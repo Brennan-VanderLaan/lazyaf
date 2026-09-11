@@ -93,6 +93,13 @@ TIERS: dict[str, dict] = {
             # asyncio_mode and the marker set are unchanged. Keep ../tdd
             # first for that reason.
             "../runner-common/tests",
+            # runner-agent's OWN suite, folded in for the same reason
+            # runner-common's was: 189 pure-Python tests, ~4s, no Docker, and
+            # until now selected by NO tier - so the remote-dispatch client,
+            # its backpressure and its CLI ran in no gate at all. PLAN.md's
+            # L3-3 recommended this. Its conftest inserts its own sys.path and
+            # the backend env already carries every dependency it imports.
+            "../runner-agent/tests",
             # The whole services/ subtree is Docker-real (12.2-INT: workspace
             # lifecycle on named volumes, local pipeline execution, WS round
             # trips) and runs in T2 - T1 stays the no-Docker tier.

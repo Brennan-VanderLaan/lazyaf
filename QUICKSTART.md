@@ -207,10 +207,11 @@ Confirm whichever you chose actually took:
 docker compose -f docker-compose.release.yml config | grep -A1 host_ip
 ```
 
-`docker-compose.yml` (the source build) hardcodes `"8000:8000"`, `"5173:80"`
-and `"8099:8099"`, so it needs a compose override file or an edit. Whichever
-you do, check with `docker compose config` — no `host_ip` line means the port
-is open to your whole network.
+`docker-compose.yml` (the source build) reads the same two variables, so the
+same `.env` governs both stacks. Its mock-endpoint port (`8099`) is pinned to
+`127.0.0.1` outright — a dev mock has no reason to be reachable off the host.
+Whichever stack you run, check with `docker compose config`: no `host_ip` line
+means the port is open to your whole network.
 
 ## 5. Get the step images
 

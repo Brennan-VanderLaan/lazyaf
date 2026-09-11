@@ -443,13 +443,16 @@ by anyone checking the claim.
 **New — landed 2026-08-30, less travelled.** Self-hosted model endpoints and the agent
 harness (see [above](#agents-can-run-on-your-own-hardware)). Verified against a real ollama
 on one host and against a mock server in CI; `reach: runner-local` and `reach: proxy` are
-implemented but have never been run against a second machine, and cards cannot select a
-self-hosted endpoint yet.
+implemented but have never been run against a second machine. Cards *can* now select a
+self-hosted endpoint: the card modal offers one model list covering hosted models and your
+own endpoints, and picking one writes both halves of the pairing the dispatcher needs.
 
-**IN PROGRESS.** Retiring the v1 array pipeline format in favour of the graph. The first
-two phases landed (`b79bb7f` — the graph gained terminal `merge:` / `trigger:` actions, so
-it can now express everything the array could); the rest has not. Repo YAML still takes the
-ordered-list form, and will until that work completes.
+**DONE — 2026-09-10.** The v1 array pipeline format is retired. `steps_graph` is the only
+definition a pipeline has, at the database, the wire and the executor alike; migration
+`0015` dropped the `steps` column. Repo YAML still takes the ordered-list form and always
+will — that is the *authoring* dialect, converted to a graph at the push boundary. So a
+`.lazyaf/pipelines/*.yaml` you wrote a year ago still works; it is simply no longer stored
+the way it is written.
 
 **DESIGNED, not built. Do not plan around these:**
 

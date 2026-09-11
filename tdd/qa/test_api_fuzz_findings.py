@@ -24,7 +24,7 @@ import requests
 # is owned by other lanes)
 
 # Self-contained on purpose: tdd/qa/conftest.py is shared with other QA lanes
-# and its `repo` / `base_url` fixtures have a different shape (a dict, not an
+# and its `repo` / `qa_base_url` fixtures have a different shape (a dict, not an
 # id). Module-level fixtures override conftest ones for this file only, so the
 # lanes cannot collide and this module imports nothing from conftest.
 BASE_URL = (
@@ -83,7 +83,23 @@ def _qa1_require_live_backend():
 
 
 @pytest.fixture
-def base_url():
+def qa_base_url():
+    """NOT `base_url`. That name belongs to someone else in this environment.
+
+    `pytest-base-url` ships a SESSION-scoped `_verify_url(request, base_url)`
+    (plugin.py:18) and is pulled in transitively by `pytest-playwright`
+    (`backend/pyproject.toml`). A function-scoped fixture called `base_url`
+    shadows the one that plugin expects, and the mismatch explodes in SETUP:
+
+        ScopeMismatch: You tried to access the function scoped fixture
+        base_url with a session scoped request object
+
+    Every test in this module errored on it - 63 as visible ERRORs, and 19
+    more that pytest LAUNDERED INTO XFAIL, because an xfail-marked test whose
+    setup raises reports xfail rather than error. So a third of this file was
+    reporting "known broken" without making a single HTTP request, which is
+    the most expensive kind of green there is (R4).
+    """
     return BASE_URL
 
 
@@ -217,7 +233,7 @@ def test_patch_explicit_null_leaves_the_row_intact(api, repo, feature):
 # QA-API-03  MAJOR - concurrent create of the same prompt-template name -> 500
 # =============================================================================
 
-def test_concurrent_duplicate_prompt_template_name_never_500s(api, base_url):
+def test_concurrent_duplicate_prompt_template_name_never_500s(api, qa_base_url):
     """FIXED: create_prompt_template absorbs the lost race with the codebase's
     rollback/re-select idiom, so the losers get the same 409 a sequential
     duplicate gets and the winner's row survives."""
@@ -228,7 +244,7 @@ def test_concurrent_duplicate_prompt_template_name_never_500s(api, base_url):
     def go():
         try:
             r = requests.post(
-                f"{base_url}/api/prompt-templates", json={"name": name}, timeout=60
+                f"{qa_base_url}/api/prompt-templates", json={"name": name}, timeout=60
             )
             code = r.status_code
         except Exception as exc:  # connection aborted counts as a failure too

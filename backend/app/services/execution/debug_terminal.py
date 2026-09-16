@@ -190,6 +190,222 @@ def decode_bytes(data: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# The contract as DATA (R3, go-cli plan section 3)
+# ---------------------------------------------------------------------------
+#
+# The codec above is the single definition of the wire (contract C13). Every
+# client - the Python CLI today, the Go binary that replaces it - is a copy
+# of it, and a copy pinned by nothing drifts on the first change. The Python
+# client was pinned by a test that imported BOTH modules; a Go client cannot
+# be imported by pytest, so the pin has to be data instead.
+#
+# `export_contract()` renders this module's own constants and encoders into
+# a plain dict. `scripts/gen_debug_terminal_corpus.py` writes it to
+# `tdd/contracts/debug_terminal.v1.json`; T1 proves the committed file equals
+# a fresh export; the Go suite is tested AGAINST the file and can only read
+# it. Only the server codec can write the corpus - that is what makes it one
+# source of truth rather than a third copy.
+#
+# Nothing below changes the codec. It is an enumeration of what the codec
+# already is, kept next to it so a new constant, verb or validation rule
+# lands in the export in the same edit that introduces it.
+
+#: The scalars a client must hold identically, by name. Listed explicitly
+#: rather than derived from `__all__`: this module also owns the sidecar
+#: container lifecycle, which is deliberately one-sided.
+CONTRACT_SCALARS = (
+    "PROTOCOL_VERSION",
+    "TYPE_STDIN",
+    "TYPE_RESIZE",
+    "TYPE_COMMAND",
+    "TYPE_PING",
+    "TYPE_READY",
+    "TYPE_STDOUT",
+    "TYPE_NOTICE",
+    "TYPE_CLOSED",
+    "TYPE_PONG",
+    "COMMANDS",
+    "CLOSE_NORMAL",
+    "CLOSE_BAD_TOKEN",
+    "CLOSE_NOT_ATTACHABLE",
+    "CLOSE_UNKNOWN_SESSION",
+    "CLOSE_DUPLICATE_TERMINAL",
+    "CLOSE_BOUND_EXCEEDED",
+    "MAX_FRAME_BYTES",
+    "MAX_OUTBOUND_QUEUE",
+    "RATE_WINDOW_SECONDS",
+    "RATE_MAX_FRAMES_PER_WINDOW",
+    "CONNECTION_MODE_SIDECAR",
+)
+
+#: The two frame-type sets; exported as sorted lists (a set has no order).
+CONTRACT_SETS = ("CLIENT_FRAME_TYPES", "SERVER_FRAME_TYPES")
+
+#: Sentences a client repeats word for word. The CLI's `--shell` refusal is
+#: pinned to SHELL_REFUSED_REASON, and that pin only survives a client
+#: written in another language if the client's test reads the sentence
+#: from data this module wrote.
+CONTRACT_REASONS = ("SHELL_REFUSED_REASON", "REMOTE_ATTACH_REASON")
+
+#: Wire payloads `decode_frame` MUST refuse. Each is a frame a buggy or
+#: hostile peer could actually send. This table lives in the module rather
+#: than in a test so that a new validation rule in `decode_frame` is added
+#: here in the same edit, and every client learns about it through the
+#: corpus. Insertion order is the corpus order.
+MALFORMED = {
+    "not-json": "{ not json",
+    "not-an-object": json.dumps([1, 2, 3]),
+    "wrong-version": json.dumps({"v": 99, "type": "stdin", "data": ""}),
+    "missing-version": json.dumps({"type": "ping"}),
+    "unknown-type": json.dumps({"v": 1, "type": "exec"}),
+    "stdin-without-data": json.dumps({"v": 1, "type": "stdin"}),
+    "stdin-non-string-data": json.dumps({"v": 1, "type": "stdin", "data": 7}),
+    "stdin-not-base64": json.dumps({"v": 1, "type": "stdin", "data": "not!base64"}),
+    "stdout-not-base64": json.dumps({"v": 1, "type": "stdout", "data": "@@@"}),
+    "resize-missing-rows": json.dumps({"v": 1, "type": "resize", "cols": 80}),
+    "resize-zero": json.dumps({"v": 1, "type": "resize", "cols": 0, "rows": 24}),
+    "resize-negative": json.dumps({"v": 1, "type": "resize", "cols": 80, "rows": -1}),
+    "resize-bool": json.dumps({"v": 1, "type": "resize", "cols": True, "rows": 24}),
+    "resize-float": json.dumps({"v": 1, "type": "resize", "cols": 80.5, "rows": 24}),
+    "unknown-command": json.dumps({"v": 1, "type": "command", "command": "@rm"}),
+    "command-without-verb": json.dumps({"v": 1, "type": "command"}),
+}
+
+#: A frame that is not UTF-8 text at all; refused before JSON is attempted.
+MALFORMED_NOT_UTF8 = b"\xff\xfe{}"
+
+
+def export_contract() -> dict:
+    """The wire contract as a JSON-serialisable dict. Pure; reads only this module.
+
+    Shape (every key sorted by the writer; `fields` deliberately NOT):
+
+    - ``constants.scalars``     name -> value for CONTRACT_SCALARS
+    - ``constants.sets``        name -> sorted list for CONTRACT_SETS
+    - ``constants.derived_types`` every ``TYPE_*`` attribute's value, sorted,
+      so a frame type added to the server without regenerating changes it
+    - ``constants.reasons``     name -> sentence for CONTRACT_REASONS
+    - ``frames``                encode/decode cases; ``fields`` is an ORDERED
+      list of ``[key, value]`` pairs because the byte-exact assertion needs
+      the key order the encoder used, and a JSON object would lose it in
+      any consumer that decodes objects into a map. A ``null`` value means
+      "passed as None": the encoder drops it from the wire and the decoder
+      yields no such key. ``wire`` is exactly what ``encode_frame`` wrote.
+      ``data_hex`` is the raw payload of a stdin/stdout case.
+    - ``malformed``             MALFORMED as ``{name, raw}``, the not-UTF-8
+      frame as ``{name, raw_hex}``, then the two ENCODER refusals
+    - ``base64``                encode / decode vectors and the one rejected
+      string
+    """
+    module = globals()
+
+    scalars = {name: module[name] for name in CONTRACT_SCALARS}
+    # COMMANDS is a tuple and its ORDER is contract (it is what @help and
+    # the CLI's escape menu print); a JSON array keeps it.
+    scalars["COMMANDS"] = list(COMMANDS)
+
+    sets = {name: sorted(module[name]) for name in CONTRACT_SETS}
+    derived_types = sorted(
+        value
+        for name, value in module.items()
+        if name.startswith("TYPE_") and isinstance(value, str)
+    )
+    reasons = {name: module[name] for name in CONTRACT_REASONS}
+
+    def case(name, direction, frame_type, fields, raw=None):
+        entry = {
+            "name": name,
+            "direction": direction,
+            "type": frame_type,
+            "fields": [[key, value] for key, value in fields],
+            "wire": encode_frame(frame_type, **dict(fields)),
+        }
+        if raw is not None:
+            entry["data_hex"] = bytes(raw).hex()
+        return entry
+
+    def data_case(name, direction, frame_type, raw):
+        return case(name, direction, frame_type, [("data", encode_bytes(raw))], raw)
+
+    s2c = "server->client"
+    c2s = "client->server"
+    all_256 = bytes(range(256))
+    #: The exact case raw-text framing would have corrupted (C12).
+    not_utf8 = b"\xff\xfe\x00\x80 not utf-8 \x9c"
+
+    frames = [
+        case(
+            "ready",
+            s2c,
+            TYPE_READY,
+            [("mode", CONNECTION_MODE_SIDECAR), ("container_id", "abc123def456")],
+        ),
+        data_case("stdout-all-256", s2c, TYPE_STDOUT, all_256),
+        data_case("stdout-not-utf8", s2c, TYPE_STDOUT, not_utf8),
+        case("notice", s2c, TYPE_NOTICE, [("text", "/workspace is rw")]),
+        case("closed", s2c, TYPE_CLOSED, [("reason", "resumed")]),
+        # reason=None must be DROPPED, not written as null: a client reading
+        # a `null` reason would print "None" to a human.
+        case("closed-without-reason", s2c, TYPE_CLOSED, [("reason", None)]),
+        case("pong", s2c, TYPE_PONG, []),
+        data_case("stdin-all-256", c2s, TYPE_STDIN, all_256),
+        data_case("stdin-line", c2s, TYPE_STDIN, b"ls -la /workspace\n"),
+        case("resize", c2s, TYPE_RESIZE, [("cols", 120), ("rows", 40)]),
+        case("ping", c2s, TYPE_PING, []),
+    ] + [
+        case(f"command-{verb.lstrip('@')}", c2s, TYPE_COMMAND, [("command", verb)])
+        for verb in COMMANDS
+    ]
+
+    malformed = [{"name": name, "raw": raw} for name, raw in MALFORMED.items()]
+    malformed.append({"name": "not-utf8", "raw_hex": MALFORMED_NOT_UTF8.hex()})
+    # C12 is enforced at the ENCODER too, so a raw-text frame cannot even be
+    # built; a client's encoder must refuse the same two things.
+    malformed.append({"encode_unknown_type": "exec"})
+    malformed.append({"encode_raw_bytes_in_data": True})
+
+    encode_vectors = [
+        b"",
+        b"a",
+        b"\x00",
+        all_256,
+        b"\xff" * 1024,
+        "héllo".encode("utf-8"),
+    ]
+    decode_vectors = [b"", b"\x00\x01\x02", all_256]
+    base64_section = {
+        "encode": [
+            {"bytes_hex": raw.hex(), "text": encode_bytes(raw)} for raw in encode_vectors
+        ],
+        "decode": [
+            {"text": encode_bytes(raw), "bytes_hex": decode_bytes(encode_bytes(raw)).hex()}
+            for raw in decode_vectors
+        ],
+        # Padding-free garbage: one base64 character can never be a byte.
+        # "A" is one base64 symbol short of a byte; the three CR/LF forms exist
+        # because Go's base64.StdEncoding.Strict() still IGNORES a carriage
+        # return or a line feed anywhere in its input while Python's
+        # validate=True refuses them, so a "data" field carrying a newline
+        # would decode on one side and be refused on the other with no test
+        # going red (V1-2). With them in the corpus, a Go decoder that does
+        # not guard the newline fails TestContractBase64 rather than drifting.
+        "reject": ["A", "YQ==\n", "YQ==\r\n", "Y\nQ=="],
+    }
+
+    return {
+        "constants": {
+            "scalars": scalars,
+            "sets": sets,
+            "derived_types": derived_types,
+            "reasons": reasons,
+        },
+        "frames": frames,
+        "malformed": malformed,
+        "base64": base64_section,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Sidecar container lifecycle
 # ---------------------------------------------------------------------------
 
@@ -500,8 +716,13 @@ __all__ = [
     "CLOSE_UNKNOWN_SESSION",
     "COMMANDS",
     "CONNECTION_MODE_SIDECAR",
+    "CONTRACT_REASONS",
+    "CONTRACT_SCALARS",
+    "CONTRACT_SETS",
     "DebugProtocolError",
     "DebugTerminalService",
+    "MALFORMED",
+    "MALFORMED_NOT_UTF8",
     "MAX_FRAME_BYTES",
     "MAX_OUTBOUND_QUEUE",
     "PROTOCOL_VERSION",
@@ -525,6 +746,7 @@ __all__ = [
     "decode_frame",
     "encode_bytes",
     "encode_frame",
+    "export_contract",
     "sidecar_image",
     "workspace_volume_name",
 ]

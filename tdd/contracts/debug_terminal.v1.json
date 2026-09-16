@@ -1,0 +1,371 @@
+{
+  "base64": {
+    "decode": [
+      {
+        "bytes_hex": "",
+        "text": ""
+      },
+      {
+        "bytes_hex": "000102",
+        "text": "AAEC"
+      },
+      {
+        "bytes_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+        "text": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+      }
+    ],
+    "encode": [
+      {
+        "bytes_hex": "",
+        "text": ""
+      },
+      {
+        "bytes_hex": "61",
+        "text": "YQ=="
+      },
+      {
+        "bytes_hex": "00",
+        "text": "AA=="
+      },
+      {
+        "bytes_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+        "text": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+      },
+      {
+        "bytes_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "text": "/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////w=="
+      },
+      {
+        "bytes_hex": "68c3a96c6c6f",
+        "text": "aMOpbGxv"
+      }
+    ],
+    "reject": [
+      "A",
+      "YQ==\n",
+      "YQ==\r\n",
+      "Y\nQ=="
+    ]
+  },
+  "constants": {
+    "derived_types": [
+      "closed",
+      "command",
+      "notice",
+      "ping",
+      "pong",
+      "ready",
+      "resize",
+      "stdin",
+      "stdout"
+    ],
+    "reasons": {
+      "REMOTE_ATTACH_REASON": "terminal attach is not available for steps running on a remote runner (12.7 ships local attach only)",
+      "SHELL_REFUSED_REASON": "no step container exists at a pre-step breakpoint - the step has not started. Use --sidecar to inspect the workspace it is about to run against."
+    },
+    "scalars": {
+      "CLOSE_BAD_TOKEN": 4401,
+      "CLOSE_BOUND_EXCEEDED": 4009,
+      "CLOSE_DUPLICATE_TERMINAL": 4004,
+      "CLOSE_NORMAL": 1000,
+      "CLOSE_NOT_ATTACHABLE": 4403,
+      "CLOSE_UNKNOWN_SESSION": 4404,
+      "COMMANDS": [
+        "@resume",
+        "@abort",
+        "@status",
+        "@help"
+      ],
+      "CONNECTION_MODE_SIDECAR": "sidecar",
+      "MAX_FRAME_BYTES": 65536,
+      "MAX_OUTBOUND_QUEUE": 256,
+      "PROTOCOL_VERSION": 1,
+      "RATE_MAX_FRAMES_PER_WINDOW": 200,
+      "RATE_WINDOW_SECONDS": 1.0,
+      "TYPE_CLOSED": "closed",
+      "TYPE_COMMAND": "command",
+      "TYPE_NOTICE": "notice",
+      "TYPE_PING": "ping",
+      "TYPE_PONG": "pong",
+      "TYPE_READY": "ready",
+      "TYPE_RESIZE": "resize",
+      "TYPE_STDIN": "stdin",
+      "TYPE_STDOUT": "stdout"
+    },
+    "sets": {
+      "CLIENT_FRAME_TYPES": [
+        "command",
+        "ping",
+        "resize",
+        "stdin"
+      ],
+      "SERVER_FRAME_TYPES": [
+        "closed",
+        "notice",
+        "pong",
+        "ready",
+        "stdout"
+      ]
+    }
+  },
+  "frames": [
+    {
+      "direction": "server->client",
+      "fields": [
+        [
+          "mode",
+          "sidecar"
+        ],
+        [
+          "container_id",
+          "abc123def456"
+        ]
+      ],
+      "name": "ready",
+      "type": "ready",
+      "wire": "{\"v\":1,\"type\":\"ready\",\"mode\":\"sidecar\",\"container_id\":\"abc123def456\"}"
+    },
+    {
+      "data_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "direction": "server->client",
+      "fields": [
+        [
+          "data",
+          "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+        ]
+      ],
+      "name": "stdout-all-256",
+      "type": "stdout",
+      "wire": "{\"v\":1,\"type\":\"stdout\",\"data\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==\"}"
+    },
+    {
+      "data_hex": "fffe0080206e6f74207574662d38209c",
+      "direction": "server->client",
+      "fields": [
+        [
+          "data",
+          "//4AgCBub3QgdXRmLTggnA=="
+        ]
+      ],
+      "name": "stdout-not-utf8",
+      "type": "stdout",
+      "wire": "{\"v\":1,\"type\":\"stdout\",\"data\":\"//4AgCBub3QgdXRmLTggnA==\"}"
+    },
+    {
+      "direction": "server->client",
+      "fields": [
+        [
+          "text",
+          "/workspace is rw"
+        ]
+      ],
+      "name": "notice",
+      "type": "notice",
+      "wire": "{\"v\":1,\"type\":\"notice\",\"text\":\"/workspace is rw\"}"
+    },
+    {
+      "direction": "server->client",
+      "fields": [
+        [
+          "reason",
+          "resumed"
+        ]
+      ],
+      "name": "closed",
+      "type": "closed",
+      "wire": "{\"v\":1,\"type\":\"closed\",\"reason\":\"resumed\"}"
+    },
+    {
+      "direction": "server->client",
+      "fields": [
+        [
+          "reason",
+          null
+        ]
+      ],
+      "name": "closed-without-reason",
+      "type": "closed",
+      "wire": "{\"v\":1,\"type\":\"closed\"}"
+    },
+    {
+      "direction": "server->client",
+      "fields": [],
+      "name": "pong",
+      "type": "pong",
+      "wire": "{\"v\":1,\"type\":\"pong\"}"
+    },
+    {
+      "data_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "direction": "client->server",
+      "fields": [
+        [
+          "data",
+          "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w=="
+        ]
+      ],
+      "name": "stdin-all-256",
+      "type": "stdin",
+      "wire": "{\"v\":1,\"type\":\"stdin\",\"data\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==\"}"
+    },
+    {
+      "data_hex": "6c73202d6c61202f776f726b73706163650a",
+      "direction": "client->server",
+      "fields": [
+        [
+          "data",
+          "bHMgLWxhIC93b3Jrc3BhY2UK"
+        ]
+      ],
+      "name": "stdin-line",
+      "type": "stdin",
+      "wire": "{\"v\":1,\"type\":\"stdin\",\"data\":\"bHMgLWxhIC93b3Jrc3BhY2UK\"}"
+    },
+    {
+      "direction": "client->server",
+      "fields": [
+        [
+          "cols",
+          120
+        ],
+        [
+          "rows",
+          40
+        ]
+      ],
+      "name": "resize",
+      "type": "resize",
+      "wire": "{\"v\":1,\"type\":\"resize\",\"cols\":120,\"rows\":40}"
+    },
+    {
+      "direction": "client->server",
+      "fields": [],
+      "name": "ping",
+      "type": "ping",
+      "wire": "{\"v\":1,\"type\":\"ping\"}"
+    },
+    {
+      "direction": "client->server",
+      "fields": [
+        [
+          "command",
+          "@resume"
+        ]
+      ],
+      "name": "command-resume",
+      "type": "command",
+      "wire": "{\"v\":1,\"type\":\"command\",\"command\":\"@resume\"}"
+    },
+    {
+      "direction": "client->server",
+      "fields": [
+        [
+          "command",
+          "@abort"
+        ]
+      ],
+      "name": "command-abort",
+      "type": "command",
+      "wire": "{\"v\":1,\"type\":\"command\",\"command\":\"@abort\"}"
+    },
+    {
+      "direction": "client->server",
+      "fields": [
+        [
+          "command",
+          "@status"
+        ]
+      ],
+      "name": "command-status",
+      "type": "command",
+      "wire": "{\"v\":1,\"type\":\"command\",\"command\":\"@status\"}"
+    },
+    {
+      "direction": "client->server",
+      "fields": [
+        [
+          "command",
+          "@help"
+        ]
+      ],
+      "name": "command-help",
+      "type": "command",
+      "wire": "{\"v\":1,\"type\":\"command\",\"command\":\"@help\"}"
+    }
+  ],
+  "malformed": [
+    {
+      "name": "not-json",
+      "raw": "{ not json"
+    },
+    {
+      "name": "not-an-object",
+      "raw": "[1, 2, 3]"
+    },
+    {
+      "name": "wrong-version",
+      "raw": "{\"v\": 99, \"type\": \"stdin\", \"data\": \"\"}"
+    },
+    {
+      "name": "missing-version",
+      "raw": "{\"type\": \"ping\"}"
+    },
+    {
+      "name": "unknown-type",
+      "raw": "{\"v\": 1, \"type\": \"exec\"}"
+    },
+    {
+      "name": "stdin-without-data",
+      "raw": "{\"v\": 1, \"type\": \"stdin\"}"
+    },
+    {
+      "name": "stdin-non-string-data",
+      "raw": "{\"v\": 1, \"type\": \"stdin\", \"data\": 7}"
+    },
+    {
+      "name": "stdin-not-base64",
+      "raw": "{\"v\": 1, \"type\": \"stdin\", \"data\": \"not!base64\"}"
+    },
+    {
+      "name": "stdout-not-base64",
+      "raw": "{\"v\": 1, \"type\": \"stdout\", \"data\": \"@@@\"}"
+    },
+    {
+      "name": "resize-missing-rows",
+      "raw": "{\"v\": 1, \"type\": \"resize\", \"cols\": 80}"
+    },
+    {
+      "name": "resize-zero",
+      "raw": "{\"v\": 1, \"type\": \"resize\", \"cols\": 0, \"rows\": 24}"
+    },
+    {
+      "name": "resize-negative",
+      "raw": "{\"v\": 1, \"type\": \"resize\", \"cols\": 80, \"rows\": -1}"
+    },
+    {
+      "name": "resize-bool",
+      "raw": "{\"v\": 1, \"type\": \"resize\", \"cols\": true, \"rows\": 24}"
+    },
+    {
+      "name": "resize-float",
+      "raw": "{\"v\": 1, \"type\": \"resize\", \"cols\": 80.5, \"rows\": 24}"
+    },
+    {
+      "name": "unknown-command",
+      "raw": "{\"v\": 1, \"type\": \"command\", \"command\": \"@rm\"}"
+    },
+    {
+      "name": "command-without-verb",
+      "raw": "{\"v\": 1, \"type\": \"command\"}"
+    },
+    {
+      "name": "not-utf8",
+      "raw_hex": "fffe7b7d"
+    },
+    {
+      "encode_unknown_type": "exec"
+    },
+    {
+      "encode_raw_bytes_in_data": true
+    }
+  ]
+}

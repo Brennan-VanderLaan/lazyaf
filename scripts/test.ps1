@@ -168,10 +168,10 @@ function Show-Help {
     Write-Host "  e2e         - Run full E2E tests (starts Docker backend; Playwright owns vite)"
     Write-Host "  graph       - Run graph pipeline E2E tests (starts Docker backend only)"
     Write-Host "  slow        - Run the @slow full-stack e2e tests in the compose stack (no CI tier runs these)"
-    Write-Host "  tier        - Run gated CI tier(s) via scripts/run_tier.py (e.g. 'tier T1')"
+    Write-Host "  tier        - Run gated CI tier(s) via scripts/run_tier.py (e.g. 'tier T1', 'tier TG')"
     Write-Host "  images      - Build the 12.3 step images via scripts/build_images.py (--check lists stale)"
     Write-Host "  coverage    - Run tests with coverage report"
-    Write-Host "  all         - Run the no-Docker CI tiers T1 + T3 (default; T2 needs Docker)"
+    Write-Host "  all         - Run the no-Docker CI tiers T1 + TG + T3 (default; T2 needs Docker; TG needs go)"
     Write-Host ""
     Write-Host "E2E options (after 'e2e'):" -ForegroundColor Cyan
     Write-Host "  --headed    - Run with visible browser"
@@ -313,12 +313,17 @@ try {
             }
         }
         "all" {
-            # No-Docker lanes only: T1 + T3 via the single-sourced tier
-            # script. T2 (Docker-dependent) is deliberately excluded - run
+            # No-Docker lanes only: T1 + TG + T3 via the single-sourced tier
+            # script, in the pipeline's order (TG's preflight leaves the
+            # cli/bin/lazyaf.exe that T3's debug loop drives). T2
+            # (Docker-dependent) is deliberately excluded - run
             # '.\scripts\test.ps1 tier T2' with Docker up, or the pipeline.
-            Write-Host "Running all no-Docker tiers (T1 + T3)..." -ForegroundColor Cyan
+            # A host without `go` fails TG loudly, naming the install - not
+            # a skip. run_tier.py resolves `bash` to Git Bash itself, so
+            # WSL's System32\bash.exe being first on PATH here is harmless.
+            Write-Host "Running all no-Docker tiers (T1 + TG + T3)..." -ForegroundColor Cyan
             Write-Host "Note: T2 (Docker) and slow E2E excluded - see 'tier T2' / 'e2e' / 'graph'" -ForegroundColor Yellow
-            Invoke-RunTier -Tiers @("T1", "T3")
+            Invoke-RunTier -Tiers @("T1", "TG", "T3")
         }
         "help" {
             Show-Help

@@ -16,7 +16,11 @@ round trip. What remains here is ONLY what has no real-Docker equivalent:
   still built FROM lazyaf-base:dev works fine right up until an agent step
   runs `python3 -m runner_common.agent_wrapper` in it
 - tombstones for retired/parked artifacts
+- the test-runner's Go toolchain pin against go.mod (upcoming/go-cli.md
+  §2.2): a GOTOOLCHAIN=local image with the wrong Go fails a tier, not a
+  build, so only text can pin it before the first red run
 """
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -173,6 +177,32 @@ class TestChildImages:
             TEST_RUNNER_DOCKERFILE,
         ):
             assert "LABEL lazyaf.content-hash=$CONTENT_HASH" in df
+
+
+class TestTestRunnerGoToolchain:
+    """The TG tier's Go (upcoming/go-cli.md §2.2, §10.1)."""
+
+    def test_test_runner_go_matches_go_mod_toolchain(self):
+        """The image bakes exactly the `toolchain` go.mod names and runs
+        GOTOOLCHAIN=local, so a go.mod bump beyond the image fails the tier
+        with `go: go.mod requires go >= X (running Y; GOTOOLCHAIN=local)`
+        instead of downloading a toolchain mid-tier (R1). That refusal is
+        the point - and it only points at the right fix if the two numbers
+        are meant to be equal, which is what this pins. The image builds
+        green with any version, so no real-Docker test can see the drift."""
+        pinned = re.search(r"^ARG GO_VERSION=(\S+)$", TEST_RUNNER_DOCKERFILE, re.M)
+        assert pinned, "images/test-runner/Dockerfile must carry `ARG GO_VERSION=<x.y.z>`"
+        go_mod = (REPO_ROOT / "go.mod").read_text(encoding="utf-8")
+        toolchain = re.search(r"^toolchain go(\S+)$", go_mod, re.M)
+        assert toolchain, "go.mod must carry a `toolchain goX.Y.Z` line"
+        assert pinned.group(1) == toolchain.group(1), (
+            f"images/test-runner/Dockerfile pins Go {pinned.group(1)} but go.mod's "
+            f"toolchain is go{toolchain.group(1)}: bump ARG GO_VERSION (and the two "
+            "GO_SHA256_* args from https://go.dev/dl/) to match, then rebuild the image"
+        )
+        # Without this the pin is decorative: GOTOOLCHAIN=auto would download
+        # whatever go.mod asks for and the mismatch would never surface.
+        assert "GOTOOLCHAIN=local" in TEST_RUNNER_DOCKERFILE
 
 
 class TestNoPhantomLatest:

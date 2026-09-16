@@ -110,6 +110,39 @@ steps:
     on_failure: stop
     timeout: 1800
 
+  # The Go CLI tier (upcoming/go-cli.md §10). Same single-sourced spine as
+  # the pytest tiers: run_tier.py builds the host binary through
+  # scripts/build_cli.sh (the preflight), runs `go tool gotestsum` over the
+  # root module, and gates junit-tg.xml through ci_gate.py against
+  # tdd/tier_floors.json - which has NO "TG" entry until the INTEGRATOR
+  # stamps one from the first green container run, so until then this step
+  # fails with "tier 'TG' has no floor". That is correct for a tier never
+  # measured, and it is loud (R4).
+  #
+  # PLACEMENT IS LOAD-BEARING. After tier1 because T1 holds the codec
+  # corpus-freshness test: a stale tdd/contracts/debug_terminal.v1.json
+  # fails there with "re-run the generator", a clearer first failure than
+  # TG's byte diff. Before tier2 because this tier needs no Docker socket
+  # and must not sit inside the DooD-allowlisted block below. Before tier3
+  # because tdd/e2e/test_debug_rerun.py drives the cli/bin/lazyaf that this
+  # step's preflight leaves on the run's workspace volume (§3.6) - move this
+  # step after tier3 and that test fails naming build_cli.sh.
+  #
+  # Go's module and build caches land under HOME=/workspace/home, so the
+  # handful of modules download once per worker; the image bakes the
+  # toolchain itself (GOTOOLCHAIN=local) and never downloads one mid-tier.
+  - id: "tier-go"
+    name: "TG: Go CLI unit + contract conformance (no Docker)"
+    type: script
+    config:
+      image: "lazyaf-test-runner:dev"
+      command: |
+        python3 scripts/run_tier.py TG
+    continue_in_context: true
+    on_success: next
+    on_failure: stop
+    timeout: 900
+
   # Interim DooD, step-container edition: the Docker tiers get the host
   # socket via the `needs: [docker]` step-config sugar - ONE translation
   # site (pipeline_executor) instead of raw bind-mount specs repeated per

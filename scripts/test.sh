@@ -9,9 +9,24 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BACKEND_DIR="$PROJECT_ROOT/backend"
 FRONTEND_DIR="$PROJECT_ROOT/frontend"
 
-# python3 on Linux; Git Bash on Windows sometimes only has `python`.
+# python3 on Linux/macOS. On Windows (Git Bash) `python` comes FIRST - the
+# same order scripts/test.ps1 uses - because a stock Windows PATH puts the
+# Microsoft Store's `python3` redirector (WindowsApps/python3 ->
+# AppInstallerPythonRedirector.exe) ahead of any real install: `command -v
+# python3` finds it, and running it opens the Store instead of run_tier.py.
 # Fall back to the literal name so only python-needing lanes fail (loudly).
-PYTHON="$(command -v python3 || command -v python || echo python3)"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) PYTHON_CANDIDATES="python python3" ;;
+    *)                    PYTHON_CANDIDATES="python3 python" ;;
+esac
+PYTHON=""
+for candidate in $PYTHON_CANDIDATES; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        PYTHON="$candidate"
+        break
+    fi
+done
+: "${PYTHON:=python3}"
 
 # E2E test configuration
 BACKEND_PORT=8765
@@ -160,11 +175,14 @@ case "${1:-all}" in
         echo "Coverage report: backend/htmlcov/index.html"
         ;;
     all)
-        # No-Docker lanes only: T1 + T3 via the single-sourced tier script.
-        # T2 (Docker-dependent) is deliberately excluded - run
-        # `./scripts/test.sh tier T2` with Docker up, or the full pipeline.
-        echo "Running all no-Docker tiers (T1 + T3)..."
-        "$PYTHON" "$PROJECT_ROOT/scripts/run_tier.py" T1 T3
+        # No-Docker lanes only: T1 + TG + T3 via the single-sourced tier
+        # script, in the pipeline's order (TG's preflight leaves the
+        # cli/bin/lazyaf that T3's debug loop drives). T2 (Docker-dependent)
+        # is deliberately excluded - run `./scripts/test.sh tier T2` with
+        # Docker up, or the full pipeline. A host without `go` fails TG
+        # loudly, naming the install - not a skip.
+        echo "Running all no-Docker tiers (T1 + TG + T3)..."
+        "$PYTHON" "$PROJECT_ROOT/scripts/run_tier.py" T1 TG T3
         ;;
     *)
         echo "Usage: $0 [unit|integration|demo|e2e|e2e-quick|slow|tier|images|all|coverage]"
@@ -175,10 +193,10 @@ case "${1:-all}" in
         echo "  e2e         - Run full browser E2E tests (starts compose stack; Playwright owns vite)"
         echo "  e2e-quick   - Run E2E API tests only (no browser, no servers needed)"
         echo "  slow        - Run the @slow full-stack e2e tests in the compose stack (no CI tier runs these)"
-        echo "  tier        - Run gated CI tier(s) via scripts/run_tier.py (e.g. 'tier T1', 'tier T2')"
+        echo "  tier        - Run gated CI tier(s) via scripts/run_tier.py (e.g. 'tier T1', 'tier TG', 'tier T2')"
         echo "  images      - Build the 12.3 step images via scripts/build_images.py (--check lists stale)"
         echo "  coverage    - Run tests with coverage report"
-        echo "  all         - Run the no-Docker CI tiers T1 + T3 (default; T2 needs Docker)"
+        echo "  all         - Run the no-Docker CI tiers T1 + TG + T3 (default; T2 needs Docker; TG needs go)"
         echo ""
         echo "E2E options (after 'e2e'):"
         echo "  --headed    - Run with visible browser"

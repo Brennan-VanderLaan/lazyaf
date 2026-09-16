@@ -207,6 +207,23 @@ class TestGateFails:
         assert "cannot read results" in result.stderr
 
 
+def _run_tier_tiers() -> set:
+    """The tier names scripts/run_tier.py can run, loaded by file path.
+
+    By path rather than `import run_tier`: scripts/ is not a package and this
+    test must not depend on sys.path tricks. run_tier.py is stdlib-only at
+    import time (it shells out for everything), so loading it is cheap.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "lazyaf_run_tier_for_floors", REPO_ROOT / "scripts" / "run_tier.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return set(module.TIERS)
+
+
 class TestCommittedConfig:
     """The committed baseline/floors files must stay parseable by the gate."""
 
@@ -219,7 +236,19 @@ class TestCommittedConfig:
 
     def test_tier_floors_shape(self):
         floors = json.loads(COMMITTED_FLOORS.read_text(encoding="utf-8"))
-        assert set(floors) == {"T1", "T2", "T3"}
+        # The tier set comes from scripts/run_tier.py, the single source of
+        # tier selection - not from a literal here. Both directions matter: a
+        # tier run_tier.py can run MUST have a floor (or ci_gate refuses it
+        # with "has no floor", and the next person baselines the refusal), and
+        # a floor for a tier that no longer exists is a standing number nobody
+        # measures. The literal {"T1", "T2", "T3"} this replaces failed the
+        # day the Go tier TG was stamped (2026-09-16) without saying anything
+        # true about the file.
+        assert set(floors) == set(_run_tier_tiers()), (
+            f"tier_floors.json tiers {sorted(floors)} != run_tier.py TIERS "
+            f"{sorted(_run_tier_tiers())}: every runnable tier needs a floor "
+            "stamped from a green run, and no floor may outlive its tier"
+        )
         for tier, spec in floors.items():
             assert isinstance(spec["floor"], int) and spec["floor"] > 0, tier
             assert spec["floor"] <= spec["measured"], f"{tier} floor above measured count"

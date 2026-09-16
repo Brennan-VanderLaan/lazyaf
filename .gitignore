@@ -22,8 +22,13 @@ npm-debug.log*
 *.swo
 
 # Environment
+# Every .env variant is ignored, including backup copies (.env.bak.*), so a
+# `git add -A` can never stage one: the tracked-tree secret scanner only sees
+# a file AFTER it is in the index. The one tracked template is un-ignored.
 .env
 .env.local
+.env.*
+!.env.example
 
 # Database
 *.db
@@ -56,3 +61,7 @@ coverage.xml
 
 # CI gate transient junit outputs (local tier runs)
 junit-t*.xml
+
+# Go CLI build outputs (scripts/build_cli.sh)
+cli/bin/
+cli/dist/

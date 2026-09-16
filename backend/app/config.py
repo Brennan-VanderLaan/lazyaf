@@ -130,9 +130,10 @@ def _missing_secret_message(var_name: str, reason: str) -> str:
             "Set it one of these ways:",
             "",
             "  compose / local dev",
-            "    python scripts/bootstrap_secrets.py",
+            "    lazyaf init",
             "    (generates strong values into .env; idempotent, and it never",
-            "     overwrites a value you already set)",
+            "     overwrites a value you already set; until the Go CLI ships,",
+            "     python scripts/bootstrap_secrets.py does the same)",
             "",
             "  docker secrets / kubernetes",
             "    mount the value at a path and set",
@@ -202,8 +203,7 @@ def _ephemeral_secret(var_name: str) -> str:
             "inside this process: every credential minted with it STOPS "
             "VERIFYING when the backend restarts, and no runner agent in "
             "another process or container can authenticate against it. Run "
-            "`python scripts/bootstrap_secrets.py` (or set %s / %s_FILE) for a "
-            "value that persists.",
+            "`lazyaf init` (or set %s / %s_FILE) for a value that persists.",
             var_name,
             DEV_EPHEMERAL_FLAG,
             var_name,

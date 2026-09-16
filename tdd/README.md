@@ -175,7 +175,7 @@ There is no external CI and never will be — **LazyAF gates LazyAF**. The
 pipeline definition lives in `.lazyaf/pipelines/test-suite.yaml`, is re-synced
 from the pushed commit on every push to the default branch, and is bound to a
 `push` trigger on `main`. A push to the internal remote runs the suite as
-**three tiers** (one pipeline step each) inside a runner container, and each
+**four tiers** (one pipeline step each - T1, then TG for the Go CLI, then T2 and T3) inside a runner container, and each
 tier is gated by `scripts/ci_gate.py` (standing rule R4: no fake green).
 
 ### The tiers (single-sourced in `scripts/run_tier.py`)

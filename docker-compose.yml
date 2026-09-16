@@ -36,9 +36,9 @@ services:
       # that used to live in backend/app/config.py were public, and they mint
       # step JWTs and enrol runner agents. Compose cannot generate a value for
       # you, so it refuses to start and tells you the one command that can.
-      # `bootstrap_secrets.py` is idempotent - it never touches a value you set.
-      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
-      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      # `lazyaf init` is idempotent - it never touches a value you set.
+      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: lazyaf init}'
+      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: lazyaf init}'
     networks:
       - lazyaf-network
     restart: unless-stopped
@@ -104,7 +104,7 @@ services:
       # 12.7 both sides silently defaulted to the same public constant, so this
       # line did not need to exist and the handshake "worked" for everyone on
       # earth. It is explicit now, and the agent refuses to dial without it.
-      - 'LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      - 'LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: lazyaf init}'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -197,8 +197,8 @@ services:
       # host's .env, so one bootstrap run covers both stacks - and the pair
       # below must match, or runner-agent-e2e never enrols and the runner-panel
       # browser spec renders an empty fleet.
-      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
-      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: lazyaf init}'
+      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: lazyaf init}'
     volumes:
       - ./tdd:/tdd  # Mount test directory for running e2e tests
       - /var/run/docker.sock:/var/run/docker.sock  # Docker socket - e2e lane exercises LocalExecutor
@@ -238,7 +238,7 @@ services:
       # no fleet to render.
       - LAZYAF_RUNNER_ALLOW_INSECURE=1
       # Must equal backend-e2e's LAZYAF_RUNNER_AUTH_SECRET above.
-      - 'LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      - 'LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: lazyaf init}'
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:

@@ -38,12 +38,12 @@ services:
       - CONTAINER_NETWORK=lazyaf-qa-network
       # Same required shared secrets as every other stack (12.7): there is no
       # default in the source any more. This project shares the repo's .env, so
-      # one `python scripts/bootstrap_secrets.py` covers dev, e2e and QA.
+      # one `lazyaf init` covers dev, e2e and QA.
       # Deliberately NOT the LAZYAF_DEV_EPHEMERAL_SECRETS shortcut: a sandbox
       # that re-keys itself on every restart turns "my step token stopped
       # verifying" into a QA finding about LazyAF rather than about the harness.
-      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
-      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: lazyaf init}'
+      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: lazyaf init}'
     volumes:
       - ./backend/app:/app/app
       - ./backend/alembic:/app/alembic

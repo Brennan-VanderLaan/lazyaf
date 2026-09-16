@@ -33,10 +33,12 @@ internet. There is no configuration that makes that safe today.
 - **Docker Engine 24+ with Compose v2** (`docker compose version` must work).
   Docker Desktop on Windows/macOS includes both.
 - **~15 GB free disk** for images and workspaces.
-- **Python 3.10+** for `scripts/bootstrap_secrets.py` (mandatory),
-  `scripts/preflight.py` (optional) and the `lazyaf` CLI. The stack itself
-  does not need it. `scripts/build_images.py` additionally needs the Docker
-  SDK: `pip install docker`.
+- **The `lazyaf` CLI** (step 2). One static binary, no Python: it writes
+  your `.env`, checks the machine, ingests repos and lands branches.
+- **Python 3.10+ only if you build the step images from source**
+  (`scripts/build_images.py`, which also needs the Docker SDK:
+  `pip install docker`) or run `lazyaf tests reconcile --from-collect`, which
+  runs inside your own pytest. The release stack itself needs neither.
 - **An API key** for [Anthropic](https://console.anthropic.com/) and/or
   [Google Gemini](https://aistudio.google.com/apikey) — *or* your own
   ollama/vLLM server (see [step 10](#10-optional-run-against-your-own-gpu)),
@@ -52,18 +54,64 @@ git clone https://github.com/Brennan-VanderLaan/lazyaf.git
 cd lazyaf
 ```
 
-## 2. Make your `.env` and generate your secrets
+## 2. Install the CLI
+
+The `lazyaf` binary is what creates your `.env` and checks the machine, so it
+comes **before** the stack now — the onboarding order flipped with the Go CLI
+(it used to be "compose first, `pip install ./cli` last").
+
+**Install the CLI** (from v0.3.0)
+
+```bash
+curl -fsSL https://github.com/Brennan-VanderLaan/lazyaf/releases/latest/download/install.sh | bash
+```
+
+Installs a single static binary into `~/.local/bin` after verifying its sha256
+against the release's `checksums.txt`, and tells you the one line to add if
+that directory is not on your PATH. Pin a version with
+`LAZYAF_VERSION=v0.3.0`. Re-running upgrades (or repairs) in place.
+
+**Windows:** run the same line in Git Bash (it installs `lazyaf.exe` into
+`%USERPROFILE%\.local\bin`), or download `lazyaf_<ver>_windows_amd64.exe` and
+`checksums.txt` from the release page, verify with
+`Get-FileHash -Algorithm SHA256`, and put the folder on your user PATH.
+
+The binary needs no Python. The one exception is
+`lazyaf tests reconcile --from-collect`, which runs a collector *inside your
+pytest* and therefore needs the interpreter your suite uses.
+
+> **Until v0.3.0 is cut** that URL 404s. Build the same binary from this
+> checkout with `bash scripts/build_cli.sh --host-only` (any Go >= 1.21; it
+> downloads the pinned go1.26.8 once) and put `cli/bin/` on your PATH. The
+> Python CLI (`pip install ./cli`) is still in the tree and still works, but
+> it is being replaced and has neither `init` nor `doctor`. If you installed
+> it that way, its `lazyaf` (a `Scripts/lazyaf` or `bin/lazyaf` under your
+> Python) may sit earlier on PATH than `~/.local/bin`; `install.sh` warns
+> about that by name, and `pip uninstall lazyaf-cli` removes it once the
+> cutover has landed.
+
+Check it works:
+
+```bash
+lazyaf --version
+```
+
+## 3. Make your `.env` and generate your secrets
 
 **This step is mandatory.** The backend refuses to start without it, and so
 does compose.
 
 ```bash
-python scripts/bootstrap_secrets.py
+lazyaf init
 ```
 
 That one command creates `.env` from `.env.example` if you do not have one, and
 fills in the two shared secrets the backend refuses to start without. It prints
 none of them, and it is safe to re-run — it never overwrites a value you set.
+Run it in the checkout, or in the folder holding `docker-compose.release.yml`;
+it refuses a directory that does not look like a LazyAF one rather than
+guessing, and `--env-file PATH` points it anywhere else. `lazyaf init --check`
+reports what is missing and changes nothing.
 
 Then open `.env` and paste in whichever API keys you have. Every other variable
 is optional; the defaults are correct for both compose files.
@@ -120,33 +168,33 @@ value. Example manifests: [`deploy/k8s/`](deploy/k8s/README.md).
 > **Careful what you paste in public.** `docker compose config` and
 > `docker inspect` print the *interpolated* environment — your API keys **and
 > these secrets** in plain text. Redact before sharing either one in an issue.
-> `docker compose logs` is safe; `scripts/preflight.py` and
-> `scripts/bootstrap_secrets.py` never print a value at all.
+> `docker compose logs` is safe; `lazyaf doctor` and `lazyaf init` never
+> print a value at all.
 
-## 3. Preflight (optional, strongly recommended)
+## 4. Doctor (optional, strongly recommended)
 
 ```bash
-python scripts/preflight.py        # checking the pull path
-python scripts/preflight.py --dev  # checking the build-from-source path
+lazyaf doctor        # checking the pull path
+lazyaf doctor --dev  # checking the build-from-source path
 ```
 
 It checks Docker, free ports, disk space, whether your `.env` has usable keys
 and the shared secrets set (it inspects shape only and never prints a value),
-and whether the images it needs exist — **including a registry lookup**, so it
-will tell you outright whether the published images exist at the tag you chose.
-Every failure it reports comes with the command that fixes it. It changes
-nothing.
+whether the images it needs exist — **including a registry lookup**
+(`--offline` skips it), so it will tell you outright whether the published
+images exist at the tag you chose — and whether a backend answers at the URL
+the CLI would use (`--server` / `LAZYAF_SERVER`). Every failure it reports
+comes with the command that fixes it. It changes nothing.
 
-## 4. Start the stack
+## 5. Start the stack
 
-There are two ways, and one caveat you should know first: **no versioned
-release has been tagged yet.** `git tag` in this repository is empty, so there
-is no `v0.1.0` to pin to. The `main` image tag is what the publish workflow
-pushes on each commit to the default branch, and it is what `.env.example`
-defaults `LAZYAF_VERSION` to. `preflight.py` (step 3) tells you whether those
-images are actually there.
+There are two ways. `LAZYAF_VERSION` in `.env` picks the image tag for the
+pull path: `main` is what the publish workflow pushes on each commit to the
+default branch and is what `.env.example` defaults to; `v0.2.0` is the first
+release tag. `lazyaf doctor` (step 4) tells you whether the images are
+actually there at the tag you chose.
 
-### 4a. Build from source — always works from this checkout
+### 5a. Build from source — always works from this checkout
 
 ```bash
 docker compose up -d --build
@@ -162,7 +210,7 @@ It brings up four services: `backend` (8000), `frontend` (5173), a loopback
 used by the test suite). All four publish on `127.0.0.1` or attach to the
 internal network only.
 
-### 4b. Pull prebuilt images — faster, if they exist for your tag
+### 5b. Pull prebuilt images — faster, if they exist for your tag
 
 Set `LAZYAF_VERSION` in `.env` first, then:
 
@@ -174,7 +222,7 @@ docker compose -f docker-compose.release.yml up -d
 > **If `pull` fails with "manifest unknown":** no image has been published at
 > that tag. Try `main`, check the
 > [packages page](https://github.com/Brennan-VanderLaan/lazyaf/pkgs/container/lazyaf%2Fbackend),
-> or use 4a — it works today, unconditionally.
+> or use 5a — it works today, unconditionally.
 
 Either way, open **http://localhost:5173**. The API is on
 http://localhost:8000, with interactive docs at http://localhost:8000/docs and
@@ -213,7 +261,7 @@ same `.env` governs both stacks. Its mock-endpoint port (`8099`) is pinned to
 Whichever stack you run, check with `docker compose config`: no `host_ip` line
 means the port is open to your whole network.
 
-## 5. Get the step images
+## 6. Get the step images
 
 Pipeline steps and AI agent cards run inside dedicated step images. The
 backend looks them up by their **local** tag — `lazyaf-claude:dev` and
@@ -221,7 +269,7 @@ friends — and it deliberately does **not** pull them for you: a missing image
 fails the step with a clear message rather than downloading something behind
 your back.
 
-**Building from source (matches 4a):**
+**Building from source (matches 5a):**
 
 ```bash
 pip install docker                  # the build script drives the Docker SDK
@@ -234,14 +282,15 @@ plus `test-runner` and `debug-sidecar`). The agent images install a Node
 toolchain and the vendor CLIs, so this takes a while the first time. Later
 runs skip anything whose content hash is unchanged.
 
-**Pulling them instead (matches 4b):** they are published without the
+**Pulling them instead (matches 5b):** they are published without the
 `lazyaf-` prefix (the registry path already says `lazyaf`), so each one needs
-a pull *and* a retag to the local name the backend looks for. Let preflight
-write the commands — it reads the image list from `scripts/build_images.py`,
-so it stays right when the set changes:
+a pull *and* a retag to the local name the backend looks for. Let doctor
+write the commands — its image list is generated from
+`scripts/build_images.py`'s table (and T1 fails if the two ever differ), so
+it stays right when the set changes:
 
 ```bash
-python scripts/preflight.py
+lazyaf doctor
 ```
 
 It prints a `docker pull` + `docker tag` pair, filled in with your version,
@@ -274,28 +323,15 @@ foreach ($name in "base","debug-sidecar","agent-base",
 That list is a snapshot; the authoritative one is the `IMAGES` table in
 `scripts/build_images.py`.
 
-## 6. Install the CLI
-
-The `lazyaf` CLI ingests your local repos into the platform and lands
-finished branches back onto your real remote.
-
-```bash
-pip install ./cli
-```
-
-It is not on PyPI, and **no release has been tagged**, so there is no wheel to
-download yet — install it from the checkout. (When a release is cut, it will
-attach `lazyaf_cli-<version>-py3-none-any.whl` to the
-[releases page](https://github.com/Brennan-VanderLaan/lazyaf/releases).)
-
-Check it works:
-
-```bash
-lazyaf --version
-lazyaf list          # talks to http://localhost:8000; override with LAZYAF_SERVER
-```
-
 ## 7. Ingest a repo
+
+The CLI you installed in step 2 ingests your local repos into the platform and
+lands finished branches back onto your real remote. With the stack up, check
+they can see each other first:
+
+```bash
+lazyaf list          # talks to http://localhost:8000; override with LAZYAF_SERVER or --server
+```
 
 ```bash
 lazyaf ingest /path/to/your/repo --name my-project
@@ -387,15 +423,14 @@ only matters on the release compose file; a source build ignores it.
 | Tag | What it is |
 |-----|-----------|
 | `main` | What the publish workflow pushes on each commit to the default branch. `.env.example`'s default. Moves under you; expect breakage. |
-| `v0.1.0`, `v0.2.0`, … | A published release — reproducible, the tag never moves. **None exist yet:** no `v*` tag has been created in this repository. |
-| `latest` | Only exists once a stable release has been published. Not yet. |
+| `v0.2.0`, `v0.3.0`, … | A published release — reproducible, the tag never moves. `v0.2.0` is the first; `v0.3.0` is the one that ships the Go CLI. |
+| `latest` | The newest stable release, once one has been published with that tag. |
 
 Published tags are listed on the
 [packages page](https://github.com/Brennan-VanderLaan/lazyaf/pkgs/container/lazyaf%2Fbackend).
-`python scripts/preflight.py` checks your chosen tag against the registry for
-you.
+`lazyaf doctor` checks your chosen tag against the registry for you.
 
-Keep the step images (step 5) on the same tag as the services. Mixing
+Keep the step images (step 6) on the same tag as the services. Mixing
 versions is not tested.
 
 ## Everyday commands
@@ -445,13 +480,13 @@ bundled same-host runners do deliberately.
 
 ## Troubleshooting
 
-**`docker compose` stops with "not set. Run: python scripts/bootstrap_secrets.py"**
-— you skipped step 2, or you are running compose from a directory that does
-not contain your `.env`. Run the command it names.
+**`docker compose` stops with "not set. Run: lazyaf init"** — you skipped
+step 3, or you are running compose from a directory that does not contain
+your `.env`. Run the command it names.
 
 **`docker compose` says "port is already allocated"** — something else owns
 8000, 5173 or 8099. Set `LAZYAF_BACKEND_PORT` / `LAZYAF_FRONTEND_PORT` in
-`.env` (release stack), or stop the other process. `preflight.py` names the
+`.env` (release stack), or stop the other process. `lazyaf doctor` names the
 container when a container is the culprit.
 
 **"network lazyaf-network was found but has incorrect label"** — the source
@@ -459,19 +494,18 @@ stack and the release stack are both trying to own that network. Bring the
 other one down first.
 
 **`pull` fails with "manifest unknown"** — nothing is published at that tag.
-Run `python scripts/preflight.py` to see which tags exist, or build from
-source (step 4a).
+Run `lazyaf doctor` to see which tags exist, or build from source (step 5a).
 
 **The UI loads but everything is empty** — nothing has been ingested yet.
 Run `lazyaf ingest` (step 7). If `lazyaf list` cannot connect, the backend is
 not up: check `docker compose logs backend`.
 
 **A card or step fails with "Image not found: lazyaf-…:dev"** — you skipped
-step 5, or the tags did not get applied. Re-run `python scripts/preflight.py`
-and follow what it prints.
+step 6, or the tags did not get applied. Re-run `lazyaf doctor` and follow
+what it prints.
 
 **An agent card fails immediately** — usually a missing or wrong API key.
-Check `preflight.py`, fix `.env`, then recreate the backend so it picks the
+Check `lazyaf doctor`, fix `.env`, then recreate the backend so it picks the
 new value up: `docker compose up -d backend`.
 
 **An `openai-harness` step is refused with "has never been probed"** — that

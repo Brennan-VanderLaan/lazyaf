@@ -157,26 +157,58 @@ Concretely, what is different here:
 want a hosted agent to do work — or your own ollama/vLLM box, or neither: cards, repos,
 pipelines, shell/container steps, and the git server all run without any key.
 
-The whole path, in order, is in **[QUICKSTART.md](QUICKSTART.md)**. The two steps people
-miss:
+The whole path, in order, is in **[QUICKSTART.md](QUICKSTART.md)**. The order changed
+with the Go CLI: **the CLI is installed first**, because it is what creates your `.env` and
+checks the machine.
+
+**Install the CLI** (from v0.3.0)
 
 ```bash
-python scripts/bootstrap_secrets.py   # MANDATORY. Creates .env and generates the two
+curl -fsSL https://github.com/Brennan-VanderLaan/lazyaf/releases/latest/download/install.sh | bash
+```
+
+Installs a single static binary into `~/.local/bin` after verifying its sha256 against the
+release's `checksums.txt`, and tells you the one line to add if that directory is not on
+your PATH. Pin a version with `LAZYAF_VERSION=v0.3.0`. Re-running upgrades (or repairs) in
+place.
+
+**Windows:** run the same line in Git Bash (it installs `lazyaf.exe` into
+`%USERPROFILE%\.local\bin`), or download `lazyaf_<ver>_windows_amd64.exe` and
+`checksums.txt` from the release page, verify with `Get-FileHash -Algorithm SHA256`, and
+put the folder on your user PATH.
+
+The binary needs no Python. The one exception is `lazyaf tests reconcile --from-collect`,
+which runs a collector *inside your pytest* and therefore needs the interpreter your suite
+uses.
+
+> Until v0.3.0 is cut, that URL 404s. From this checkout, `bash scripts/build_cli.sh
+> --host-only` builds the same binary to `cli/bin/lazyaf`. The Python CLI it replaces
+> (`pip install ./cli`) is still in the tree and still works, but it is being replaced and
+> has neither `init` nor `doctor`; see [cli/README.md](cli/README.md). If you installed it
+> that way, its `lazyaf` (a `Scripts/lazyaf` or `bin/lazyaf` under your Python) may sit
+> earlier on PATH than `~/.local/bin`; `install.sh` warns about that by name, and
+> `pip uninstall lazyaf-cli` removes it once the cutover has landed.
+
+The steps people miss:
+
+```bash
+lazyaf init                           # MANDATORY. Creates .env and generates the two
                                       # shared secrets the backend refuses to start
                                       # without. Idempotent; never prints a value.
+lazyaf doctor                         # checks Docker, ports, disk, .env and images,
+                                      # and prints the command that fixes each problem
 python scripts/build_images.py        # builds the six lazyaf-*:dev step images
-                                      # (needs the docker SDK: pip install docker)
+                                      # (source builds only; pulling needs no Python)
 ```
 
 There is no default for `LAZYAF_STEP_AUTH_SECRET` or `LAZYAF_RUNNER_AUTH_SECRET`, in the
-source or in either compose file. Both compose files fail fast with the command above if
+source or in either compose file. Both compose files fail fast with `Run: lazyaf init` if
 they are unset, and `backend/app/config.py` treats the two constants LazyAF used to ship as
 *unset* — so an inherited `.env` cannot quietly keep that hole open.
 
-Then point LazyAF at a repo with the CLI:
+Then point LazyAF at a repo:
 
 ```bash
-pip install ./cli               # not on PyPI, and no release has been tagged yet
 lazyaf ingest /path/to/your/repo --name my-project
 ```
 
@@ -251,8 +283,8 @@ Two smaller notes, since they are easy to get wrong:
 
 - `docker compose config` and `docker inspect` print the **interpolated** environment —
   your API keys and both shared secrets in plain text. Redact before pasting either into an
-  issue. `docker compose logs`, `scripts/preflight.py` and `scripts/bootstrap_secrets.py`
-  never print a secret value.
+  issue. `docker compose logs`, `lazyaf doctor` and `lazyaf init` never print a secret
+  value.
 - A runner agent on a genuinely remote host must use `wss://`. The dispatch frame carries
   the step's JWT and its secret environment, and the agent refuses plaintext `ws://` to a
   non-loopback host unless you set `LAZYAF_RUNNER_ALLOW_INSECURE=1` — which the bundled
@@ -386,7 +418,7 @@ Components:
 | `images/` | The `lazyaf-{base,debug-sidecar,agent-base,claude,gemini,test-runner}:dev` step images and the in-container control runtime |
 | `runner-common/` | Shared agent-step runtime baked into the agent images — the executors, the OpenAI-compatible harness, and the `pytest-lazyaf` plugin |
 | `runner-agent/` | `lazyaf-runner` — the remote runner agent |
-| `cli/` | `lazyaf-cli` — ingest, land, list, branches, tests reconcile, debug |
+| `cli/` | Go CLI (`lazyaf`): ingest, land, list, branches, tests reconcile, debug, init, doctor. The Python `lazyaf-cli` package it replaces is still beside it until the 0.3.0 cutover |
 | `tdd/` | The test suite, split into tiers |
 | `.lazyaf/pipelines/` | LazyAF's own CI pipeline |
 
@@ -429,7 +461,8 @@ Status vocabulary: **COMPLETE** (landed and covered by the gate), **IN PROGRESS*
 graph editor, cards, the internal git server and its triggers, the workspace lifecycle,
 the control layer that reports step status/logs/usage over HTTP, remote runner agents, the
 spec layer, per-step effort telemetry, experiments, and debug re-run with an attachable
-sidecar shell. `.lazyaf/pipelines/test-suite.yaml` runs three tiers plus a zero-cost mock
+sidecar shell. `.lazyaf/pipelines/test-suite.yaml` runs four tiers (unit, the Go CLI's
+contract + unit tier, Docker-dependent integration, quick e2e) plus a zero-cost mock
 agent step, a step pinned to a remote runner, two self-hosted harness steps, and a final
 step that asserts through the API that each step ran on the execution path its definition
 asked for. The floors every tier must clear are committed in `tdd/tier_floors.json` --
@@ -473,9 +506,10 @@ the way it is written.
 - **Remote runners are exercised on loopback only.** The protocol, registry, dispatch, and
   remote workspace provisioning run on every push against a real runner-agent process — on
   the same host. Genuinely remote hardware is manual and less travelled.
-- **No release has been published.** No `v*` tag exists in this repository yet, so there is
-  no versioned image set and no CLI wheel to download. Build from source, or track the
-  `main` image tag. See [QUICKSTART.md](QUICKSTART.md).
+- **Releases are young.** `v0.2.0` is the first tag; it shipped the Python CLI as a wheel.
+  From `v0.3.0` a release carries the six `lazyaf` binaries, `checksums.txt` and
+  `install.sh` instead, and the Python CLI is deleted from the tree. Until then, build the
+  binary from source or track the `main` image tag. See [QUICKSTART.md](QUICKSTART.md).
 
 The roadmap, the design decisions, and the reasoning behind them live in
 [PLAN.md](PLAN.md).
@@ -535,16 +569,19 @@ python scripts/build_images.py --check    # list missing/stale images without bu
 ```
 
 **The project gates itself with its own pipeline.** `.lazyaf/pipelines/test-suite.yaml` is
-LazyAF's CI: pushing to LazyAF's internal remote runs the suite in three tiers (unit,
-Docker-dependent integration, quick e2e), plus a zero-cost mock-agent step, a step pinned to
+LazyAF's CI: pushing to LazyAF's internal remote runs the suite in four tiers (unit, the Go
+CLI's contract + unit tier, Docker-dependent integration, quick e2e), plus a zero-cost
+mock-agent step, a step pinned to
 a remote runner, and two `openai-harness` steps against a mock OpenAI server. A final step
 then asserts, through the API, that every step actually ran on the execution path its
 definition asked for — so a silent fallback to a different path fails the run instead of
 passing quietly.
 
 GitHub Actions exists in this repo, but it **packages; it does not gate**: `images.yml`
-publishes images to GHCR and `release.yml` builds the CLI wheel, both fired by a tag or a
-push a human made after watching the dogfood pipeline go green. Test gating is LazyAF's job.
+publishes images to GHCR and `release.yml` builds the six CLI binaries (plus
+`checksums.txt` and `install.sh`; the wheel job it replaces is still there until the 0.3.0
+cutover), both fired by a tag or a push a human made after watching the dogfood pipeline go
+green. Test gating is LazyAF's job.
 
 Two rules the suite enforces on itself, worth knowing before you send a patch: each tier has
 a committed floor on how many tests must actually execute, and every skip must be in a

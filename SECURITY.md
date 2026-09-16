@@ -34,6 +34,16 @@ and nothing in the codebase pretends otherwise.
 - **Publishing a leaked credential.** CI refuses to publish an image or a
   release if the tree or the built image layers contain a live-format
   credential.
+- **A tampered CLI download.** From v0.3.0 the release ships the `lazyaf`
+  binaries with a `checksums.txt` written by the same job that built them;
+  `install.sh` computes the sha256 of what it downloaded and stops before
+  installing anything if it does not match, and there is no `--insecure` to
+  skip that. The installed binary is then run and its reported version
+  compared to the requested one. There is no self-update path to secure:
+  re-running the install line is the upgrade. (The Python CLI this replaces
+  is still in the tree until the cutover and has no such check; if a
+  `pip install ./cli` copy sits earlier on PATH than the verified binary,
+  `install.sh` says so and names it rather than letting it win silently.)
 
 ## What LazyAF explicitly does NOT defend against
 

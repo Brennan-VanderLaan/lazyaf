@@ -14,7 +14,7 @@ services:
       # for these. Failing HERE, at interpolation, beats a crash-looping
       # container - and this file uses --reload, where the traceback scrolls
       # past on the next edit.
-      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
-      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: lazyaf init}'
+      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: lazyaf init}'
     command: uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     restart: unless-stopped

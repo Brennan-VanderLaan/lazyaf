@@ -200,6 +200,7 @@ table so the shrinkage is visible.
 | **12 — Runner architecture + spec/eval layer** | **COMPLETE** (2026-09-10) apart from 12.9, which is deliberately out of scope | Every phase through 12.8 landed; 12.8 closed in `96ed87d` (P3-P5) + `0adfad0` (P6). Detail retired to [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md) |
 | **13 — Benchmark & evaluation harness** | **NOT STARTED** | Zero implementation. Grep for `BenchmarkCase` / `StrategyTemplate` / `TrialIteration` / `fail_to_pass` / `cost_to_solve` across `backend/`, `frontend/`, `cli/`, `tdd/` returns one hit, a comment at `backend/app/services/agent_run.py:15`. Design: this document + `docs/milestone-13/` |
 | **14 — Self-hosted OpenAI-compatible endpoints** | **COMPLETE** (2026-08-30) | Commit `4b429c6`: 56 files, ~21.5k lines. `ModelEndpoint` + migration `0011_model_endpoints.py`, capability probe, agent harness in `runner-common/runner_common/harness/`, stdlib mock OpenAI server, Endpoints UI. Out of the 12.x sequence |
+| **Go CLI — `lazyaf` binary replaces the Python CLI (0.3.0)** | **IN PROGRESS** on branch `go-cli`: P0–P3 landed, P4 (the deletion) waits on the acceptance gate (`upcoming/go-cli.md` §13.3) | Root `go.mod`; `cli/cmd/lazyaf` + `cli/internal/{api,cmd,debugproto,doctor,envfile,gitx,initcmd,reconcile,terminal,ui,version}`; codec pinned to the server's exported corpus `tdd/contracts/debug_terminal.v1.json`; parity ledger `tdd/contracts/cli_parity.json` (61 entries: 42 ported to named Go tests, 19 retired with a reason) enforced from both sides (`tdd/unit/scripts/test_cli_parity_ledger.py`, `cli/internal/parity/ledger_test.go`); TG tier via `go tool gotestsum`; `release.yml` builds six binaries + `checksums.txt` + `install.sh`. The Python CLI, `bootstrap_secrets.py` and `preflight.py` are still in the tree until P4; docs and compose messages already say `lazyaf init` / `lazyaf doctor` |
 | **14.5 — Runner images with inference baked in** | **DESIGNED** | Zero implementation. Evidence corrected 2026-08-31 — the old "no `vllm`/`ollama` anywhere" line was false (M14's endpoint layer uses both words). The absent 14.5 identifiers are the evidence: no `images/node-layer/`, `images/runner-ollama/`, `images/runner-vllm/`; no `scripts/build_inference_images.py`; no `refuses_without_gpu`; no `gpu.py` `detect()`/`verdict()`; no GPU-yield mechanism. Doc: `upcoming/wave9-145-runner-images.md` |
 
 ### Milestone 12 phases
@@ -244,7 +245,7 @@ exit gates: [`historical-documents/phase-12-runner-architecture.md`](historical-
 | Alembic head (committed) | **`0015_drop_pipeline_steps`** | Corrected 2026-09-10. `backend/alembic/versions/` holds 0001-0007, 0009-0015 (there is no `0008`); `tdd/integration/test_migrations.py:42` pins `ALEMBIC_HEAD_REVISION = "0015"` and `uv run alembic heads` reports a single head. `0013` went to endpoint modalities (`70f9d6c`), so 12.8's two revisions became **`0014`** (backfill) and **`0015`** (drop) rather than the `0013`/`0014` this file used to promise. The next free id is **`0016`**. |
 | MCP tools | 45 | `grep -c '@mcp.tool' backend/app/mcp/server.py` |
 | Release CI | Publishes **9 images** to GHCR: 3 service (`backend`, `frontend`, `runner-agent`) + 6 step (`base`, `agent-base`, `claude`, `gemini`, `test-runner`, `debug-sidecar`) | `.github/workflows/images.yml`; the step list is read from `scripts/build_images.py`'s `IMAGES` table, not duplicated |
-| Release tags | **None. `git tag` is empty.** `release.yml` triggers only on `push: tags: ['v*']` (plus manual dispatch), so the tag path has never fired. `images.yml` also runs on push to `main`. | `.github/workflows/release.yml:51-54`, `images.yml:60-64` |
+| Release tags | **`v0.2.0`** (first tag; shipped the Python CLI wheel). `release.yml` triggers on `push: tags: ['v*']` (plus manual dispatch); from v0.3.0 it attaches the six Go binaries, `checksums.txt` and `install.sh` instead of a wheel (`upcoming/go-cli.md` section 9.1). `images.yml` also runs on push to `main`. | `git tag`; `.github/workflows/release.yml:73-76`, `images.yml:60-64` |
 
 ---
 
@@ -1406,6 +1407,60 @@ Decisions made DURING implementation (all shipped and gate-verified):
   runners retired)? — is answered by the tree: `images/agent-base` installs
   `runner-common` system-wide and asserts the import at build time, `claude` and
   `gemini` inherit it, and the monolithic entrypoints were deleted in `67a4e1c`.
+
+#### The Go CLI (2026-09-16, `upcoming/go-cli.md`)
+
+- **2026-09-16 Hard cutover to one Go binary, released as 0.3.0.** (Owner.)
+  The Python CLI (`cli/lazyaf/`, click + httpx + rich), `scripts/bootstrap_secrets.py`
+  and `scripts/preflight.py` are replaced by `lazyaf` with `init` and `doctor`
+  folded in. No "fallback for one release": two wire clients and two secret
+  writers with their own placeholder rules is the drift the ledger exists to
+  prevent. Deletion happens in ONE commit (P4) and only after the §13.3 gate;
+  until then both CLIs coexist in the tree and the docs say "being replaced",
+  never "removed". `scripts/build_images.py` stays Python (owner decision).
+- **2026-09-16 `go.mod` at the repo root, not under `cli/`.** (Claude, from
+  the judged designs.) `install.sh`'s unsupported-platform fallback is
+  `go install .../cli/cmd/lazyaf@v0.3.0`, which only resolves against the plain
+  `vX.Y.Z` tags release-please creates; a module under `cli/` would need
+  `cli/v0.3.0` tags nothing produces, so the fallback would lie (R1).
+- **2026-09-16 The wire contract is DATA the server emits, not a second copy
+  pinned by cross-import.** (Claude.) `debug_terminal.export_contract()` ->
+  `tdd/contracts/debug_terminal.v1.json`; T1 proves the file is fresh and that
+  the server satisfies it; TG holds the Go codec to it byte for byte. Only the
+  server can write it, so R3 holds with two consumers.
+- **2026-09-16 The parity ledger gates the deletion from both sides.** (Claude.)
+  `tdd/contracts/cli_parity.json`: one entry per Python test class (per function
+  for `test_bootstrap_secrets.py`), each either `go: [...]` naming real
+  `func TestX` / `t.Run` literals or `retired: "<kind>: <reason>"` from a closed
+  set of kinds. Enforcement A (T1, `ast.parse`, no imports) checks keys ==
+  collected classes and every Go reference resolves; Enforcement B (TG,
+  `go/parser`) is permanent and refuses a carrier's deletion without a ledger
+  edit. Landed today at 61 entries: 42 ported, 19 retired (9 packaging-wheel,
+  6 superseded-by-contract, 1 each rich-specific / python-websockets-specific /
+  python-interpreter / semantics-changed). The four corpus classes of
+  `test_terminal_protocol_contract.py` are listed as survivors (they outlive
+  P4) and Enforcement A checks by AST that a survivor never touches the Python
+  client. The T1 -N / TG +M reconciliation is written at P4 from the last green
+  junit, not before.
+- **2026-09-16 Onboarding order flips: install the CLI first.** (Claude, follows
+  from folding init/doctor in.) QUICKSTART step 2 is the install line
+  (`curl ... releases/latest/download/install.sh | bash`, marked "from v0.3.0"
+  because the URL 404s until the tag exists); `lazyaf init` and `lazyaf doctor`
+  are steps 3 and 4; the stack comes after. Compose fail-fast messages and
+  `backend/app/config.py`'s remedies say `Run: lazyaf init` now; `config.py`
+  keeps one transitional mention of `bootstrap_secrets.py` because
+  `tdd/unit/config/test_auth_secrets.py:72` pins it until P4.
+- **2026-09-16 The version is the tag, learned via `-ldflags -X`; nothing in
+  the tree carries a CLI version to bump.** (Claude.) A dev build says
+  `dev+<sha>[.dirty]`, never a bare semver; `check_binary_version.py` proves all
+  six release binaries recorded the tag before `gh release`. The standing
+  release PR must not be merged before P4 (it becomes mergeable long before;
+  every P0-P3 commit uses a hidden type so it never reads as a `feat`).
+- **2026-09-16 Manual acceptance (§13.3 step 6): NOT YET RECORDED.** The owner
+  runs `lazyaf init && lazyaf doctor`, `lazyaf list`, and the
+  `debug rerun --break` / `debug attach --token` loop on Windows Git Bash and
+  one Linux box; the result is written here before P4. The Windows raw-console
+  keystroke granularity (§12) is verified in that same step.
 
 ---
 

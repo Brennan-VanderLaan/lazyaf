@@ -4,8 +4,10 @@
 #   The fastest way to run LazyAF without building anything. Every service
 #   here uses a PREBUILT image from GHCR; there is not a single `build:`
 #   stanza and not a single source bind-mount. Clone (or just download this
-#   one file plus .env.example), run `scripts/bootstrap_secrets.py` to make
-#   a .env with real auth secrets in it, `pull`, `up`. That is it.
+#   one file plus .env.example), run `lazyaf init` to make a .env with real
+#   auth secrets in it, `pull`, `up`. That is it. `lazyaf` is the single
+#   static binary from the release page (from v0.3.0; the install line is in
+#   QUICKSTART.md step 2) - it needs no Python.
 #
 # WHAT THIS IS NOT
 #   This is not the development stack and it is not a test harness. Use
@@ -24,9 +26,9 @@
 #   share a database.
 #
 # USAGE
-#   python scripts/bootstrap_secrets.py   # creates .env AND generates the
+#   lazyaf init                           # creates .env AND generates the
 #                                         # shared secrets; then add API keys
-#   python scripts/preflight.py           # optional but recommended
+#   lazyaf doctor                         # optional but recommended
 #   docker compose -f docker-compose.release.yml pull
 #   docker compose -f docker-compose.release.yml up -d
 #   open http://localhost:5173
@@ -94,13 +96,13 @@ services:
       #
       # Compose cannot generate a value for you, so it stops here instead of
       # starting something insecure. Either:
-      #   python scripts/bootstrap_secrets.py       (writes fresh random values
+      #   lazyaf init                               (writes fresh random values
       #                                              into .env; safe to re-run)
       # or, if you deliver secrets by mounted file, drop these two lines and use
       # LAZYAF_STEP_AUTH_SECRET_FILE / LAZYAF_RUNNER_AUTH_SECRET_FILE instead -
       # the _FILE form takes precedence. See deploy/k8s/README.md.
-      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py (or set LAZYAF_STEP_AUTH_SECRET_FILE)}'
-      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py (or set LAZYAF_RUNNER_AUTH_SECRET_FILE)}'
+      - 'LAZYAF_STEP_AUTH_SECRET=${LAZYAF_STEP_AUTH_SECRET:?not set. Run: lazyaf init (or set LAZYAF_STEP_AUTH_SECRET_FILE)}'
+      - 'LAZYAF_RUNNER_AUTH_SECRET=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: lazyaf init (or set LAZYAF_RUNNER_AUTH_SECRET_FILE)}'
     networks:
       - lazyaf-network
     healthcheck:
@@ -161,7 +163,7 @@ services:
       # upgrade is rejected before accept() otherwise, and this host simply
       # never appears in the runner list. Sharing one .env variable is what
       # keeps the two halves from drifting.
-      - 'LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: python scripts/bootstrap_secrets.py}'
+      - 'LAZYAF_RUNNER_TOKEN=${LAZYAF_RUNNER_AUTH_SECRET:?not set. Run: lazyaf init}'
       # The agent REFUSES plaintext ws:// to a non-loopback host by default,
       # because the execute_step frame carries the step JWT and the step's
       # secret environment. `backend` is a compose service name, not

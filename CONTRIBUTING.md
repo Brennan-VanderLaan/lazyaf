@@ -36,11 +36,19 @@ applies **from now on**.
 | `perf` | Faster/leaner, same behaviour | **Performance** | patch |
 | `refactor` | Restructuring, no behaviour change | **Refactoring** | patch |
 | `docs` | Documentation only | **Documentation** | patch |
-| `test` | Tests only | hidden | patch |
-| `chore` | Housekeeping, deps, tooling | hidden | patch |
-| `build` | Build system, packaging | hidden | patch |
-| `ci` | `.github/` and pipeline plumbing | hidden | patch |
-| `style` | Formatting only | hidden | patch |
+| `test` | Tests only | hidden | none |
+| `chore` | Housekeeping, deps, tooling | hidden | none |
+| `build` | Build system, packaging | hidden | none |
+| `ci` | `.github/` and pipeline plumbing | hidden | none |
+| `style` | Formatting only | hidden | none |
+
+> **Hidden types do not move the version - observed, not assumed.** On
+> 2026-09-16 three `chore:`/`ci:` commits landed on `main` after `v0.2.0` and
+> release-please's run completed without opening a release PR. Earlier
+> revisions of this table said "patch" for every hidden type; that was wrong
+> for this repository's configuration, and it matters: a wave that must not
+> ship a release mid-flight (the Go CLI's P0-P3, `upcoming/go-cli.md` section
+> 4.5) relies on hidden types to keep the standing release PR unchanged.
 
 "Hidden" means the commit still counts toward *whether* there is a release; it
 just does not get its own changelog line. The sections are defined explicitly in
@@ -91,7 +99,7 @@ below `1.0.0`:
 
 | Commit | `0.1.0` becomes |
 |---|---|
-| `fix:` / `perf:` / `refactor:` / `docs:` / `chore:` | `0.1.1` |
+| `fix:` / `perf:` / `refactor:` / `docs:` | `0.1.1` |
 | `feat:` | `0.2.0` |
 | `feat!:` or `BREAKING CHANGE:` | `0.2.0` |
 
@@ -123,25 +131,34 @@ other version (a hotfix line, a `1.0.0-rc1` prerelease).
 
 ## The version number lives in exactly one place
 
-`cli/lazyaf/__init__.py`:
+**The git tag**, which release-please derives from
+`.github/.release-please-manifest.json`. Nothing in the tree carries a version
+to bump by hand: the container images take the number from the tag, and the
+`lazyaf` binary learns it at build time — `scripts/build_cli.sh` stamps
+`-ldflags -X .../internal/version.Version=<tag>` on a tag build, and every
+other build reports `dev+<sha>` (never a bare semver), so a source build past
+the release PR cannot claim to be the release.
 
-```python
-# x-release-please-start-version
-__version__ = "0.1.0"
-# x-release-please-end
-```
+`.github/scripts/check_binary_version.py` runs `go version -m` over all six
+release binaries and fails the release if any of them recorded a version other
+than the tag; the release job also executes the host binary's
+`--version --short` and compares it to the tag. Both are hard stops before
+`gh release`.
 
-`cli/pyproject.toml` reads it via `[tool.setuptools.dynamic]`, and the container
-images take the same number from the git tag. The bracketing comments are what
-release-please's generic updater keys on; it rewrites the version *between*
-them. The markers bracket the assignment rather than sitting on the end of it
-because `tdd/unit/packaging` reads that line as text, and a trailing comment
-would end up inside the version string it parses out.
+**Until the 0.3.0 cutover** the Python CLI is still in the tree, and its
+`cli/lazyaf/__init__.py` still carries a `__version__` that release-please's
+`extra-files` block rewrites for the wheel. That is the copy being replaced:
+the cutover commit deletes the file and the `extra-files` block together, and
+`.github/scripts/check_release_version.py` (the wheel-vs-tag check) goes with
+them. Do not edit either version line by hand in the meantime; release-please
+rewrites it inside the release PR, and a manual bump only conflicts with the
+next one.
 
-**Do not edit that line by hand.** release-please rewrites it inside the release
-PR. A manual bump only conflicts with the next one, and
-`.github/scripts/check_release_version.py` will fail the release if the wheel
-and the tag ever disagree.
+**Do not merge the standing release PR before the cutover commit lands.**
+release-please refreshes it on every push, so it is mergeable long before the
+Go binary is what a release would ship; the pre-merge checklist in
+`.github/WORKFLOWS.md` spells out what its diff must contain (`CHANGELOG.md`
+and the manifest, nothing else).
 
 ---
 

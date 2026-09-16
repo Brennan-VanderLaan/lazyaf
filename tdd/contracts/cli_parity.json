@@ -1,0 +1,385 @@
+{
+  "_about": [
+    "THE PARITY LEDGER (upcoming/go-cli.md section 11, R2): where every Python CLI test went before it is deleted.",
+    "One entry per Python test class (per module-level function for test_bootstrap_secrets.py, which has no classes), keyed file::Name.",
+    "A value is {\"go\": [\"<package>.<TestFunc>\", \"<package>.<TestFunc>/<subtest>\", ...]} naming the Go tests that now carry the property,",
+    "or {\"retired\": \"<kind>: <reason>\"} with kind from the closed set held by both enforcement tests and a reason of at least 40 characters naming what replaces it.",
+    "An optional \"note\" states what inside a ported class was retired individually.",
+    "<package> is the directory under cli/internal/ (reconcile's external test package reconcile_test is keyed by its directory, reconcile).",
+    "<subtest> is the t.Run literal as Go's testing package reports it: spaces rewritten to underscores.",
+    "A Go test named in a retired reason (package.TestX) must exist too; both enforcements resolve those.",
+    "Enforcement A: tdd/unit/scripts/test_cli_parity_ledger.py (T1, ast.parse only, no imports) - keys == collected Python tests; every Go reference resolves.",
+    "Enforcement B: cli/internal/parity/ledger_test.go (TG, go/parser) - every Go reference still exists; a carrier cannot be deleted without editing this file.",
+    "survivors: classes in a ledger file that are NOT deleted at P4 (the corpus half of the contract test) and so have no disposition. Enforcement A checks they do not import the Python client.",
+    "Nothing here may be TBD. A missing carrier is an open problem in the plan, not a retirement."
+  ],
+  "survivors": {
+    "tdd/unit/debug/test_terminal_protocol_contract.py": [
+      "TestCorpusIsCurrent",
+      "TestServerSatisfiesItsOwnCorpus",
+      "TestDerivedTypes",
+      "TestEscapeSurfaceIsClientOnly"
+    ]
+  },
+  "entries": {
+    "tdd/unit/scripts/test_cli_debug.py::TestTerminalUrl": {
+      "go": [
+        "terminal.TestTerminalURL",
+        "terminal.TestTerminalURL/http_becomes_ws",
+        "terminal.TestTerminalURL/https_becomes_wss",
+        "terminal.TestTerminalURL/trailing_slash_does_not_double",
+        "terminal.TestTerminalURL/an_explicit_ws_url_is_accepted",
+        "terminal.TestTerminalURL/a_schemeless_server_url_is_refused_not_guessed",
+        "terminal.TestTerminalURL/the_token_never_enters_the_url"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_debug.py::TestEscapeDecoder": {
+      "go": [
+        "debugproto.TestEscapeDecoder",
+        "debugproto.TestEscapeDecoder/plain_bytes_pass_through_untouched",
+        "debugproto.TestEscapeDecoder/an_at_sign_in_the_byte_stream_is_just_input",
+        "debugproto.TestEscapeDecoder/escape_plus_key_becomes_a_command",
+        "debugproto.TestEscapeDecoder/doubled_escape_sends_one_literal_escape_byte",
+        "debugproto.TestEscapeDecoder/escape_split_across_two_reads_still_works",
+        "debugproto.TestEscapeDecoder/input_before_and_after_a_command_keeps_its_order",
+        "debugproto.TestEscapeDecoder/detach_keys",
+        "debugproto.TestEscapeDecoder/an_unknown_escape_key_is_reported_not_swallowed"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_debug.py::TestRunTerminal": {
+      "go": [
+        "terminal.TestRunTerminal",
+        "terminal.TestRunTerminal/a_full_attach_round_trip",
+        "terminal.TestRunTerminal/the_initial_window_size_is_announced",
+        "terminal.TestRunTerminal/no_resize_is_sent_when_the_size_is_unknown",
+        "terminal.TestRunTerminal/arbitrary_output_bytes_survive",
+        "terminal.TestRunTerminal/a_closed_frame_ends_the_attach_with_the_servers_reason",
+        "terminal.TestRunTerminal/local_eof_ends_the_attach",
+        "terminal.TestRunTerminal/detach_leaves_the_session_paused_and_says_so",
+        "terminal.TestRunTerminal/an_undecodable_server_frame_is_reported_not_dropped",
+        "terminal.TestRunTerminal/an_unknown_escape_key_is_reported_and_sends_nothing",
+        "terminal.TestRunTerminal/a_dropped_connection_is_reported_with_its_close_reason"
+      ],
+      "note": "The Python ScriptedSocket validated outbound frames with the server codec; the Go ScriptedSocket validates with debugproto.Decode, which the corpus pins to the server byte for byte."
+    },
+    "tdd/unit/scripts/test_cli_debug.py::TestCloseDetails": {
+      "go": [
+        "terminal.TestCloseDetails",
+        "terminal.TestCloseDetails/a_rejected_handshake_reports_its_http_status",
+        "terminal.TestCloseDetails/a_close_code_is_not_mistaken_for_a_handshake_status",
+        "terminal.TestCloseDetails/the_upgrade_refusal_names_where_the_reason_can_be_read",
+        "terminal.TestCloseDetails/every_close_code_has_a_sentence_when_the_reason_is_dropped",
+        "terminal.TestCloseDetails/the_servers_reason_wins_when_it_survives",
+        "terminal.TestCloseDetails/every_close_code_the_server_can_send_has_a_meaning"
+      ],
+      "note": "python-websockets-specific: the two websockets-shape tests (rcvd-vs-flat close, legacy handshake exception) have no carrier; coder/websocket has one CloseError shape and one rejected-handshake response, there is nothing else to read."
+    },
+    "tdd/unit/scripts/test_cli_debug.py::TestConsoleIO": {
+      "go": [
+        "terminal.TestConsoleIO",
+        "terminal.TestConsoleIO/output_reaches_a_binary_stream_byte_exact",
+        "terminal.TestConsoleIO/size_is_a_positive_pair_or_none"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_debug.py::TestAttachCommand": {
+      "go": [
+        "cmd.TestDebugAttach",
+        "cmd.TestDebugAttach/shell_is_refused_with_the_reason_never_downgraded",
+        "cmd.TestDebugAttach/the_refusal_text_is_the_servers_word_for_word",
+        "cmd.TestDebugAttach/an_unattachable_session_is_refused_with_the_api_reason",
+        "cmd.TestDebugAttach/print_credential_mints_without_opening_a_socket",
+        "cmd.TestDebugAttach/the_interactive_path_runs_end_to_end_under_the_click_runner",
+        "cmd.TestDebugAttach/token_skips_the_mint_so_the_servers_join_command_is_true",
+        "cmd.TestDebugAttach/the_shipped_cli_group_exposes_every_debug_verb"
+      ],
+      "note": "click-specific: the two click-wiring tests (the placeholder attach is replaced on the group; the import happens lazily) have no carrier; cobra registers the real command directly and there is no placeholder to replace."
+    },
+    "tdd/unit/scripts/test_cli_debug.py::TestWebsocketsExtra": {
+      "retired": "python-websockets-specific: the dialer (coder/websocket) is compiled into the binary; no optional extra exists to be absent, and no version bound exists to be checked."
+    },
+
+    "tdd/unit/scripts/test_cli_errors.py::TestUntrustedTextIsNeverParsed": {
+      "go": [
+        "ui.TestVerbatimQuoting",
+        "ui.TestVerbatimQuoting/git_stderr_is_quoted_verbatim_brackets_and_all",
+        "ui.TestVerbatimQuoting/a_closing_tag_shape_does_not_crash_the_report",
+        "ui.TestVerbatimQuoting/the_summary_line_is_not_parsed_either",
+        "ui.TestVerbatimQuoting/the_remedy_is_not_parsed_either",
+        "ui.TestVerbatimQuoting/windows_line_endings_do_not_double_space_the_quote",
+        "ui.TestVerbatimQuoting/an_empty_detail_is_not_printed_as_a_blank_quotation"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestNothingExitsZeroOnFailure": {
+      "go": [
+        "ui.TestFailNeverExitsZero",
+        "ui.TestFailNeverExitsZero/fail_refuses_to_be_asked_for_a_zero_exit",
+        "ui.TestFailNeverExitsZero/fail_exits_with_the_code_it_was_given",
+        "ui.TestFailNeverExitsZero/a_plain_error_is_still_a_refusal_not_a_zero",
+        "cmd.TestIngestRefusesNoCommits",
+        "cmd.TestIngestRefusesNoCommits/ingest_refuses_a_repo_with_no_commits",
+        "cmd.TestIngestRefusesNoCommits/the_no_commits_refusal_names_the_two_commands_that_fix_it"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestUsageErrorsCarryAnExample": {
+      "go": [
+        "cmd.TestUsageErrorsCarryAnExample",
+        "cmd.TestUsageErrorsCarryAnExample/ingest_without_name_names_the_flag_and_shows_a_command",
+        "cmd.TestUsageErrorsCarryAnExample/land_without_branch_shows_a_command",
+        "cmd.TestUsageErrorsCarryAnExample/a_missing_positional_shows_a_command_too",
+        "cmd.TestUsageErrorsCarryAnExample/the_example_comes_from_the_commands_own_help",
+        "cmd.TestUsageErrorsCarryAnExample/every_command_documents_a_runnable_example",
+        "cmd.TestUsageErrorsCarryAnExample/a_mistyped_command_suggests_the_real_one",
+        "cmd.TestUsageErrorsCarryAnExample/a_wholly_unknown_command_does_not_invent_a_suggestion"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestBackendUrl": {
+      "go": [
+        "api.TestResolveServerURL",
+        "api.TestResolveServerURL/a_schemeless_url_is_refused_not_guessed",
+        "api.TestResolveServerURL/an_empty_server_setting_is_refused",
+        "api.TestResolveServerURL/a_trailing_slash_does_not_become_a_double_slash_404",
+        "api.TestResolveServerURL/the_message_says_where_the_url_came_from",
+        "api.TestResolveServerURL/describe_server_names_both_ways_to_change_it",
+        "terminal.TestTerminalURL/a_schemeless_server_url_is_refused_not_guessed"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestTheServerIsQuoted": {
+      "go": [
+        "api.TestServerWordsQuoted",
+        "api.TestServerWordsQuoted/a_string_detail_is_printed",
+        "api.TestServerWordsQuoted/a_pydantic_422_envelope_is_rendered_readably",
+        "api.TestServerWordsQuoted/a_non_json_error_body_is_still_shown",
+        "api.TestServerWordsQuoted/a_status_with_no_body_says_so_rather_than_going_quiet",
+        "api.TestServerWordsQuoted/a_404_uses_the_commands_own_words_when_it_has_them",
+        "api.TestServerWordsQuoted/a_200_that_is_not_json_blames_the_right_component"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestEveryTransportFailureIsHandled": {
+      "go": [
+        "api.TestTransportFailures",
+        "api.TestTransportFailures/an_unreachable_backend_names_the_url_and_how_to_check_it",
+        "api.TestTransportFailures/a_timeout_is_distinguished_from_a_refusal",
+        "api.TestTransportFailures/a_dns_failure_is_a_refusal_not_a_traceback",
+        "api.TestTransportFailures/a_schemeless_url_is_refused_before_any_dial"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestOneErrorIdiom": {
+      "go": ["api.TestOnlyAPIImportsNetHTTP"],
+      "note": "The property is enforced by go/parser over the import lists (net/http only in internal/api, coder/websocket only in internal/terminal) instead of by grepping for httpx."
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestStreams": {
+      "go": [
+        "ui.TestStreams",
+        "ui.TestStreams/refusals_go_to_stderr",
+        "ui.TestStreams/warnings_go_to_stderr",
+        "ui.TestStreams/results_stay_on_stdout"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestIngestRefusesEarly": {
+      "go": [
+        "cmd.TestIngestRefusesEarly",
+        "cmd.TestIngestRefusesEarly/a_blank_name_is_refused_here_not_by_the_api",
+        "cmd.TestIngestRefusesEarly/a_nonexistent_branch_is_refused_before_the_repo_is_created",
+        "cmd.TestIngestRefusesEarly/the_branch_refusal_lists_the_branches_that_do_exist",
+        "cmd.TestIngestRefusesEarly/a_path_that_is_not_a_git_repo_names_the_remedy"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestLand": {
+      "go": [
+        "cmd.TestLand",
+        "cmd.TestLand/the_push_refspec_is_fully_qualified_on_both_sides",
+        "cmd.TestLand/a_failed_pr_does_not_report_success",
+        "cmd.TestLand/a_successful_pr_still_reports_success",
+        "cmd.TestLand/running_outside_a_clone_names_the_remedy"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_errors.py::TestAgainstRealRich": {
+      "retired": "rich-specific: no markup language exists in the Go binary, so there is no renderer to feed bracketed text through; the property it guarded (untrusted text survives structurally) is ui.TestVerbatimQuoting."
+    },
+
+    "tdd/unit/scripts/test_cli_tests_reconcile.py::TestRefusesAmbiguousInput": {
+      "go": [
+        "reconcile.TestRefusesAmbiguousInput",
+        "reconcile.TestRefusesAmbiguousInput/no_source_refuses",
+        "reconcile.TestRefusesAmbiguousInput/no_source_message_names_the_orphaning_hazard",
+        "reconcile.TestRefusesAmbiguousInput/no_source_does_not_fall_back_to_env_var",
+        "reconcile.TestRefusesAmbiguousInput/no_source_does_not_fall_back_to_cwd_manifest",
+        "reconcile.TestRefusesAmbiguousInput/both_sources_refuses"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_tests_reconcile.py::TestRefusesResultsManifest": {
+      "go": [
+        "reconcile.TestRefusesResultsManifest",
+        "reconcile.TestRefusesResultsManifest/results_manifest_refused_by_default",
+        "reconcile.TestRefusesResultsManifest/refusal_explains_the_partial_run_problem",
+        "reconcile.TestRefusesResultsManifest/manifest_alias_is_refused_the_same_way",
+        "reconcile.TestRefusesResultsManifest/explicit_opt_in_is_accepted"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_tests_reconcile.py::TestRefusesEmptyDeclaredSet": {
+      "go": [
+        "reconcile.TestRefusesEmptyDeclaredSet",
+        "reconcile.TestRefusesEmptyDeclaredSet/empty_refs_manifest_refused",
+        "reconcile.TestRefusesEmptyDeclaredSet/missing_manifest_refused",
+        "reconcile.TestRefusesEmptyDeclaredSet/malformed_manifest_refused"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_tests_reconcile.py::TestManifestHelpers": {
+      "go": [
+        "reconcile.TestManifestHelpers",
+        "reconcile.TestManifestHelpers/classify",
+        "reconcile.TestManifestHelpers/normalize_dedupes_and_keeps_first_path",
+        "reconcile.TestManifestHelpers/bare_list_manifest_accepted"
+      ]
+    },
+    "tdd/unit/scripts/test_cli_tests_reconcile.py::TestFromCollect": {
+      "go": [
+        "reconcile.TestFromCollect",
+        "reconcile.TestFromCollect/collect_finds_every_marked_test",
+        "reconcile.TestFromCollect/collection_error_refuses",
+        "reconcile.TestPluginIsTheVerbatimPythonLiteral"
+      ],
+      "note": "Runs a REAL python -m pytest --collect-only over the fixture suite in cli/internal/reconcile/testdata; red on a box without pytest, by design."
+    },
+
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_creates_env_from_the_template_when_missing": {
+      "go": ["initcmd.TestCreatesEnvFromTemplate"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_generates_both_secrets_with_real_entropy": {
+      "go": ["envfile.TestGenerateSecretShape"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_two_installations_do_not_share_a_secret": {
+      "go": ["envfile.TestTwoRunsDiffer"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_rerunning_changes_nothing": {
+      "go": ["initcmd.TestIdempotent"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_an_existing_value_is_never_overwritten": {
+      "go": ["envfile.TestKeptIsKept"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_unrelated_keys_and_comments_survive": {
+      "go": ["envfile.TestUnrelatedLinesSurvive"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_an_empty_assignment_is_filled_in_place": {
+      "go": [
+        "envfile.TestEmptyAssignmentFilledInPlace",
+        "envfile.TestEmptyAssignmentFilledInPlace/filled_where_it_stands_with_no_shadowing_duplicate",
+        "envfile.TestEmptyAssignmentFilledInPlace/the_last_active_assignment_is_the_one_replaced",
+        "envfile.TestEmptyAssignmentFilledInPlace/quotes_and_export_are_assignments_too"
+      ]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_a_retired_default_or_placeholder_is_replaced": {
+      "go": ["envfile.TestPlaceholderReplaced"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_a_file_pointer_is_respected_instead_of_generating": {
+      "go": [
+        "envfile.TestFilePointerDelegates",
+        "envfile.TestFilePointerDelegates/pointer_in_the_file",
+        "envfile.TestFilePointerDelegates/pointer_in_the_ambient_environment"
+      ]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_no_generated_secret_is_ever_printed": {
+      "go": [
+        "initcmd.TestNeverPrintsASecret/no_generated_secret_is_ever_printed",
+        "envfile.TestSecretRedactsUnderEveryVerb"
+      ]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_an_existing_secret_is_never_printed_back": {
+      "go": ["initcmd.TestNeverPrintsASecret/an_existing_secret_is_never_printed_back"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_check_mode_does_not_print_secrets_either": {
+      "go": ["initcmd.TestNeverPrintsASecret/check_mode_does_not_print_secrets_either"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_check_reports_missing_and_changes_nothing": {
+      "go": ["initcmd.TestCheckMode/check_reports_missing_and_changes_nothing"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_check_passes_once_bootstrapped": {
+      "go": ["initcmd.TestCheckMode/check_passes_once_bootstrapped_and_reports_each_verdict"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_check_on_a_missing_file_fails_without_creating_it": {
+      "go": ["initcmd.TestCheckMode/check_on_a_missing_file_fails_without_creating_it"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_concurrent_runs_leave_one_consistent_file": {
+      "go": ["initcmd.TestConcurrentRuns"],
+      "note": "Six real processes re-executed through TestMain (LAZYAF_TEST_HELPER=init), so O_EXCL is exercised across processes as the Python test did."
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_a_concurrent_run_does_not_clobber_a_value_written_between_read_and_write": {
+      "go": [
+        "initcmd.TestReReadInsideTheLock",
+        "initcmd.TestReReadInsideTheLock/a_key_written_by_the_other_process_survives"
+      ]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_a_stale_lock_does_not_wedge_the_next_run_forever": {
+      "go": [
+        "envfile.TestStaleLockIsBroken",
+        "envfile.TestStaleLockIsBroken/a_stale_lock_is_unlinked_and_taken"
+      ]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_runs_on_a_bare_interpreter_with_no_dependencies": {
+      "retired": "python-interpreter: a static binary has no interpreter and no dependencies to be absent; the release smoke on a bare runner (release.yml, three OSes, no checkout) is the equivalent proof."
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_default_env_file_is_the_repo_root_in_a_checkout": {
+      "go": ["initcmd.TestRootMarkers"]
+    },
+    "tdd/unit/scripts/test_bootstrap_secrets.py::test_standalone_download_writes_beside_itself_not_a_level_up": {
+      "retired": "semantics-changed: the binary lives in ~/.local/bin, so 'beside itself' is meaningless; replaced by initcmd.TestRefusesUnmarkedDirectory - without a root marker init REFUSES and names --env-file instead of writing somewhere by guess."
+    },
+
+    "tdd/unit/scripts/test_preflight.py::TestTheFormsAValidValueTakes": {
+      "go": ["doctor.TestPortForms", "doctor.TestEnvExampleValuesParse"]
+    },
+    "tdd/unit/scripts/test_preflight.py::TestTheFormsThatAreGenuinelyWrong": {
+      "go": [
+        "doctor.TestPortRefusals",
+        "doctor.TestPortRefusals/the_refusal_does_not_advise_removing_the_host_ip"
+      ]
+    },
+
+    "tdd/unit/debug/test_terminal_protocol_contract.py::TestConstantParity": {
+      "retired": "superseded-by-contract: the server emits constants.scalars/sets into tdd/contracts/debug_terminal.v1.json; debugproto.TestContractConstants and debugproto.TestContractReasons hold the Go codec to it, and TestCorpusIsCurrent (Python, kept) proves the file is fresh."
+    },
+    "tdd/unit/debug/test_terminal_protocol_contract.py::TestServerToClient": {
+      "retired": "superseded-by-contract: every server->client frame is a corpus case with its exact wire string; debugproto.TestContractFrames decodes each and re-encodes it byte for byte, and debugproto.TestContractFramesCoverEveryType refuses a type the corpus forgot."
+    },
+    "tdd/unit/debug/test_terminal_protocol_contract.py::TestClientToServer": {
+      "retired": "superseded-by-contract: every client->server frame is a corpus case whose wire string the server wrote; debugproto.TestContractFrames requires the Go encoder to reproduce it byte-identically, which is the old both-encoders-agree assertion with the server as the reference."
+    },
+    "tdd/unit/debug/test_terminal_protocol_contract.py::TestRejectionParity": {
+      "retired": "superseded-by-contract: the 16 malformed frames, the not-utf8 frame and the two encoder refusals are corpus cases; debugproto.TestContractMalformed refuses each with a ProtocolError and debugproto.TestContractRefusalsAreProtocolErrorsAndNothingElseIs keeps that the only error type."
+    },
+    "tdd/unit/debug/test_terminal_protocol_contract.py::TestBase64Parity": {
+      "retired": "superseded-by-contract: the encode/decode/reject vectors are the corpus base64 section, written by the server; debugproto.TestContractBase64 checks the Go codec against them with strict decoding."
+    },
+    "tdd/unit/debug/test_terminal_protocol_contract.py::TestClientOnlySurface": {
+      "retired": "superseded-by-contract: debugproto.TestEscapeKeysMapToWireCommands maps every escape key onto constants.scalars.COMMANDS from the corpus and debugproto.TestEscapeSurface pins the byte and the keys; TestEscapeSurfaceIsClientOnly (Python, kept) proves the server has no escape byte."
+    },
+
+    "tdd/unit/packaging/test_wheel_build.py::TestWheelContents": {
+      "retired": "packaging-wheel: there is no wheel; the artefact carries only the product because the binary is built with -trimpath and CGO_ENABLED=0 by scripts/build_cli.sh and proven by release.yml's smoke in a directory with no checkout."
+    },
+    "tdd/unit/packaging/test_wheel_build.py::TestSdistContents": {
+      "retired": "packaging-wheel: there is no sdist; the source distribution is the git tag itself, resolvable by go install github.com/Brennan-VanderLaan/lazyaf/cli/cmd/lazyaf@<tag> because go.mod lives at the repo root."
+    },
+    "tdd/unit/packaging/test_wheel_build.py::TestFreshVenvInstall": {
+      "retired": "packaging-wheel: a fresh machine can run it is now release.yml's three-OS smoke job, which installs the attached assets with cli/install.sh and runs the real binary with no checkout and no Python."
+    },
+    "tdd/unit/packaging/test_wheel_metadata.py::TestVersionSingleSource": {
+      "retired": "packaging-wheel: the version has no in-tree copy to keep single; the tag is stamped by -ldflags -X, checked across all six binaries by .github/scripts/check_binary_version.py (tdd/unit/scripts/test_check_binary_version.py) and version.TestDevBuildSaysDev keeps a plain build honest."
+    },
+    "tdd/unit/packaging/test_wheel_metadata.py::TestPublishableMetadata": {
+      "retired": "packaging-wheel: nothing is published to an index; the release page carries the binaries, checksums.txt and install.sh, and cli/README.md is the human-facing description the smoke's --help complements."
+    },
+    "tdd/unit/packaging/test_wheel_metadata.py::TestEntryPoint": {
+      "retired": "packaging-wheel: there is no console_scripts entry point; the binary IS the entry point, and the release smoke runs its --help and --version --short on every OS before publishing."
+    },
+    "tdd/unit/packaging/test_wheel_metadata.py::TestDependencies": {
+      "retired": "packaging-wheel: runtime dependencies are compiled in and hash-pinned by go.sum; go mod verify and go mod tidy with git diff --exit-code run in release.yml and pr-build.yml before any build."
+    },
+    "tdd/unit/packaging/test_wheel_metadata.py::TestPackagesAreExplicit": {
+      "retired": "packaging-wheel: there is no package list to keep explicit; the Go module's packages are the directories under cli/, walked by go vet ./... and go test ./... in the TG tier."
+    },
+    "tdd/unit/packaging/test_wheel_metadata.py::TestPackagedTreeIsClean": {
+      "retired": "packaging-wheel: no .env or credential-shaped file can ship because nothing under cli/ is packaged as a tree; secret-scan.yml scans every tracked file, and cli/bin and cli/dist are gitignored build outputs."
+    }
+  }
+}

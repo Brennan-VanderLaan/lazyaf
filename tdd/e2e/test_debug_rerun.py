@@ -13,11 +13,24 @@ Nothing in the middle is a double. The pipeline runs on real containers, the
 workspace is a real named volume, the sidecar is a real
 `lazyaf-debug-sidecar:dev` container, the terminal is a REAL WebSocket to a
 REAL uvicorn serving the real app, and the client on the other end of it is
-the shipped CLI terminal client (`lazyaf.debug_cmd.run_terminal`) - not a
-test harness that happens to speak the same JSON. That last point is the
-reason this test earns its runtime: it is the only place where the CLI's
+the SHIPPED CLI BINARY - `lazyaf debug attach <sid> --token <t> --server
+<url>`, driven as a subprocess with stdin piped (upcoming/go-cli.md §3.6) -
+not a test harness that happens to speak the same JSON. That last point is
+the reason this test earns its runtime: it is the only place where the CLI's
 codec and the server's codec meet over a socket rather than in a contract
 test.
+
+The binary comes from `$LAZYAF_CLI_BIN`, default `<repo>/cli/bin/lazyaf[.exe]`
+(what the TG tier's preflight, `bash scripts/build_cli.sh --host-only`, leaves
+on the run's workspace volume - §10.4). Absent, this file FAILS naming that
+command; it never skips (R4): a skipped exit gate is the fake green the
+tier floors exist to catch.
+
+With stdin a pipe the client runs line-buffered (it says so on stderr) and
+the escape decoder is still applied to the raw bytes, so `\x1dr` followed by
+a newline is `@resume` as a `command` frame and then one stdin frame
+carrying the newline. The server may already be closing when that second
+frame arrives - harmless, and it is not asserted against (§13.4).
 
 The ONE stub is workspace population: the git clone needs the backend's git
 server reachable from the container network, which is the `e2e-lane` skip
@@ -32,6 +45,7 @@ sidecar image is a loud preflight failure, never a skip (R4).
 """
 import asyncio
 import json
+import os
 import socket as socket_mod
 import sys
 from pathlib import Path
@@ -44,9 +58,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-for _path in (str(REPO_ROOT / "backend"), str(REPO_ROOT / "cli")):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+if str(REPO_ROOT / "backend") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "backend"))
 
 from app.main import app
 from app.models import Pipeline, PipelineRun, Repo
@@ -58,13 +71,19 @@ from app.services.execution.debug_state import DebugState
 from app.services.workspace.state_machine import generate_volume_name
 import app.services.workspace_service as workspace_service_module
 
-from lazyaf import debug_cmd
-
 pytestmark = [pytest.mark.e2e, pytest.mark.local_exec]
 
 STEP_IMAGE = "python:3.12-slim"
 MARKER = "bytes-written-by-the-first-step"
 FIX_FILE = "/workspace/repo/fix.txt"
+
+#: The shipped binary (§3.6). $LAZYAF_CLI_BIN, else what build_cli.sh
+#: --host-only leaves under cli/bin.
+LAZYAF_CLI_BIN = Path(
+    os.environ.get("LAZYAF_CLI_BIN")
+    or REPO_ROOT / "cli" / "bin" / ("lazyaf.exe" if os.name == "nt" else "lazyaf")
+)
+BUILD_REMEDY = "bash scripts/build_cli.sh --host-only"
 
 
 # -----------------------------------------------------------------------------
@@ -127,6 +146,22 @@ def free_port() -> int:
     with socket_mod.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+@pytest.fixture
+def cli_bin() -> str:
+    """The built `lazyaf` binary - loud when absent (R4), never a skip.
+
+    The TG tier's preflight builds it before T3 runs (§10.4); a developer
+    running T3 alone builds it once with the named command.
+    """
+    if not LAZYAF_CLI_BIN.is_file():
+        pytest.fail(
+            f"the lazyaf binary is missing at {LAZYAF_CLI_BIN} (override with "
+            f"$LAZYAF_CLI_BIN). This test drives the SHIPPED CLI over a real "
+            f"socket, so build it first:\n    {BUILD_REMEDY}"
+        )
+    return str(LAZYAF_CLI_BIN)
 
 
 @pytest.fixture
@@ -205,6 +240,9 @@ async def stack(async_engine, monkeypatch, docker_client):
         {
             "factory": factory,
             "ws_base": f"ws://127.0.0.1:{port}",
+            # What the binary's --server takes: it derives ws:// itself
+            # (terminal.TerminalURL) and refuses a schemeless URL (§5).
+            "http_base": f"http://127.0.0.1:{port}",
             "run_ids": run_ids,
             "docker": docker_client,
         },
@@ -298,36 +336,57 @@ async def wait_for_run(api_client, run_id: str, *statuses) -> dict:
     )
 
 
-class DrivenConsole:
-    """A console the TEST types into, handed to the real terminal client.
+class AttachedCLI:
+    """The shipped binary, attached, with the TEST at the keyboard.
 
-    Replaces exactly one thing - the keyboard and the screen - so everything
-    between it and the container (the escape decoder, the frame codec, the
-    websocket, the endpoint, the exec'd shell) is production code.
+    `lazyaf debug attach <sid> --token <t> --server <url>` as a subprocess:
+    stdin is the pipe the test types into, stdout is the sidecar shell's
+    byte stream (the client writes it byte-exact), stderr is the client's
+    own chatter (the READ-WRITE banner, the console mode, the final reason).
+    Everything between the pipe and the container - the escape decoder, the
+    frame codec, the websocket, the endpoint, the exec'd shell - is
+    production code, in the production binary.
     """
 
-    def __init__(self, size=(100, 30)):
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._size = size
+    def __init__(self, proc: asyncio.subprocess.Process):
+        self.proc = proc
         self.output = bytearray()
+        self.stderr = bytearray()
         self._wakeup = asyncio.Event()
+        self._pumps = [
+            asyncio.create_task(self._pump(proc.stdout, self.output)),
+            asyncio.create_task(self._pump(proc.stderr, self.stderr)),
+        ]
 
-    # -- the terminal client's surface --------------------------------------
+    @classmethod
+    async def start(cls, cli_bin: str, server_url: str, session_id: str, token: str) -> "AttachedCLI":
+        proc = await asyncio.create_subprocess_exec(
+            cli_bin,
+            "--server", server_url,
+            "debug", "attach", session_id, "--token", token,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        return cls(proc)
 
-    async def next_input(self):
-        return await self._queue.get()
-
-    def write_output(self, data: bytes) -> None:
-        self.output += data
-        self._wakeup.set()
-
-    def size(self):
-        return self._size
+    async def _pump(self, stream, sink: bytearray) -> None:
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            sink += chunk
+            self._wakeup.set()
 
     # -- the test's surface --------------------------------------------------
 
     def type(self, data: bytes) -> None:
-        self._queue.put_nowait(data)
+        """Keystrokes. The client is line-buffered on a pipe, so a line at a
+        time reaches the shell; stdin stays OPEN until close(), exactly as a
+        keyboard does, so `local input reached EOF` can never be the way an
+        attach ends here."""
+        self.proc.stdin.write(data)
 
     async def wait_for_output(self, needle: bytes, timeout: float = 60.0) -> bytes:
         deadline = asyncio.get_running_loop().time() + timeout
@@ -336,7 +395,13 @@ class DrivenConsole:
             if remaining <= 0:
                 raise AssertionError(
                     f"{needle!r} never appeared on the terminal: "
-                    f"{bytes(self.output)!r}"
+                    f"{bytes(self.output)!r}\nclient stderr: {self.stderr_text()!r}"
+                )
+            if self.proc.returncode is not None:
+                raise AssertionError(
+                    f"the client exited {self.proc.returncode} before "
+                    f"{needle!r} appeared: {bytes(self.output)!r}\n"
+                    f"client stderr: {self.stderr_text()!r}"
                 )
             self._wakeup.clear()
             try:
@@ -344,6 +409,28 @@ class DrivenConsole:
             except asyncio.TimeoutError:
                 continue
         return bytes(self.output)
+
+    async def wait(self, timeout: float = 60.0) -> int:
+        """The client's exit code, once it ends on its own; every byte it
+        wrote has been read before this returns."""
+        code = await asyncio.wait_for(self.proc.wait(), timeout=timeout)
+        await asyncio.gather(*self._pumps)
+        return code
+
+    def stderr_text(self) -> str:
+        return bytes(self.stderr).decode("utf-8", "replace")
+
+    async def close(self) -> None:
+        if self.proc.returncode is None:
+            self.proc.kill()
+            await self.proc.wait()
+        for pump in self._pumps:
+            pump.cancel()
+        await asyncio.gather(*self._pumps, return_exceptions=True)
+        try:
+            self.proc.stdin.close()
+        except Exception:  # noqa: BLE001 - a pipe the child already dropped
+            pass
 
 
 # -----------------------------------------------------------------------------
@@ -353,7 +440,7 @@ class DrivenConsole:
 
 class TestDebugRerunLoop:
     async def test_failed_run_debugged_fixed_from_the_shell_and_completed(
-        self, api_client, stack, repo_and_pipeline
+        self, api_client, stack, repo_and_pipeline, cli_bin
     ):
         pipeline_id = repo_and_pipeline["pipeline_id"]
 
@@ -404,12 +491,9 @@ class TestDebugRerunLoop:
         token = response.json()["token"]
         assert read_join_token(token) == session_id
 
-        console = DrivenConsole()
-        notices: list[str] = []
-        url = debug_cmd.terminal_url(stack.ws_base, session_id)
-        attach = asyncio.create_task(
-            debug_cmd.attach_socket(url, token, console, notice=notices.append)
-        )
+        # The binary, with the credential the server minted - the exact line
+        # `join_command` prints once --token exists (§5): no second mint.
+        console = await AttachedCLI.start(cli_bin, stack.http_base, session_id, token)
         try:
             # The sidecar mounts the paused run's workspace: step 0's bytes.
             console.type(b"cat /workspace/repo/marker.txt\n")
@@ -423,20 +507,33 @@ class TestDebugRerunLoop:
             assert b"fix.txt" in listing
 
             # --- 5. @resume, over the wire, from the CLI's escape key ---
-            console.type(b"\x1dr")
-            result = await asyncio.wait_for(attach, timeout=60)
+            # Ctrl-] r, then the newline the line-buffered client needs to
+            # hand the chunk over (§13.4). stdin stays open: the attach
+            # ends because the SERVER closes it with "resumed".
+            console.type(b"\x1dr\n")
+            exit_code = await console.wait(timeout=60)
         finally:
-            attach.cancel()
+            await console.close()
 
-        assert result.commands == ["@resume"], (
-            "Ctrl-] r must reach the server as a `command` frame - never as "
-            "the bytes '@resume' sniffed out of stdin (C12)"
-        )
-        assert result.reason == "resumed"
-        assert result.exit_code == 0
-        assert any("READ-WRITE" in n for n in notices), (
-            "the server's banner must reach the operator: /workspace is "
+        client_said = console.stderr_text()
+        # C12, observed from outside the process: Ctrl-] r must reach the
+        # server as a `command` frame, never as the bytes '@resume' sniffed
+        # out of stdin. The Python driver exposed `result.commands` for this;
+        # a subprocess exposes its EFFECT - the server, which only resumes on
+        # a command frame, closed the terminal saying "resumed", and step 6
+        # below sees the run complete. Typed bytes would have gone to the
+        # shell (`^]r` echoed on stdout) and the gate would still be paused.
+        # (The sidecar's own MOTD names the @-verbs, so the shell's output
+        # cannot be grepped for '@resume' as a negative.)
+        assert "resumed" in client_said, client_said
+        assert exit_code == 0, client_said
+        assert "READ-WRITE" in client_said, (
+            "the banner must reach the operator on stderr: /workspace is "
             "read-write and the resumed step sees the edits"
+        )
+        assert "line-buffered" in client_said, (
+            "a pipe is not a TTY; the client must SAY it is running "
+            "line-buffered rather than pretend to be a raw terminal (R1)"
         )
 
         # --- 6. the pipeline completes ------------------------------------
@@ -487,7 +584,7 @@ class TestDebugRerunLoop:
         )
 
     async def test_a_terminal_without_a_credential_is_refused_at_the_upgrade(
-        self, api_client, stack, repo_and_pipeline
+        self, api_client, stack, repo_and_pipeline, cli_bin
     ):
         """C14 over a real socket - and the fact the contract got wrong.
 
@@ -523,22 +620,26 @@ class TestDebugRerunLoop:
 
         await wait_until(_paused, message="the gate never paused")
 
-        url = debug_cmd.terminal_url(stack.ws_base, session_id)
-        result = await asyncio.wait_for(
-            debug_cmd.attach_socket(
-                url, "not-a-real-token", DrivenConsole(), session_id=session_id
-            ),
-            timeout=30,
+        # The binary with a credential that proves nothing: the session is
+        # attachable (so the client gets as far as the socket), and the
+        # upgrade is what refuses.
+        console = await AttachedCLI.start(
+            cli_bin, stack.http_base, session_id, "not-a-real-token"
         )
+        try:
+            exit_code = await console.wait(timeout=30)
+        finally:
+            await console.close()
+        reason = console.stderr_text()
 
-        assert result.exit_code == 1, "a refused attach must not read as success"
-        assert "403" in result.reason, (
+        assert exit_code == 1, f"a refused attach must not read as success: {reason}"
+        assert "403" in reason, (
             "the CLI must name the status it actually got, not a close code "
-            "the handshake never carried"
+            f"the handshake never carried: {reason}"
         )
-        assert f"lazyaf debug status {session_id}" in result.reason, (
+        assert f"lazyaf debug status {session_id}" in reason, (
             "R1: when the reason is undeliverable, the CLI must say where it "
-            "CAN be read rather than guessing"
+            f"CAN be read rather than guessing: {reason}"
         )
         # No sidecar was created for a refused upgrade.
         assert stack.docker.containers.list(

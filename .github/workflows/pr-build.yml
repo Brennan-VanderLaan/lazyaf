@@ -12,14 +12,19 @@
 #
 #   What this workflow answers is a narrower question that the dogfood
 #   pipeline does not: "can the RELEASE ARTIFACTS still be produced?" A
-#   Dockerfile that no longer builds, a wheel whose entry point is broken, a
+#   Dockerfile that no longer builds, a CLI that no longer cross-compiles, a
 #   base image whose content-hash chain has drifted - none of those show up
 #   in a green test suite, and all of them turn a version tag into a failed
 #   release at the worst possible moment. Catching them at review time is
 #   the entire purpose here.
 #
 # WHAT IT BUILDS
-#   * the lazyaf CLI wheel, installed into a clean venv and smoke-run
+#   * the lazyaf CLI binary for all six release targets via
+#     scripts/build_cli.sh (CGO off, so cross-compilation is proven), the
+#     host one smoke-run, and cli/install.sh syntax- and shellcheck-ed
+#   * TRANSITIONAL, until the P4 cutover of upcoming/go-cli.md: the Python
+#     CLI wheel, installed into a clean venv and smoke-run (`cli-wheel`,
+#     deleted in P4 with cli/lazyaf/)
 #   * every step image in scripts/build_images.py's IMAGES table, built
 #     by that script so the content-hash chain is exercised
 #   * the backend, frontend and runner-agent service images
@@ -74,8 +79,88 @@ jobs:
     uses: ./.github/workflows/secret-scan.yml
 
   # ---------------------------------------------------------------------------
-  # The wheel a user pip-installs. Built the same way release.yml builds it,
-  # so a packaging break surfaces here rather than mid-release.
+  # The binary a user installs. Built the same way release.yml builds it -
+  # scripts/build_cli.sh, all six targets - so a cross-compilation break, a
+  # go.sum drift or a broken install.sh surfaces here rather than mid-release.
+  #
+  # `go vet` is a compile-class check, not a test. There is deliberately no
+  # `go test` here: the TG tier of the dogfood pipeline runs the Go suite
+  # (upcoming/go-cli.md §10), GitHub does not.
+  # ---------------------------------------------------------------------------
+  cli-binary:
+    name: cli binary (six targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A dev build reads its commit from the VCS stamp (§4.2).
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        # Same SHA pin as release.yml; the toolchain is go.mod's `toolchain`
+        # line, which the test-runner image also bakes (GOTOOLCHAIN=local).
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify the module graph
+        # go.sum must cover exactly what the tree needs; a dependency added
+        # without `go mod tidy` would fail a user's `go install` fallback.
+        run: |
+          set -euo pipefail
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build the six binaries
+        # CGO_ENABLED=0 inside the script: proves every target cross-compiles
+        # with no C toolchain, which is what makes the binaries static.
+        run: bash scripts/build_cli.sh
+
+      - name: Smoke the host binary
+        # A PR build has no tag, so build_cli.sh stamps `dev` and the binary
+        # must say `dev+<sha>` - "dev must say dev" (§4.3) is proven on every
+        # PR, not just at release time.
+        run: |
+          set -euo pipefail
+          bin=cli/dist/lazyaf_dev_linux_amd64
+          got="$("$bin" --version --short)"
+          case "$got" in
+            dev+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+            *) echo "::error::dev build reports '$got', expected dev+<7 hex>"; exit 1 ;;
+          esac
+          "$bin" --version
+          "$bin" --help >/dev/null
+
+      - name: Check install.sh
+        # shellcheck ships on ubuntu-latest; no third-party action. The same
+        # script is attached to every release, so a shell bug here is a
+        # broken installer for every platform at once.
+        run: |
+          set -euo pipefail
+          bash -n cli/install.sh
+          shellcheck --version
+          shellcheck cli/install.sh
+
+      - name: Upload the binaries for inspection
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lazyaf-cli-binaries
+          path: cli/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # TRANSITIONAL - DELETED IN P4 together with cli/lazyaf/.
+  # The wheel a user pip-installs today. Built the same way release.yml
+  # builds it, so a packaging break surfaces here rather than mid-release.
   # ---------------------------------------------------------------------------
   cli-wheel:
     name: cli wheel

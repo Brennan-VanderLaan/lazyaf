@@ -1,5 +1,5 @@
 # =============================================================================
-# LazyAF - cut a release (CLI wheel + onboarding assets)
+# LazyAF - cut a release (CLI binaries + onboarding assets)
 # =============================================================================
 #
 # THIS WORKFLOW PACKAGES; IT DOES NOT GATE.
@@ -13,33 +13,59 @@
 #
 #   So: do not add a test job here, and do not make a release conditional on
 #   one. The only things allowed to stop a release are "the artifact could
-#   not be built", "the artifact's version does not match the tag", and "the
-#   tree contains a credential".
+#   not be built", "the artifact's version does not match the tag", "the
+#   installer cannot install it on a real runner", and "the tree contains a
+#   credential".
 #
-# WHAT A RELEASE CONTAINS
-#   * lazyaf_cli-<version>-py3-none-any.whl  - `pip install` this
-#   * lazyaf_cli-<version>.tar.gz            - the sdist
-#   * docker-compose.release.yml + .env.example + preflight.py - what a
-#     stranger needs to run the whole stack without cloning anything. The
-#     compose header tells them to run preflight, so it has to ship WITH it.
+# WHAT A RELEASE CONTAINS (upcoming/go-cli.md §6, §9.1)
+#   * lazyaf_<ver>_{linux,darwin,windows}_{amd64,arm64}[.exe] - six bare
+#     static binaries, no archive, no tar/unzip dependency
+#   * checksums.txt                          - sha256sum format, version-free
+#   * install.sh                             - `curl -fsSL .../releases/latest/download/install.sh | bash`
+#   * docker-compose.release.yml + .env.example - what a stranger needs to
+#     run the whole stack without cloning anything (`lazyaf init` makes the
+#     .env, `lazyaf doctor` checks the host - both are in the binary)
+#
+#   TRANSITIONAL (P3 of the Go CLI plan, until the P4 cutover commit): the
+#   `wheel` and `pypi` jobs below still build and attach the Python CLI
+#   wheel exactly as before. They are deleted in P4 together with cli/lazyaf/;
+#   until then a dispatch on a branch runs BOTH paths so the new one can be
+#   compared to the old. No v* tag is cut in this state - see WORKFLOWS.md,
+#   "do not merge the release PR before P4".
 #
 #   The container images are NOT built here. images.yml publishes those to
 #   GHCR and is triggered by the SAME tag push, so the two run in parallel
 #   and a `v*` tag produces the complete set. They are separate workflows
 #   because they fail for completely different reasons and a broken frontend
-#   build should not withhold the wheel.
+#   build should not withhold the CLI.
 #
 # HOW TO RELEASE
 #   1. Let the dogfood pipeline go green on the revision you want to ship.
-#   2. Bump `__version__` in cli/lazyaf/__init__.py.
-#   3. Tag it: `git tag v0.2.0 && git push origin v0.2.0`.
-#   4. This workflow and images.yml both fire on the tag.
+#   2. Merge the release PR that release-please.yml keeps open (the version
+#      is the tag; nothing in the tree is bumped by hand - §4).
+#   3. release-please tags vX.Y.Z and dispatches this workflow and images.yml
+#      at the tag. A hand-pushed tag fires both the same way.
+#
+# HOW THE BINARY'S VERSION IS PROVEN
+#   scripts/build_cli.sh stamps the tag into the binary with -ldflags -X and
+#   keeps -buildvcs ON, so Go also records `mod <module> v<tag>` from the
+#   checkout. .github/scripts/check_binary_version.py reads `go version -m`
+#   on ALL SIX binaries (no execution needed) and refuses any that does not
+#   carry the tag - under -trimpath Go omits the -ldflags line, so the VCS
+#   stamp is the proof it reads, and a `+dirty` or pseudo-version stamp is
+#   refused (the checkout at the tag must be clean; cli/dist/ is gitignored
+#   so the build itself does not dirty it). The smoke job then RUNS the
+#   installed binary on ubuntu, macOS and Windows and compares `--version
+#   --short` to the tag. Both are hard stops before `gh release`.
 #
 # SECURITY POSTURE
-#   * Top-level `permissions: contents: read`. Exactly one job widens it, to
-#     `contents: write`, and only so `gh release` can attach files.
+#   * Top-level `permissions: contents: read`. Exactly two jobs widen it, to
+#     `contents: write`, and only so `gh release` can attach files (`publish`
+#     for the binaries; the transitional `wheel` job until P4).
 #   * No third-party secret exists in this repository and none is referenced.
 #     The GH release step uses the automatic per-run GITHUB_TOKEN.
+#   * `publish` runs only at a tag ref. A dispatch on a branch builds and
+#     smokes everything and publishes nothing.
 #   * PyPI publishing is OPT-IN, manual, and tokenless - see the `pypi` job.
 #   * Never triggered by `pull_request`/`pull_request_target`, so fork code
 #     can never reach a job that holds a write token.
@@ -57,6 +83,7 @@ on:
         description: >-
           Also publish to PyPI. OFF by default and deliberately unavailable
           from a tag push - see the `pypi` job before switching it on.
+          (Transitional: the input and the job go with the wheel in P4.)
         type: boolean
         default: false
 
@@ -75,8 +102,321 @@ jobs:
     uses: ./.github/workflows/secret-scan.yml
 
   # ---------------------------------------------------------------------------
+  # Build all six binaries in ONE job, so one checksums.txt is written by the
+  # shell that built the files - no artefact stitching across a matrix.
+  # ---------------------------------------------------------------------------
+  build:
+    name: cli binaries (six targets)
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # build_cli.sh stamps the commit; a dev build reads the VCS stamp.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        # The toolchain comes from go.mod's `toolchain` line, the same one
+        # the test-runner image bakes with GOTOOLCHAIN=local (§2.2), so CI
+        # and the dogfood tier compile with byte-identical Go.
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify the module graph
+        # `go mod verify` checks every cached module against go.sum; the tidy
+        # diff proves go.mod/go.sum are exactly what the tree needs - a
+        # dependency added without a tidy would build here and fail a user's
+        # `go install` fallback.
+        run: |
+          set -euo pipefail
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: go vet
+        # Compile-class checks, not a test (WORKFLOWS.md rule 1 still holds:
+        # the dogfood tier runs `go test`, GitHub does not).
+        run: go vet ./...
+
+      - name: Build the six binaries
+        # THE one build definition (§2.5): ldflags, targets and checksum
+        # format live in scripts/build_cli.sh, which pr-build.yml, the TG
+        # tier preflight and developers call too. On a tag ref the version
+        # is ${GITHUB_REF_NAME#v}; on a branch dispatch it is `dev+<sha>`.
+        run: bash scripts/build_cli.sh
+
+      - name: Check every binary carries the tag
+        # Tag refs only (a dispatch on a branch has no tag to match). Hard
+        # stop: the binary is what a user runs, and a mismatch cannot be
+        # corrected after upload, only superseded.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python3 .github/scripts/check_binary_version.py --tag "${TAG}" --dist cli/dist
+        env:
+          TAG: ${{ github.ref_name }}
+
+      - name: Run the host binary and compare it to the tag
+        # The checker above proves the recorded bytes; this proves the bytes
+        # RUN and say the tag. The smoke job repeats it on three OSes after
+        # install.sh has put the binary in place.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          bin="cli/dist/lazyaf_${TAG#v}_linux_amd64"
+          got="$("$bin" --version --short)"
+          if [ "$got" != "${TAG#v}" ]; then
+            echo "::error::$bin reports version '$got', tag is $TAG"
+            exit 1
+          fi
+          "$bin" --version
+        env:
+          TAG: ${{ github.ref_name }}
+
+      - name: Stage the release assets
+        # A FLAT directory: the six binaries, checksums.txt and install.sh
+        # side by side, exactly as they sit on the GitHub Release, so the
+        # smoke job installs from the artefact the way a user installs from
+        # the release (install.sh --from-dir reads this layout).
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp cli/dist/* cli/install.sh release-assets/
+          ls -l release-assets/
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lazyaf-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Install from the artefact on a real ubuntu, macOS and Windows runner with
+  # the attached install.sh, then exercise the installed binary in a
+  # directory with NO checkout context. This is the old fresh-venv wheel
+  # smoke made stronger: it proves the installer, the asset names, the
+  # checksums and the real OS binary before anything is published.
+  #
+  # No `go test` here (pr-build.yml:5-11, WORKFLOWS.md rule 1): GitHub
+  # packages, the dogfood pipeline gates.
+  # ---------------------------------------------------------------------------
+  smoke:
+    name: install smoke (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      # A red macOS must not hide the state of Windows.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Download the release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lazyaf-release-assets
+          path: assets
+
+      - name: Install with the attached install.sh
+        # `shell: bash` is Git Bash on windows-latest - the same shell the
+        # owner uses. RUNNER_TEMP is a Windows path there; cygpath makes it
+        # the /d/a/... spelling bash and the script quote the same way.
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)" in
+            MINGW*|MSYS*) tmp="$(cygpath -u "$RUNNER_TEMP")" ;;
+            *) tmp="$RUNNER_TEMP" ;;
+          esac
+          echo "LAZYAF_SMOKE_TMP=$tmp" >> "$GITHUB_ENV"
+          bash assets/install.sh --from-dir assets --install-dir "$tmp/bin" --no-completions
+
+      - name: Exercise the installed binary outside any checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$LAZYAF_SMOKE_TMP"
+          bin="$tmp/bin/lazyaf"
+          if [ -x "$bin.exe" ]; then bin="$bin.exe"; fi
+          mkdir -p "$tmp/nowhere" && cd "$tmp/nowhere"
+
+          got="$("$bin" --version --short)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            want="${TAG#v}"
+            if [ "$got" != "$want" ]; then
+              echo "::error::installed binary reports '$got', tag is $TAG"; exit 1
+            fi
+          else
+            # A branch dispatch builds dev binaries; "dev must say dev" (§4).
+            case "$got" in dev+*) ;; *) echo "::error::dev build reports '$got'"; exit 1 ;; esac
+          fi
+          "$bin" --version
+          "$bin" --help >/dev/null
+
+          # cobra's bash script must at least parse everywhere; on macOS it
+          # is additionally sourced under Apple's /bin/bash 3.2 (§7, the
+          # UNVERIFIED case - a red here means documenting bash-completion@2
+          # for macOS, never weakening the check).
+          "$bin" completion bash > "$tmp/lazyaf.bash"
+          bash -n "$tmp/lazyaf.bash"
+          if [ "$(uname -s)" = "Darwin" ]; then
+            /bin/bash -c 'source "$1" && complete -p lazyaf' _ "$tmp/lazyaf.bash"
+          fi
+
+          # `init --check` against a file that does not exist must say
+          # MISSING and exit 1 without creating anything (§8.1).
+          set +e
+          out="$("$bin" init --check --env-file "$tmp/nope" 2>&1)"; rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" -ne 1 ] || ! echo "$out" | grep -q MISSING; then
+            echo "::error::init --check on a missing file: exit $rc, expected 1 printing MISSING"; exit 1
+          fi
+          if [ -e "$tmp/nope" ]; then echo "::error::init --check created $tmp/nope"; exit 1; fi
+          "$bin" doctor --help >/dev/null
+        env:
+          TAG: ${{ github.ref_name }}
+
+  # ---------------------------------------------------------------------------
+  # Attach the smoked assets to the GitHub Release. Runs ONLY at a tag ref -
+  # a branch dispatch stops after the smoke.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: binaries -> GitHub Release
+    # TRANSITIONAL: `wheel` is in the needs list so that, on a tag, the two
+    # `gh release` writers run one after the other instead of racing to
+    # create the same release (the second one uploads with --clobber). P4
+    # deletes `wheel` and this becomes `needs: smoke`.
+    needs: [smoke, wheel]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # The elevated permission, and the only step that uses it is
+      # `gh release`.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `gh release create --verify-tag` needs to see the tag object; the
+          # compose file and .env.example come from the tree.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the smoked assets
+        # Publishing the EXACT files the smoke job installed, never a rebuild.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lazyaf-release-assets
+          path: release-assets
+
+      - name: Collect the onboarding assets
+        # Attached so somebody can run the stack from two downloaded files
+        # plus the binary, without cloning the repo. Missing files WARN
+        # rather than fail: they belong to the compose lane, and a rename
+        # there should not block a CLI release.
+        run: |
+          set -euo pipefail
+          for asset in docker-compose.release.yml .env.example; do
+            if [ -f "$asset" ]; then
+              cp "$asset" release-assets/
+            else
+              echo "::warning::$asset is missing; releasing without it"
+            fi
+          done
+          ls -l release-assets/
+
+      - name: Write the release notes
+        # From a file rather than `--generate-notes` so the body is
+        # deterministic and the onboarding instructions come FIRST - the
+        # commit log is interesting to us and useless to a newcomer.
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          # Registries reject uppercase path segments and github.repository_owner
+          # is mixed case, so the GHCR path printed below has to be lowered or
+          # the copy-pasted `docker pull` fails.
+          OWNER_LC="$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "## Install the CLI"
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://github.com/${REPO}/releases/download/${TAG}/install.sh | LAZYAF_VERSION=${TAG} bash"
+            echo '```'
+            echo
+            echo "Installs one static binary into \`~/.local/bin\` after verifying its sha256 against \`checksums.txt\`, and prints the one line to add if that directory is not on your PATH. Re-running upgrades (or repairs) in place."
+            echo
+            echo "**Windows:** run the same line in Git Bash (it installs \`lazyaf.exe\` into \`%USERPROFILE%\\.local\\bin\`), or download \`lazyaf_${VERSION}_windows_amd64.exe\` and \`checksums.txt\` below, verify with \`Get-FileHash -Algorithm SHA256\`, and put the folder on your user PATH. \`windows/arm64\` is built and version-checked but never executed in CI (no runner): built, untested."
+            echo
+            echo "## Run the stack"
+            echo
+            echo 'Download `docker-compose.release.yml` and `.env.example` from the assets below into an empty folder, then:'
+            echo
+            echo '```bash'
+            echo 'lazyaf init                       # makes .env and generates the two required auth secrets'
+            echo "echo LAZYAF_VERSION=${TAG} >> .env"
+            echo '# then edit .env to add your ANTHROPIC_API_KEY / GEMINI_API_KEY'
+            echo 'lazyaf doctor                     # docker, disk, ports, the .env, the images'
+            echo 'docker compose -f docker-compose.release.yml pull'
+            echo 'docker compose -f docker-compose.release.yml up -d'
+            echo '```'
+            echo
+            echo "Images for this release are published to \`ghcr.io/${OWNER_LC}/lazyaf/*\` under the tag \`${TAG}\` by the \`images\` workflow, which the same tag push triggers."
+            echo
+            echo "## Provenance"
+            echo
+            echo "CLI version \`${VERSION}\`, built from commit \`${SHA}\`. Every binary was checked against the tag with \`go version -m\`, and the installed binary was run on ubuntu, macOS and Windows before this release was created."
+            echo "LazyAF's own dogfood pipeline is what tested this revision; GitHub Actions only packaged it."
+          } > release-notes.md
+          cat release-notes.md
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          SHA: ${{ github.sha }}
+
+      - name: Publish the GitHub Release
+        # `gh` rather than a third-party release action: one fewer pinned
+        # dependency in a job that holds a write token.
+        #
+        # Re-runnable on purpose. If the release already exists (a rerun
+        # after a transient failure, or release-please created it with the
+        # changelog notes), upload with --clobber instead of failing.
+        run: |
+          set -euo pipefail
+          PRERELEASE=""
+          case "${TAG}" in *-*) PRERELEASE="--prerelease" ;; esac
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists; replacing its assets"
+            gh release upload "${TAG}" release-assets/* --clobber
+          else
+            # shellcheck disable=SC2086
+            gh release create "${TAG}" release-assets/* \
+              --title "${TAG}" \
+              --notes-file release-notes.md \
+              --verify-tag \
+              ${PRERELEASE}
+          fi
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+  # ---------------------------------------------------------------------------
+  # TRANSITIONAL - DELETED IN P4 together with cli/lazyaf/.
   # Build the wheel, prove it is installable, prove its version matches the
-  # tag, then attach it to the GitHub Release.
+  # tag, then attach it to the GitHub Release. Left exactly as it shipped
+  # 0.2.0 so the old path stays comparable to the new one until the cutover.
   # ---------------------------------------------------------------------------
   wheel:
     name: cli wheel -> GitHub Release
@@ -237,6 +577,7 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------------
+  # TRANSITIONAL - DELETED IN P4 with the wheel job.
   # OPTIONAL: publish to PyPI. OFF unless a human asks for it.
   #
   # WHY OPT-IN RATHER THAN AUTOMATIC

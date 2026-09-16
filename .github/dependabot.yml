@@ -21,6 +21,18 @@
 # the `# vX.Y.Z` comment beside it, which is exactly the maintenance burden
 # that pinning creates and nothing more. Review the diff of the action itself
 # before merging - a SHA bump is a supply-chain change, not a chore.
+#
+# ONE EXCEPTION, and why it does not contradict the paragraph above: the Go
+# modules in the root go.mod (the `lazyaf` binary's dependencies -
+# upcoming/go-cli.md §9.3). They ARE the product's supply chain, exactly like
+# pip's. The difference is mechanical, not philosophical: every Go module is
+# hash-pinned in go.sum, `go mod verify` runs against those hashes in
+# pr-build.yml and release.yml BEFORE a bump can merge, and a merged bump is
+# tested AFTER merge by the dogfood pipeline's TG tier on the push to main -
+# which is precisely how a merged actions bump is treated today. pip has no
+# go.sum and no `go mod verify`, so pip stays out. A gomod PR is a `build`
+# commit (a patch bump under CONTRIBUTING.md's table); gotestsum rides the
+# same PR because go.mod's `tool` directive pins it there.
 
 version: 2
 
@@ -40,4 +52,20 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "ci"
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: "gomod"
+    # The root go.mod - the ONLY Go module in the tree (§2.1).
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # One PR for all of them, for the same reason as the actions group.
+    groups:
+      gomod:
+        patterns: ["*"]
+    labels:
+      - "dependencies"
+      - "cli"
+    commit-message:
+      prefix: "build(cli)"
     open-pull-requests-limit: 3

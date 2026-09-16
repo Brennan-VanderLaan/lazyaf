@@ -9,15 +9,28 @@ not changed. Nothing in `.github/` votes on whether a change is good.
 
 What lives here is **release engineering**: taking a revision the dogfood
 pipeline already blessed and turning it into artifacts a stranger can install
-and run — a wheel, a set of container images, and a compose file that pulls
-them. Two rules follow from that, and both are repeated at the top of every
-workflow file so nobody has to find this document to learn them:
+and run — a static `lazyaf` binary per platform with an installer, a set of
+container images, and a compose file that pulls them. Two rules follow from
+that, and both are repeated at the top of every workflow file so nobody has to
+find this document to learn them:
 
 1. **Do not add the test suite to any of these workflows.** The moment `pytest`
-   runs here, GitHub becomes the quality gate and the standing decision has
-   been reversed by accident.
+   or `go test` runs here, GitHub becomes the quality gate and the standing
+   decision has been reversed by accident. (`go vet` is a compile-class check
+   and is allowed; the Go suite runs in the dogfood pipeline's TG tier.)
 2. **The only things allowed to block a publish** are "the artifact could not
-   be produced" and "the artifact contains a credential".
+   be produced", "the artifact's version is not the tag", "the installer
+   cannot install it on a real runner", and "the artifact contains a
+   credential".
+
+> **Transitional state (P3 of `upcoming/go-cli.md`).** The Go binary and the
+> Python wheel coexist in the tree until the P4 cutover commit. `release.yml`
+> therefore has both paths (`build`/`smoke`/`publish` for the binaries, the
+> old `wheel`/`pypi` jobs for the wheel) and `pr-build.yml` has both
+> `cli-binary` and `cli-wheel`. Everything marked *transitional* below is
+> deleted in P4 together with `cli/lazyaf/`. **No `v*` tag is cut in this
+> state, and the standing release PR is not merged** — see
+> [Do not merge the release PR before P4](#do-not-merge-the-release-pr-before-p4).
 
 ---
 
@@ -27,10 +40,10 @@ workflow file so nobody has to find this document to learn them:
 |---|---|---|
 | `workflows/pr-build.yml` | PR to `main`, manual | Builds every release artifact and scans the images. Pushes nothing. Not run on `main` itself &mdash; `images.yml` already builds everything there. |
 | `workflows/images.yml` | push to `main`, tag `v*`, manual | Builds and **pushes** every image to GHCR. |
-| `workflows/release.yml` | tag `v*`, manual | Builds the CLI wheel, attaches it (plus the onboarding files) to a GitHub Release. Optional, opt-in PyPI publish. |
+| `workflows/release.yml` | tag `v*`, manual | Builds the six CLI binaries in one job, proves every one carries the tag (`check_binary_version.py`), installs them with the attached `install.sh` on ubuntu, macOS and Windows and runs them, then attaches binaries + `checksums.txt` + `install.sh` + the onboarding files to a GitHub Release. `publish` runs only at a tag ref. *Transitional:* also the CLI wheel (`wheel`) and the opt-in PyPI publish (`pypi`). |
 | `workflows/secret-scan.yml` | called by the three above; also manual | The leak gate. Reusable, so there is one definition and no drift. |
 | `workflows/release-please.yml` | push to `main`, manual | Works out the next version from the commit log, keeps a standing release PR, and on merge cuts the `v*` tag &mdash; then dispatches `release.yml` + `images.yml` at it. Publishes nothing itself. |
-| `dependabot.yml` | monthly | Keeps the pinned action SHAs current. `github-actions` only. |
+| `dependabot.yml` | monthly | Keeps the pinned action SHAs current (`github-actions`) and the Go module graph current (`gomod`, the root `go.mod`). Nothing else. |
 
 | Config | Purpose |
 |---|---|
@@ -44,7 +57,8 @@ workflow file so nobody has to find this document to learn them:
 | `scripts/scan_image_secrets.py` | Fails if a built image bakes a credential or contains a `.env`. |
 | `scripts/step_images.py` | Reads the step-image list out of `scripts/build_images.py`'s `IMAGES` table. |
 | `scripts/publish_image.py` | Owns the GHCR tag policy; tags and pushes one image. |
-| `scripts/check_release_version.py` | Fails a release whose wheel version disagrees with the git tag. |
+| `scripts/check_binary_version.py` | Fails a release if any of the six binaries does not carry the tag's version, read from `go version -m` without executing them (see [How the binary's version is proven](#how-the-binarys-version-is-proven)). |
+| `scripts/check_release_version.py` | *Transitional, deleted in P4.* Fails a release whose wheel version disagrees with the git tag. |
 
 ---
 
@@ -53,7 +67,7 @@ workflow file so nobody has to find this document to learn them:
 This is the hard requirement, so it is stated concretely rather than as a
 principle.
 
-**No secret is needed to build anything.** Not the wheel, not any image. The
+**No secret is needed to build anything.** Not the binaries, not any image. The
 AI provider keys are a *run-time* input supplied by the operator's `.env`; they
 are never a build-time input, never a `--build-arg`, never a BuildKit secret
 mount. That is what makes "the images never bake an AI key" a structural fact
@@ -65,13 +79,17 @@ and it is used in exactly two places: `docker login ghcr.io` (job-scoped
 access token. No organisation secret. Nothing long-lived anywhere.
 
 **Least privilege.** Every workflow declares `permissions: contents: read` at
-the top level. Three jobs widen it, each by one entry:
+the top level. These jobs widen it, each by one entry:
 
 | Job | Extra permission | Why |
 |---|---|---|
 | `images.yml` → `step-images`, `service-images` | `packages: write` | push to GHCR |
-| `release.yml` → `wheel` | `contents: write` | attach assets to the Release |
-| `release.yml` → `pypi` | `id-token: write` | mint a short-lived OIDC identity for PyPI |
+| `release.yml` → `publish` | `contents: write` | attach the binaries, `checksums.txt`, `install.sh` and the onboarding files to the Release; runs only at a tag ref |
+| `release.yml` → `wheel` (*transitional*) | `contents: write` | attach the wheel to the Release; deleted in P4 |
+| `release.yml` → `pypi` (*transitional*) | `id-token: write` | mint a short-lived OIDC identity for PyPI; deleted in P4 |
+
+The `build` and `smoke` jobs of `release.yml` — the ones that run `go`, the
+installer and the built binary — hold `contents: read` only.
 
 **`pull_request_target` is never used.** The build workflow triggers on
 `pull_request`, which runs fork code with the fork's read-only token and no
@@ -91,22 +109,36 @@ A tag can be moved by whoever owns the action; a SHA cannot. The complete list
 of third-party code that runs in these workflows:
 
 ```
-actions/checkout@11d5960a326750d5838078e36cf38b85af677262          # v4.2.2
-actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065      # v5.6.0
-actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
-actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1            # v7.0.1
+actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e            # v7.0.0
+actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97        # v7.0.0
+actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a     # v7.0.1
+actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2  (transitional)
 ```
+
+`actions/setup-go` is the one addition for the Go CLI. Its SHA was verified
+against the GitHub API on 2026-09-16 (`gh api repos/actions/setup-go/git/ref/tags/v7.0.0`
+→ commit `b7ad1dad…`; the release is dated 2026-07-16, not a prerelease, and
+its `action.yml` runs on `node24` and takes `go-version-file` and `cache`). It
+reads the toolchain from `go.mod`'s `toolchain` line, so CI, the test-runner
+image (`GOTOOLCHAIN=local`) and a developer's box compile with the same Go.
 
 That is deliberately short. Registry login, image pushing and release creation
 are done with plain `docker` and `gh` rather than with third-party actions,
 because those are the steps that hold a token.
 
 A SHA pin never picks up a security fix on its own, so `dependabot.yml` watches
-them — scoped to `github-actions` only, batched into one monthly PR. It does
-**not** watch pip/npm/docker: those are LazyAF's own supply chain and belong to
-the dogfood pipeline, not to a bot on GitHub. Read the action's diff before
-merging a bump; a SHA change is a supply-chain change, not a chore.
+them — `github-actions`, batched into one monthly PR. It also watches the root
+`go.mod` (`gomod`, monthly, one grouped PR labelled `cli`, prefix `build(cli)`):
+Go modules are the binary's supply chain the way pip's are the backend's, but
+they are hash-pinned in `go.sum`, `go mod verify` runs against those hashes
+before a bump can merge, and the merged bump is tested after merge by the
+dogfood pipeline's TG tier — the same treatment a merged actions bump gets. It
+does **not** watch pip/npm/docker: those have no `go.sum` equivalent and belong
+to the dogfood pipeline, not to a bot on GitHub. Read the diff before merging
+any bump; a SHA or module change is a supply-chain change, not a chore.
 
 ---
 
@@ -249,22 +281,67 @@ docker tag  ghcr.io/brennan-vanderlaan/lazyaf/base:latest lazyaf-base:dev
 > path reuses rather than replaces.
 
 1. Let the dogfood pipeline go green on the revision you want to ship.
-2. Bump `__version__` in `cli/lazyaf/__init__.py` (the single source of the CLI
-   version; `cli/pyproject.toml` reads it via `[tool.setuptools.dynamic]`).
-3. `git tag v0.2.0 && git push origin v0.2.0`.
+2. Nothing to bump. The tag **is** the version: `scripts/build_cli.sh` stamps
+   `${GITHUB_REF_NAME#v}` into the binary with `-ldflags -X`, and no file in
+   the tree carries a CLI version (`upcoming/go-cli.md` §4). *Transitional:*
+   until P4 the wheel still reads `__version__` from `cli/lazyaf/__init__.py`,
+   which release-please's `extra-files` entry bumps in the release PR.
+3. `git tag v0.3.0 && git push origin v0.3.0`.
 
 The tag fires `release.yml` and `images.yml` in parallel. They are separate
 workflows because they fail for entirely different reasons, and a broken
-frontend build should not withhold the wheel.
+frontend build should not withhold the CLI.
 
-`check_release_version.py` compares the built wheel's version against the tag
-and stops the release on a mismatch. The comparison reduces both sides to
-lowercase alphanumerics, so the PEP 440 spelling `1.0.0rc1` matches the tag
-`v1.0.0-rc1` while `0.1.0` against `v0.2.0` fails. A published version can
-never be reused, which is why this is checked before the upload rather than
-noticed after it.
+### How the binary's version is proven
 
-### PyPI (optional, opt-in, tokenless)
+Two checks, both hard stops before `gh release`, in `release.yml`:
+
+1. **`check_binary_version.py --tag vX.Y.Z --dist cli/dist`** runs
+   `go version -m` on **all six** binaries — Go prints a binary's recorded
+   build settings for any GOOS/GOARCH without executing it — and refuses any
+   whose recorded version is not exactly `X.Y.Z` (exit 1 naming it), any whose
+   file name or recorded GOOS/GOARCH disagrees with the tag, and a matrix with
+   a target missing. Exit 2 if `dist/` holds no binaries at all. Exact string
+   compare; the PEP 440 normalisation the wheel checker needed was a wheel
+   problem.
+
+   What "recorded version" means, verified on go1.26.8 rather than assumed:
+   Go records the `-ldflags` line in the binary's build info **only when the
+   build did not pass `-trimpath`** (with `-trimpath`, `cmd/go` omits it —
+   Go issue 52372 — and `build_cli.sh` passes `-trimpath` by design). The
+   checker therefore accepts either of two proofs: the `build -ldflags=`
+   line naming `internal/version.Version=X.Y.Z`, or the `mod … vX.Y.Z` line
+   that Go 1.24+ stamps from the VCS checkout when HEAD is exactly at the
+   tag. That is why `build_cli.sh` keeps `-buildvcs` **on** for tag builds
+   (a stated deviation from the plan's `-buildvcs=false`, recorded in the
+   script's header): with `-trimpath` the VCS stamp is the only
+   executable-free proof left, and the P3 verifiers found that the original
+   flags produced binaries with *neither* — every real tag build was
+   refused. A stamp that names another version is refused as a mismatch;
+   a pseudo-version (HEAD not at a v0/v1 tag) or a `+dirty` suffix is
+   refused too. Two consequences a release engineer must know: `cli/dist/`
+   and `cli/bin/` must stay in `.gitignore` (untracked files count as
+   dirty, so the first binary written would otherwise stamp `+dirty` on
+   the other five), and the module version is derived from the tag only for
+   v0/v1 tags on this `/v`-less module path. A binary offering neither
+   proof — built with `-trimpath` *and* `-buildvcs=false` — is refused with
+   a message naming both lines and the build-flag remedy. It is never waved
+   through. `tdd/unit/scripts/test_check_binary_version.py::
+   TestAgainstARealTagBuild` (T1) re-proves all of this on every run by
+   building a tagged scratch clone through the real `build_cli.sh` and
+   running the real checker over the six binaries.
+2. **The bytes run.** The `build` job executes the linux/amd64 binary's
+   `--version --short` and compares it to the tag; the `smoke` job installs
+   from the artefact with the attached `install.sh` on ubuntu, macOS and
+   Windows and does the same on each, plus `--help`, `completion bash`
+   (sourced under Apple's `/bin/bash` 3.2 on macOS), `init --check` against a
+   missing file (must print `MISSING` and exit 1) and `doctor --help`, all in
+   a directory with no checkout.
+
+A branch dispatch runs `build` and `smoke` with `dev+<sha>` binaries and skips
+`publish`; that is how the release path is rehearsed without cutting a tag.
+
+### PyPI (optional, opt-in, tokenless) — *transitional, deleted in P4*
 
 `release.yml` has a `pypi` job that is **off by default and unreachable from a
 tag push**. It runs only via *Run workflow* with `publish_to_pypi` checked.
@@ -342,7 +419,32 @@ GITHUB_REF_TYPE=tag GITHUB_REF_NAME=v1.4.0 GITHUB_SHA=$(git rev-parse HEAD) \
   python .github/scripts/publish_image.py --local lazyaf-base:dev \
     --repo ghcr.io/brennan-vanderlaan/lazyaf/base --dry-run
 
-# the release version check
+# the binary version check, against a real TAG dist. A dev dist cannot pass
+# (its files are lazyaf_dev_*), and this working tree is neither clean nor at
+# the tag, so rehearse it the way the release runner sees it: a scratch clone
+# of the Go tree, one commit, tagged. (T1 does exactly this on every run:
+# tdd/unit/scripts/test_check_binary_version.py::TestAgainstARealTagBuild.)
+rm -rf /tmp/tagged && mkdir -p /tmp/tagged/scripts /tmp/tagged/cli
+cp go.mod go.sum .gitignore /tmp/tagged/ && cp -r cli/cmd cli/internal /tmp/tagged/cli/ \
+  && cp scripts/build_cli.sh /tmp/tagged/scripts/      # .gitignore matters: cli/dist/ must be ignored
+git -C /tmp/tagged init -q && git -C /tmp/tagged add -A && git -C /tmp/tagged commit -qm tree && git -C /tmp/tagged tag v0.9.9
+( cd /tmp/tagged && GITHUB_REF_TYPE=tag GITHUB_REF_NAME=v0.9.9 GITHUB_SHA=$(git rev-parse HEAD) bash scripts/build_cli.sh )
+python .github/scripts/check_binary_version.py --tag v0.9.9 --dist /tmp/tagged/cli/dist   # exit 0, six "VCS stamp" OK lines
+
+# ... and PROVE it bites, for the RIGHT reason: build the same commit under
+# another tag name; the six files say 0.9.8, the VCS stamp says v0.9.9, and
+# the refusal is a version MISMATCH (not "no proof of version")
+( cd /tmp/tagged && GITHUB_REF_TYPE=tag GITHUB_REF_NAME=v0.9.8 GITHUB_SHA=$(git rev-parse HEAD) bash scripts/build_cli.sh )
+python .github/scripts/check_binary_version.py --tag v0.9.8 --dist /tmp/tagged/cli/dist   # exit 1: "VCS stamp records module version v0.9.9, but this release is tagged v0.9.8"
+
+# the installer, end to end, from a local dist (no network)
+bash -n cli/install.sh && shellcheck cli/install.sh
+bash cli/install.sh --from-dir cli/dist --install-dir /tmp/lazyaf-bin --no-completions
+/tmp/lazyaf-bin/lazyaf --version --short     # dev+<sha> from a dev dist
+LAZYAF_FORCE_PLATFORM=plan9/mips bash cli/install.sh --from-dir cli/dist   # refuses, names the six
+go test ./cli/internal/installsh/ -count=1 -v # the same, as the TG tier runs it
+
+# the transitional wheel check (deleted in P4)
 python -m build --outdir /tmp/dist cli/
 python .github/scripts/check_release_version.py --tag v0.1.0 --dist /tmp/dist
 ```
@@ -433,10 +535,11 @@ about correctness either.
   release-please.yml  (job: release-please)
     reads commits since bootstrap-sha / the last tag
     opens or refreshes ONE release PR:
-      "chore(main): release 0.2.0"
+      "chore(main): release 0.3.0"
       - CHANGELOG.md entry
-      - cli/lazyaf/__init__.py  __version__ = "0.2.0"
-      - .github/.release-please-manifest.json  -> 0.2.0
+      - .github/.release-please-manifest.json  -> 0.3.0
+      - cli/lazyaf/__init__.py  __version__ = "0.3.0"   <-- transitional: gone in P4
+                                                            with the extra-files entry
             |
             |   ... the PR sits there, always current,
             |   ... rewritten on every further push to main
@@ -445,20 +548,22 @@ about correctness either.
             |
             v
   release-please.yml runs again on the merge commit
-    creates tag  v0.2.0
+    creates tag  v0.3.0
     creates the GitHub Release with the changelog notes
             |
             v
   release-please.yml  (job: package)
-    gh workflow run release.yml --ref v0.2.0
-    gh workflow run images.yml  --ref v0.2.0
+    gh workflow run release.yml --ref v0.3.0
+    gh workflow run images.yml  --ref v0.3.0
             |
-            +--> release.yml : wheel + sdist + docker-compose.release.yml
-            |                  + .env.example + preflight.py, uploaded onto
-            |                  the Release release-please just made
+            +--> release.yml : six lazyaf_0.3.0_<os>_<arch> binaries +
+            |                  checksums.txt + install.sh +
+            |                  docker-compose.release.yml + .env.example,
+            |                  uploaded onto the Release release-please just
+            |                  made (transitional: the wheel + sdist too)
             |
             +--> images.yml  : every service and step image to GHCR, tagged
-                               v0.2.0 / 0.2.0 / latest / sha-<short>
+                               v0.3.0 / 0.3.0 / latest / sha-<short>
 ```
 
 ### Why the `package` job exists (the one real gotcha)
@@ -476,8 +581,9 @@ both — they are just unreachable from automation. `workflow_dispatch` and
 dispatches both workflows with `--ref` set to the new tag. Both already read
 `github.ref` / `GITHUB_REF_NAME`, so a dispatch *at a tag ref* is
 indistinguishable from a tag push: `release.yml` still runs
-`check_release_version.py`, `images.yml` still computes the `latest` tag set.
-Neither file needed a change.
+`check_binary_version.py` (and, transitionally, `check_release_version.py`),
+`images.yml` still computes the `latest` tag set. Neither file needed a change
+for the dispatch itself.
 
 The other way to solve this is a personal access token, so the tag push looks
 like it came from a person. Rejected — it would introduce the first long-lived
@@ -497,28 +603,54 @@ with `include-component-in-tag: false`, which produces plain `v0.2.0` tags. The
 alternative — a component per publishable thing — would produce `cli-v0.2.0`,
 which matches neither existing workflow's `v*` filter and would need
 `publish_image.py`'s tag policy rewritten too. And it would be modelling
-something that is not true: the CLI wheel and the container images are not
+something that is not true: the CLI binaries and the container images are not
 independently versioned here, they are two renderings of *one* revision, and
 the compose file pins them with a single `LAZYAF_VERSION`. One number, one tag.
+It is also what makes `install.sh`'s source-build fallback true: `go install
+github.com/Brennan-VanderLaan/lazyaf/cli/cmd/lazyaf@v0.3.0` resolves against a
+plain `v0.3.0` tag on the root module, which a component tag would not be.
 
 **`release-type: simple`, not `python`.** The `python` strategy tries to find
 and update `setup.py`, `setup.cfg` and `pyproject.toml` relative to the package
-root. At the repo root none of those exist, and the one that does exist
-(`cli/pyproject.toml`) declares `dynamic = ["version"]` — there is deliberately
-no version string in it to update. `simple` adds only a `version.txt` updater,
-and that updater is `createIfMissing: false`, so with no `version.txt` in the
-tree it is a no-op and nothing unwanted gets created. The actual version bump
-is then done explicitly, by an `extra-files` generic updater pointed at
-`cli/lazyaf/__init__.py`, which keys on a pair of release-please block-marker
-comments now bracketing the `__version__` assignment. Explicit beats a
-strategy's file-discovery magic when the layout is non-standard, and this
-layout is non-standard on purpose.
+root. At the repo root none of those exist. `simple` adds only a `version.txt`
+updater, and that updater is `createIfMissing: false`, so with no `version.txt`
+in the tree it is a no-op and nothing unwanted gets created. For the Go binary
+that is the whole story: **nothing in the tree carries the CLI version**, the
+binary learns it from the tag through `-ldflags -X` in `scripts/build_cli.sh`,
+and a source build past a release says `dev+<sha>` rather than claiming the
+release ("dev must say dev", `upcoming/go-cli.md` §4). A `version.go` bumped by
+release-please was considered and rejected for exactly that reason: it would be
+a second rendered copy of the version, and every commit after the release PR
+merged would report the release version while being N commits past it.
 
-The markers bracket the line rather than sitting on the end of it: release-please
-also supports an end-of-line marker, but `tdd/unit/packaging` parses that line as
-text (`line.split("=", 1)[1].strip().strip("\"'")`), so a trailing comment lands
-inside the version string it extracts and seven packaging tests go red. Bracketing
-keeps the assignment byte-for-byte plain and both contracts hold.
+*Transitional (until P4):* the wheel still needs its version inside the
+package, so `release-please-config.json` still carries an `extra-files`
+generic updater pointed at `cli/lazyaf/__init__.py`, keyed on a pair of
+block-marker comments bracketing the `__version__` assignment (bracketing
+rather than an end-of-line marker because `tdd/unit/packaging` parses that
+line as text). **The P4 cutover commit deletes the whole `extra-files` array
+in the same commit that deletes `cli/lazyaf/__init__.py`** — release-please
+v17's behaviour on a configured extra-file whose path no longer exists could
+not be verified locally, and landing both in one commit makes the worst case a
+visibly failed release-please run on the next push to `main`, never a
+mis-bumped file.
+
+### Do not merge the release PR before P4
+
+release-please refreshes the standing release PR on every push to `main`, so it
+is mergeable long before the Go cutover has landed. Merging it in the
+transitional state would tag a release whose `install.sh`,
+`releases/latest/download/…` URL and release notes all describe a binary the
+release also ships, while the README still says `pip install` — two CLIs in one
+release. There is no mechanical guard against this; the rule is the guard:
+
+* every commit from P0 to P3 of `upcoming/go-cli.md` uses a hidden type
+  (`build(cli):`, `test:`, `ci:`, `chore:`, `docs:`), so the release PR does not
+  become a `feat` release that still ships a wheel;
+* the P4 cutover commit is `feat(cli)!: replace the Python CLI with a Go
+  binary; …` and is what makes the release PR read `0.3.0`;
+* **only after P4 has landed** is the release PR re-inspected and merged (see
+  the checklist below).
 
 **`bootstrap-sha: 8b567e5ad34203ce552451cb82eeb6a9d2144b36`.** This project has
 not been using conventional commits — `git log` is full of `12.3: ...` and
@@ -580,23 +712,28 @@ one-time wrinkles. In order:
    run with no release PR is the *expected* outcome at this point, not a
    failure. `bootstrap-sha` means it can see no releasable history yet.
 4. **Check the release PR when it appears.** Titled
-   `chore(main): release 0.1.1` (or `0.2.0` after a `feat`). It must change
-   three files:
-   - `CHANGELOG.md` — created for the first time
-   - `.github/.release-please-manifest.json` — `0.1.0` to the new version
-   - `cli/lazyaf/__init__.py` — the `__version__` line
-
-   **If `cli/lazyaf/__init__.py` is not in the diff, stop and fix the
-   `extra-files` wiring before merging.** A release whose wheel still says
-   `0.1.0` under a `v0.1.1` tag is caught later by
-   `check_release_version.py`, but catching it in the PR is free.
-5. **Merge it.** release-please creates `v0.1.1` and a GitHub Release, then the
-   `package` job dispatches `release.yml` and `images.yml` at that tag.
+   `chore(main): release X.Y.Z`. What its diff must contain depends on which
+   side of the cutover you are on:
+   - **Transitional (before P4):** three files — `CHANGELOG.md`,
+     `.github/.release-please-manifest.json`, and `cli/lazyaf/__init__.py`'s
+     `__version__` line. Do not merge it in this state (see above).
+   - **From P4 on:** exactly two files — `CHANGELOG.md` and
+     `.github/.release-please-manifest.json` — **and nothing else**. A third
+     file in the diff means the `extra-files` block survived the cutover and
+     release-please is bumping a stale path; stop and fix
+     `release-please-config.json` before merging. The binary's version is the
+     tag, proven by `check_binary_version.py` and by the installed binary
+     running on three OSes, not by any file in the tree.
+5. **Merge it.** release-please creates `vX.Y.Z` and a GitHub Release, then
+   the `package` job dispatches `release.yml` and `images.yml` at that tag.
 6. **Verify the fan-out.** Two runs should appear in the Actions tab within
    seconds of the release-please run finishing, both showing the tag as their
-   ref. When they are done the Release should carry the wheel, the sdist,
-   `docker-compose.release.yml`, `.env.example` and `preflight.py`, and GHCR
-   should have `latest` for the first time.
+   ref. When they are done the Release should carry the six
+   `lazyaf_X.Y.Z_<os>_<arch>[.exe]` binaries, `checksums.txt`, `install.sh`,
+   `docker-compose.release.yml` and `.env.example` (transitional: the wheel
+   and sdist too), GHCR should have `latest`, and
+   `https://github.com/Brennan-VanderLaan/lazyaf/releases/latest/download/install.sh`
+   — the line the README prints — should start resolving.
 
 Note that `0.1.0` itself is never tagged: the manifest declares it as the
 current version, i.e. already shipped. If the first tag really must be
@@ -618,5 +755,28 @@ updater's block-marker logic was ported to Python and run against the real
 and `tdd/unit/packaging` (33 tests, including a real wheel build and a fresh
 venv install) is green with the markers in place.
 
+For the Go release path (P3), what was checked on the dev box, on Windows
+under Git Bash: both workflow files parse; the `build`/`smoke`/`publish` job
+graph resolves and `publish` is unreachable without a tag ref; the setup-go
+SHA was confirmed against the GitHub tags API; `check_binary_version.py` was
+run against real `go version -m` transcripts from go1.26.8 (its T1 test feeds
+it the same canned shapes) **and** against a real tag build: a scratch clone
+tagged `v0.9.9`, built through `scripts/build_cli.sh` in tag mode, passes on
+all six binaries via the VCS stamp; the same commit built under
+`GITHUB_REF_NAME=v0.9.8` exits 1 with the mismatch reason on all six; a
+binary built without `-trimpath` carries the `-ldflags` line; an empty dist
+exits 2. (The P3 verifiers had shown that with the plan's original
+`-buildvcs=false` every tag build was refused with "no proof of version" —
+which is why tag builds now keep `-buildvcs` on.) `install.sh` passes `bash -n`, installs from a
+local dist into a directory whose path contains a space, refuses a corrupted
+byte before installing anything, refuses `plan9/mips` naming the six targets,
+and its Go test (`cli/internal/installsh`) is green.
+
 What genuinely cannot be known until the first run: whether the repo setting in
-step 1 is on, and whether branch protection on `main` lets the release PR merge.
+step 1 is on, whether branch protection on `main` lets the release PR merge,
+whether cobra's bash completion script sources under Apple's `/bin/bash` 3.2
+(the macOS `smoke` job is the check; a red there means documenting
+`bash-completion@2`/zsh for macOS, not weakening the check), and whether
+release-please v17 tolerates the `extra-files` deletion in P4 (see above).
+`shellcheck` is not installed on the dev box, so the `cli-binary` job's
+`shellcheck cli/install.sh` step is the first place it runs.

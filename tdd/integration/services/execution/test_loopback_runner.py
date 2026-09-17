@@ -74,6 +74,7 @@ from tdd.integration.conftest import (  # noqa: E402
     free_port,
     start_uvicorn,
     stop_uvicorn,
+    sibling_network,
 )
 
 from app.config import get_settings  # noqa: E402
@@ -331,6 +332,16 @@ async def lane(tmp_path, monkeypatch, docker_client):
                 "LAZYAF_RUNNER_LOG_LEVEL": "DEBUG",
             }
         )
+        # ...and the sibling-reachable NETWORK. The address above is only half
+        # of "reachable": the runner starts its step containers on
+        # LAZYAF_STEP_NETWORK, default `bridge`, and docker does not route
+        # between the default bridge and the user-defined network this
+        # process's advertised IP lives on when the suite runs inside a
+        # container. None on the host, where host.docker.internal needs no
+        # help - so the runner keeps its own default there.
+        step_network = sibling_network(docker_client)
+        if step_network:
+            env["LAZYAF_STEP_NETWORK"] = step_network
         handle = log_path.open("w", encoding="utf-8")
         process = subprocess.Popen(
             [sys.executable, "-m", "lazyaf_runner"],

@@ -64,6 +64,47 @@ def advertise_addr() -> str:
     return "host.docker.internal"
 
 
+def sibling_network(docker_client):
+    """The docker network a SIBLING must join to reach `advertise_addr()`.
+
+    None on the host: there `advertise_addr()` is host.docker.internal, which
+    Docker Desktop resolves from any network, the default `bridge` included.
+
+    Inside a container it is the network that carries our advertised IP - and
+    it matters as much as the address does. Docker isolates bridge networks
+    from each other, so a sibling started on the default `bridge` cannot reach
+    an IP that lives on a user-defined network (lazyaf-network in the compose
+    stack). The runner agent's DEFAULT_STEP_NETWORK is exactly `bridge`
+    (runner-agent/lazyaf_runner/config.py:58), which is why the loopback lane's
+    three step-reports-home tests passed on every host run and failed in the
+    dogfood container, each one waiting out its whole budget until tier2 hit
+    its 900 s step timeout (dogfood run 5931f877, 2026-09-17).
+
+    Derived from the daemon rather than hardcoded, and it RAISES when it cannot
+    tell: quietly answering `bridge` is the bug this exists to remove (R1).
+    """
+    if not running_in_container():
+        return None
+    ours = advertise_addr()
+    try:
+        me = docker_client.containers.get(socket.gethostname())
+        networks = me.attrs["NetworkSettings"]["Networks"]
+    except Exception as exc:  # noqa: BLE001 - reported with the remedy below
+        raise RuntimeError(
+            "running inside a container but could not inspect it to find the "
+            f"network siblings must join (hostname {socket.gethostname()!r}): "
+            f"{exc}. The tier needs the docker socket (`needs: [docker]`) and a "
+            "hostname equal to the container id, which is docker's default."
+        ) from exc
+    for name, spec in networks.items():
+        if spec.get("IPAddress") == ours:
+            return name
+    raise RuntimeError(
+        f"this container advertises {ours} but none of its networks carries "
+        f"that address: { {n: v.get('IPAddress') for n, v in networks.items()} }"
+    )
+
+
 def wait_for_port(port: int, host: str = "127.0.0.1", timeout: float = 10.0) -> None:
     """Readiness poll: block until a TCP connect to host:port succeeds,
     or raise loudly after the deadline."""

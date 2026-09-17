@@ -546,35 +546,79 @@ func TestConsoleIO(t *testing.T) {
 		}
 	})
 	t.Run("the size watcher emits only on change", func(t *testing.T) {
+		// The watcher's READS are the state this test waits on. A trigger
+		// send returning only proves the watcher took the trigger, not that
+		// it has re-read the size: change the size in that gap and the
+		// "unchanged" trigger sees the new size, emits, and blocks in a send
+		// nobody receives while the test blocks on its next trigger. Under
+		// load that was a ten-minute hang, not a failure. Every wait below is
+		// generous and named, so a loaded host fails only if the watcher is
+		// wrong, and says which step it was wrong at.
+		const deadline = 10 * time.Second
 		var mu = make(chan [2]int, 1)
 		mu <- [2]int{80, 24}
+		reads := make(chan struct{}, 16)
 		size := func() (int, int, bool) {
 			s := <-mu
 			mu <- s
+			reads <- struct{}{}
 			return s[0], s[1], true
 		}
+		setSize := func(s [2]int) {
+			<-mu
+			mu <- s
+		}
+		awaitRead := func(when string) {
+			t.Helper()
+			select {
+			case <-reads:
+			case <-time.After(deadline):
+				t.Fatalf("the watcher never read the size %s", when)
+			}
+		}
 		trigger := make(chan struct{})
+		fire := func(when string) {
+			t.Helper()
+			select {
+			case trigger <- struct{}{}:
+			case <-time.After(deadline):
+				t.Fatalf("the watcher took no trigger %s: it is stuck emitting an event nothing caused", when)
+			}
+		}
+		expect := func(want [2]int, changes <-chan [2]int) {
+			t.Helper()
+			select {
+			case got := <-changes:
+				if got != want {
+					t.Fatalf("change = %v, want %v", got, want)
+				}
+			case <-time.After(deadline):
+				t.Fatalf("no resize event for %v", want)
+			}
+		}
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		changes := watchSize(ctx, size, trigger)
-		trigger <- struct{}{} // same size: nothing
-		<-mu
-		mu <- [2]int{100, 30}
-		trigger <- struct{}{} // changed: one event
-		select {
-		case got := <-changes:
-			if got != [2]int{100, 30} {
-				t.Fatalf("change = %v", got)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("no resize event after a change")
-		}
-		trigger <- struct{}{} // unchanged again
-		select {
-		case got := <-changes:
-			t.Fatalf("spurious resize event %v", got)
-		case <-time.After(50 * time.Millisecond):
-		}
+		awaitRead("at start")
+
+		fire("with the size unchanged")
+		awaitRead("for the unchanged trigger")
+
+		setSize([2]int{100, 30})
+		fire("after the size changed")
+		expect([2]int{100, 30}, changes)
+		awaitRead("for the changed trigger")
+
+		fire("with the size unchanged again")
+		awaitRead("for the second unchanged trigger")
+
+		// `changes` is unbuffered: a spurious event would leave the watcher
+		// blocked in its send, deaf to triggers. It taking this trigger and
+		// the NEXT event being the new size is the proof that the unchanged
+		// triggers emitted nothing - no clock window asserts an absence.
+		setSize([2]int{120, 40})
+		fire("after the second change")
+		expect([2]int{120, 40}, changes)
 	})
 	t.Run("the poll trigger fires and stops with the context", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())

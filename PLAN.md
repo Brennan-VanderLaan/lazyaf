@@ -200,7 +200,7 @@ table so the shrinkage is visible.
 | **12 — Runner architecture + spec/eval layer** | **COMPLETE** (2026-09-10) apart from 12.9, which is deliberately out of scope | Every phase through 12.8 landed; 12.8 closed in `96ed87d` (P3-P5) + `0adfad0` (P6). Detail retired to [`historical-documents/phase-12-runner-architecture.md`](historical-documents/phase-12-runner-architecture.md) |
 | **13 — Benchmark & evaluation harness** | **NOT STARTED** | Zero implementation. Grep for `BenchmarkCase` / `StrategyTemplate` / `TrialIteration` / `fail_to_pass` / `cost_to_solve` across `backend/`, `frontend/`, `cli/`, `tdd/` returns one hit, a comment at `backend/app/services/agent_run.py:15`. Design: this document + `docs/milestone-13/` |
 | **14 — Self-hosted OpenAI-compatible endpoints** | **COMPLETE** (2026-08-30) | Commit `4b429c6`: 56 files, ~21.5k lines. `ModelEndpoint` + migration `0011_model_endpoints.py`, capability probe, agent harness in `runner-common/runner_common/harness/`, stdlib mock OpenAI server, Endpoints UI. Out of the 12.x sequence |
-| **Go CLI — `lazyaf` binary replaces the Python CLI (0.3.0)** | **IN PROGRESS** on branch `go-cli`: P0–P3 landed, P4 (the deletion) waits on the acceptance gate (`upcoming/go-cli.md` §13.3) | Root `go.mod`; `cli/cmd/lazyaf` + `cli/internal/{api,cmd,debugproto,doctor,envfile,gitx,initcmd,reconcile,terminal,ui,version}`; codec pinned to the server's exported corpus `tdd/contracts/debug_terminal.v1.json`; parity ledger `tdd/contracts/cli_parity.json` (61 entries: 42 ported to named Go tests, 19 retired with a reason) enforced from both sides (`tdd/unit/scripts/test_cli_parity_ledger.py`, `cli/internal/parity/ledger_test.go`); TG tier via `go tool gotestsum`; `release.yml` builds six binaries + `checksums.txt` + `install.sh`. The Python CLI, `bootstrap_secrets.py` and `preflight.py` are still in the tree until P4; docs and compose messages already say `lazyaf init` / `lazyaf doctor` |
+| **Go CLI — `lazyaf` binary replaces the Python CLI (0.3.0)** | **IN PROGRESS** on branch `go-cli`: P0–P3 landed; §13.3 gate lines 1–5 green as of 2026-09-17 (dogfood run `237e96b5` 12/12, `release.yml` smoke on three OSes); P4 (the deletion) waits on line 6 only — the owner's interactive `debug attach` (`upcoming/go-cli.md` §13.3) | Root `go.mod`; `cli/cmd/lazyaf` + `cli/internal/{api,cmd,debugproto,doctor,envfile,gitx,initcmd,reconcile,terminal,ui,version}`; codec pinned to the server's exported corpus `tdd/contracts/debug_terminal.v1.json`; parity ledger `tdd/contracts/cli_parity.json` (61 entries: 42 ported to named Go tests, 19 retired with a reason) enforced from both sides (`tdd/unit/scripts/test_cli_parity_ledger.py`, `cli/internal/parity/ledger_test.go`); TG tier via `go tool gotestsum`; `release.yml` builds six binaries + `checksums.txt` + `install.sh`. The Python CLI, `bootstrap_secrets.py` and `preflight.py` are still in the tree until P4; docs and compose messages already say `lazyaf init` / `lazyaf doctor` |
 | **14.5 — Runner images with inference baked in** | **DESIGNED** | Zero implementation. Evidence corrected 2026-08-31 — the old "no `vllm`/`ollama` anywhere" line was false (M14's endpoint layer uses both words). The absent 14.5 identifiers are the evidence: no `images/node-layer/`, `images/runner-ollama/`, `images/runner-vllm/`; no `scripts/build_inference_images.py`; no `refuses_without_gpu`; no `gpu.py` `detect()`/`verdict()`; no GPU-yield mechanism. Doc: `upcoming/wave9-145-runner-images.md` |
 
 ### Milestone 12 phases
@@ -1456,11 +1456,42 @@ Decisions made DURING implementation (all shipped and gate-verified):
   six release binaries recorded the tag before `gh release`. The standing
   release PR must not be merged before P4 (it becomes mergeable long before;
   every P0-P3 commit uses a hidden type so it never reads as a `feat`).
-- **2026-09-16 Manual acceptance (§13.3 step 6): NOT YET RECORDED.** The owner
-  runs `lazyaf init && lazyaf doctor`, `lazyaf list`, and the
-  `debug rerun --break` / `debug attach --token` loop on Windows Git Bash and
-  one Linux box; the result is written here before P4. The Windows raw-console
-  keystroke granularity (§12) is verified in that same step.
+- **2026-09-17 Gate lines 1-5 of §13.3 are green; the dogfood took four runs,
+  and each red was a finding, not noise.** (Claude.) The repo was re-ingested
+  into the rebuilt stack with the Go binary and `go-cli` pushed as the internal
+  `main` (the trigger is a literal `branches: ["main"]`).
+  Run `ea97dd3b` died at tier1 on one documented timing flake, so the Go tier
+  never ran; the CLASS was fixed (`6cfd3c7`: tests wait on the state they
+  assert via one shared `tdd/shared/wait.py`, never on a proxy row or a clock;
+  150 stress runs under load, 0 failures). Run `5931f877` went green through
+  tier1 and the new Go tier, then hit tier2's 900 s timeout: three loopback
+  runner tests start step containers on the runner's default `bridge` network,
+  which cannot reach a lane living on `lazyaf-network` - they had likely never
+  passed inside the dogfood (`45f17ff`: `sibling_network()` derives the network
+  from the daemon and raises rather than answering `bridge`). Run `022a6c0c`
+  went green through all four tiers and failed mock-agent with "connected
+  runners: none" - an environment fact, not a code one: the compose
+  `runner-agent` service had not been started on the rebuilt stack.
+  **Run `237e96b5` passed all 12 steps**: `CI GATE [T1]: OK executed=5969`,
+  `[TG]: OK executed=482`, `[T2]: OK executed=83`, `[T3]: OK executed=22`.
+  Gate 5 remote: `release.yml` dispatched on the branch (run 35157081801) built
+  six binaries and the install smoke went green on ubuntu, windows and macos.
+  Surfaced and NOT fixed here: production's engine runs on sqlite3's 5 s
+  default busy timeout, so the 503-under-lock mode the tests now tolerate at
+  60 s exists in the product at 5 s.
+- **2026-09-17 Manual acceptance (§13.3 step 6): NOT YET RECORDED - the
+  non-interactive half is pre-verified, the keyboard half is the owner's.**
+  Against the owner's stack on Windows (Git Bash, `dev+45f17ff`): `doctor` 14
+  OK / 2 WARN (8000 and 5173 held by LazyAF's own containers, attributed as
+  such) rc=0; `list`, `branches`; `debug rerun <run> --break secret-scan` ->
+  `status` reads `waiting_at_bp` / `attach: available`; `debug attach
+  --print-credential` mints a token and opens no socket, and REFUSES with the
+  remedy while the run is not yet paused; `extend`; `abort`; `debug list` empty
+  afterwards. What no agent can verify is a human at a real console: `debug
+  attach` with arrow keys, Ctrl-C reaching the remote shell, and `Ctrl-] r` to
+  resume, on Windows Git Bash and one Linux box. The Windows raw-console
+  keystroke granularity (§12) is verified in that same step; the result is
+  written here before P4.
 
 ---
 

@@ -50,6 +50,7 @@ from app.services.model_endpoints.scheduler import (  # noqa: E402
     try_admit,
     uses_admission_gate,
 )
+from tdd.shared.wait import DEFAULT_TIMEOUT, wait_until  # noqa: E402
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -264,21 +265,46 @@ class TestWaiting:
         holder = await _make_step_execution(db_session, index=0)
         await try_admit(db_session, holder.id, endpoint)
         waiter = await _make_step_execution(db_session, index=1)
+        lines = []
 
-        async def _release_soon():
-            await asyncio.sleep(0.1)
+        async def _release_once_waiting():
+            # The holder frees the slot only after the waiter has ANNOUNCED
+            # its wait - the line admit() emits on its first pass
+            # (scheduler.py:299-301), which is the product's own signal that
+            # the first try_admit lost. `asyncio.sleep(0.1)` guessed that the
+            # waiter's first try_admit lands inside 0.1 s; when it did not,
+            # the slot was free on that first try, the waiter was admitted
+            # without ever waiting, and the "admitted ... after waiting" line
+            # this test asserts was never written (only a waiter that logged
+            # a wait logs an admission, scheduler.py:315-324).
+            await wait_until(
+                lambda: [line for line in lines if "waiting for endpoint" in line],
+                what="the waiter announced its wait",
+            )
             holder.status = StepExecutionStatus.COMPLETED.value
             await db_session.commit()
             notify_release(endpoint.id)
 
-        lines = []
-        release = asyncio.create_task(_release_soon())
+        release = asyncio.create_task(_release_once_waiting())
+        # `poll` is the shared deadline, not 0.05: this test is the WAKE
+        # (scheduler.py:303-310 parks on the Condition and notify_release
+        # is what frees it), so the poll backstop must not be able to admit
+        # the waiter first. That also keeps the waiter parked, off the one
+        # `db_session` both tasks share, while the release task commits on
+        # it - the 0.05 s poll let `try_admit` run on that session mid-commit.
+        started = asyncio.get_running_loop().time()
         await admit(
             db_session, waiter.id, endpoint,
-            log=lines.append, timeout=5, poll=0.05, log_interval=0.0,
+            log=lines.append, timeout=DEFAULT_TIMEOUT, poll=DEFAULT_TIMEOUT,
+            log_interval=0.0,
         )
+        waited = asyncio.get_running_loop().time() - started
         await release
 
+        assert waited < DEFAULT_TIMEOUT, (
+            f"admitted only after {waited:.1f}s: the waiter was not woken by "
+            "notify_release and fell through to the poll backstop"
+        )
         await db_session.refresh(waiter)
         assert waiter.model_endpoint_id == endpoint.id
         assert any("admitted to endpoint local-4090" in line for line in lines)

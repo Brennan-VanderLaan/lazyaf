@@ -19,6 +19,8 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from tdd.shared.wait import DEFAULT_TIMEOUT as WAIT_DEADLINE
+
 # -----------------------------------------------------------------------------
 # Shared secrets (12.7). MUST run before `from app.main import app` below.
 #
@@ -298,7 +300,23 @@ async def async_engine(tmp_path):
         f"sqlite+aiosqlite:///{db_path}",
         echo=False,
         future=True,
-        connect_args={"timeout": 30},
+        # SQLite's busy timeout is the ONE fuse under every wait a test makes
+        # on this engine, so it is sized from the shared deadline rather than
+        # guessed. A lock held longer than it is not "slow", it is an
+        # OperationalError: the four losers of a five-way claim answer 503
+        # instead of the 400 the conditional UPDATE promises (cards.py:259-281),
+        # and a step task minting its rows crashes instead of dispatching
+        # (pipeline_executor.py:2682 `_load_local_step_context`, a SELECT
+        # blocked by a request session's still-open commit). Both were seen
+        # at the old fixed 30 s under host starvation (QA findings S2 and S3,
+        # 2026-09-16). At 3x the deadline a request, the step task it spawns
+        # and the completion hook it lands can queue behind one another and
+        # still cost only latency, which the tests' 20 s waits then report as
+        # the product being slow - the only thing they are allowed to say
+        # (tdd/shared/wait.py). Production's engine (backend/app/database.py:15)
+        # runs on sqlite3's 5 s default; that gap is a product question, not
+        # this fixture's.
+        connect_args={"timeout": WAIT_DEADLINE * 3},
     )
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -344,7 +362,23 @@ async def db_session(async_engine) -> AsyncGenerator[AsyncSession, None]:
 async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     """Provide an async HTTP client for API testing.
 
-    This client is configured to use the test database session.
+    Every request is served by the test's own ``db_session`` - ONE
+    AsyncSession, which is not safe under concurrent requests. A test that
+    fires requests concurrently (``asyncio.gather`` over several posts) must
+    use ``concurrent_client`` below, which is the production shape.
+
+    Why this one stays shared, stated rather than left as an accident: a
+    per-request ``client`` was tried on 2026-09-16 against the whole T1
+    api+demos selection (1036 tests) and exactly two refused it, both in
+    tdd/integration/api/test_spec_api.py::TestSeedMilestone12
+    (test_reconcile_rewrites_retired_text_in_place and
+    test_seed_test_refs_idempotent_and_repairs). They write a row through
+    ``db_session``, commit, call the API to rewrite that row, and re-select
+    it through ``db_session`` - whose identity map (``expire_on_commit=False``)
+    still holds their own pre-API copy, so the API's rewrite is invisible
+    unless the API wrote the same session object. Those two tests are not
+    wrong to want that, and they are the only reason this fixture is not
+    the per-request one.
     """
     async def override_get_db():
         yield db_session
@@ -355,6 +389,38 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
 
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def concurrent_client(async_engine) -> AsyncGenerator[AsyncClient, None]:
+    """A client that gives every request its OWN database session.
+
+    The shared-session `client` fixture cannot express a race: two requests
+    on one AsyncSession interleave inside one transaction, which is not what
+    the running stack does. This one hands each request a fresh session on
+    the same file-backed engine, exactly as production's ``get_db`` does
+    (backend/app/database.py:76-78), so N simultaneous POSTs contend for the
+    SQLite write lock as they do in production - which is the only way to
+    test that a claim is atomic (QA finding T6).
+
+    Moved here from tdd/integration/api/test_cards_api.py so the next suite
+    that races requests reuses it instead of growing its own (R3). A test
+    using it has no session of its own: read state back through a fresh
+    ``async_sessionmaker(async_engine)`` session, as the card race tests do.
+    """
+    factory = async_sessionmaker(
+        async_engine, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def override_get_db():
+        async with factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
     app.dependency_overrides.clear()
 
 

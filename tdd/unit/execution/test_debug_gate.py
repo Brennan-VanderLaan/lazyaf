@@ -39,6 +39,7 @@ from app.services.execution.debug_state import DebugState
 from app.services.pipeline_executor import PipelineExecutor
 from app.services.websocket import manager
 from app.services.workspace.state_machine import generate_volume_name
+from tdd.shared.wait import DEFAULT_TIMEOUT, wait_until
 
 
 # -----------------------------------------------------------------------------
@@ -274,15 +275,22 @@ SCRIPT_GRAPH = {
 }
 
 
-async def wait_until(predicate, timeout=20.0, interval=0.02):
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        value = await predicate()
-        if value:
-            return value
-        await asyncio.sleep(interval)
-    raise AssertionError("condition never became true")
+async def settled(awaitable, what: str):
+    """Await one of the product's own coroutines or tasks, bounded.
+
+    `asyncio.wait_for(..., timeout=5.0)` was a fixed guess in event-wait
+    clothing: a gate's return path is a row read plus `_teardown_pause` on
+    aiosqlite (debug_session_service.py:477), and 5 s of that under a
+    shared CPU is a race. The completion IS the signal; the deadline is the
+    shared one so a wedged gate fails as an assertion about the product,
+    never as a tier that hung.
+    """
+    try:
+        return await asyncio.wait_for(awaitable, timeout=DEFAULT_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise AssertionError(
+            f"{what}: not finished after {DEFAULT_TIMEOUT:g}s"
+        ) from None
 
 
 async def read_session(factory, session_id) -> DebugSession:
@@ -440,8 +448,23 @@ class TestGatePausesAndResumes:
                 repo=repo,
                 breakpoints=["first"],
             )
+
+        # Wait on the FRAME, which is what this test asserts - not on the row.
+        # The row commits at debug_session_service.py:647 and the frame goes
+        # out at :649, after a `refresh` and a `to_dict`; a wait on the row
+        # returns inside that window and reads an empty socket. Same shape
+        # as test_ws_runner_endpoint's `_settle`: a proxy signal, one step
+        # ahead of the state under assertion.
+        def waiting_frame():
+            waiting = [
+                f
+                for f in env.socket.of_type("debug_session_status")
+                if f["status"] == DebugState.WAITING_AT_BP.value
+            ]
+            return waiting[-1] if waiting else None
+
         await wait_until(
-            lambda: _session_status(env.factory, session.id, DebugState.WAITING_AT_BP)
+            waiting_frame, what="a WAITING_AT_BP debug_session_status frame"
         )
         frames = env.socket.of_type("debug_session_status")
         assert frames, "the pause must be visible on the WS channel"
@@ -664,11 +687,11 @@ class TestABreakpointOnAGraphStepIdFires:
             )
             await db.commit()
 
-        result = await asyncio.wait_for(
+        result = await settled(
             debug_session_service.gate(
                 env.factory, run.id, marker.id, SimpleNamespace(value="local")
             ),
-            timeout=5.0,
+            what="the gate on a row with no step_id",
         )
         assert result.outcome is DebugGateOutcome.RESUME
         assert result.paused is False, (
@@ -706,7 +729,7 @@ class TestABreakpointOnAGraphStepIdFires:
         finally:
             async with env.factory() as db:
                 await debug_session_service.resume(db, session_id)
-            await asyncio.wait_for(gate_task, timeout=5.0)
+            await settled(gate_task, what="the resumed gate")
 
 
 # -----------------------------------------------------------------------------
@@ -795,7 +818,7 @@ class TestGatePlacementDoesNotHoldTheRunLock:
                 id=str(uuid4()), name="written-during-pause", default_branch="main"
             )
             db.add(probe)
-            await asyncio.wait_for(db.commit(), timeout=5.0)
+            await settled(db.commit(), what="a commit during the pause")
             assert await db.get(Repo, probe.id) is not None
 
         async with env.factory() as db:
@@ -1064,6 +1087,6 @@ class TestWorkspacePin:
 
         async with env.factory() as db:
             await debug_session_service.resume(db, session.id)
-        result = await asyncio.wait_for(gate_task, timeout=5.0)
+        result = await settled(gate_task, what="the resumed remote gate")
         assert result.outcome is DebugGateOutcome.RESUME
         assert result.paused is True

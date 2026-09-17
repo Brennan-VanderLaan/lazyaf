@@ -40,6 +40,8 @@ from sqlalchemy.pool import NullPool
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from tdd.shared.wait import wait_until_sync
+
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
 sys.path.insert(0, str(backend_path))
 
@@ -203,6 +205,29 @@ def roundtrip(ws):
         message = ws.receive_json()
         if message["type"] == "pong":
             return
+    raise AssertionError("no pong within 20s")
+
+
+def expect_pong(ws):
+    """The `pong` answering the frame sent just before this call.
+
+    The receive loop is sequential (ws_runners.py:430-500), so the next pong
+    IS that answer - a real signal, not a poll. The one frame the product
+    may legally put in front of it is its own keepalive `ping`: after
+    RECEIVE_TIMEOUT (20 s, runner_protocol.py:52-55) of inbound silence the
+    endpoint sends one and keeps reading (ws_runners.py:437-440). A test
+    thread that a loaded host stalls for 20 s between two frames therefore
+    reads `ping` where it expected `pong`, which is the shape of the one F
+    this file produced under load (item 21, TestPerMessageSessions). That
+    ping is skipped here and nothing else is: any other frame is a product
+    fault and fails naming the frame. The deadline is `roundtrip`'s bound.
+    """
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        message = ws.receive_json()
+        if message["type"] == "pong":
+            return message
+        assert message["type"] == "ping", f"expected pong, got {message!r}"
     raise AssertionError("no pong within 20s")
 
 
@@ -424,12 +449,29 @@ class TestMidSessionErrors:
         with connect(client) as ws:
             registered(ws)
             ws.send_json({"type": "heartbeat"})
-            assert ws.receive_json()["type"] == "pong"
+            expect_pong(ws)
 
 
 # -----------------------------------------------------------------------------
 # Contract 2: per-message DB sessions
 # -----------------------------------------------------------------------------
+
+# The receive loop closes every session it opens before it answers (see
+# `handle`, ws_runners.py:503-541). The ONLY other opener on a connection is
+# the death watchdog (ws_runners.py:583), and it opens one only after
+# DEATH_TIMEOUT (30 s) of inbound silence - then closes the socket. So a
+# non-zero `live` right after a pong is not a leaked per-message session; it
+# is the product correctly declaring a runner dead because this host stalled
+# the test thread for 30 s between two frames. No wait can make that pass
+# (the socket is about to close), so the assertion stays instantaneous and
+# the message says which of the two it is.
+_LIVE_AFTER_PONG = (
+    "a session is live right after a pong: either the handler leaked it "
+    "(ws_runners.py:503-541) or the death watchdog (ws_runners.py:583) has "
+    "declared this runner dead after DEATH_TIMEOUT of silence - the host "
+    "stalled the test thread between two frames"
+)
+
 
 class TestPerMessageSessions:
     def test_no_session_is_held_across_the_connection(self, client, ws_env):
@@ -437,16 +479,23 @@ class TestPerMessageSessions:
             registered(ws)
             roundtrip(ws)
             after_register = ws_env.sessions.opened
-            assert ws_env.sessions.live == 0
+            assert ws_env.sessions.live == 0, _LIVE_AFTER_PONG
 
             for _ in range(5):
                 ws.send_json({"type": "heartbeat"})
-                assert ws.receive_json()["type"] == "pong"
+                expect_pong(ws)
 
             roundtrip(ws)
-            # Every heartbeat opened AND closed its own session.
+            # Every heartbeat opened AND closed its own session. These are
+            # asserted the instant the pong lands, not polled: the pong is
+            # sent only after the handler's `async with` has exited
+            # (ws_runners.py:507-509), and `_TrackedSession.__aexit__`
+            # decrements `live` before it awaits the real close, so `live`
+            # is 0 here by construction. Polling until it reads 0 would let a
+            # session that outlives its message by seconds pass - the exact
+            # defect contract 2 exists to catch.
             assert ws_env.sessions.opened >= after_register + 5
-            assert ws_env.sessions.live == 0
+            assert ws_env.sessions.live == 0, _LIVE_AFTER_PONG
             assert ws_env.sessions.closed == ws_env.sessions.opened
 
     def test_the_endpoint_never_holds_two_sessions_at_once(self, client, ws_env):
@@ -466,7 +515,7 @@ class TestPerMessageSessions:
             roundtrip(ws)
             before = _run(ws_env.url, _load_runner("pi-1")).last_heartbeat
             ws.send_json({"type": "heartbeat", "timestamp": "2099-01-01T00:00:00"})
-            assert ws.receive_json()["type"] == "pong"
+            expect_pong(ws)
             roundtrip(ws)
             after = _run(ws_env.url, _load_runner("pi-1")).last_heartbeat
         assert after >= before
@@ -677,6 +726,9 @@ class TestTeardown:
             # task running the app, which would abort the teardown a real
             # disconnect always gets to finish.
             ws.close(protocol.CLOSE_NORMAL)
+            # Waits on BOTH fields asserted below. They land in one commit
+            # (runner_registry.py:212-223), but the wait observes what the
+            # test asserts rather than relying on that.
             row = _settle(ws_env.url, "pi-1", RunnerState.DISCONNECTED.value)
         assert row.status == RunnerState.DISCONNECTED.value
         assert row.websocket_id is None
@@ -691,8 +743,16 @@ class TestTeardown:
             _run(ws_env.url, _hold(ids["execution_id"], "pi-1"))
             roundtrip(ws)
             ws.close(protocol.CLOSE_NORMAL)
-            _settle(ws_env.url, "pi-1", RunnerState.DISCONNECTED.value)
-            execution = _run(ws_env.url, _load_execution(ids["execution_id"]))
+            # Wait on the EXECUTION row, the row asserted below - not on the
+            # runner row. teardown() (ws_runners.py:617-625) is two commits:
+            # first `registry.disconnect` marks the runner DISCONNECTED
+            # (runner_registry.py:223), THEN `on_runner_disconnect` requeues
+            # the execution (job_recovery.py:174-188). `_settle` on the runner
+            # returned between them, and one dogfood run read the execution
+            # in that window: `assert 'assigned' == 'pending'`.
+            execution = _settle_execution(
+                ws_env.url, ids["execution_id"], StepExecutionStatus.PENDING.value
+            )
         assert execution.status == StepExecutionStatus.PENDING.value
         assert execution.runner_id is None
 
@@ -769,6 +829,11 @@ class TestDeathWatchdog:
             with pytest.raises(WebSocketDisconnect):
                 for _ in range(50):
                     ws.receive_json()
+            # The watchdog requeues (job_recovery.py:125 -> :174-188, one
+            # commit) BEFORE it closes the socket (ws_runners.py:601-602), so
+            # the close the client just saw already implies the requeue; the
+            # wait still observes the `runner_id` asserted below rather than
+            # inferring it from `status`.
             execution = _settle_execution(
                 ws_env.url, ids["execution_id"], StepExecutionStatus.PENDING.value
             )
@@ -902,22 +967,93 @@ def _rotate_websocket_id(runner_id):
     return _op
 
 
-def _settle(url, runner_id, status, timeout=20.0):
-    """Wait for the endpoint's teardown, which runs after the socket closes."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+# -----------------------------------------------------------------------------
+# Settling: wait on the ROW THE TEST ASSERTS (R4)
+#
+# The endpoint's teardown runs AFTER the socket closes, in the app's task,
+# and it is TWO commits in a fixed order (ws_runners.py:617-625):
+#
+#   1. `registry.disconnect`      -> runner.websocket_id = None,
+#                                    runner.status = DISCONNECTED
+#                                    (runner_registry.py:212-223, one commit)
+#   2. `recovery.on_runner_disconnect` -> execution.status = PENDING,
+#                                    execution.runner_id = None,
+#                                    runner.current_step_execution_id = None
+#                                    (job_recovery.py:174-188, one commit)
+#
+# A test that asserts on the execution row must therefore wait on the
+# execution row. Waiting on the runner row and then loading the execution
+# once is a race on the gap between the two commits - the T1 dogfood failure
+# named in tdd/tier_floors.json. Each helper's predicate reads exactly the
+# fields its callers assert and returns the row once they hold.
+#
+# Polls go through `_run`, which builds a fresh engine per read (see its
+# docstring for why); 0.05 s between polls keeps that churn where it was.
+# The 20 s default deadline is the shared helper's: a bound on a real wait,
+# not a guess about its length.
+# -----------------------------------------------------------------------------
+
+_SETTLE_INTERVAL = 0.05
+
+
+class _NotYet:
+    """Falsy observation for a settle predicate.
+
+    `wait_until_sync` reports the predicate's LAST value on the deadline, so a
+    miss returns this instead of `None`: its repr is the fields actually seen,
+    and the failure reads `... still status='assigned', runner_id='pi-1'`.
+    """
+
+    def __init__(self, **fields):
+        self.fields = fields
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return ", ".join(f"{name}={value!r}" for name, value in self.fields.items())
+
+
+def _settle(url, runner_id, status):
+    """Wait for the RUNNER row to show `status` with its fence cleared.
+
+    Teardown's FIRST commit only. This says nothing about the execution row,
+    which is the SECOND commit - a test asserting on the execution waits with
+    `_settle_execution`.
+    """
+
+    def observe():
         row = _run(url, _load_runner(runner_id))
-        if row.status == status:
+        if row.status == status and row.websocket_id is None:
             return row
-        time.sleep(0.05)
-    raise AssertionError(f"runner {runner_id} never reached {status}")
+        return _NotYet(status=row.status, websocket_id=row.websocket_id)
+
+    return wait_until_sync(
+        observe,
+        interval=_SETTLE_INTERVAL,
+        what=f"runner {runner_id} torn down to {status!r} with websocket_id=None",
+    )
 
 
-def _settle_execution(url, execution_id, status, timeout=20.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+def _settle_execution(url, execution_id, status, runner_id=None):
+    """Wait for the EXECUTION row to show `status` owned by `runner_id`.
+
+    Both fields are written in the requeue's single commit
+    (job_recovery.py:174-175, :188); the predicate observes both because both
+    are what the callers assert.
+    """
+
+    def observe():
         row = _run(url, _load_execution(execution_id))
-        if row.status == status:
+        if row.status == status and row.runner_id == runner_id:
             return row
-        time.sleep(0.05)
-    raise AssertionError(f"step execution {execution_id} never reached {status}")
+        return _NotYet(status=row.status, runner_id=row.runner_id)
+
+    return wait_until_sync(
+        observe,
+        interval=_SETTLE_INTERVAL,
+        what=(
+            f"step execution {execution_id} requeued as {status!r} "
+            f"with runner_id={runner_id!r}"
+        ),
+    )

@@ -12,9 +12,10 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from tdd.shared.wait import DEFAULT_TIMEOUT, wait_until
 
 # Add backend and tdd to path for imports
 backend_path = Path(__file__).parent.parent.parent.parent / "backend"
@@ -22,8 +23,6 @@ tdd_path = Path(__file__).parent.parent.parent.parent / "tdd"
 sys.path.insert(0, str(backend_path))
 sys.path.insert(0, str(tdd_path))
 
-from app.database import get_db
-from app.main import app
 from app.models import Card, Job, PipelineRun, Repo, StepRun, TestRef, TestRun
 
 from shared.factories import repo_create_payload, repo_ingest_payload, card_create_payload, card_update_payload
@@ -145,32 +144,6 @@ async def card_in_review(client, db_session, repo_id, *, title="Reviewed work"):
 
     await stage_card(db_session, card_id, status="in_review", branch_name=branch)
     return card_id
-
-
-@pytest_asyncio.fixture
-async def concurrent_client(async_engine):
-    """A client that gives every request its OWN database session.
-
-    The shared-session `client` fixture cannot express a race: two requests
-    on one AsyncSession interleave inside one transaction, which is not what
-    the running stack does. This one hands each request a fresh session on
-    the same file-backed engine, so N simultaneous POSTs contend for the
-    SQLite write lock exactly as they do in production - which is the only
-    way to test that the card claim is atomic (QA finding T6).
-    """
-    factory = async_sessionmaker(
-        async_engine, class_=AsyncSession, expire_on_commit=False
-    )
-
-    async def override_get_db():
-        async with factory() as session:
-            yield session
-
-    app.dependency_overrides[get_db] = override_get_db
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
-    app.dependency_overrides.clear()
 
 
 class TestListCards:
@@ -883,10 +856,77 @@ def trigger_spy(monkeypatch):
     return calls
 
 
-async def settle(cycles=40):
-    """Let the dispatched step task run to wherever it is going."""
-    for _ in range(cycles):
-        await asyncio.sleep(0.01)
+class _Observed:
+    """Falsy carrier for what a `wait_until` predicate saw but did not accept.
+
+    The shared helper reports the predicate's LAST value on its deadline
+    (tdd/shared/wait.py:43-49); wrapping the observation keeps polling AND
+    makes the failure read "still 'in_progress' after 20.0s" rather than
+    "still False".
+    """
+
+    def __init__(self, value):
+        self.value = value
+
+    def __bool__(self):
+        return False
+
+    def __repr__(self):
+        return repr(self.value)
+
+
+async def drain_run(run_id, timeout=DEFAULT_TIMEOUT):
+    """Wait until the executor has NO in-flight task for this run.
+
+    Several tests below assert what a run's completion did NOT do - no
+    card_complete gate call, no card walked into in_review, no second run.
+    A negative can only be asserted once the work that could still do it has
+    finished, and the executor's task registry is its own definition of
+    "finished": the step task, the run continuation, the on_run_complete hook
+    that lands the card and then awaits the gate, and the lock-eviction
+    straggler all run inside tasks it registers under keys carrying the run
+    id (pipeline_executor.py:1174-1192; `wait_for_run` at :1251-1265 reads
+    the same registry, and tdd/conftest.py's `_drain_pipeline_executor` reads
+    it too). Polled through the shared helper rather than awaited through
+    `wait_for_run`, because a deadline on an awaited gather would CANCEL the
+    executor's tasks mid-commit - the hard cancel cancel_run's comment
+    (pipeline_executor.py:5439-5443) exists to avoid.
+
+    This replaces `settle()`, a fixed 0.4 s sleep that encoded a guess at how
+    long the step task takes; the guess held on an idle laptop and not in
+    the dogfood container (tdd/tier_floors.json, T1 note).
+    """
+    from app.services.pipeline_executor import pipeline_executor
+
+    def in_flight():
+        pending = [
+            key
+            for key, task in list(pipeline_executor._tasks.items())
+            if run_id in key and not task.done()
+        ]
+        return _Observed(f"in-flight executor tasks {pending}") if pending else True
+
+    await wait_until(
+        in_flight,
+        timeout=timeout,
+        what=f"run {run_id[:8]} drained",
+    )
+
+
+async def drain_card_work(async_engine, card_id):
+    """`drain_run` for every ad-hoc run the card has, read from a session of
+    its own (the atomic-claim tests below hold no `db_session`)."""
+    factory = async_sessionmaker(
+        async_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    async with factory() as session:
+        run_ids = (
+            await session.execute(
+                select(PipelineRun.id).where(PipelineRun.trigger_ref == card_id)
+            )
+        ).scalars().all()
+    for run_id in run_ids:
+        await drain_run(run_id)
 
 
 AGENT_LOG_LINE = "[agent] rewriting the module\n"
@@ -922,38 +962,38 @@ async def read_job(client, db_session, job_id):
     return response.json()
 
 
-async def await_card_status(client, db_session, card_id, expected, timeout=10.0):
-    """Poll until the card reaches `expected`, then return it.
+async def await_card_status(client, db_session, card_id, expected):
+    """Wait until the card reaches `expected`, then return it.
 
     The run completes on a background step task, so the card's terminal
-    status arrives whenever that task gets there. Polling keeps the
-    assertion about the OUTCOME instead of about how many event-loop turns
-    the settle helper happened to buy.
+    status arrives whenever that task gets there. The predicate reads the
+    card the assertion is about, so a deadline reports "card status
+    'in_review': still 'in_progress' after 20.0s" - the failed assertion,
+    not a wait that gave up (tdd/shared/wait.py).
     """
-    deadline = asyncio.get_event_loop().time() + timeout
-    card = await read_card(client, db_session, card_id)
-    while card["status"] != expected and asyncio.get_event_loop().time() < deadline:
-        await asyncio.sleep(0.02)
+
+    async def card_reached_status():
         card = await read_card(client, db_session, card_id)
-    assert card["status"] == expected, (
-        f"card stayed {card['status']!r}; expected {expected!r} within {timeout}s"
+        return card if card["status"] == expected else _Observed(card["status"])
+
+    return await wait_until(
+        card_reached_status, what=f"card status {expected!r}"
     )
-    return card
 
 
-async def await_card_gate(trigger_spy, expected_status, timeout=5.0):
+async def await_card_gate(trigger_spy, expected_status):
     """Wait for the card_complete gate to fire for `expected_status`.
 
     The card's status is COMMITTED before the gate is awaited, so a test that
     polls the status and then reads the spy is racing the last two lines of
-    the completion handler.
+    the completion handler. The wait is on the spy itself - the list the
+    assertion reads - and the assertion afterwards is still EXACTLY one call.
     """
-    deadline = asyncio.get_event_loop().time() + timeout
-    while (
-        not any(call[2] == expected_status for call in trigger_spy)
-        and asyncio.get_event_loop().time() < deadline
-    ):
-        await asyncio.sleep(0.02)
+    await wait_until(
+        lambda: any(call[2] == expected_status for call in trigger_spy)
+        or _Observed([call[2] for call in trigger_spy]),
+        what=f"card_complete gate fired for {expected_status!r}",
+    )
     assert [call[2] for call in trigger_spy] == [expected_status], (
         f"card_complete gate calls were {trigger_spy!r}; expected exactly one "
         f"for {expected_status!r}"
@@ -987,11 +1027,14 @@ async def act_as_container(client, executor, log_line=AGENT_LOG_LINE):
     return step_id
 
 
-async def await_dispatch(executor, timeout=10.0):
+async def await_dispatch(executor, timeout=DEFAULT_TIMEOUT):
     """Wait for the step to reach the executor, loudly.
 
     A bare ``Event.wait()`` on a step that never dispatches hangs the whole
-    suite with no message; this fails the one test that broke.
+    suite with no message; this fails the one test that broke. The Event is
+    the real signal the stub sets at dispatch, so the timeout is only the
+    deadline on it - the shared 20 s, so a loaded host fails here only when
+    the step really never dispatched (tdd/shared/wait.py).
     """
     try:
         await asyncio.wait_for(executor.dispatched.wait(), timeout=timeout)
@@ -1121,10 +1164,14 @@ class TestCancelJobCancelsTheRun:
         """The full sequence: cancel, then let the step task finish anyway."""
         card = await start_agent_card(client, ingested_repo["id"])
         await await_dispatch(parked_executor)
+        run = await adhoc_run_for(db_session, card["id"])
 
         await client.post(f"/api/jobs/{card['job_id']}/cancel")
         parked_executor.release.set()  # the container "exits 0" after the kill
-        await settle()
+        # Every assertion below is about what the step task did NOT do once
+        # it got its exit, so wait for it to be gone rather than for a guess
+        # at how long it takes (see drain_run).
+        await drain_run(run.id)
 
         card_after = await read_card(client, db_session, card["id"])
         assert card_after["status"] == "failed"
@@ -1133,10 +1180,9 @@ class TestCancelJobCancelsTheRun:
         assert job_after["status"] == "failed"
         assert job_after["error"] == "Cancelled by user"
 
-        # Give a gate call that should NOT happen time to happen: the card
-        # status commits before the gate is awaited, so reading the spy the
-        # instant the status lands would pass whether or not it fires.
-        await settle()
+        # The gate is awaited INSIDE the drained task, after the card status
+        # commits: with nothing of the run left in flight, an empty spy means
+        # it never fired, not that it has not fired yet.
         assert trigger_spy == [], (
             "a cancelled run fired the card_complete gate - that is the "
             "self-triggering loop with an extra step in front of it"
@@ -1336,7 +1382,9 @@ class TestCardOutcomeRespectsTests:
             **results,
         )
         executor.release.set()
-        await settle()
+        # The callers assert the gate did NOT fire; that needs the run's
+        # tasks gone, not a pause (see drain_run).
+        await drain_run(run.id)
         return run
 
     async def test_red_suite_holds_the_card_out_of_review(
@@ -1360,10 +1408,8 @@ class TestCardOutcomeRespectsTests:
             "the agent step succeeded but the repo suite is red - the card "
             "must not reach in_review"
         )
-        # Give a gate call that should NOT happen time to happen: the card
-        # status commits before the gate is awaited, so reading the spy the
-        # instant the status lands would pass whether or not it fires.
-        await settle()
+        # _finish_run drained the run's tasks, and the gate is awaited inside
+        # them after the status commits: an empty spy means it never fired.
         assert trigger_spy == [], (
             "a red card fired the card_complete gate - the verification "
             "pipeline was handed a red branch as if it were done"
@@ -1416,14 +1462,15 @@ class TestCardOutcomeRespectsTests:
         )
 
         parked_executor.release.set()
+        # The status commits BEFORE the gate is awaited, so the spy is only
+        # final once the run's tasks are gone (see drain_run). Drained here,
+        # before read_card's _fresh() expires `run` and `run.id` would lazy-
+        # load outside the greenlet.
+        await drain_run(run.id)
         card_after = await await_card_status(
             client, db_session, card["id"], "failed"
         )
         assert card_after["status"] != "in_review"
-        # Give a gate call that should NOT happen time to happen: the card
-        # status commits before the gate is awaited, so reading the spy the
-        # instant the status lands would pass whether or not it fires.
-        await settle()
         assert trigger_spy == [], (
             "a card whose verification step went red fired the card_complete "
             "gate"
@@ -1467,7 +1514,6 @@ class TestCardOutcomeRespectsTests:
         await await_dispatch(parked_executor)
         await act_as_container(client, parked_executor)
         parked_executor.release.set()
-        await settle()
 
         await await_card_status(client, db_session, card["id"], "in_review")
 
@@ -1509,11 +1555,19 @@ class TestCardJobLogsAreNotDark:
         card = await start_agent_card(client, ingested_repo["id"])
         await await_dispatch(parked_executor)
         await act_as_container(client, parked_executor)
-        await settle(cycles=10)  # let the log flush land
 
-        response = await client.get(f"/api/jobs/{card['job_id']}/logs")
-        assert response.status_code == 200, response.text
-        assert "rewriting the module" in response.json()["logs"], (
+        # Wait on the state asserted - the line showing up in THIS endpoint's
+        # response - not on a pause for "the log flush" to land.
+        async def logs_carry_the_line():
+            response = await client.get(f"/api/jobs/{card['job_id']}/logs")
+            assert response.status_code == 200, response.text
+            logs = response.json()["logs"]
+            return logs if "rewriting the module" in logs else _Observed(logs)
+
+        logs = await wait_until(
+            logs_carry_the_line, what="the agent's log line in GET /jobs/{id}/logs"
+        )
+        assert "rewriting the module" in logs, (
             "the card modal polls this endpoint every 3s while a job runs; "
             "before completion Job.logs is empty, so it has to fall back to "
             "the StepRun the job is linked to"
@@ -1724,6 +1778,15 @@ class TestRejectStopsTheWork:
         self, client, ingested_repo, db_session, parked_executor
     ):
         """Reject then start: exactly one live run, ever."""
+        # The stub's `release` Event is shared by every run it executes. With
+        # release_on_cancel left True, rejecting the first run SETS it, so the
+        # replacement run below never parks: it "exits 0" at once, is failed
+        # for never having reported, and lands the card `failed` - in about
+        # 30 ms, racing the live-run count at the end of this test, which then
+        # reads 0 (the flake tdd/tier_floors.json's T1 note records). Leaving
+        # the first container "alive" after the kill, as the sibling test
+        # above does, keeps the replacement parked and genuinely live.
+        parked_executor.release_on_cancel = False
         card = await start_agent_card(client, ingested_repo["id"])
         await await_dispatch(parked_executor)
         first_run = await adhoc_run_for(db_session, card["id"])
@@ -1922,6 +1985,19 @@ class TestStartingACardIsAtomic:
     These tests use `concurrent_client`, which gives every request its own
     session: on the shared session of the ordinary `client` fixture there is
     no race to lose.
+
+    The RETRY race also parks the winner's run (`parked_executor`). Under the
+    T1 stub an agent step fails at dispatch (no control-layer image), the
+    run fails, and `on_run_complete` lands the card back at `failed` about
+    100 ms after the winning response - while the slowest of the five
+    "simultaneous" retries can still be reading the card. RETRY_FROM includes
+    `failed` (routers/cards.py:180), so that straggler wins a SECOND claim,
+    correctly: it is retrying a card that really did fail. The old test
+    measured host speed (the flake tdd/tier_floors.json's T1 note names);
+    parking the run keeps the card in_progress until the test says
+    otherwise, which is the state "five simultaneous retries" presumes.
+    `start` needs no parking: START_FROM is `todo` alone, and nothing the
+    failing run does puts the card back there.
     """
 
     async def _card(self, client, repo_id, title="Concurrent"):
@@ -1980,7 +2056,10 @@ class TestStartingACardIsAtomic:
             )
         )
         codes = sorted(r.status_code for r in responses)
-        await settle()
+        # The winner's run fails at dispatch under the T1 stub; let it go all
+        # the way (on_run_complete included) so the count below covers what
+        # its completion spawned, not only what the requests wrote.
+        await drain_card_work(async_engine, card_id)
 
         jobs, runs = await self._counts(async_engine, card_id)
         assert codes == [200, 400, 400, 400, 400], (
@@ -1992,7 +2071,12 @@ class TestStartingACardIsAtomic:
         )
 
     async def test_five_simultaneous_retries_produce_one_new_run(
-        self, concurrent_client, clean_git_repos, clean_runner_registry, async_engine
+        self,
+        concurrent_client,
+        clean_git_repos,
+        clean_runner_registry,
+        async_engine,
+        parked_executor,
     ):
         repo = await self._ingested_repo(concurrent_client)
         card_id = await self._card(concurrent_client, repo["id"], title="Retry race")
@@ -2010,12 +2094,17 @@ class TestStartingACardIsAtomic:
             )
         )
         codes = sorted(r.status_code for r in responses)
-        await settle()
-
-        jobs, runs = await self._counts(async_engine, card_id)
         assert codes == [200, 400, 400, 400, 400], (
             f"{codes.count(200)} of 5 simultaneous retries were accepted"
         )
+
+        # Only now may the card leave in_progress (see the class docstring).
+        # Let the run finish - it fails, never having reported - so the count
+        # covers its completion too, exactly as the start race above.
+        parked_executor.release.set()
+        await drain_card_work(async_engine, card_id)
+
+        jobs, runs = await self._counts(async_engine, card_id)
         assert (jobs, runs) == (1, 1)
 
     async def test_approve_and_reject_cannot_both_win(

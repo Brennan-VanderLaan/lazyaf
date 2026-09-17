@@ -10,8 +10,10 @@ hard drop-oldest buffer ceiling, an HTTP-free watchdog loop, and
 shell-wrapping with `set -e` + mkdir-HOME semantics identical to
 local_executor.build_step_command.
 """
+import subprocess
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +25,7 @@ from control.executor import (
     build_shell_command,
     execute_command,
 )
+from tdd.shared import wait
 
 
 class FakeClient:
@@ -219,24 +222,103 @@ class TestQuietProcessFlush:
         assert "early\n" in client.batches[0][1]
 
     def test_flushes_on_batch_size(self, tmp_path, monkeypatch):
+        """The size trigger flushes while the process is STILL RUNNING - not
+        the final drain wearing a size-capped slice as a disguise.
+
+        No clock, and no process the test spawns on its own exit path. The
+        script prints two batches' worth of lines and then parks on the
+        bash BUILTIN `read` against a stdin pipe the test owns. The client
+        observes the product signal directly: on its first `send_logs` it
+        records whether the process is still alive (`proc.poll() is None`)
+        and only then closes stdin, which is what lets bash exit. The only
+        other flush path is the final drain, which starts after
+        `process.wait()` (executor.py:274-275), so a flush that saw the
+        process alive can only have been the size trigger (executor.py:214).
+
+        Two earlier forms lost on a loaded host without the product being
+        wrong. `batches[0] - start < 0.45 s` with `start` taken before Popen
+        measured bash spawn time. Its replacement had the script poll for a
+        file with `while [ ! -e flushed ]; do sleep 0.02; done` - a `sleep`
+        PROCESS per iteration - and under a saturated host the size trigger
+        fired while the process was alive in 10/10 probe runs, yet 2/10
+        ended in the watchdog's exit 124 (one with MSYS `sleep` dying on
+        `cygheap read copy failed`) because the exit path, not the trigger,
+        was starved; the assertion then blamed the trigger. `read` spawns
+        nothing, and the liveness flag is the claim itself.
+        """
         monkeypatch.setattr(executor_mod, "LOG_BATCH_SIZE", 2)
         monkeypatch.setattr(executor_mod, "LOG_BATCH_INTERVAL", 30.0)  # timer off
-        client = FakeClient()
-        start = time.monotonic()
+
+        # Capture the Popen so the client can poll it, and give bash a stdin
+        # pipe for `read` to park on. Scoped to the executor module (same
+        # shape as the `threading` namespace in test_failed_final_drain_...):
+        # the proxy forwards everything else - PIPE, STDOUT, run,
+        # TimeoutExpired - to the real module untouched.
+        captured: list[subprocess.Popen] = []
+
+        class CapturingPopen(subprocess.Popen):
+            def __init__(self, *args, **kwargs):
+                kwargs["stdin"] = subprocess.PIPE
+                super().__init__(*args, **kwargs)
+                captured.append(self)
+
+        class _Subprocess:
+            Popen = CapturingPopen
+
+            def __getattr__(self, name):
+                return getattr(subprocess, name)
+
+        monkeypatch.setattr(executor_mod, "subprocess", _Subprocess())
+
+        alive: dict[str, bool] = {}
+
+        class ReleasingClient(FakeClient):
+            def send_logs(self, lines, stream="stdout"):
+                ok = super().send_logs(lines, stream)
+                if "at_first_flush" not in alive:
+                    # The sender thread starts after Popen returned
+                    # (executor.py:262-265), so the process is captured.
+                    (proc,) = captured
+                    alive["at_first_flush"] = proc.poll() is None
+                    proc.stdin.close()  # EOF for `read`: the process's exit
+                return ok
+
+        client = ReleasingClient()
         config = _config(
-            "for i in 1 2 3 4; do echo line$i; done\nsleep 0.5",
+            "for i in 1 2 3 4; do echo line$i; done\n"
+            "read -r _ || true",  # `set -e`: EOF must not become exit 1
             working_directory=str(tmp_path),
+            # Only the bound on a BROKEN trigger: a green run exits on the
+            # stdin close and never comes near it, so it is wide on purpose
+            # (three times the shared default) - the probe above saw bash's
+            # first echo land 11 s and 88 s after Popen on the saturated
+            # host, and a bound this test can trip for host reasons is the
+            # defect it was rewritten to remove. A trigger that never fires
+            # ends here as a watchdog kill (exit 124) instead of hanging
+            # the tier on `read`.
+            timeout_seconds=3 * wait.DEFAULT_TIMEOUT,
         )
 
         result = execute_command(config, client)
 
-        assert result.exit_code == 0
+        # The claim, observed where it happens: the first flush found the
+        # process alive. A missing key means nothing was ever sent while it
+        # ran - the watchdog killed it and even the final drain sent nothing.
+        assert alive.get("at_first_flush") is True, (
+            "the size trigger never flushed while the process was alive: "
+            f"first flush saw alive={alive.get('at_first_flush')!r}, "
+            f"result={result!r}"
+        )
+        # And it was the SIZE that triggered it: one exact LOG_BATCH_SIZE
+        # slice, the first two lines in order (executor.py:214).
+        assert client.batches[0][1] == ["line1\n", "line2\n"]
         assert sorted(client.all_lines()) == [
             "line1\n", "line2\n", "line3\n", "line4\n",
         ]
-        # Size-triggered flush fired while the process was still sleeping
-        # (the 30s timer could not have fired within this test's lifetime)
-        assert client.batches[0][0] - start < 0.45
+        # The exit was the test's own stdin close, not the watchdog: bash
+        # read EOF and left through `|| true`, so the result is a clean 0.
+        assert result.timed_out is False
+        assert result.exit_code == 0
 
 
 class TestFlushDiscipline:
@@ -326,14 +408,47 @@ class TestFlushDiscipline:
                 self.gate = threading.Event()
 
             def send_logs(self, lines, stream="stdout"):
-                self.gate.wait(timeout=5.0)
+                # The deadline of an event wait, not its schedule: the gate
+                # is set by `sender_stop` below. Left unset, the send returns
+                # and the batch count below names the defect.
+                self.gate.wait(timeout=wait.DEFAULT_TIMEOUT)
                 super().send_logs(lines, stream)
                 self.dropped_log_lines += len(lines)  # what a real client does
                 return False
 
         client = GatedRefusingClient()
-        releaser = threading.Timer(0.8, client.gate.set)
-        releaser.start()
+
+        # WHAT OPENS THE GATE. The blocked first slice must return only after
+        # `sender_stop` is set (executor.py:275, right after `process.wait()`).
+        # Released any earlier it is a pre-stop slice, the next slice is
+        # `due` pre-stop as well (executor.py:214), and the bail path this
+        # test exists for is never reached - three batches instead of two.
+        # A `threading.Timer(0.8, ...)` guessed that five echos exit inside
+        # 0.8 s; a loaded host disagreed. So the gate opens ON that set:
+        # executor.py:167-168 creates `output_done` then `sender_stop`, and
+        # the executor reaches `threading` through its module global, so a
+        # namespace handing out one instrumented Event per call is scoped to
+        # this one execute_command and touches no other thread's Events.
+        events: list[threading.Event] = []
+
+        class _Event(threading.Event):
+            def set(self):
+                super().set()
+                if events.index(self) == 1:  # sender_stop
+                    client.gate.set()
+
+        def _event():
+            event = _Event()
+            events.append(event)
+            return event
+
+        monkeypatch.setattr(
+            executor_mod,
+            "threading",
+            SimpleNamespace(
+                Event=_event, Lock=threading.Lock, Thread=threading.Thread
+            ),
+        )
         config = _config(
             "for i in 1 2 3 4 5; do echo line$i; done",
             working_directory=str(tmp_path),
@@ -342,7 +457,6 @@ class TestFlushDiscipline:
         try:
             result = execute_command(config, client)
         finally:
-            releaser.cancel()
             client.gate.set()
 
         assert result.exit_code == 0
